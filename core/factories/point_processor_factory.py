@@ -17,7 +17,9 @@ class PointProcessorFactory:
     @staticmethod
     def create_processor(method: str, parameters: dict, average_structure: Optional[dict] = None) -> Optional[IPointParametersProcessor]:
         if method == 'from_average':
-            return FromAveragePointProcessor(parameters, average_structure)
+            rspace_info = parameters.get('rspace_info', {})
+            num_chunks = rspace_info.get('num_chunks', 10)  # Default to 10 if not specified
+            return FromAveragePointProcessor(parameters, average_structure, num_chunks=num_chunks)
         elif method == 'central':
             return CentralPointProcessor(parameters)
         elif method == 'full_list':
