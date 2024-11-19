@@ -1,0 +1,48 @@
+{
+    "structInfo": {
+        "working_durectory": "./pmn_300k_RN",
+        "filename": "pmn_300k_RN.rmc6f",
+        "cells_limits_min":[0,0,0],
+        "cells_limits_max":[2,2,2]
+    },
+    "peakInfo": {
+        "hkl_limits": [
+            {
+                "limit": [10.0, 10.0, 10.0],
+                "subvolume_step": [5.0, 5.0, 5.0]
+            }
+        ],
+        "specialPoints": [
+            {   
+                "customReciprocalSpacePoints": "./hklList.dat",
+                "spaceGroupSymmetry": "F d -3 m",
+                "coordinate": [0.0, 0.0, 0.0],
+                "shape": "sphere",
+                "radius": 0.202
+            }
+        ]
+    },
+    "rspace_info": {
+		
+        "method": "from_average",
+        "filter_type": "Chebyshev",
+        "save_rifft_coordinates": true,
+		"smooth_intensities": true,
+        "print_intensities": false,
+        "rspace_parallel_processing": true,
+        "points": [
+            {
+                "elementSymbol": "Pb",
+                "referenceNumber": 1,
+                "distFromAtomCenter": [0.65, 0.65, 0.65],
+                "stepInAngstrom": [0.05, 0.05, 0.05]
+            },
+            {
+                "elementSymbol": "Nb",
+                "referenceNumber": 2,
+                "distFromAtomCenter": [0.65, 0.65, 0.65],
+                "stepInAngstrom": [0.05, 0.05, 0.05]
+            }
+        ]
+    }
+}
