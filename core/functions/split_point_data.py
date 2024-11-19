@@ -4,27 +4,37 @@ Created on Wed Nov 13 16:51:00 2024
 
 @author: Maksim Eremenko
 """
-
 # functions/split_point_data.py
 
 import numpy as np
 from data_structures.point_data import PointData
+from typing import List
+import math
 
-def split_point_data(point_data: PointData, chunk_size: int) -> [PointData]:
+def split_point_data(point_data: PointData, num_chunks: int) -> List[PointData]:
     """
-    Splits the PointData into smaller chunks.
+    Splits the PointData into a specified number of chunks.
 
     Args:
         point_data (PointData): The complete point data.
-        chunk_size (int): The number of points per chunk.
+        num_chunks (int): The desired number of chunks.
 
     Returns:
-        [PointData]: A list of PointData instances, each containing a subset of the data.
+        List[PointData]: A list of PointData instances, each containing a subset of the data.
     """
     num_points = point_data.coordinates.shape[0]
+    if num_chunks <= 0:
+        raise ValueError("Number of chunks must be a positive integer.")
+    if num_chunks > num_points:
+        raise ValueError("Number of chunks cannot exceed the number of points.")
+
+    # Calculate the number of points per chunk
+    points_per_chunk = math.ceil(num_points / num_chunks)
+
     chunks = []
-    for start in range(0, num_points, chunk_size):
-        end = start + chunk_size
+    for i in range(num_chunks):
+        start = i * points_per_chunk
+        end = min(start + points_per_chunk, num_points)
         chunk_coordinates = point_data.coordinates[start:end]
         chunk_dist = point_data.dist_from_atom_center[start:end]
         chunk_step = point_data.step_in_frac[start:end]

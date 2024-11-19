@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Oct 29 14:52:11 2024
-
-@author: Maksim Eremenko
-"""
-
 # main.py
 
 import os
@@ -15,13 +8,10 @@ from factories.configuration_processor_factory import ConfigurationProcessorFact
 from factories.parameters_processor_factory import ParametersProcessorFactoryProvider
 from factories.point_processor_factory import PointProcessorFactory
 from data_structures.point_data import PointData
-from functions.split_point_data import split_point_data
 from processors.point_data_processor import PointDataProcessor
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 
-
 def main():
-    # Configuration file processing
     setup_logging()
     logger = logging.getLogger('app')
 
@@ -124,10 +114,15 @@ def main():
             # Determine the method
             rspace_info = parameters.get('rspace_info', {})
             method = rspace_info.get('method')
-            point_data_hdf5_path = '../tests/config/point_data.hdf5'  # Path to save/load point data
+            point_data_hdf5_path = '../tests/config/processed_point_data/point_data.hdf5'  # Path to save/load point data
             # Set HDF5 file path in parameters
             parameters['hdf5_file_path'] = point_data_hdf5_path
-            # Create the appropriate point processor
+
+            # Specify the number of chunks
+            num_chunks = rspace_info.get('num_chunks', 10)  # Default to 10 if not specified
+            logger.info(f"Number of chunks to create: {num_chunks}")
+
+            # Create the appropriate point processor with num_chunks
             point_processor = PointProcessorFactory.create_processor(method, parameters, average_structure={
                 'average_coords': average_coords,
                 'elements': elements,
@@ -148,49 +143,18 @@ def main():
             
             logger.info("Point data prepared for calculation.")
             
-            # Access data from point_data
-            coordinates = point_data.coordinates               # NumPy array of shape (N, D)
-            dist_from_atom_center = point_data.dist_from_atom_center  # NumPy array
-            step_in_frac = point_data.step_in_frac             # NumPy array
-            central_point_ids = point_data.central_point_ids   # NumPy array
-            
-            # Example: Output some data
-            logger.debug(f"Coordinates shape: {coordinates.shape}")
-            logger.debug(f"First few coordinates:\n{coordinates[:5]}")
-            logger.debug(f"Central Point IDs:\n{central_point_ids[:5]}")
-            
-            point_data_chunks = split_point_data(point_data, 10)  # Split into chunks of 10 points each
-            
             # Initialize DataSaver
             data_saver = RIFFTInDataSaver(output_dir='../tests/config/processed_point_data', file_extension='hdf5')
 
-            # Process each point_data chunk
-            point_data_file_paths = []
-            for chunk_id, point_data_chunk in enumerate(point_data_chunks):
-                # Each chunk should include 'central_point_ids'
-                chunk_dict = {
-                    'coordinates': point_data_chunk.coordinates,
-                    'dist_from_atom_center': point_data_chunk.dist_from_atom_center,
-                    'step_in_frac': point_data_chunk.step_in_frac,
-                    'central_point_ids': point_data_chunk.central_point_ids
-                }
+            # Initialize PointDataProcessor
+            point_data_processor = PointDataProcessor(data_saver=data_saver, save_rifft_coordinates=rspace_info.get('save_rifft_coordinates', False))
 
-                # Initialize PointDataProcessor
-                point_data_processor = PointDataProcessor(data_saver=data_saver, save_rifft_coordinates=True)
-                saved_files = point_data_processor.process_point_data_chunk(chunk_id, chunk_dict)
-                if saved_files:
-                    if 'grid_points' in saved_files:
-                        logger.info(f"Processed point_data chunk {chunk_id}. Grid points saved to {saved_files['grid_points']}")
-                    if 'amplitudes' in saved_files:
-                        logger.info(f"Processed point_data chunk {chunk_id}. Amplitudes saved to {saved_files['amplitudes']}")
-                    point_data_file_paths.append(saved_files)
-                else:
-                    logger.info(f"No data generated for point_data chunk {chunk_id}.")
+            # Process point data
+            point_data_processor.process_point_data(point_data)
+
         except Exception as e:
             logger.error(f"An error occurred: {e}")
-
     except Exception as e:
         logger.error(f"An error occurred: {e}")
-
 if __name__ == '__main__':
     main()
