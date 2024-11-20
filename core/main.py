@@ -10,6 +10,7 @@ from factories.point_processor_factory import PointProcessorFactory
 from data_structures.point_data import PointData
 from processors.point_data_processor import PointDataProcessor
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
+from processors.point_data_hkl_manager import HKLIntervalManager
 
 def main():
     setup_logging()
@@ -151,9 +152,22 @@ def main():
 
             # Process point data
             point_data_processor.process_point_data(point_data)
-
+            
         except Exception as e:
             logger.error(f"An error occurred: {e}")
+        try:
+            # Initialize PointDataHKLManager
+            hkl_data_hdf5_path = '../tests/config/processed_point_data/point_hkl_data.hdf5'
+            point_data_hkl_manager = HKLIntervalManager(
+            hdf5_file_path=hkl_data_hdf5_path,
+            parameters=parameters,
+            supercell=supercell
+            )
+            # Process hkl intervals
+            point_data_hkl_manager.process_hkl_intervals()
+        except Exception as e:
+                logger.error(f"An error occurred: {e}")
+                
     except Exception as e:
         logger.error(f"An error occurred: {e}")
 if __name__ == '__main__':
