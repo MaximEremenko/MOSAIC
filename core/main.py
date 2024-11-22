@@ -165,9 +165,7 @@ def main():
             
         # Databaser data processing
         try:     
-            # Initialize DatabaseManager
-            db_path = '../tests/config/processed_point_data/point_hkl_associations.db'
-            db_manager = DatabaseManager(db_path)
+
 
             # Convert PointData to list of dictionaries for batch insertion
             point_data_list = []
@@ -182,9 +180,6 @@ def main():
                 }
                 point_data_list.append(pd_dict)
 
-            # Insert PointData in batch
-            point_ids = db_manager.insert_point_data_batch(point_data_list)
-            logger.info(f"Inserted or found {len(point_ids)} PointData entries in the database.")
 
             # HKL Interval processing
             hkl_data_hdf5_path = '../tests/config/processed_point_data/point_hkl_data.hdf5'
@@ -206,7 +201,16 @@ def main():
                 hkl_intervals.append(hkl_interval)
 
             logger.info(f"Loaded {len(hkl_intervals)} hkl_intervals from HKLIntervalManager.")
-
+            
+            
+            
+            
+            # Initialize DatabaseManager
+            db_path = '../tests/config/processed_point_data/point_hkl_associations.db'
+            db_manager = DatabaseManager(db_path)            
+            # Insert PointData in batch
+            point_ids = db_manager.insert_point_data_batch(point_data_list)
+            logger.info(f"Inserted or found {len(point_ids)} PointData entries in the database.")
             # Insert HKLIntervals in batch
             hkl_ids = db_manager.insert_hkl_interval_batch(hkl_intervals)
             logger.info(f"Inserted or found {len(hkl_ids)} HKLInterval entries in the database.")
@@ -228,23 +232,23 @@ def main():
             unsaved_associations = db_manager.get_unsaved_associations()
             logger.info(f"Processing {len(unsaved_associations)} unsaved associations.")
 
-            # Example processing: Placeholder for actual data saving logic
-            # Replace this loop with actual processing code
-            updates = []
-            for point_id, hkl_id in unsaved_associations:
-                # TODO: Implement your data processing and saving logic here
-                # For demonstration, we'll assume processing is successful and mark as saved
-                # e.g., process_data(point_id, hkl_id)
+            # # Example processing: Placeholder for actual data saving logic
+            # # Replace this loop with actual processing code
+            # updates = []
+            # for point_id, hkl_id in unsaved_associations:
+            #     # TODO: Implement your data processing and saving logic here
+            #     # For demonstration, we'll assume processing is successful and mark as saved
+            #     # e.g., process_data(point_id, hkl_id)
                 
-                # After successful processing, prepare to update the saved status
-                updates.append((1, point_id, hkl_id))  # 1 represents True
+            #     # After successful processing, prepare to update the saved status
+            #     updates.append((1, point_id, hkl_id))  # 1 represents True
 
-            if updates:
-                db_manager.update_saved_status_batch(updates)
-                logger.info(f"Updated saved status for {len(updates)} associations.")
+            # if updates:
+            #     db_manager.update_saved_status_batch(updates)
+            #     logger.info(f"Updated saved status for {len(updates)} associations.")
 
-            # Close the database connection
-            db_manager.close()
+            # # Close the database connection
+            # db_manager.close()
 
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}")
