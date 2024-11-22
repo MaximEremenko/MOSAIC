@@ -1,6 +1,7 @@
 # main.py
 
 import os
+import numpy as np
 import logging
 from utilities.logger_config import setup_logging
 
@@ -11,6 +12,11 @@ from data_structures.point_data import PointData
 from processors.point_data_processor import PointDataProcessor
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 from processors.point_data_hkl_manager import HKLIntervalManager
+from managers.database_manager import DatabaseManager  # Import the DatabaseManager
+
+import h5py  # For reading HDF5 files
+import json  # For secure parsing
+
 
 def main():
     setup_logging()
@@ -62,22 +68,6 @@ def main():
         logger.info("Elements:\n%s", elements.head())
         logger.info("Vectors (Base Vectors):\n%s", vectors)
         logger.info("Metric:\n%s", metric)
-
-        # If processed using the configuration file, save to HDF5
-        if file_type != 'hdf5':
-            from data_storage.hdf5_data_storage import HDF5ConfigDataSaver
-            data_saver = HDF5ConfigDataSaver(config_hdf5_file_path)
-            data = {
-                'original_coords': original_coords,
-                'average_coords': average_coords,
-                'elements': elements,
-                'refnumbers': refnumbers,
-                'vectors': vectors,
-                'metric': metric,
-                'supercell': supercell
-            }
-            data_saver.save_data(data)
-            logger.info(f"Processed data saved to HDF5 file: {config_hdf5_file_path}")
 
         # Parameters file processing
         parameters_file_path = '../tests/config/input_parameters.json'
@@ -144,31 +134,90 @@ def main():
             
             logger.info("Point data prepared for calculation.")
             
-            # Initialize DataSaver
-            data_saver = RIFFTInDataSaver(output_dir='../tests/config/processed_point_data', file_extension='hdf5')
+            # Initialize DatabaseManager
+            db_path = '../tests/config/processed_point_data/point_hkl_associations.db'
+            db_manager = DatabaseManager(db_path)
 
-            # Initialize PointDataProcessor
-            point_data_processor = PointDataProcessor(data_saver=data_saver, save_rifft_coordinates=rspace_info.get('save_rifft_coordinates', False))
+            # Convert PointData to list of dictionaries for batch insertion
+            point_data_list = []
+            for i in range(point_data.central_point_ids.size):
+                pd_dict = {
+                    'central_point_id': int(point_data.central_point_ids[i]),
+                    'coordinates': point_data.coordinates[i].tolist(),
+                    'dist_from_atom_center': point_data.dist_from_atom_center[i].tolist(),
+                    'step_in_frac': point_data.step_in_frac[i].tolist(),
+                    'chunk_id': int(point_data.chunk_ids[i]),
+                    'grid_amplitude_initialized': int(point_data.grid_amplitude_initialized[i])
+                }
+                point_data_list.append(pd_dict)
 
-            # Process point data
-            point_data_processor.process_point_data(point_data)
-            
-        except Exception as e:
-            logger.error(f"An error occurred: {e}")
-        try:
-            # Initialize PointDataHKLManager
+            # Insert PointData in batch
+            point_ids = db_manager.insert_point_data_batch(point_data_list)
+            logger.info(f"Inserted or found {len(point_ids)} PointData entries in the database.")
+
+            # HKL Interval processing
             hkl_data_hdf5_path = '../tests/config/processed_point_data/point_hkl_data.hdf5'
             point_data_hkl_manager = HKLIntervalManager(
-            hdf5_file_path=hkl_data_hdf5_path,
-            parameters=parameters,
-            supercell=supercell
+                hdf5_file_path=hkl_data_hdf5_path,
+                parameters=parameters,
+                supercell=supercell
             )
-            # Process hkl intervals
             point_data_hkl_manager.process_hkl_intervals()
-        except Exception as e:
-                logger.error(f"An error occurred: {e}")
+
+            # Extract HKLIntervals as list of dictionaries
+            hkl_intervals = []
+            for d in point_data_hkl_manager.hkl_intervals:
+                hkl_interval = {
+                    'h_range': d['h_range'],
+                    'k_range': d['k_range'],
+                    'l_range': d['l_range']
+                }
+                hkl_intervals.append(hkl_interval)
+
+            logger.info(f"Loaded {len(hkl_intervals)} hkl_intervals from HKLIntervalManager.")
+
+            # Insert HKLIntervals in batch
+            hkl_ids = db_manager.insert_hkl_interval_batch(hkl_intervals)
+            logger.info(f"Inserted or found {len(hkl_ids)} HKLInterval entries in the database.")
+
+            # Create associations between PointData and HKLIntervals in bulk
+            # Generate all possible (point_id, hkl_id) pairs
+            associations = []
+            for point_id in point_ids:
+                for hkl_id in hkl_ids:
+                    associations.append((point_id, hkl_id))
+
+            logger.info(f"Creating {len(associations)} associations between PointData and HKLIntervals.")
+
+            # Insert associations in batch
+            db_manager.associate_point_hkl_batch(associations)
+            logger.info("All PointData and HKLInterval associations have been created or already exist.")
+
+            # Optional: Process unsaved associations
+            unsaved_associations = db_manager.get_unsaved_associations()
+            logger.info(f"Processing {len(unsaved_associations)} unsaved associations.")
+
+            # Example processing: Placeholder for actual data saving logic
+            # Replace this loop with actual processing code
+            updates = []
+            for point_id, hkl_id in unsaved_associations:
+                # TODO: Implement your data processing and saving logic here
+                # For demonstration, we'll assume processing is successful and mark as saved
+                # e.g., process_data(point_id, hkl_id)
                 
+                # After successful processing, prepare to update the saved status
+                updates.append((1, point_id, hkl_id))  # 1 represents True
+
+            if updates:
+                db_manager.update_saved_status_batch(updates)
+                logger.info(f"Updated saved status for {len(updates)} associations.")
+
+            # Close the database connection
+            db_manager.close()
+
+        except Exception as e:
+            logger.error(f"An unexpected error occurred: {e}")
     except Exception as e:
-        logger.error(f"An error occurred: {e}")
+        logger.error(f"An unexpected error occurred: {e}")
 if __name__ == '__main__':
     main()
