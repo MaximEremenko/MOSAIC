@@ -81,7 +81,7 @@ class HKLIntervalManager:
         existing_intervals_set = set(self._interval_to_str(interval) for interval in self.hkl_intervals)
         new_intervals_set = set(self._interval_to_str(interval) for interval in new_hkl_intervals)
         intervals_to_add = [interval for interval in new_hkl_intervals if self._interval_to_str(interval) not in existing_intervals_set]
-
+        self.new_intervals_set = new_intervals_set
         self.hkl_intervals.extend(intervals_to_add)
         self.logger.info(f"Added {len(intervals_to_add)} new hkl intervals. Total intervals: {len(self.hkl_intervals)}")
 
