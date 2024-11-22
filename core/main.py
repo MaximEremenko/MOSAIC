@@ -13,6 +13,7 @@ from processors.point_data_processor import PointDataProcessor
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 from processors.point_data_hkl_manager import HKLIntervalManager
 from managers.database_manager import DatabaseManager  # Import the DatabaseManager
+from functions.split_point_data import split_point_data
 
 import h5py  # For reading HDF5 files
 import json  # For secure parsing
@@ -68,6 +69,22 @@ def main():
         logger.info("Elements:\n%s", elements.head())
         logger.info("Vectors (Base Vectors):\n%s", vectors)
         logger.info("Metric:\n%s", metric)
+
+        # If processed using the configuration file, save to HDF5
+        if file_type != 'hdf5':
+            from data_storage.hdf5_data_storage import HDF5ConfigDataSaver
+            data_saver = HDF5ConfigDataSaver(config_hdf5_file_path)
+            data = {
+                'original_coords': original_coords,
+                'average_coords': average_coords,
+                'elements': elements,
+                'refnumbers': refnumbers,
+                'vectors': vectors,
+                'metric': metric,
+                'supercell': supercell
+            }
+            data_saver.save_data(data)
+            logger.info(f"Processed data saved to HDF5 file: {config_hdf5_file_path}")
 
         # Parameters file processing
         parameters_file_path = '../tests/config/input_parameters.json'
@@ -134,6 +151,20 @@ def main():
             
             logger.info("Point data prepared for calculation.")
             
+            # Initialize DataSaver
+            data_saver = RIFFTInDataSaver(output_dir='../tests/config/processed_point_data', file_extension='hdf5')
+
+            # Initialize PointDataProcessor
+            point_data_processor = PointDataProcessor(data_saver=data_saver, save_rifft_coordinates=rspace_info.get('save_rifft_coordinates', False))
+
+            # Process point data
+            point_data_processor.process_point_data(point_data)
+
+        except Exception as e:
+            logger.error(f"An error occurred: {e}")
+            
+        # Databaser data processing
+        try:     
             # Initialize DatabaseManager
             db_path = '../tests/config/processed_point_data/point_hkl_associations.db'
             db_manager = DatabaseManager(db_path)
