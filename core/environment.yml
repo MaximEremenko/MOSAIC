@@ -1,0 +1,17 @@
+channels:
+- conda-forge
+- defaults
+dependencies:
+- pip
+- pip:
+  - mrcfile==1.5.0
+  - finufft==2.2.0
+- dask
+- dill
+- matplotlib
+- numba
+- numpy
+- pandas
+- scipy
+- h5py
+name: MOSAIC
