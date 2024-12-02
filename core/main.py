@@ -202,9 +202,6 @@ def main():
 
             logger.info(f"Loaded {len(hkl_intervals)} hkl_intervals from HKLIntervalManager.")
             
-            
-            
-            
             # Initialize DatabaseManager
             db_path = '../tests/config/processed_point_data/point_hkl_associations.db'
             db_manager = DatabaseManager(db_path)            
