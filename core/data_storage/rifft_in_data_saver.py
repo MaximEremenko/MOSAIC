@@ -105,3 +105,47 @@ class RIFFTInDataSaver:
             self.logger.error(f"Unsupported file extension: {self.file_extension}")
             raise ValueError(f"Unsupported file extension: {self.file_extension}")
         return file_path
+    def load_data(self, filename):
+        """
+        Loads data from a file with the given filename.
+    
+        Args:
+            filename (str): Name of the file to load data from.
+    
+        Returns:
+            dict or np.ndarray: The loaded data. If the file is HDF5, a dictionary of datasets is returned.
+                                If the file is NPY, a NumPy array is returned.
+    
+        Raises:
+            ValueError: If the file extension is unsupported or if the file does not exist.
+        """
+        file_path = os.path.join(self.output_dir, filename)
+    
+        if not os.path.exists(file_path):
+            self.logger.error(f"File not found: {file_path}")
+            raise FileNotFoundError(f"File not found: {file_path}")
+    
+        if self.file_extension == 'hdf5':
+            try:
+                self.logger.debug(f"Loading data from HDF5 file: {file_path}")
+                data = {}
+                with h5py.File(file_path, 'r') as h5file:
+                    for dataset_name in h5file.keys():
+                        data[dataset_name] = h5file[dataset_name][:]
+                        self.logger.debug(f"Loaded dataset '{dataset_name}' with shape {data[dataset_name].shape}")
+                return data
+            except Exception as e:
+                self.logger.error(f"Failed to load data from HDF5 file: {e}")
+                raise e
+        elif self.file_extension == 'npy':
+            try:
+                self.logger.debug(f"Loading data from NPY file: {file_path}")
+                data = np.load(file_path, allow_pickle=True)
+                self.logger.debug(f"Loaded NPY array with shape {data.shape}")
+                return data
+            except Exception as e:
+                self.logger.error(f"Failed to load data from NPY file: {e}")
+                raise e
+        else:
+            self.logger.error(f"Unsupported file extension: {self.file_extension}")
+            raise ValueError(f"Unsupported file extension: {self.file_extension}")

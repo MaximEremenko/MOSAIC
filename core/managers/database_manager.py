@@ -114,7 +114,7 @@ class DatabaseManager:
                     UPDATE Point_HKL_Association
                     SET saved = ?
                     WHERE point_id = ? AND hkl_id = ?
-                """, [(saved, point_id, hkl_id) for point_id in point_ids])
+                """, [(saved, pid, hkl_id) for pid in point_ids])
 
                 self.logger.debug(f"Updated saved status for chunk_id={chunk_id} and HKLInterval ID={hkl_id} for {len(point_ids)} PointData entries.")
 
