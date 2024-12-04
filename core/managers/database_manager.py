@@ -226,16 +226,15 @@ class DatabaseManager:
             # Prepare data for insertion
             insert_data = []
             for pd in point_data_list:
-                data_json = json.dumps({
-                    'coordinates': pd['coordinates'],
-                    'dist_from_atom_center': pd['dist_from_atom_center'],
-                    'step_in_frac': pd['step_in_frac']
-                })
+                coordinates_json = json.dumps(pd['coordinates'])
+                dist_json = json.dumps(pd['dist_from_atom_center'])
+                step_json = json.dumps(pd['step_in_frac'])
+            
                 insert_data.append((
                     pd['central_point_id'],
-                    data_json,
-                    data_json,  # Assuming same structure; adjust if necessary
-                    data_json,  # Assuming same structure; adjust if necessary
+                    coordinates_json,   # Only coordinates data
+                    dist_json,          # Only dist_from_atom_center data
+                    step_json,          # Only step_in_frac data
                     pd['chunk_id'],
                     pd['grid_amplitude_initialized']
                 ))

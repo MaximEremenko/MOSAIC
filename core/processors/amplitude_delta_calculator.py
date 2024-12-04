@@ -39,12 +39,12 @@ def compute_amplitudes_delta(
         """
         rifft_amplitudes = {}
         for chunk_id in chunk_ids:
-            filename = rifft_saver.generate_filename(chunk_id, suffix='_rift')
+            filename = rifft_saver.generate_filename(chunk_id, suffix='_amplitudes')
             file_path = os.path.join(rifft_saver.output_dir, filename)
             if os.path.exists(file_path):
                 try:
                     data = rifft_saver.load_data(filename)
-                    rifft_amplitudes[chunk_id] = data.get('rift_amplitudes', np.array([]))
+                    rifft_amplitudes[chunk_id] = data.get('amplitudes', np.array([]))
                     logger.debug(f"Loaded rifft_amplitudes for chunk_id: {chunk_id} from file: {filename}")
                 except Exception as e:
                     logger.error(f"Error loading rifft_amplitudes for chunk_id: {chunk_id} from file: {filename}: {e}")
@@ -75,7 +75,22 @@ def compute_amplitudes_delta(
     vectors = parameters["vectors"]                  # Reciprocal space matrix B_ (D, D)
     supercell = parameters["supercell"]
     charge = parameters.get("charge", 0)
+    def vec2spacemat(vectors):
+        av = vectors[:, 0]
+        bv = vectors[:, 1]
+        cv = vectors[:, 2]
 
+        # basis vectors of reciprocal space
+        a_ = np.cross(bv, cv)/(np.dot(av, np.cross(bv, cv)))
+        b_ = np.cross(cv, av)/(np.dot(av, np.cross(bv, cv)))
+        c_ = np.cross(av, bv)/(np.dot(av, np.cross(bv, cv)))
+
+        B_ = np.array([a_, b_, c_])
+        B = np.linalg.inv(B_)
+        G_ = np.matmul(B_.T, B_)
+        G = np.matmul(B.T, B)
+        return B, B_, G, G_
+    B, B_, G, G_ = vec2spacemat(vectors/supercell)
     # Initialize complex coefficients
     M = original_coords.shape[0]
     c = np.ones(M, dtype=np.complex128)
@@ -102,7 +117,7 @@ def compute_amplitudes_delta(
     def process_ihkl_element(
         ihkl: dict,
         element: str,
-        vectors: np.ndarray,
+        B_: np.ndarray,
         mask_strategy: any,
         mask_parameters: dict
     ):
@@ -112,7 +127,7 @@ def compute_amplitudes_delta(
         Args:
             ihkl (dict): HKL interval information.
             element (str): Chemical element symbol.
-            vectors (np.ndarray): Reciprocal space matrix B_.
+            B_ (np.ndarray): Reciprocal space matrix B_.
             mask_strategy (MaskStrategy): Instance of mask strategy.
             mask_parameters (dict): Parameters for the mask strategy.
 
@@ -122,14 +137,14 @@ def compute_amplitudes_delta(
         logger.debug(f"Processing ihkl: {ihkl}, element: {element}")
 
         # Generate q-space grid
-        q_space_grid = generate_q_space_grid_sync(ihkl, vectors, mask_parameters, mask_strategy)
+        q_space_grid = generate_q_space_grid_sync(ihkl, B_, mask_parameters, mask_strategy, supercell)
         if q_space_grid.size == 0:
             logger.debug(f"No q-space points after masking for ihkl: {ihkl}, element: {element}")
             return None  # Skip if no points
 
         # Calculate form factors
-        ff_calculator = FormFactorFactoryProducer.get_factory('default').create_calculator(method='default')
-        ff = ff_calculator.calculate(q_space_grid, element, charge=charge)
+        #ff_calculator = FormFactorFactoryProducer.get_factory('default').create_calculator(method='default')
+        ff = FormFactorFactoryProducer.calculate(q_space_grid, element, charge=charge)
 
         # Extract mask for elements
         mask_elements = (elements == element)
@@ -197,12 +212,12 @@ def compute_amplitudes_delta(
         )
     
         # Generate filename based on chunk_id
-        filename = rifft_saver.generate_filename(chunk_id, suffix='_rift')
+        filename = rifft_saver.generate_filename(chunk_id, suffix='_amplitudes')
     
         # Load existing rifft amplitudes if file exists
         try:
             existing_data = rifft_saver.load_data(filename)
-            rifft_amplitudes_chunk = existing_data.get('rift_amplitudes', np.array([]))
+            rifft_amplitudes_chunk = existing_data.get('_amplitudes', np.array([]))
             rifft_amplitudes_chunk = np.concatenate((rifft_amplitudes_chunk, r_amplitudes_partial))
         except FileNotFoundError:
             rifft_amplitudes_chunk = r_amplitudes_partial  # Initialize if file does not exist
@@ -220,16 +235,17 @@ def compute_amplitudes_delta(
     #@delayed
     def generate_q_space_grid(
         ihkl: dict,
-        vectors: np.ndarray,
+        B_: np.ndarray,
         mask_parameters: dict,
-        mask_strategy: any
+        mask_strategy: any,
+        supercell: np.ndarray
     ) -> np.ndarray:
         """
         Generates the q-space grid for a given ihkl interval, applying masking.
 
         Args:
             ihkl (dict): HKL interval information.
-            vectors (np.ndarray): Reciprocal space matrix B_.
+            B_ (np.ndarray): Reciprocal space matrix B_.
             mask_parameters (dict): Parameters for mask generation.
             mask_strategy (MaskStrategy): Instance of mask strategy.
 
@@ -240,30 +256,31 @@ def compute_amplitudes_delta(
         h_start, h_end = ihkl['h_start'] , ihkl['h_end']
         k_start, k_end = ihkl['k_start'] , ihkl['k_end']
         l_start, l_end = ihkl['l_start'] , ihkl['l_end']
-        step = mask_parameters.get('step_in_frac', 0.05)
+        step = 1/supercell
 
         # Create ranges
-        h_vals = np.arange(h_start, h_end + step, step) if h_end > h_start else np.array([h_start])
-        k_vals = np.arange(k_start, k_end + step, step) if k_end > k_start else np.array([k_start])
-        l_vals = np.arange(l_start, l_end + step, step) if l_end > l_start else np.array([l_start])
+        h_vals = np.arange(h_start, h_end + step[0], step[0]) if h_end > h_start else np.array([h_start])
+        k_vals = np.arange(k_start, k_end + step[1], step[1]) if k_end > k_start else np.array([k_start])
+        l_vals = np.arange(l_start, l_end + step[2], step[2]) if l_end > l_start else np.array([l_start])
 
         # Create meshgrid
         mesh = np.meshgrid(h_vals, k_vals, l_vals, indexing='ij')
         q_points = np.stack([m.flatten() for m in mesh], axis=1)  # Shape: (M, 3)
 
         # Convert to q-space using vectors
-        q_space = 2 * np.pi * np.dot(q_points, vectors.T)  # Shape: (M, D)
-
+       
+        spetial_points = np.array((0,0,0))
         # Apply mask using MaskStrategy instance
-        mask = mask_strategy.generate_mask(q_space, mask_parameters)
-        q_space_masked = q_space[mask]
-
+        mask = mask_strategy.apply(q_points, spetial_points)
+        q_points_masked = q_points[mask]
+        q_space_masked = 2 * np.pi * np.dot(q_points_masked, B_)  # Shape: (M, D)
+        
         return q_space_masked
 
-    @delayed
+    #@delayed
     def generate_rifft_grid(
         chunk_data: list,
-        supercell: dict
+        supercell: np.ndarray
     ) -> np.ndarray:
         """
         Generates the RIFFT grid based on chunk data and supercell information.
@@ -306,9 +323,10 @@ def compute_amplitudes_delta(
 
     def generate_q_space_grid_sync(
         ihkl: dict,
-        vectors: np.ndarray,
+        B_: np.ndarray,
         mask_parameters: dict,
-        mask_strategy: any
+        mask_strategy: any,
+        supercell:np.ndarray
     ) -> np.ndarray:
         """
         Synchronous wrapper to generate q-space grid.
@@ -322,18 +340,18 @@ def compute_amplitudes_delta(
         Returns:
             np.ndarray: Masked q-space grid coordinates.
         """
-        return compute(generate_q_space_grid(ihkl, vectors, mask_parameters, mask_strategy))[0]
+        return compute(generate_q_space_grid(ihkl, B_, mask_parameters, mask_strategy, supercell))[0]
 
     def generate_rifft_grid_sync(
         chunk_data: list,
-        supercell: dict
+        supercell: np.ndarray
     ) -> np.ndarray:
         """
         Synchronous wrapper to generate rifft grid.
 
         Args:
             chunk_data (list): List of point_data dictionaries associated with the chunk_id.
-            supercell (dict): Supercell information (e.g., lattice parameters).
+            supercell (np.ndarray): Supercell information (e.g., lattice parameters).
 
         Returns:
             np.ndarray: RIFFT grid coordinates (M, D).
@@ -347,34 +365,34 @@ def compute_amplitudes_delta(
             task = process_ihkl_element(
                 ihkl=ihkl,
                 element=element,
-                vectors=vectors,
+                B_=B_,
                 mask_strategy=MaskStrategy,  # <-- Pass the MaskStrategy instance
                 mask_parameters=MaskStrategyParameters
             )
             ihkl_element_tasks.append(task)
 
-    # Create chunk_id tasks
-    chunk_id_tasks = []
-    for task in ihkl_element_tasks:
-        if task is not None:
-            ihkl_result = compute(task)  # <-- Correct usage: compute returns a tuple
-            if ihkl_result is None:
-                continue  # Skip if ihkl_result is None
-            ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av = ihkl_result
-            for chunk_id in chunk_ids:
-                chunk_task = process_chunk_id(
-                    chunk_id=chunk_id,
-                    ihkl_id=ihkl_id,
-                    q_space_grid=q_space_grid,
-                    q_amplitudes=q_amplitudes,
-                    q_amplitudes_av=q_amplitudes_av,
-                    rifft_saver=rifft_saver,
-                    point_data_list=point_data_list
-                )
-                chunk_id_tasks.append(chunk_task)
-
-    # Execute all chunk_id tasks collectively for better parallelism
-    if chunk_id_tasks:
-        compute(*chunk_id_tasks)
+        # Create chunk_id tasks
+        chunk_id_tasks = []
+        for task in ihkl_element_tasks:
+            if task is not None:
+                ihkl_result = compute(task)  # <-- Correct usage: compute returns a tuple
+                if ihkl_result is None:
+                    continue  # Skip if ihkl_result is None
+                ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av = ihkl_result[0]
+                for chunk_id in chunk_ids:
+                    chunk_task = process_chunk_id(
+                        chunk_id=chunk_id,
+                        ihkl_id=ihkl_id,
+                        q_space_grid=q_space_grid,
+                        q_amplitudes=q_amplitudes,
+                        q_amplitudes_av=q_amplitudes_av,
+                        rifft_saver=rifft_saver,
+                        point_data_list=point_data_list
+                    )
+                    chunk_id_tasks.append(chunk_task)
+    
+        # Execute all chunk_id tasks collectively for better parallelism
+        if chunk_id_tasks:
+            compute(*chunk_id_tasks)
 
     logger.info("Completed compute_amplitudes_delta")
