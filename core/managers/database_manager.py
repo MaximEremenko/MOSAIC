@@ -19,7 +19,92 @@ class DatabaseManager:
         self.connection = sqlite3.connect(self.db_path)
         self.cursor = self.connection.cursor()
         self._initialize_database()
+    def get_pending_chunk_ids(self) -> List[int]:
+        """
+        Retrieves unique chunk_ids from PointData that are pending processing.
 
+        Returns:
+            List[int]: List of unique chunk_ids.
+        """
+        try:
+            self.cursor.execute("""
+                SELECT DISTINCT chunk_id
+                FROM PointData
+            """)
+            rows = self.cursor.fetchall()
+            chunk_ids = [row[0] for row in rows]
+            self.logger.debug(f"Retrieved {len(chunk_ids)} unique chunk_ids for processing.")
+            return chunk_ids
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to retrieve chunk_ids: {e}")
+            return []
+        
+    def get_pending_parts(self) -> List[Dict]:
+        """
+        Retrieves pending HKLInterval entries that need processing.
+
+        Returns:
+            List[Dict]: List of HKLInterval dictionaries.
+        """
+        try:
+            self.cursor.execute("""
+                SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
+                FROM HKLInterval
+            """)
+            rows = self.cursor.fetchall()
+            pending_parts = []
+            for row in rows:
+                pending_parts.append({
+                    'id': row[0],
+                    'h_range': [row[1], row[2]],
+                    'k_range': [row[3], row[4]],
+                    'l_range': [row[5], row[6]]
+                })
+            self.logger.debug(f"Retrieved {len(pending_parts)} HKLInterval entries for processing.")
+            return pending_parts
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to retrieve HKLInterval entries: {e}")
+            return []    
+    def get_point_data_for_point_ids(self, point_ids: List[int]) -> List[Dict]:
+        """
+        Retrieves point data for the given list of point_ids.
+
+        Args:
+            point_ids (List[int]): List of point_ids to retrieve data for.
+
+        Returns:
+            List[Dict]: List of dictionaries containing point data.
+        """
+        if not point_ids:
+            return []
+
+        placeholders = ','.join(['?'] * len(point_ids))
+        query = f"""
+            SELECT central_point_id, coordinates, dist_from_atom_center, step_in_frac, chunk_id, grid_amplitude_initialized
+            FROM PointData
+            WHERE central_point_id IN ({placeholders})
+        """
+
+        try:
+            self.cursor.execute(query, point_ids)
+            rows = self.cursor.fetchall()
+            point_data_list = []
+            for row in rows:
+                point_data = {
+                    'central_point_id': row[0],
+                    'coordinates': json.loads(row[1]),
+                    'dist_from_atom_center': json.loads(row[2]),
+                    'step_in_frac': json.loads(row[3]),
+                    'chunk_id': row[4],
+                    'grid_amplitude_initialized': row[5],
+                    'id': row[0]  # Assuming central_point_id is unique and serves as 'id'
+                }
+                point_data_list.append(point_data)
+            self.logger.debug(f"Retrieved point data for {len(point_data_list)} points.")
+            return point_data_list
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to retrieve point data for point_ids={point_ids}: {e}")
+            return []
     def _initialize_database(self):
         """
         Creates tables if they do not exist.
