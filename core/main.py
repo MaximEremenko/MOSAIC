@@ -296,7 +296,7 @@ def main():
                 }
                 
                 # Step 5: Initialize MaskStrategy instance
-                mask_parameters = parameters["peakInfo"]["specialPoints"][0]["radius"]
+                mask_parameters = parameters["peakInfo"]
                 mask_strategy = SphereShapeStrategy(mask_parameters)
                 
                 # Step 6: Initialize FormFactorFactoryProducer
@@ -310,7 +310,7 @@ def main():
                         MaskStrategy=mask_strategy,
                         MaskStrategyParameters=mask_parameters,
                         db_manager=db_manager,
-                        output_dir='../tests/config/processed_point_data/amplitudes_delta'
+                        output_dir='../tests/config/processed_point_data'
                     )
                     logger.info("Amplitude delta computation completed successfully.")
                 except Exception as e:

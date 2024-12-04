@@ -10,48 +10,100 @@ Created on Wed Nov 27 19:13:01 2024
 import numpy as np
 from interfaces.shape_strategy import ShapeStrategy
 
+from itertools import product
+import numpy as np
+
 class SphereShapeStrategy(ShapeStrategy):
-    def __init__(self, radius: float):
-        self.radius = radius
+    def __init__(self, spetial_points_param: dict):
+        self.spetial_points_param = spetial_points_param
 
-    def apply(self, data_points: np.ndarray, central_points: np.ndarray) -> np.ndarray:
+    def apply(self, data_points: np.ndarray, spetial_points: np.ndarray) -> np.ndarray:
         """
-        Generates a mask for points within multiple spheres.
-
-        Args:
-            data_points (np.ndarray): Data points array.
-            central_points (np.ndarray): Array of centers of the spheres.
-
-        Returns:
-            np.ndarray: Boolean mask array.
+        Generates a mask for points within multiple spheres, including all integer-shifted 
+        equivalents of the special points within the data_points domain.
         """
-        # Initialize mask
+
+        # Helper function from the provided code
+        def corresponding_value(n_val, a):
+            if n_val == 0:
+                return abs(a)
+            else:
+                return np.sign(n_val) * (np.abs(n_val) + np.abs(a))
+
+        def find_val_in_interval(coord_min, coord_max, a):
+            # Adjust the range boundaries to the nearest integers
+            coord_min_int = np.floor(coord_min).astype(np.int32)  # Largest integer <= coord_min
+            coord_max_int = np.ceil(coord_max).astype(np.int32)   # Smallest integer >= coord_max
+
+            coord_min = np.round(coord_min, 8)
+            coord_max = np.round(coord_max, 8)
+    
+            solutions = np.empty(0)
+            for n_val in range(coord_min_int, coord_max_int + 1):
+                if n_val == 0:
+                    # Check both +a and -a if they fall within [coord_min, coord_max]
+                    if (coord_min <= a <= coord_max) and (coord_min <= -a <= coord_max):
+                        # both +a and -a fit
+                        solutions = np.append(solutions, -abs(a))
+                        solutions = np.append(solutions, abs(a))
+                    elif (coord_min <= a <= coord_max):
+                        solutions = np.append(solutions, abs(a))
+                    elif coord_min <= -a <= coord_max:
+                        solutions = np.append(solutions, -abs(a))
+                else:
+                    expr_val = corresponding_value(n_val, a)
+                    if coord_min <= expr_val <= coord_max:
+                        solutions = np.append(solutions, expr_val)
+    
+            solutions = np.unique(solutions, axis=0)
+            solutions = np.round(solutions, 8)
+            return solutions
+
         mask = np.zeros(len(data_points), dtype=bool)
-        # Calculate distances from all data points to each central point
-        for central_point in central_points:
-            distances = np.linalg.norm(data_points - central_point, axis=1)
-            mask |= distances <= self.radius
+
+        # Determine data_points bounding range
+        coord_min = np.min(data_points, axis=0)
+        coord_max = np.max(data_points, axis=0)
+
+        # Iterate over each special point defined in the parameters
+        for sp_point in self.spetial_points_param["specialPoints"]:
+            radius = sp_point["radius"]
+            base_coord = sp_point["coordinate"]
+
+            # Find all integer-based solutions within the given intervals for each dimension
+            solutions_x = find_val_in_interval(coord_min[0], coord_max[0], base_coord[0])
+            solutions_y = find_val_in_interval(coord_min[1], coord_max[1], base_coord[1])
+            solutions_z = find_val_in_interval(coord_min[2], coord_max[2], base_coord[2])
+
+            # Generate all possible combinations of (x, y, z) from these solutions
+            for cx, cy, cz in product(solutions_x, solutions_y, solutions_z):
+                spetial_point = np.array([cx, cy, cz])
+                distances = np.linalg.norm(data_points - spetial_point, axis=1)
+                mask |= distances <= radius
+
         return mask
 
+    
+        
 class EllipsoidShapeStrategy(ShapeStrategy):
     def __init__(self, axes: np.ndarray, theta: float, phi: float):
         self.axes = axes
         self.rotation_matrix = self._create_rotation_matrix(theta, phi)
 
-    def apply(self, data_points: np.ndarray, central_points: np.ndarray) -> np.ndarray:
+    def apply(self, data_points: np.ndarray, spetial_points: np.ndarray) -> np.ndarray:
         """
         Generates a mask for points within multiple ellipsoids.
 
         Args:
             data_points (np.ndarray): Data points array.
-            central_points (np.ndarray): Array of centers of the ellipsoids.
+            spetial_points (np.ndarray): Array of centers of the ellipsoids.
 
         Returns:
             np.ndarray: Boolean mask array.
         """
         mask = np.zeros(len(data_points), dtype=bool)
-        for central_point in central_points:
-            shifted_points = data_points - central_point
+        for spetial_point in spetial_points:
+            shifted_points = data_points - spetial_point
             rotated_points = shifted_points @ self.rotation_matrix.T
             scaled_points = rotated_points / self.axes
             distances = np.sum(scaled_points**2, axis=1)
