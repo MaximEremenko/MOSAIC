@@ -97,8 +97,8 @@ class FromAveragePointProcessor(IPointParametersProcessor):
                 step_in_angstrom_array = np.array(step_in_angstrom).reshape(1, -1)          # Shape: (1, D)
 
                 # Convert to fractional units
-                fractional_dist = angstrom_to_fractional(dist_from_atom_center_array, self.vectors)  # Shape: (1, D)
-                fractional_step = angstrom_to_fractional(step_in_angstrom_array, self.vectors)      # Shape: (1, D)
+                fractional_dist = dist_from_atom_center_array #angstrom_to_fractional(dist_from_atom_center_array, self.vectors)  # Shape: (1, D)
+                fractional_step = step_in_angstrom_array #angstrom_to_fractional(step_in_angstrom_array, self.vectors)      # Shape: (1, D)
 
                 # Repeat dist and step for each central point
                 num_points = fractional_coords.shape[0]
