@@ -18,7 +18,9 @@ from functions.split_point_data import split_point_data
 import h5py  # For reading HDF5 files
 import json  # For secure parsing
 
-
+from form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
+from strategies.shape_strategies import SphereShapeStrategy
+from processors.amplitude_delta_calculator import compute_amplitudes_delta
 def main():
     setup_logging()
     logger = logging.getLogger('app')
@@ -229,23 +231,92 @@ def main():
             unsaved_associations = db_manager.get_unsaved_associations()
             logger.info(f"Processing {len(unsaved_associations)} unsaved associations.")
 
-            # # Example processing: Placeholder for actual data saving logic
-            # # Replace this loop with actual processing code
-            # updates = []
-            # for point_id, hkl_id in unsaved_associations:
-            #     # TODO: Implement your data processing and saving logic here
-            #     # For demonstration, we'll assume processing is successful and mark as saved
-            #     # e.g., process_data(point_id, hkl_id)
+            # ADDD YOUR CODE HERE
+            if unsaved_associations:
+                logger.info("Starting processing of unsaved associations.")
                 
-            #     # After successful processing, prepare to update the saved status
-            #     updates.append((1, point_id, hkl_id))  # 1 represents True
-
-            # if updates:
-            #     db_manager.update_saved_status_batch(updates)
-            #     logger.info(f"Updated saved status for {len(updates)} associations.")
-
-            # # Close the database connection
-            # db_manager.close()
+                # Step 1: Extract unique point_ids and hkl_ids from unsaved_associations
+                point_ids = list(set([assoc[0] for assoc in unsaved_associations]))
+                hkl_ids = list(set([assoc[1] for assoc in unsaved_associations]))
+                
+                logger.info(f"Unique Point IDs to process: {len(point_ids)}")
+                logger.info(f"Unique HKL Interval IDs to process: {len(hkl_ids)}")
+                
+                # Step 2: Retrieve point data for these point_ids
+                all_point_data = db_manager.get_point_data_for_point_ids(point_ids)
+                
+                if not all_point_data:
+                    logger.warning("No point data found for the unsaved associations.")
+                else:
+                    logger.info(f"Retrieved data for {len(all_point_data)} points.")
+                
+                # Step 3: Retrieve HKL interval data for these hkl_ids
+                hkl_intervals = []
+                if hkl_ids:
+                    placeholders = ','.join(['?'] * len(hkl_ids))
+                    query = f"SELECT * FROM HKLInterval WHERE id IN ({placeholders})"
+                    #try:
+                    db_manager.cursor.execute(query, hkl_ids)
+                    rows = db_manager.cursor.fetchall()
+                    for row in rows:
+                        hkl_interval = {
+                            'id': row[0],
+                            'h_start': row[1],
+                            'h_end': row[2],
+                            'k_start': row[3],
+                            'k_end': row[4],
+                            'l_start': row[5],
+                            'l_end': row[6]
+                        }
+                        hkl_intervals.append(hkl_interval)
+                    logger.info(f"Retrieved data for {len(hkl_intervals)} HKL intervals.")
+                    # except sqlite3.Error as e:
+                        # logger.error(f"Failed to retrieve HKL intervals: {e}")
+                
+                # Step 4: Prepare compute_params for amplitude delta computation
+                compute_params = {
+                    "hkl_intervals": hkl_intervals,
+                    "point_data_list": [
+                        {
+                            'central_point_id': pd['central_point_id'],
+                            'coordinates': pd['coordinates'],
+                            'dist_from_atom_center': pd['dist_from_atom_center'],
+                            'step_in_frac': pd['step_in_frac'],
+                            'chunk_id': pd['chunk_id'],
+                            'grid_amplitude_initialized': pd['grid_amplitude_initialized'],
+                            'id': pd['central_point_id']  # Assuming 'central_point_id' is unique and serves as 'id'
+                        }
+                        for pd in all_point_data
+                    ],
+                    "original_coords": original_coords.to_numpy(),
+                    "average_coords": average_coords.to_numpy(),
+                    "elements": elements.to_numpy(),
+                    "vectors": vectors,
+                    "supercell": supercell
+                }
+                
+                # Step 5: Initialize MaskStrategy instance
+                mask_parameters = parameters["peakInfo"]["specialPoints"][0]["radius"]
+                mask_strategy = SphereShapeStrategy(mask_parameters)
+                
+                # Step 6: Initialize FormFactorFactoryProducer
+                form_factor_factory_producer = DefaultFormFactorCalculator()
+                
+                # Step 7: Compute amplitude deltas
+                try:
+                    amplitude_data_chunks = compute_amplitudes_delta(
+                        parameters=compute_params,
+                        FormFactorFactoryProducer=form_factor_factory_producer,
+                        MaskStrategy=mask_strategy,
+                        MaskStrategyParameters=mask_parameters,
+                        db_manager=db_manager,
+                        output_dir='../tests/config/processed_point_data/amplitudes_delta'
+                    )
+                    logger.info("Amplitude delta computation completed successfully.")
+                except Exception as e:
+                    logger.error(f"Failed to compute amplitude deltas: {e}")
+                    amplitude_data_chunks = {}
+                    db_manager.close()
 
         except Exception as e:
             logger.error(f"An unexpected error occurred: {e}")
