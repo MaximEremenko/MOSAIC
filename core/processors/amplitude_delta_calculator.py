@@ -35,7 +35,7 @@ def compute_amplitudes_delta(
             chunk_ids (list): List of chunk_id integers.
 
         Returns:
-            dict: Dictionary mapping chunk_id to rifft_amplitudes (numpy arrays).
+            dict: Dictionary mapping chunk_id to amplitudes (numpy arrays).
         """
         rifft_amplitudes = {}
         for chunk_id in chunk_ids:
@@ -45,13 +45,13 @@ def compute_amplitudes_delta(
                 try:
                     data = rifft_saver.load_data(filename)
                     rifft_amplitudes[chunk_id] = data.get('amplitudes', np.array([]))
-                    logger.debug(f"Loaded rifft_amplitudes for chunk_id: {chunk_id} from file: {filename}")
+                    logger.debug(f"Loaded amplitudes for chunk_id: {chunk_id} from file: {filename}")
                 except Exception as e:
                     logger.error(f"Error loading rifft_amplitudes for chunk_id: {chunk_id} from file: {filename}: {e}")
                     rifft_amplitudes[chunk_id] = np.array([])  # Initialize empty if load fails
             else:
                 rifft_amplitudes[chunk_id] = np.array([])  # Initialize empty if file does not exist
-                logger.debug(f"No existing rifft_amplitudes for chunk_id: {chunk_id}. Initialized empty array.")
+                logger.debug(f"No existing _amplitudes for chunk_id: {chunk_id}. Initialized empty array.")
         return rifft_amplitudes
 
     """
@@ -217,7 +217,7 @@ def compute_amplitudes_delta(
         # Load existing rifft amplitudes if file exists
         try:
             existing_data = rifft_saver.load_data(filename)
-            rifft_amplitudes_chunk = existing_data.get('_amplitudes', np.array([]))
+            rifft_amplitudes_chunk = existing_data.get('amplitudes', np.array([]))
             rifft_amplitudes_chunk = np.concatenate((rifft_amplitudes_chunk, r_amplitudes_partial))
         except FileNotFoundError:
             rifft_amplitudes_chunk = r_amplitudes_partial  # Initialize if file does not exist
