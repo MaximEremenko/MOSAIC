@@ -44,8 +44,7 @@ class RMC6fProcessor(IConfigurationFileProcessor):
         self.data_frame = self.parser.parse(self.content)
         self.header_lines = self.parser.header_lines
 
-        # Store the original coordinates before any processing
-        self.original_coordinates = self.data_frame[['x', 'y', 'z']].copy()
+
 
         # Extract metadata
         self.metadata = self.metadata_extractor.extract(self.header_lines)
@@ -62,12 +61,16 @@ class RMC6fProcessor(IConfigurationFileProcessor):
             self.metric = self.cell_calculator.calculate_metric(self.vectors)
         else:
             raise ValueError("Cell parameters are missing in the metadata.")
-
+            
+        # Store the original coordinates before any processing
+        self.original_coordinates = self.data_frame[['x', 'y', 'z']].copy()@self.vectors
+        self.original_coordinates.columns = self.data_frame[['x', 'y', 'z']].columns
         # Process data to calculate or read average coordinates
         self.data_frame = self.data_processor.process(self.data_frame, self.supercell)
 
         # Update average_coordinates and elements
-        self.average_coordinates = self.data_frame[['x', 'y', 'z']]
+        self.average_coordinates = self.data_frame[['x', 'y', 'z']].copy()@self.vectors
+        self.average_coordinates.columns = self.data_frame[['x', 'y', 'z']].columns
         self.elements = self.data_frame['element']
         self.refNumbers = self.data_frame['refNumber']
 
