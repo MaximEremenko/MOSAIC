@@ -141,7 +141,7 @@ class PointDataProcessor:
         self.logger.debug(f"Chunk {chunk_id}: Generating amplitude data for central_point_id={central_point_id}")
 
         # Assign zero values to amplitude
-        amplitude = np.zeros(grid_points.shape[0])
+        amplitude = np.zeros(grid_points.shape[0], dtype=np.complex128)
 
         # Prepare amplitude data: central_point_id, amplitude
         amplitude_data = np.hstack((
