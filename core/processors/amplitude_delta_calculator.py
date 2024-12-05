@@ -9,6 +9,8 @@ from utilities.nufft_wrapper import execute_nufft, execute_inverse_nufft
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 from managers.database_manager import DatabaseManager
 
+from processors.rifft_grid_generator import GridGenerator1D, GridGenerator2D, GridGenerator3D
+
 logger = logging.getLogger(__name__)
 
 
@@ -218,7 +220,7 @@ def compute_amplitudes_delta(
         try:
             existing_data = rifft_saver.load_data(filename)
             rifft_amplitudes_chunk = existing_data.get('amplitudes', np.array([]))
-            rifft_amplitudes_chunk = np.concatenate((rifft_amplitudes_chunk, r_amplitudes_partial))
+            rifft_amplitudes_chunk = rifft_amplitudes_chunk[:,1] +  r_amplitudes_partial
         except FileNotFoundError:
             rifft_amplitudes_chunk = r_amplitudes_partial  # Initialize if file does not exist
     
@@ -278,6 +280,104 @@ def compute_amplitudes_delta(
         return q_space_masked
 
     #@delayed
+    def grid_generator_factory(dimensionality, step_in_frac):
+        """
+        Factory method to get the appropriate GridGenerator based on dimensionality.
+
+        Args:
+            dimensionality (int): Dimensionality of the data (1, 2, or 3).
+            step_in_frac (float or array-like): Step sizes for each dimension.
+
+        Returns:
+            GridGenerator*: Instance of the appropriate GridGenerator class.
+        """
+        if dimensionality == 1:
+            return GridGenerator1D(step_in_frac)
+        elif dimensionality == 2:
+            return GridGenerator2D(step_in_frac)
+        elif dimensionality == 3:
+            return GridGenerator3D(step_in_frac)
+        else:
+            logger.error(f"Unsupported dimensionality: {dimensionality}")
+            raise ValueError(f"Unsupported dimensionality: {dimensionality}")
+    
+    def _generate_grid(chunk_id: int, dimensionality, step_in_frac, central_point, dist, central_point_id):
+        """
+        Generates grid points around a central point.
+
+        Args:
+            chunk_id (int): The ID of the chunk.
+            dimensionality (int): Dimensionality of the data (1, 2, or 3).
+            step_in_frac (float or array-like): Step sizes for each dimension.
+            central_point (np.ndarray): Coordinates of the central point.
+            dist (np.ndarray): Distances from the central point.
+            central_point_id (int or str): Original ID of the central point.
+
+        Returns:
+            np.ndarray: Array of grid points generated around the central point.
+        """
+        epsilon = 1e-12
+
+        # Generate grid ranges for each dimension using the provided approach with epsilon adjustment
+        x_space_grid = np.arange(-dist[0],
+                                 dist[0] + step_in_frac[0] - epsilon,
+                                 step_in_frac[0])
+        y_space_grid = np.arange(-dist[1],
+                                 dist[1] + step_in_frac[1] - epsilon,
+                                 step_in_frac[1])
+        z_space_grid = np.arange(-dist[2],
+                                 dist[2] + step_in_frac[2] - epsilon,
+                                 step_in_frac[2])
+        
+        # Create meshgrid
+        mesh = np.meshgrid(x_space_grid, y_space_grid, z_space_grid, indexing='ij')
+        grid_points = np.vstack([m.flatten() for m in mesh]).T + central_point
+        
+        #grid_generator = grid_generator_factory(dimensionality, step_in_frac)
+        #grid_points = grid_generator.generate_grid_around_point(central_point, dist)
+        #logger.debug(f"Chunk {chunk_id}: Generated {grid_points.shape[0]} grid points for central_point_id={central_point_id}")
+
+        return grid_points 
+    def _process_chunk(chunk_data):
+        """
+        Processes a single chunk of points.
+
+        Args:
+            chunk_id (int): The ID of the chunk.
+            mask (np.ndarray): Boolean array indicating which points in the chunk are uninitialized.
+        """
+       
+        coordinates = np.array([pd['coordinates'] for pd in chunk_data])
+        dist_from_atom_center = np.array([pd['dist_from_atom_center'] for pd in chunk_data])
+        step_in_frac = np.array([pd['step_in_frac'] for pd in chunk_data])
+        ids = np.array([pd['id'] for pd in chunk_data])
+        dimensionality = coordinates.shape[1]
+
+        all_grid_data = []
+ 
+
+        for i in range(coordinates.shape[0]):
+            central_point = coordinates[i]
+            dist = dist_from_atom_center[i]
+            step = step_in_frac[i]
+            central_point_id = ids[i]
+          
+            grid_points = _generate_grid(chunk_id, dimensionality, step, central_point, dist, central_point_id)
+            #amplitude_data = _generate_amplitude(chunk_id, central_point_id, i)
+
+            # Collect data for this chunk
+            all_grid_data.append(grid_points)
+           # all_amplitude_data.append(amplitude_data)
+
+        # Merge all grid_points and amplitudes for this chunk
+        merged_grid_points = np.vstack(all_grid_data)
+        #merged_amplitude_data = np.vstack(all_amplitude_data)
+
+        # Mark all points in this chunk as initialized
+        #self.point_data.grid_amplitude_initialized[mask] = True
+        #self.logger.debug(f"Chunk {chunk_id}: All uninitialized points marked as initialized.")
+        return merged_grid_points
+        
     def generate_rifft_grid(
         chunk_data: list,
         supercell: np.ndarray
@@ -295,12 +395,12 @@ def compute_amplitudes_delta(
         # Example implementation: Adjust based on actual requirements
         # Assuming supercell contains necessary info to generate r_space_grid
         # Here, we simply extract coordinates for demonstration
-        coordinates = np.array([pd['coordinates'] for pd in chunk_data])
-        dist_from_atom_center = np.array([pd['dist_from_atom_center'] for pd in chunk_data])
-        step_in_frac = np.array([pd['step_in_frac'] for pd in chunk_data])
+        #coordinates = np.array([pd['coordinates'] for pd in chunk_data])
+        #dist_from_atom_center = np.array([pd['dist_from_atom_center'] for pd in chunk_data])
+        #step_in_frac = np.array([pd['step_in_frac'] for pd in chunk_data])
 
         # Combine to generate r_space_grid; customize as needed
-        r_space_grid = coordinates - dist_from_atom_center  # Placeholder operation
+        r_space_grid = _process_chunk(chunk_data) #coordinates - dist_from_atom_center  # Placeholder operation
         return r_space_grid
 
     def initialize_rifft_amplitudes(
