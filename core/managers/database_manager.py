@@ -82,7 +82,7 @@ class DatabaseManager:
         query = f"""
             SELECT central_point_id, coordinates, dist_from_atom_center, step_in_frac, chunk_id, grid_amplitude_initialized
             FROM PointData
-            WHERE central_point_id IN ({placeholders})
+            WHERE id IN ({placeholders})
         """
 
         try:
@@ -162,7 +162,7 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error(f"An error occurred initializing the database: {e}")
 
-    def update_saved_status_for_chunk_or_point(self, hkl_id: int, point_id: int = None, chunk_id: int = None, saved: int = 1):
+    def update_saved_status_for_chunk_or_point(self, hkl_id: int, point_id: int = None, chunk_id: int = None, saved: int = 0):
         """
         Updates the `saved` status for associations based on either `chunk_id` or `point_id`, combined with `hkl_id`.
 
@@ -404,26 +404,91 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error(f"Failed to batch update saved status: {e}")
             self.connection.rollback()
-
+            
     def get_unsaved_associations(self) -> List[Tuple[int, int]]:
         """
-        Retrieves all Point_HKL_Association entries that have not been saved.
-
+        Retrieves (point_id, hkl_id) tuples for all (chunk_id, hkl_id) pairs
+        where ALL associations are unsaved (saved=0).
+        
         Returns:
-            List[Tuple[int, int]]: List of (point_id, hkl_id) tuples.
+            List[Tuple[int, int]]: A list of (point_id, hkl_id) that are fully unsaved
+            within their respective (chunk_id, hkl_id) group.
         """
         try:
+            # 1. Identify fully unsaved (chunk_id, hkl_id) pairs
             self.cursor.execute("""
-                SELECT point_id, hkl_id
-                FROM Point_HKL_Association
-                WHERE saved = 0
+                SELECT pd.chunk_id,
+                       pha.hkl_id,
+                       COUNT(*) AS total_count,
+                       SUM(CASE WHEN pha.saved = 0 THEN 1 ELSE 0 END) AS unsaved_count
+                FROM Point_HKL_Association pha
+                JOIN PointData pd ON pha.point_id = pd.id
+                GROUP BY pd.chunk_id, pha.hkl_id
             """)
+            
             rows = self.cursor.fetchall()
-            self.logger.debug(f"Retrieved {len(rows)} unsaved associations.")
-            return rows
+    
+            # Filter to get only (chunk_id, hkl_id) that are fully unsaved
+            fully_unsaved_pairs = [(r[0], r[1]) for r in rows if r[2] == r[3] and r[2] > 0]
+    
+            if not fully_unsaved_pairs:
+                self.logger.debug("No (chunk_id, hkl_id) pairs are fully unsaved.")
+                return []
+            
+            # 2. Retrieve all unsaved (point_id, hkl_id) for these fully unsaved pairs
+            # We'll do this by using a placeholder approach in the query
+            # First, transform list of tuples into a flattened parameter list
+            # We'll generate a WHERE clause like: 
+            # (pd.chunk_id = ? AND pha.hkl_id = ?) OR (pd.chunk_id = ? AND pha.hkl_id = ?) ...
+            conditions = []
+            params = []
+            for chunk_id, hkl_id in fully_unsaved_pairs:
+                conditions.append("(pd.chunk_id = ? AND pha.hkl_id = ?)")
+                params.extend([chunk_id, hkl_id])
+            
+            where_clause = " OR ".join(conditions)
+            query = f"""
+                SELECT pha.point_id, pha.hkl_id
+                FROM Point_HKL_Association pha
+                JOIN PointData pd ON pha.point_id = pd.id
+                WHERE pha.saved = 0
+                  AND ({where_clause})
+            """
+    
+            self.cursor.execute(query, params)
+            all_unsaved_associations = self.cursor.fetchall()
+    
+            self.logger.debug(
+                f"Retrieved {len(all_unsaved_associations)} unsaved associations "
+                f"for {len(fully_unsaved_pairs)} fully unsaved (chunk_id, hkl_id) pairs."
+            )
+            
+            return all_unsaved_associations
+    
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to retrieve unsaved associations: {e}")
+            self.logger.error(f"Database error while retrieving consistently unsaved associations: {e}")
             return []
+
+
+    # def get_unsaved_associations(self) -> List[Tuple[int, int]]:
+    #     """
+    #     Retrieves all Point_HKL_Association entries that have not been saved.
+
+    #     Returns:
+    #         List[Tuple[int, int]]: List of (point_id, hkl_id) tuples.
+    #     """
+    #     try:
+    #         self.cursor.execute("""
+    #             SELECT point_id, hkl_id
+    #             FROM Point_HKL_Association
+    #             WHERE saved = 0
+    #         """)
+    #         rows = self.cursor.fetchall()
+    #         self.logger.debug(f"Retrieved {len(rows)} unsaved associations.")
+    #         return rows
+    #     except sqlite3.Error as e:
+    #         self.logger.error(f"Failed to retrieve unsaved associations: {e}")
+    #         return []
 
     def close(self):
         """

@@ -39,10 +39,10 @@ class SphereShapeStrategy(ShapeStrategy):
             coord_max = np.round(coord_max, 8)
     
             solutions = np.empty(0)
-            for n_val in range(coord_min_int, coord_max_int + 1):
+            for n_val in range(coord_min_int-2, coord_max_int + 2):
                 if n_val == 0:
                     # Check both +a and -a if they fall within [coord_min, coord_max]
-                    if (coord_min <= a <= coord_max) and (coord_min <= -a <= coord_max):
+                    if (coord_min-2 <= a <= coord_max+2) and (coord_min-2 <= -a <= coord_max+2):
                         # both +a and -a fit
                         solutions = np.append(solutions, -abs(a))
                         solutions = np.append(solutions, abs(a))
