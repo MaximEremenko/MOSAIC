@@ -4,7 +4,7 @@ import os
 import numpy as np
 import logging
 from utilities.logger_config import setup_logging
-
+from processors.rifft_grid_generator import GridGenerator1D, GridGenerator2D, GridGenerator3D
 from factories.configuration_processor_factory import ConfigurationProcessorFactoryProvider
 from factories.parameters_processor_factory import ParametersProcessorFactoryProvider
 from factories.point_processor_factory import PointProcessorFactory
@@ -310,7 +310,8 @@ def main():
                         MaskStrategy=mask_strategy,
                         MaskStrategyParameters=mask_parameters,
                         db_manager=db_manager,
-                        output_dir='../tests/config/processed_point_data'
+                        output_dir='../tests/config/processed_point_data',
+                        point_data_processor = point_data_processor
                     )
                     logger.info("Amplitude delta computation completed successfully.")
                 except Exception as e:

@@ -8,41 +8,40 @@
     "peakInfo": {
         "hkl_limits": [
             {
-                "limit": [15.0, 15.0, 15.0],
-                "subvolume_step": [5.0, 5.0, 5.0]
+                "limit": [4.0, 4.0, 4.0],
+                "subvolume_step": [8.0, 8.0, 8.0]
             }
         ],
         "specialPoints": [
             {   
-                "customReciprocalSpacePoints": "./hklList.dat",
                 "spaceGroupSymmetry": "F d -3 m",
                 "coordinate": [0.0, 0.0, 0.0],
+                "shape": "sphere",
+                "radius": 0.202
+            },
+            {   
+                "spaceGroupSymmetry": "F d -3 m",
+                "coordinate": [0.5, 0.5, 0.5],
                 "shape": "sphere",
                 "radius": 0.202
             }
         ]
     },
     "rspace_info": {
-        "num_chunks": 4,
+        "num_chunks": 2,
         "fresh_start": false,
         "method": "from_average",
         "filter_type": "Chebyshev",
         "save_rifft_coordinates": false,
-		"smooth_intensities": true,
+        "smooth_intensities": true,
         "print_intensities": false,
         "rspace_parallel_processing": false,
         "points": [
             {
                 "elementSymbol": "Pb",
                 "referenceNumber": 1,
-                "distFromAtomCenter": [0.1, 0.1, 0.1],
-                "stepInAngstrom": [0.5, 0.5, 0.5]
-            },
-            {
-                "elementSymbol": "Nb",
-                "referenceNumber": 2,
-                "distFromAtomCenter": [0.1, 0.1, 0.1],
-                "stepInAngstrom": [0.5, 0.5, 0.5]
+                "distFromAtomCenter": [0.5, 0.5, 0.5],
+                "stepInAngstrom": [0.25, 0.25, 0.25]
             }
 ]
     }

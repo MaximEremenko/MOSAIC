@@ -4,12 +4,13 @@ import numpy as np
 from dask import delayed, compute
 import logging
 import os
-
+import time
 from utilities.nufft_wrapper import execute_nufft, execute_inverse_nufft
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 from managers.database_manager import DatabaseManager
 
 from processors.rifft_grid_generator import GridGenerator1D, GridGenerator2D, GridGenerator3D
+from processors.point_data_processor import PointDataProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ def compute_amplitudes_delta(
     MaskStrategyParameters: dict,
     db_manager: DatabaseManager,
     output_dir: str,
+    point_data_processor: PointDataProcessor
 ):
    
     def initialize_rifft_amplitudes(
@@ -155,14 +157,14 @@ def compute_amplitudes_delta(
             return None
 
         # Perform NUFFT calculations
-        q_amplitudes = ff * execute_nufft(original_coords[mask_elements], c[mask_elements], q_space_grid, eps=1e-5)
-        q_amplitudes_av = execute_nufft(average_coords[mask_elements], c[mask_elements], q_space_grid, eps=1e-5)
-        q_amplitudes_delta = execute_nufft(original_coords[mask_elements] - average_coords[mask_elements], c[mask_elements], q_space_grid, eps=1e-5)
+        q_amplitudes = ff * execute_nufft(original_coords[mask_elements], c[mask_elements], q_space_grid, eps=1e-15)
+        q_amplitudes_av = execute_nufft(average_coords[mask_elements], c[mask_elements], q_space_grid, eps=1e-15)
+        q_amplitudes_delta = execute_nufft(original_coords[mask_elements] - average_coords[mask_elements], c[mask_elements], q_space_grid, eps=1e-15)
 
         # Final computation
         q_amplitudes_av_final = ff * q_amplitudes_av * q_amplitudes_delta / c.size
 
-        logger.debug(f"Completed NUFFT computations for ihkl: {ihkl}, element: {element}")
+        logger.info(f"Completed NUFFT computations for ihkl: {ihkl}, element: {element}")
 
         return (ihkl['id'], element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
 
@@ -191,7 +193,7 @@ def compute_amplitudes_delta(
         Returns:
             None
         """
-        logger.debug(f"Processing chunk_id: {chunk_id} for ihkl_id: {ihkl_id}")
+        logger.info(f"Processing chunk_id: {chunk_id} for ihkl_id: {ihkl_id}")
     
         # Retrieve all point_data associated with this chunk_id
         chunk_data = [pd for pd in point_data_list if pd["chunk_id"] == chunk_id]
@@ -214,25 +216,37 @@ def compute_amplitudes_delta(
         )
     
         # Generate filename based on chunk_id
-        filename = rifft_saver.generate_filename(chunk_id, suffix='_amplitudes')
+        filename = point_data_processor.data_saver.generate_filename(chunk_id, suffix='_amplitudes')
     
         # Load existing rifft amplitudes if file exists
         try:
-            existing_data = rifft_saver.load_data(filename)
+            #time.sleep(20)
+            existing_data = point_data_processor.data_saver.load_data(filename)
             rifft_amplitudes_chunk = existing_data.get('amplitudes', np.array([]))
-            rifft_amplitudes_chunk = rifft_amplitudes_chunk[:,1] +  r_amplitudes_partial
+            il = np.round(np.array(q_space_grid[:,2], dtype = np.float64, order="C" ), 8)
+            if np.all(il!=0):
+                rifft_amplitudes_chunk[:,1] = rifft_amplitudes_chunk[:,1] +  r_amplitudes_partial + np.conj(r_amplitudes_partial)
+            else:
+                rifft_amplitudes_chunk[:,1] = rifft_amplitudes_chunk[:,1] +  r_amplitudes_partial 
         except FileNotFoundError:
-            rifft_amplitudes_chunk = r_amplitudes_partial  # Initialize if file does not exist
+            logger.info(f"No amplitudes file for chunk_id: {chunk_id} to file: {filename}")
+            #rifft_amplitudes_chunk = r_amplitudes_partial  # Initialize if file does not exist
+        
+
+    
     
         # Save updated rifft amplitudes
-        rifft_saver.save_data({'rift_amplitudes': rifft_amplitudes_chunk}, filename, append=False)
-        logger.debug(f"Saved rifft amplitudes for chunk_id: {chunk_id} to file: {filename}")
+        #rifft_saver.save_data({'rift_amplitudes': rifft_amplitudes_chunk}, filename, append=False)
+        point_data_processor._save_chunk_data(chunk_id, None, rifft_amplitudes_chunk)
+        #time.sleep(20)
+        logger.info(f"Saved rifft amplitudes for chunk_id: {chunk_id} to file: {filename}")
     
         # Update database to mark this (point, hkl) association as saved
         # Assuming all points in chunk_data are associated with ihkl_id
         updates = [(1, pd['id'], ihkl_id) for pd in chunk_data]
-        db_manager.update_saved_status_batch(updates)
-        logger.debug(f"Updated saved status for chunk_id: {chunk_id} and ihkl_id: {ihkl_id}")
+       #db_manager.update_saved_status_batch(updates)
+        db_manager.update_saved_status_for_chunk_or_point(ihkl_id, None, chunk_id, 1)
+        logger.info(f"Updated saved status for chunk_id: {chunk_id} and ihkl_id: {ihkl_id}")
 
     #@delayed
     def generate_q_space_grid(
@@ -274,6 +288,7 @@ def compute_amplitudes_delta(
         spetial_points = np.array((0,0,0))
         # Apply mask using MaskStrategy instance
         mask = mask_strategy.apply(q_points, spetial_points)
+        #mask[:] = True
         q_points_masked = q_points[mask]
         q_space_masked = 2 * np.pi * np.dot(q_points_masked, B_)  # Shape: (M, D)
         
@@ -440,7 +455,7 @@ def compute_amplitudes_delta(
         Returns:
             np.ndarray: Masked q-space grid coordinates.
         """
-        return compute(generate_q_space_grid(ihkl, B_, mask_parameters, mask_strategy, supercell))[0]
+        return generate_q_space_grid(ihkl, B_, mask_parameters, mask_strategy, supercell)
 
     def generate_rifft_grid_sync(
         chunk_data: list,
@@ -459,8 +474,9 @@ def compute_amplitudes_delta(
         return compute(generate_rifft_grid(chunk_data, supercell))[0]
 
     # Collect all delayed tasks and execute
-    ihkl_element_tasks = []
+    
     for ihkl in hkl_intervals:
+        ihkl_element_tasks = []
         for element in unique_elements:
             task = process_ihkl_element(
                 ihkl=ihkl,
@@ -470,29 +486,41 @@ def compute_amplitudes_delta(
                 mask_parameters=MaskStrategyParameters
             )
             ihkl_element_tasks.append(task)
-
+        
+                # Extract from the first tuple in the list
+        ihkl_id = ihkl_element_tasks[0][0]     # from the first element
+        element = "All"     # from the first element
+        q_space_grid = ihkl_element_tasks[0][2] # from the first element
+        
+        # Sum q_amplitudes across all tuples in the list
+        q_amplitudes = np.sum([x[3] for x in ihkl_element_tasks], axis=0)
+        
+        # Sum q_amplitudes_av_final across all tuples in the list
+        q_amplitudes_av_final = np.sum([x[4] for x in ihkl_element_tasks], axis=0)
+        hkl_intervals_task = (ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+        
         # Create chunk_id tasks
         chunk_id_tasks = []
-        for task in ihkl_element_tasks:
-            if task is not None:
-                ihkl_result = compute(task)  # <-- Correct usage: compute returns a tuple
-                if ihkl_result is None:
-                    continue  # Skip if ihkl_result is None
-                ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av = ihkl_result[0]
-                for chunk_id in chunk_ids:
-                    chunk_task = process_chunk_id(
-                        chunk_id=chunk_id,
-                        ihkl_id=ihkl_id,
-                        q_space_grid=q_space_grid,
-                        q_amplitudes=q_amplitudes,
-                        q_amplitudes_av=q_amplitudes_av,
-                        rifft_saver=rifft_saver,
-                        point_data_list=point_data_list
-                    )
-                    chunk_id_tasks.append(chunk_task)
+
+        if hkl_intervals_task is not None:
+            #ihkl_result = compute(task)  # <-- Correct usage: compute returns a tuple
+            #if ihkl_result is None:
+            #    continue  # Skip if ihkl_result is None
+            ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av = hkl_intervals_task
+            for chunk_id in chunk_ids:
+                chunk_task = process_chunk_id(
+                    chunk_id=chunk_id,
+                    ihkl_id=ihkl_id,
+                    q_space_grid=q_space_grid,
+                    q_amplitudes=q_amplitudes,
+                    q_amplitudes_av=q_amplitudes_av,
+                    rifft_saver=rifft_saver,
+                    point_data_list=point_data_list
+                )
+                chunk_id_tasks.append(chunk_task)
     
         # Execute all chunk_id tasks collectively for better parallelism
-        if chunk_id_tasks:
-            compute(*chunk_id_tasks)
+        #if chunk_id_tasks:
+        #    compute(*chunk_id_tasks)
 
     logger.info("Completed compute_amplitudes_delta")
