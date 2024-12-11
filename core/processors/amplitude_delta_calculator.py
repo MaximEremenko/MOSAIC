@@ -143,7 +143,7 @@ def compute_amplitudes_delta(
         # Generate q-space grid
         q_space_grid = generate_q_space_grid_sync(ihkl, B_, mask_parameters, mask_strategy, supercell)
         if q_space_grid.size == 0:
-            logger.debug(f"No q-space points after masking for ihkl: {ihkl}, element: {element}")
+            logger.warning(f"No q-space points after masking for ihkl: {ihkl}, element: {element}")
             return None  # Skip if no points
 
         # Calculate form factors
@@ -316,7 +316,7 @@ def compute_amplitudes_delta(
             logger.error(f"Unsupported dimensionality: {dimensionality}")
             raise ValueError(f"Unsupported dimensionality: {dimensionality}")
     
-    def _generate_grid(chunk_id: int, dimensionality, step_in_frac, central_point, dist, central_point_id):
+    def _generate_grid(chunk_id: int, dimensionality, step_sizes, central_point, dist_from_atom_center, central_point_id):
         """
         Generates grid points around a central point.
 
@@ -331,21 +331,32 @@ def compute_amplitudes_delta(
         Returns:
             np.ndarray: Array of grid points generated around the central point.
         """
+        # Generate each dimension independently
         epsilon = 1e-12
-
-        # Generate grid ranges for each dimension using the provided approach with epsilon adjustment
-        x_space_grid = np.arange(-dist[0],
-                                 dist[0] + step_in_frac[0] - epsilon,
-                                 step_in_frac[0])
-        y_space_grid = np.arange(-dist[1],
-                                 dist[1] + step_in_frac[1] - epsilon,
-                                 step_in_frac[1])
-        z_space_grid = np.arange(-dist[2],
-                                 dist[2] + step_in_frac[2] - epsilon,
-                                 step_in_frac[2])
-        
-        # Create meshgrid
-        mesh = np.meshgrid(x_space_grid, y_space_grid, z_space_grid, indexing='ij')
+        grids = []
+        for i in range(3):
+            dist = dist_from_atom_center[i]
+            step = step_sizes[i]
+            
+            # If step is zero or the distance is too small to form more than one step:
+            # Just produce a single point in that dimension
+            if step <= 0 or dist <= step:
+                logger.debug(f"Dimension {i}: step={step}, dist={dist}, generating single-point dimension.")
+                grid = np.array([0.0])
+            else:
+                # Produce a range in this dimension
+                start = -dist
+                stop = dist + step - epsilon
+                grid = np.arange(start, stop, step)
+                # If no points generated due to floating point issues, fallback to single-point
+                if grid.size == 0:
+                    logger.debug(f"Dimension {i}: Could not form a range, fallback to single point.")
+                    grid = np.array([0.0])
+    
+            grids.append(grid)
+    
+        # Now form the meshgrid from the possibly mixed-dimensional grids
+        mesh = np.meshgrid(*grids, indexing='ij')
         grid_points = np.vstack([m.flatten() for m in mesh]).T + central_point
         
         #grid_generator = grid_generator_factory(dimensionality, step_in_frac)
@@ -488,16 +499,36 @@ def compute_amplitudes_delta(
             ihkl_element_tasks.append(task)
         
                 # Extract from the first tuple in the list
-        ihkl_id = ihkl_element_tasks[0][0]     # from the first element
-        element = "All"     # from the first element
-        q_space_grid = ihkl_element_tasks[0][2] # from the first element
+        # ihkl_id = ihkl_element_tasks[0][0]     # from the first element
+        # element = "All"     # from the first element
+        # q_space_grid = ihkl_element_tasks[0][2] # from the first element
         
-        # Sum q_amplitudes across all tuples in the list
-        q_amplitudes = np.sum([x[3] for x in ihkl_element_tasks], axis=0)
+        # # Sum q_amplitudes across all tuples in the list
+        # q_amplitudes = np.sum([x[3] for x in ihkl_element_tasks], axis=0)
         
-        # Sum q_amplitudes_av_final across all tuples in the list
-        q_amplitudes_av_final = np.sum([x[4] for x in ihkl_element_tasks], axis=0)
-        hkl_intervals_task = (ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+        # # Sum q_amplitudes_av_final across all tuples in the list
+        # q_amplitudes_av_final = np.sum([x[4] for x in ihkl_element_tasks], axis=0)
+        # hkl_intervals_task = (ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+        if ihkl_element_tasks[0] is None:
+            # Handle the case where ihkl_element_tasks is None or empty
+            hkl_intervals_task = None
+        else:
+            # Proceed only if we have tasks
+            ihkl_id = ihkl_element_tasks[0][0]
+            element = "All"
+            q_space_grid = ihkl_element_tasks[0][2]
+        
+            ihkl_id = ihkl_element_tasks[0][0]     # from the first element
+            element = "All"     # from the first element
+            q_space_grid = ihkl_element_tasks[0][2] # from the first element
+            
+            # Sum q_amplitudes across all tuples in the list
+            q_amplitudes = np.sum([x[3] for x in ihkl_element_tasks], axis=0)
+            
+            # Sum q_amplitudes_av_final across all tuples in the list
+            q_amplitudes_av_final = np.sum([x[4] for x in ihkl_element_tasks], axis=0)
+            hkl_intervals_task = (ihkl_id, element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+
         
         # Create chunk_id tasks
         chunk_id_tasks = []

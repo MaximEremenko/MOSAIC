@@ -26,7 +26,7 @@ def main():
     logger = logging.getLogger('app')
 
     # Configuration file processing
-    config_file_path = '../tests/config/pmn_300k_RN.rmc6f'
+    config_file_path = '../tests/config/pmn_300k_RNAVERAGE.rmc6f'
     processor_type = 'calculate'  # 'read' or 'calculate'
     average_file_path = '../tests/config/external_average_file.rmc6f'  # Only needed when processor_type is 'read'
 
