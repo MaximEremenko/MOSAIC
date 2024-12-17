@@ -18,15 +18,18 @@ from functions.split_point_data import split_point_data
 import h5py  # For reading HDF5 files
 import json  # For secure parsing
 
-from form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
+#from form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
 from strategies.shape_strategies import SphereShapeStrategy
 from processors.amplitude_delta_calculator import compute_amplitudes_delta
+
+from form_factors.form_factor_factory_producer import FormFactorFactoryProducer
+
 def main():
     setup_logging()
     logger = logging.getLogger('app')
 
     # Configuration file processing
-    config_file_path = '../tests/config/pmn_300k_RNAVERAGE.rmc6f'
+    config_file_path = '../tests/config/pmn30pt_533kAVERAGE.rmc6f'
     processor_type = 'calculate'  # 'read' or 'calculate'
     average_file_path = '../tests/config/external_average_file.rmc6f'  # Only needed when processor_type is 'read'
 
@@ -300,13 +303,13 @@ def main():
                 mask_strategy = SphereShapeStrategy(mask_parameters)
                 
                 # Step 6: Initialize FormFactorFactoryProducer
-                form_factor_factory_producer = DefaultFormFactorCalculator()
-                
+                form_factor_factory_producer = FormFactorFactoryProducer.get_factory('neutron')
+                form_factor_factory_calculator = form_factor_factory_producer.create_calculator(method='default')
                 # Step 7: Compute amplitude deltas
                 try:
                     amplitude_data_chunks = compute_amplitudes_delta(
                         parameters=compute_params,
-                        FormFactorFactoryProducer=form_factor_factory_producer,
+                        FormFactorFactoryProducer=form_factor_factory_calculator,
                         MaskStrategy=mask_strategy,
                         MaskStrategyParameters=mask_parameters,
                         db_manager=db_manager,

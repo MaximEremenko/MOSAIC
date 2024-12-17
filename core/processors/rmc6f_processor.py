@@ -16,7 +16,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, Dict
 
-class RMC6fProcessor(IConfigurationFileProcessor):
+class RMC6fProcessor( ):
     def __init__(self, file_path: str, data_processor: IConfigurationDataProcessor):
         self.file_path = file_path
         self.data_processor = data_processor

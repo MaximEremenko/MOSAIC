@@ -34,41 +34,45 @@ class HDF5ConfigDataSaver(IConfigDataSaver):
                     print(f" - {key}: {type(value)}")
             
             with h5py.File(self.hdf5_file_path, 'w') as hdf5_file:
-                # Save datasets
-                print("Creating 'original_coords' dataset.")
-                hdf5_file.create_dataset('original_coords', data=data['original_coords'].to_numpy())
-                
-                print("Creating 'average_coords' dataset.")
-                hdf5_file.create_dataset('average_coords', data=data['average_coords'].to_numpy())
-                
+                # Save original_coords and average_coords
+                for key in ['original_coords', 'average_coords']:
+                    coords = data[key]
+                    print(f"Creating '{key}' dataset with shape {coords.shape}")
+                    hdf5_file.create_dataset(key, data=coords.to_numpy())
+
                 # Save elements as fixed-length ASCII strings
-                print("Encoding 'elements' as fixed-length ASCII strings.")
                 elements_encoded = np.array(data['elements'].to_list(), dtype='S')
-                print("Creating 'elements' dataset.")
+                print("Creating 'elements' dataset")
                 hdf5_file.create_dataset('elements', data=elements_encoded)
-                
-                print("Creating 'refnumbers' dataset.")
+
+                # Save refnumbers
+                print("Creating 'refnumbers' dataset")
                 hdf5_file.create_dataset('refnumbers', data=data['refnumbers'].to_numpy())
-                
-                
-                print("Creating 'vectors' dataset.")
-                hdf5_file.create_dataset('vectors', data=data['vectors'])
-                
-                # Save metric as a group
-                print("Creating 'metric' group.")
+
+                # Save vectors
+                vectors = data['vectors']
+                print("Creating 'vectors' dataset")
+                hdf5_file.create_dataset('vectors', data=vectors)
+
+                # Save metric dynamically based on the key (length/area/volume)
                 metric_group = hdf5_file.create_group('metric')
-                print("Creating 'reciprocal_vectors' dataset within 'metric' group.")
-                metric_group.create_dataset('reciprocal_vectors', data=data['metric']['reciprocal_vectors'])
-                print("Creating 'volume' dataset within 'metric' group.")
-                metric_group.create_dataset('volume', data=data['metric']['volume'])
-                
-                print("Creating 'supercell' dataset.")
+                print("Saving 'metric' group")
+                metric = data['metric']
+                metric_key = next(key for key in metric if key in ['length', 'area', 'volume'])
+                print(f"Creating 'metric/{metric_key}' dataset")
+                metric_group.create_dataset(metric_key, data=metric[metric_key])
+                print("Creating 'metric/reciprocal_vectors' dataset")
+                metric_group.create_dataset('reciprocal_vectors', data=metric['reciprocal_vectors'])
+
+                # Save supercell
+                print("Creating 'supercell' dataset")
                 hdf5_file.create_dataset('supercell', data=data['supercell'])
-            
+
             print(f"Data successfully saved to {self.hdf5_file_path}")
         except Exception as e:
             print(f"Failed to save data to HDF5 file: {e}")
             raise
+
 
 class HDF5ConfigDataLoader(IConfigDataLoader):
     def __init__(self, hdf5_file_path: str):
@@ -79,43 +83,53 @@ class HDF5ConfigDataLoader(IConfigDataLoader):
 
     def load_data(self):
         try:
+            print(f"Loading data from HDF5: {self.hdf5_file_path}")
             with h5py.File(self.hdf5_file_path, 'r') as hdf5_file:
-                print(f"Reading 'original_coords' dataset from {self.hdf5_file_path}")
-                original_coords = pd.DataFrame(
-                    hdf5_file['original_coords'][:], columns=['x', 'y', 'z']
-                )
-                
-                print(f"Reading 'average_coords' dataset from {self.hdf5_file_path}")
-                average_coords = pd.DataFrame(
-                    hdf5_file['average_coords'][:], columns=['x', 'y', 'z']
-                )
-                
-                print(f"Reading 'elements' dataset from {self.hdf5_file_path}")
+                # Load original_coords and average_coords
+                def get_column_names(shape):
+                    if shape[1] == 1:
+                        return ['x']
+                    elif shape[1] == 2:
+                        return ['x', 'y']
+                    else:
+                        return ['x', 'y', 'z']
+
+                original_coords_data = hdf5_file['original_coords'][:]
+                original_coords = pd.DataFrame(original_coords_data, columns=get_column_names(original_coords_data.shape))
+                print("Loaded 'original_coords'")
+
+                average_coords_data = hdf5_file['average_coords'][:]
+                average_coords = pd.DataFrame(average_coords_data, columns=get_column_names(average_coords_data.shape))
+                print("Loaded 'average_coords'")
+
+                # Load elements
                 elements = pd.Series(
-                    [elem.decode('utf-8') for elem in hdf5_file['elements'][:]], name='element'
+                    [elem.decode('utf-8') for elem in hdf5_file['elements'][:]],
+                    name='element'
                 )
-                
-                print(f"Reading 'refnumbers' dataset from {self.hdf5_file_path}")
- 
-                
-                refnumbers = pd.DataFrame(
-                    hdf5_file['refnumbers'][:], columns=['refnumbers']
-                )
-                
-                
-                print(f"Reading 'vectors' dataset from {self.hdf5_file_path}")
+                print("Loaded 'elements'")
+
+                # Load refnumbers
+                refnumbers = pd.Series(hdf5_file['refnumbers'][:], name='refnumbers')
+                print("Loaded 'refnumbers'")
+
+                # Load vectors
                 vectors = hdf5_file['vectors'][:]
-                
-                print(f"Reading 'metric' group from {self.hdf5_file_path}")
+                print("Loaded 'vectors'")
+
+                # Load metric group dynamically
                 metric_group = hdf5_file['metric']
+                metric_key = next(key for key in metric_group if key in ['length', 'area', 'volume'])
                 metric = {
-                    'reciprocal_vectors': metric_group['reciprocal_vectors'][:],
-                    'volume': metric_group['volume'][()]
+                    metric_key: metric_group[metric_key][()],
+                    'reciprocal_vectors': metric_group['reciprocal_vectors'][:]
                 }
-                
-                print(f"Reading 'supercell' dataset from {self.hdf5_file_path}")
+                print(f"Loaded 'metric' with key '{metric_key}'")
+
+                # Load supercell
                 supercell = hdf5_file['supercell'][:]
-            
+                print("Loaded 'supercell'")
+
             print(f"Data successfully loaded from {self.hdf5_file_path}")
             return {
                 'original_coords': original_coords,
@@ -127,5 +141,6 @@ class HDF5ConfigDataLoader(IConfigDataLoader):
                 'supercell': supercell
             }
         except Exception as e:
-            print(f"Failed to read from HDF5 file: {e}")
+            print(f"Failed to load data from HDF5 file: {e}")
             raise
+
