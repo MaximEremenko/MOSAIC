@@ -7,18 +7,24 @@ import logging
 from typing import List, Dict, Tuple
 
 class DatabaseManager:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, dimension: int = 3):
         """
         Initializes the DatabaseManager.
 
         Args:
             db_path (str): Path to the SQLite database file.
+            dimension (int): Dimension of data (1, 2, or 3).
+                1D: Only h_range is used.
+                2D: h_range and k_range are used.
+                3D: h_range, k_range, and l_range are used.
         """
         self.db_path = db_path
+        self.dimension = dimension
         self.logger = logging.getLogger(self.__class__.__name__)
         self.connection = sqlite3.connect(self.db_path)
         self.cursor = self.connection.cursor()
         self._initialize_database()
+
     def get_pending_chunk_ids(self) -> List[int]:
         """
         Retrieves unique chunk_ids from PointData that are pending processing.
@@ -41,30 +47,39 @@ class DatabaseManager:
         
     def get_pending_parts(self) -> List[Dict]:
         """
-        Retrieves pending HKLInterval entries that need processing.
+        Retrieves pending ReciprocalSpaceInterval entries that need processing.
 
+        Based on the dimension, we only return the ranges that apply.
+        
         Returns:
-            List[Dict]: List of HKLInterval dictionaries.
+            List[Dict]: List of interval dictionaries with dimension-appropriate keys.
         """
         try:
             self.cursor.execute("""
                 SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
-                FROM HKLInterval
+                FROM ReciprocalSpaceInterval
             """)
             rows = self.cursor.fetchall()
             pending_parts = []
             for row in rows:
-                pending_parts.append({
-                    'id': row[0],
-                    'h_range': [row[1], row[2]],
-                    'k_range': [row[3], row[4]],
-                    'l_range': [row[5], row[6]]
-                })
-            self.logger.debug(f"Retrieved {len(pending_parts)} HKLInterval entries for processing.")
+                interval_id = row[0]
+                h_range = [row[1], row[2]]
+                k_range = [row[3], row[4]] if self.dimension > 1 else [0.0, 0.0]
+                l_range = [row[5], row[6]] if self.dimension > 2 else [0.0, 0.0]
+
+                interval_dict = {'id': interval_id, 'h_range': h_range}
+                if self.dimension > 1:
+                    interval_dict['k_range'] = k_range
+                if self.dimension > 2:
+                    interval_dict['l_range'] = l_range
+                pending_parts.append(interval_dict)
+
+            self.logger.debug(f"Retrieved {len(pending_parts)} ReciprocalSpaceInterval entries for processing.")
             return pending_parts
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to retrieve HKLInterval entries: {e}")
-            return []    
+            self.logger.error(f"Failed to retrieve ReciprocalSpaceInterval entries: {e}")
+            return []
+
     def get_point_data_for_point_ids(self, point_ids: List[int]) -> List[Dict]:
         """
         Retrieves point data for the given list of point_ids.
@@ -105,6 +120,7 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error(f"Failed to retrieve point data for point_ids={point_ids}: {e}")
             return []
+
     def _initialize_database(self):
         """
         Creates tables if they do not exist.
@@ -123,9 +139,9 @@ class DatabaseManager:
                 )
             """)
 
-            # Create HKLInterval table
+            # Create ReciprocalSpaceInterval table
             self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS HKLInterval (
+                CREATE TABLE IF NOT EXISTS ReciprocalSpaceInterval (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     h_start REAL,
                     h_end REAL,
@@ -137,24 +153,24 @@ class DatabaseManager:
                 )
             """)
 
-            # Create Point_HKL_Association table with `saved` boolean field
+            # Create Point_ReciprocalSpace_Association table with `saved` boolean field
             self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS Point_HKL_Association (
+                CREATE TABLE IF NOT EXISTS Point_ReciprocalSpace_Association (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     point_id INTEGER,
-                    hkl_id INTEGER,
+                    reciprocal_space_id INTEGER,
                     saved INTEGER DEFAULT 0,
                     FOREIGN KEY (point_id) REFERENCES PointData(id),
-                    FOREIGN KEY (hkl_id) REFERENCES HKLInterval(id),
-                    UNIQUE(point_id, hkl_id)
+                    FOREIGN KEY (reciprocal_space_id) REFERENCES ReciprocalSpaceInterval(id),
+                    UNIQUE(point_id, reciprocal_space_id)
                 )
             """)
 
             # Create indexes for faster lookups
             self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_pointdata_central_point_id ON PointData (central_point_id);")
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_hklinterval_ranges ON HKLInterval (h_start, h_end, k_start, k_end, l_start, l_end);")
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_association_point_id ON Point_HKL_Association (point_id);")
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_association_hkl_id ON Point_HKL_Association (hkl_id);")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_reciprocal_spaceinterval_ranges ON ReciprocalSpaceInterval (h_start, h_end, k_start, k_end, l_start, l_end);")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_association_point_id ON Point_ReciprocalSpace_Association (point_id);")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_association_reciprocal_space_id ON Point_ReciprocalSpace_Association (reciprocal_space_id);")
 
             # Commit changes
             self.connection.commit()
@@ -162,32 +178,23 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error(f"An error occurred initializing the database: {e}")
 
-    def update_saved_status_for_chunk_or_point(self, hkl_id: int, point_id: int = None, chunk_id: int = None, saved: int = 0):
+    def update_saved_status_for_chunk_or_point(self, reciprocal_space_id: int, point_id: int = None, chunk_id: int = None, saved: int = 0):
         """
-        Updates the `saved` status for associations based on either `chunk_id` or `point_id`, combined with `hkl_id`.
-
-        Args:
-            hkl_id (int): The ID of the HKLInterval.
-            point_id (int, optional): The ID of the PointData. Default is None.
-            chunk_id (int, optional): The chunk ID for updating based on `chunk_id`. Default is None.
-            saved (int, optional): The status value for `saved`. Default is 1 (indicating saved).
+        Updates the `saved` status for associations based on either `chunk_id` or `point_id`, combined with `reciprocal_space_id`.
         """
         try:
             # Begin transaction
             self.connection.execute('BEGIN')
 
-            # Update by point_id if provided
             if point_id is not None:
                 self.cursor.execute("""
-                    UPDATE Point_HKL_Association
+                    UPDATE Point_ReciprocalSpace_Association
                     SET saved = ?
-                    WHERE point_id = ? AND hkl_id = ?
-                """, (saved, point_id, hkl_id))
-                self.logger.debug(f"Updated saved status for PointData ID={point_id} and HKLInterval ID={hkl_id}.")
-
-            # Update by chunk_id if provided
+                    WHERE point_id = ? AND reciprocal_space_id = ?
+                """, (saved, point_id, reciprocal_space_id))
+                self.logger.debug(f"Updated saved status for PointData ID={point_id} and ReciprocalSpaceInterval ID={reciprocal_space_id}.")
             elif chunk_id is not None:
-                # First, find all point_ids associated with the given chunk_id
+                # Find all point_ids associated with the given chunk_id
                 self.cursor.execute("""
                     SELECT id FROM PointData
                     WHERE chunk_id = ?
@@ -196,30 +203,24 @@ class DatabaseManager:
 
                 # Update all associations for the given chunk_id
                 self.cursor.executemany("""
-                    UPDATE Point_HKL_Association
+                    UPDATE Point_ReciprocalSpace_Association
                     SET saved = ?
-                    WHERE point_id = ? AND hkl_id = ?
-                """, [(saved, pid, hkl_id) for pid in point_ids])
+                    WHERE point_id = ? AND reciprocal_space_id = ?
+                """, [(saved, pid, reciprocal_space_id) for pid in point_ids])
 
-                self.logger.debug(f"Updated saved status for chunk_id={chunk_id} and HKLInterval ID={hkl_id} for {len(point_ids)} PointData entries.")
+                self.logger.debug(f"Updated saved status for chunk_id={chunk_id} and ReciprocalSpaceInterval ID={reciprocal_space_id} for {len(point_ids)} PointData entries.")
 
             # Commit changes
             self.connection.commit()
             self.logger.info("Saved status updated successfully.")
 
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to update saved status for hkl_id={hkl_id}, point_id={point_id}, chunk_id={chunk_id}: {e}")
+            self.logger.error(f"Failed to update saved status for reciprocal_space_id={reciprocal_space_id}, point_id={point_id}, chunk_id={chunk_id}: {e}")
             self.connection.rollback()
 
     def insert_point_data_batch(self, point_data_list: List[Dict]) -> List[int]:
         """
         Inserts multiple PointData entries into the database.
-
-        Args:
-            point_data_list (List[Dict]): List of dictionaries containing PointData information.
-
-        Returns:
-            List[int]: List of PointData IDs (inserted or existing).
         """
         point_ids = []
         try:
@@ -281,120 +282,120 @@ class DatabaseManager:
             self.connection.rollback()
             return point_ids
 
-    def insert_hkl_interval_batch(self, hkl_interval_list: List[Dict]) -> List[int]:
+    def insert_reciprocal_space_interval_batch(self, reciprocal_space_interval_list: List[Dict]) -> List[int]:
         """
-        Inserts multiple HKLInterval entries into the database.
+        Inserts multiple ReciprocalSpaceInterval entries into the database, adapted for dimension.
 
-        Args:
-            hkl_interval_list (List[Dict]): List of dictionaries containing HKLInterval information.
-
-        Returns:
-            List[int]: List of HKLInterval IDs (inserted or existing).
+        For dimension < 3, we store l_range as 0.0,0.0
+        For dimension < 2, we store k_range as 0.0,0.0
         """
-        hkl_ids = []
+        reciprocal_space_ids = []
         try:
             # Prepare data for insertion
             insert_data = []
-            for interval in hkl_interval_list:
-                insert_data.append((
-                    interval['h_range'][0],
-                    interval['h_range'][1],
-                    interval['k_range'][0],
-                    interval['k_range'][1],
-                    interval['l_range'][0],
-                    interval['l_range'][1]
-                ))
+            for interval in reciprocal_space_interval_list:
+                h_start, h_end = interval['h_range']
+                if self.dimension > 1:
+                    k_start, k_end = interval['k_range']
+                else:
+                    k_start, k_end = 0.0, 0.0
+                if self.dimension > 2:
+                    l_start, l_end = interval['l_range']
+                else:
+                    l_start, l_end = 0.0, 0.0
+
+                insert_data.append((h_start, h_end, k_start, k_end, l_start, l_end))
 
             # Begin transaction
             self.connection.execute('BEGIN')
 
-            # Insert HKLInterval entries, ignoring duplicates
+            # Insert ReciprocalSpaceInterval entries, ignoring duplicates
             self.cursor.executemany("""
-                INSERT OR IGNORE INTO HKLInterval (
+                INSERT OR IGNORE INTO ReciprocalSpaceInterval (
                     h_start, h_end, k_start, k_end, l_start, l_end
                 ) VALUES (?, ?, ?, ?, ?, ?)
             """, insert_data)
 
             # Commit the transaction
             self.connection.commit()
-            self.logger.debug(f"Inserted or ignored {len(insert_data)} HKLInterval entries.")
+            self.logger.debug(f"Inserted or ignored {len(insert_data)} ReciprocalSpaceInterval entries.")
 
             # Retrieve IDs for all inserted intervals
-            query = """
-                SELECT id, h_start, h_end, k_start, k_end, l_start, l_end FROM HKLInterval
-                WHERE (h_start, h_end, k_start, k_end, l_start, l_end) IN (
-                    """ + ','.join(['(?, ?, ?, ?, ?, ?)'] * len(hkl_interval_list)) + ")"
-
+            placeholders = ','.join(['(?, ?, ?, ?, ?, ?)'] * len(insert_data))
+            query = f"""
+                SELECT id, h_start, h_end, k_start, k_end, l_start, l_end FROM ReciprocalSpaceInterval
+                WHERE (h_start, h_end, k_start, k_end, l_start, l_end) IN ({placeholders})
+            """
             flat_insert_data = [item for sublist in insert_data for item in sublist]
             self.cursor.execute(query, flat_insert_data)
             results = self.cursor.fetchall()
 
             # Map interval tuples to their IDs
-            interval_map = {tuple(row[1:]): row[0] for row in results}
+            interval_map = {tuple(r[1:]): r[0] for r in results}
 
             # Assign IDs based on the interval data
-            for interval in hkl_interval_list:
-                key = tuple(interval['h_range'] + interval['k_range'] + interval['l_range'])
-                hkl_id = interval_map.get(key)
-                if hkl_id:
-                    hkl_ids.append(hkl_id)
+            for interval in reciprocal_space_interval_list:
+                h_start, h_end = interval['h_range']
+                if self.dimension > 1:
+                    k_start, k_end = interval['k_range']
                 else:
-                    self.logger.warning(f"HKLInterval {interval} was not inserted or found.")
+                    k_start, k_end = 0.0, 0.0
+                if self.dimension > 2:
+                    l_start, l_end = interval['l_range']
+                else:
+                    l_start, l_end = 0.0, 0.0
 
-            return hkl_ids
+                key = (h_start, h_end, k_start, k_end, l_start, l_end)
+                reciprocal_space_id = interval_map.get(key)
+                if reciprocal_space_id:
+                    reciprocal_space_ids.append(reciprocal_space_id)
+                else:
+                    self.logger.warning(f"ReciprocalSpaceInterval {interval} was not inserted or found.")
+
+            return reciprocal_space_ids
 
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to batch insert HKLIntervals: {e}")
+            self.logger.error(f"Failed to batch insert ReciprocalSpaceIntervals: {e}")
             self.connection.rollback()
-            return hkl_ids
+            return reciprocal_space_ids
 
-    def associate_point_hkl_batch(self, associations: List[Tuple[int, int]]):
+    def associate_point_reciprocal_space_batch(self, associations: List[Tuple[int, int]]):
         """
-        Associates multiple PointData entries with HKLInterval entries in bulk.
-
-        Args:
-            associations (List[Tuple[int, int]]): List of (point_id, hkl_id) tuples.
+        Associates multiple PointData entries with ReciprocalSpaceInterval entries in bulk.
         """
         try:
             # Begin transaction
             self.connection.execute('BEGIN')
 
-            # Prepare data for insertion
-            insert_data = associations
-
             # Insert associations, ignoring duplicates
             self.cursor.executemany("""
-                INSERT OR IGNORE INTO Point_HKL_Association (
+                INSERT OR IGNORE INTO Point_ReciprocalSpace_Association (
                     point_id,
-                    hkl_id,
+                    reciprocal_space_id,
                     saved
                 ) VALUES (?, ?, 0)
-            """, insert_data)
+            """, associations)
 
             # Commit the transaction
             self.connection.commit()
-            self.logger.debug(f"Associated {len(insert_data)} PointData and HKLInterval pairs.")
+            self.logger.debug(f"Associated {len(associations)} PointData and ReciprocalSpaceInterval pairs.")
 
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to batch associate PointData with HKLIntervals: {e}")
+            self.logger.error(f"Failed to batch associate PointData with ReciprocalSpaceIntervals: {e}")
             self.connection.rollback()
 
     def update_saved_status_batch(self, updates: List[Tuple[int, int, int]]):
         """
-        Updates the saved status for multiple Point_HKL_Association entries in bulk.
-
-        Args:
-            updates (List[Tuple[int, int, int]]): List of (saved, point_id, hkl_id) tuples.
+        Updates the saved status for multiple Point_ReciprocalSpace_Association entries in bulk.
         """
         try:
             # Begin transaction
             self.connection.execute('BEGIN')
 
-            # Update saved status
             self.cursor.executemany("""
-                UPDATE Point_HKL_Association
+                UPDATE Point_ReciprocalSpace_Association
                 SET saved = ?
-                WHERE point_id = ? AND hkl_id = ?
+                WHERE point_id = ? AND reciprocal_space_id = ?
             """, updates)
 
             # Commit the transaction
@@ -407,49 +408,43 @@ class DatabaseManager:
             
     def get_unsaved_associations(self) -> List[Tuple[int, int]]:
         """
-        Retrieves (point_id, hkl_id) tuples for all (chunk_id, hkl_id) pairs
+        Retrieves (point_id, reciprocal_space_id) tuples for all (chunk_id, reciprocal_space_id) pairs
         where ALL associations are unsaved (saved=0).
         
         Returns:
-            List[Tuple[int, int]]: A list of (point_id, hkl_id) that are fully unsaved
-            within their respective (chunk_id, hkl_id) group.
+            List[Tuple[int, int]]: A list of (point_id, reciprocal_space_id) that are fully unsaved
+            within their respective (chunk_id, reciprocal_space_id) group.
         """
         try:
-            # 1. Identify fully unsaved (chunk_id, hkl_id) pairs
+            # 1. Identify fully unsaved (chunk_id, reciprocal_space_id) pairs
             self.cursor.execute("""
                 SELECT pd.chunk_id,
-                       pha.hkl_id,
+                       pha.reciprocal_space_id,
                        COUNT(*) AS total_count,
                        SUM(CASE WHEN pha.saved = 0 THEN 1 ELSE 0 END) AS unsaved_count
-                FROM Point_HKL_Association pha
+                FROM Point_ReciprocalSpace_Association pha
                 JOIN PointData pd ON pha.point_id = pd.id
-                GROUP BY pd.chunk_id, pha.hkl_id
+                GROUP BY pd.chunk_id, pha.reciprocal_space_id
             """)
             
             rows = self.cursor.fetchall()
-    
-            # Filter to get only (chunk_id, hkl_id) that are fully unsaved
             fully_unsaved_pairs = [(r[0], r[1]) for r in rows if r[2] == r[3] and r[2] > 0]
     
             if not fully_unsaved_pairs:
-                self.logger.debug("No (chunk_id, hkl_id) pairs are fully unsaved.")
+                self.logger.debug("No (chunk_id, reciprocal_space_id) pairs are fully unsaved.")
                 return []
             
-            # 2. Retrieve all unsaved (point_id, hkl_id) for these fully unsaved pairs
-            # We'll do this by using a placeholder approach in the query
-            # First, transform list of tuples into a flattened parameter list
-            # We'll generate a WHERE clause like: 
-            # (pd.chunk_id = ? AND pha.hkl_id = ?) OR (pd.chunk_id = ? AND pha.hkl_id = ?) ...
+            # 2. Retrieve all unsaved (point_id, reciprocal_space_id) for these fully unsaved pairs
             conditions = []
             params = []
-            for chunk_id, hkl_id in fully_unsaved_pairs:
-                conditions.append("(pd.chunk_id = ? AND pha.hkl_id = ?)")
-                params.extend([chunk_id, hkl_id])
+            for chunk_id, reciprocal_space_id in fully_unsaved_pairs:
+                conditions.append("(pd.chunk_id = ? AND pha.reciprocal_space_id = ?)")
+                params.extend([chunk_id, reciprocal_space_id])
             
             where_clause = " OR ".join(conditions)
             query = f"""
-                SELECT pha.point_id, pha.hkl_id
-                FROM Point_HKL_Association pha
+                SELECT pha.point_id, pha.reciprocal_space_id
+                FROM Point_ReciprocalSpace_Association pha
                 JOIN PointData pd ON pha.point_id = pd.id
                 WHERE pha.saved = 0
                   AND ({where_clause})
@@ -460,7 +455,7 @@ class DatabaseManager:
     
             self.logger.debug(
                 f"Retrieved {len(all_unsaved_associations)} unsaved associations "
-                f"for {len(fully_unsaved_pairs)} fully unsaved (chunk_id, hkl_id) pairs."
+                f"for {len(fully_unsaved_pairs)} fully unsaved (chunk_id, reciprocal_space_id) pairs."
             )
             
             return all_unsaved_associations
@@ -468,27 +463,6 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error(f"Database error while retrieving consistently unsaved associations: {e}")
             return []
-
-
-    # def get_unsaved_associations(self) -> List[Tuple[int, int]]:
-    #     """
-    #     Retrieves all Point_HKL_Association entries that have not been saved.
-
-    #     Returns:
-    #         List[Tuple[int, int]]: List of (point_id, hkl_id) tuples.
-    #     """
-    #     try:
-    #         self.cursor.execute("""
-    #             SELECT point_id, hkl_id
-    #             FROM Point_HKL_Association
-    #             WHERE saved = 0
-    #         """)
-    #         rows = self.cursor.fetchall()
-    #         self.logger.debug(f"Retrieved {len(rows)} unsaved associations.")
-    #         return rows
-    #     except sqlite3.Error as e:
-    #         self.logger.error(f"Failed to retrieve unsaved associations: {e}")
-    #         return []
 
     def close(self):
         """
