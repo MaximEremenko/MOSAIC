@@ -35,22 +35,66 @@ class RIFFTGridGenerator(ABC):
 
 class GridGenerator1D(RIFFTGridGenerator):
     def generate_grid_around_point(self, central_point, dist_from_atom_center):
-        if dist_from_atom_center == 0:
-            return np.array([central_point])  # Only the central point
+        """
+        Generates a 1D grid around the central point.
 
-        num_steps = int(np.ceil(dist_from_atom_center / self.step_in_frac))
-        grid_range = np.arange(-num_steps, num_steps + 1) * self.step_in_frac
-        grid_points = grid_range + central_point
-        return grid_points.reshape(-1, 1)  # Shape: (N, 1)
+        Args:
+            central_point (float): Central point of the grid.
+            dist_from_atom_center (float): Distance from the central point.
+
+        Returns:
+            np.ndarray: Generated grid points.
+        """
+        if dist_from_atom_center == 0:
+            return np.array([[central_point]])  # Only the central point
+
+        step = self.step_in_frac
+        if step <= 0 or dist_from_atom_center <= step:
+            return np.array([[central_point]])  # Single-point grid
+
+        # Generate grid points
+        epsilon = 1e-12
+        start = -dist_from_atom_center
+        stop = dist_from_atom_center + step - epsilon
+        grid = np.arange(start, stop, step)
+        return (grid + central_point).reshape(-1, 1)  # Shape: (N, 1)
+
 
 class GridGenerator2D(RIFFTGridGenerator):
     def generate_grid_around_point(self, central_point, dist_from_atom_center):
-        if dist_from_atom_center == 0:
-            return np.array([central_point])
+        """
+        Generates a 2D grid around the central point.
 
-        num_steps = int(np.ceil(dist_from_atom_center / self.step_in_frac))
-        grid_range = np.arange(-num_steps, num_steps + 1) * self.step_in_frac
-        mesh_x, mesh_y = np.meshgrid(grid_range, grid_range, indexing='ij')
+        Args:
+            central_point (np.ndarray): Central point of the grid (2D coordinates).
+            dist_from_atom_center (array-like): Distances from the central point for each axis.
+
+        Returns:
+            np.ndarray: Generated grid points.
+        """
+        dist_from_atom_center = np.array(dist_from_atom_center, dtype=float)
+        if np.all(dist_from_atom_center == 0):
+            return np.array([central_point])  # Only the central point
+
+        step = self.step_in_frac
+        step_sizes = np.array([step, step]) if np.isscalar(step) else np.array(step, dtype=float)
+        if step_sizes.shape != (2,):
+            raise ValueError("step_in_frac must be a scalar or array of shape (2,)")
+
+        grids = []
+        for i in range(2):
+            dist = dist_from_atom_center[i]
+            step = step_sizes[i]
+            if step <= 0 or dist <= step:
+                grids.append(np.array([0.0]))
+            else:
+                epsilon = 1e-12
+                start = -dist
+                stop = dist + step - epsilon
+                grids.append(np.arange(start, stop, step))
+
+        # Generate meshgrid and combine
+        mesh_x, mesh_y = np.meshgrid(*grids, indexing='ij')
         grid_points = np.vstack([mesh_x.flatten(), mesh_y.flatten()]).T + central_point
         return grid_points  # Shape: (N, 2)
 
