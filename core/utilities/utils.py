@@ -16,5 +16,7 @@ def determine_configuration_file_type(file_path: str) -> str:
         return 'rmc6f'
     elif ext == '.f2d':
             return 'f2d'
+    elif ext == '.f1d':
+            return 'f1d'
     else:
         raise ValueError(f"Unsupported file extension: {ext}")
