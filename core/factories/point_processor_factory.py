@@ -21,7 +21,9 @@ class PointProcessorFactory:
             num_chunks = rspace_info.get('num_chunks', 10)  # Default to 10 if not specified
             return FromAveragePointProcessor(parameters, average_structure, num_chunks=num_chunks)
         elif method == 'central':
-            return CentralPointProcessor(parameters)
+            rspace_info = parameters.get('rspace_info', {})
+            num_chunks = rspace_info.get('num_chunks', 10)
+            return CentralPointProcessor(parameters, average_structure, num_chunks=num_chunks)
         elif method == 'full_list':
             return FullListPointProcessor(parameters)
         else:

@@ -42,7 +42,8 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
         cell_params = self.metadata['cell_params']
         self.vectors = self.cell_calculator.calculate_vectors(cell_params)
         self.metric = self.cell_calculator.calculate_metric(self.vectors)
-
+        self.data[['X', 'Y']]      = (self.data[['X', 'Y']].values).dot(self.vectors)
+        self.data[['Xav', 'Yav']]  = (self.data[['Xav', 'Yav']].values).dot(self.vectors)
     def get_metadata(self):
         """
         Returns metadata extracted from the file.
