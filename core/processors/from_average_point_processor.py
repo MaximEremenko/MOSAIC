@@ -86,8 +86,25 @@ class FromAveragePointProcessor(IPointParametersProcessor):
 
             if not matched_rows.empty:
                 dimension = len(dist_from_atom_center)
-                coord_columns = ['x', 'y', 'z'][:dimension]
-                central_points = matched_rows[coord_columns].values  # Shape: (N, dimension)
+                # Possible sets of coordinate columns
+                coords_lower = ['x', 'y', 'z']
+                coords_av    = ['Xav', 'Yav', 'Zav']
+            
+                # Figure out which column names exist in the DataFrame
+                cols = matched_rows.columns
+            
+                if all(col in cols for col in coords_lower[:dimension]):
+                    coord_columns = coords_lower[:dimension]
+                elif all(col in cols for col in coords_av[:dimension]):
+                    coord_columns = coords_av[:dimension]
+                else:
+                    raise ValueError(
+                        f"Neither {coords_lower[:dimension]} nor {coords_av[:dimension]} "
+                        "columns are all present in the DataFrame."
+                    )
+            
+                # Extract the numpy array of selected columns
+                central_points = matched_rows[coord_columns].values  # shape: (N, dimension)
 
                 # central_points are already in fractional coordinates
                 fractional_coords = central_points  # No need to convert
