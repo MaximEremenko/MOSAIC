@@ -10,7 +10,7 @@ Created on Tue Dec  3 15:11:22 2024
 import finufft
 import numpy as np
 
-def execute_nufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, eps=1e-5):
+def execute_nufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, eps=1e-12):
     """
     Executes the appropriate finufft nufftXd3 routine based on dimensionality.
     
@@ -47,7 +47,7 @@ def execute_nufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, 
     else:
         raise ValueError(f"Unsupported dimensionality {D}. Only 1D,2D,3D supported.")
 
-def execute_inverse_nufft(q_coords: np.ndarray, c: np.ndarray, real_coords: np.ndarray, eps=1e-5):
+def execute_inverse_nufft(q_coords: np.ndarray, c: np.ndarray, real_coords: np.ndarray, eps=1e-12):
     """
     Executes the inverse NUFFT based on dimensionality.
     
