@@ -6,7 +6,7 @@ Created on Wed Nov 27 19:13:01 2024
 """
 
 # strategies/shape_strategies.py
-
+import matplotlib.pyplot as plt
 import numpy as np
 from interfaces.shape_strategy import ShapeStrategy
 
@@ -216,3 +216,71 @@ class EllipsoidShapeStrategy(ShapeStrategy):
             [-np.sin(theta),0, np.cos(theta)]
         ])
         return R_theta @ R_phi
+    
+    
+@njit
+def compute_2d_mask(data_points, radii, centers, coord_min, coord_max):
+    """
+    Computes a 2D mask for points within multiple circles.
+
+    Args:
+        data_points (np.ndarray): Array of shape (N, 2).
+        radii (np.ndarray): Radii of the circles, shape (M,).
+        centers (np.ndarray): Circle centers, shape (M, 2).
+        coord_min (np.ndarray): Minimum coordinate bounds (2,).
+        coord_max (np.ndarray): Maximum coordinate bounds (2,).
+
+    Returns:
+        np.ndarray: Boolean mask of shape (N,).
+    """
+    N = data_points.shape[0]
+    mask = np.zeros(N, dtype=np.bool_)
+
+
+    for m in range(radii.shape[0]):
+        radius = radii[m]
+        center = centers[m]
+
+        solutions_x = find_val_in_interval(coord_min[0], coord_max[0], center[0])
+        solutions_y = find_val_in_interval(coord_min[1], coord_max[1], center[1])
+
+        #solutions_x = np.arange(coord_min[0], coord_max[0] + 0.001, radius / 2)
+        #solutions_y = np.arange(coord_min[1], coord_max[1] + 0.001, radius / 2)
+
+        for cx in solutions_x:
+            for cy in solutions_y:
+                dx = data_points[:, 0] - cx
+                dy = data_points[:, 1] - cy
+                dist_sq = dx * dx + dy * dy
+                within = dist_sq <= radius * radius
+                mask |= within
+
+    return mask
+
+class CircleShapeStrategy(ShapeStrategy):
+    def __init__(self, special_points_param: Dict[str, Any]):
+        self.special_points_param = special_points_param
+
+    def apply(self, data_points: np.ndarray, central_points: np.ndarray) -> np.ndarray:
+        coord_min = np.min(data_points, axis=0)-1
+        coord_max = np.max(data_points, axis=0)+1
+
+        special_points = self.special_points_param["specialPoints"]
+        num_circles = len(special_points)
+
+        radii = np.empty(num_circles, dtype=np.float64)
+        centers = np.empty((num_circles, 2), dtype=np.float64)
+        for i, sp in enumerate(special_points):
+            radii[i] = sp["radius"]
+            centers[i, :] = sp["coordinate"]
+
+        mask = compute_2d_mask(data_points, radii, centers, coord_min, coord_max)
+        filtered_data = data_points[mask] 
+        
+        plt.scatter(filtered_data[:, 0], filtered_data[:, 1], c='blue', marker='o')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.title('Filtered Points (mask)')
+        plt.grid(True)
+        plt.show()
+        return mask
