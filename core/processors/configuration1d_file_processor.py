@@ -42,8 +42,11 @@ class ConfigurationFileProcessor1D(IConfigurationFileProcessor):
         cell_params = self.metadata['cell_params']
         self.vectors = self.cell_calculator.calculate_vectors(cell_params)
         self.metric = self.cell_calculator.calculate_metric(self.vectors)
-        self.data[['X']]      = (self.data[['X']].values).dot(self.vectors)
-        self.data[['Xav']]  = (self.data[['Xav']].values).dot(self.vectors)
+
+        # Transform X and Xav based on the lattice vectors
+        self.data[['X']] = (self.data[['X']].values).dot(self.vectors)
+        self.data[['Xav']] = (self.data[['Xav']].values).dot(self.vectors)
+
     def get_metadata(self):
         """
         Returns metadata extracted from the file.
@@ -82,7 +85,7 @@ class ConfigurationFileProcessor1D(IConfigurationFileProcessor):
 
     def get_coordinates(self) -> pd.DataFrame:
         """
-        Returns the 'X' and 'Y' coordinates from the parsed data.
+        Returns the 'X' coordinates from the parsed data.
 
         Returns:
             pd.DataFrame: DataFrame containing coordinates.
@@ -91,7 +94,7 @@ class ConfigurationFileProcessor1D(IConfigurationFileProcessor):
 
     def get_average_coordinates(self) -> pd.DataFrame:
         """
-        Returns the average coordinates ('Xav' and 'Yav') from the parsed data.
+        Returns the average coordinates ('Xav') from the parsed data.
 
         Returns:
             pd.DataFrame: DataFrame containing average coordinates.
@@ -124,3 +127,14 @@ class ConfigurationFileProcessor1D(IConfigurationFileProcessor):
             pd.Series: Series containing reference numbers.
         """
         return self.data['RefNumber']
+
+    def get_coeff(self) -> pd.Series or None:
+        """
+        Returns the 'Coeff' column if present; otherwise returns None.
+
+        Returns:
+            pd.Series or None: The Coeff column if present, else None.
+        """
+        if 'Coeff' in self.data.columns:
+            return self.data['Coeff']
+        return None

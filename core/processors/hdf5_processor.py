@@ -39,3 +39,6 @@ class HDF5Processor(IConfigurationFileProcessor):
 
     def get_metric(self) -> Dict:
         return self.data['metric']
+    
+    def get_coeff(self) -> np.ndarray:
+        return self.data['coeff']

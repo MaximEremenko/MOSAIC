@@ -98,7 +98,8 @@ def compute_amplitudes_delta(
     #B, B_#, G, G_ = vec2spacemat(vectors/supercell)
     # Initialize complex coefficients
     M = original_coords.shape[0]
-    c = np.ones(M, dtype=np.complex128)
+    #c = np.ones(M, dtype=np.complex128)
+    c = np.ones((M)) + 1J * np.zeros((M))
 
     # Initialize RIFFTInDataSaver
     rifft_saver = RIFFTInDataSaver(output_dir=output_dir, file_extension='hdf5')
@@ -168,6 +169,55 @@ def compute_amplitudes_delta(
         logger.info(f"Completed NUFFT computations for ireciprocal_space: {ireciprocal_space}, element: {element}")
 
         return (ireciprocal_space['id'], element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+
+    def process_ireciprocal_space_coeff(
+        ireciprocal_space: dict,
+        coeff: np.ndarray,
+        B_: np.ndarray,
+        mask_strategy: any,
+        mask_parameters: dict
+    ):
+        """
+        Processes a single (ireciprocal_space, element) pair.
+    
+        Args:
+            ireciprocal_space (dict): HKL interval information.
+            coeff (np.ndarray): Chemical element coefficient.
+            B_ (np.ndarray): Reciprocal space matrix B_.
+            mask_strategy (MaskStrategy): Instance of mask strategy.
+            mask_parameters (dict): Parameters for the mask strategy.
+    
+        Returns:
+            tuple: (ireciprocal_space_id, element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+        """
+        logger.debug(f"Processing ireciprocal_space: {ireciprocal_space}")
+    
+        # Generate q-space grid
+        q_space_grid = generate_q_space_grid_sync(ireciprocal_space, B_, mask_parameters, mask_strategy, supercell)
+        if q_space_grid.size == 0:
+            logger.warning(f"No q-space points after masking for ireciprocal_space: {ireciprocal_space}")
+            return None  # Skip if no points
+        M = c.size
+        c_ = coeff*(np.ones((M)) + 1J * np.zeros((M)))
+        # Calculate form factors
+        #ff_calculator = FormFactorFactoryProducer.get_factory('default').create_calculator(method='default')
+        #ff = FormFactorFactoryProducer.calculate(q_space_grid, element, charge=charge)
+    
+        # Extract mask for elements
+    
+        # Perform NUFFT calculations
+        q_amplitudes = execute_nufft(original_coords, c_, q_space_grid, eps=1e-14)
+        q_amplitudes_av = execute_nufft(average_coords, c_, q_space_grid, eps=1e-14)
+        q_amplitudes_delta = execute_nufft(original_coords - average_coords, c_, q_space_grid, eps=1e-14)
+    
+        # Final computation
+        q_amplitudes_av_final = q_amplitudes_av * q_amplitudes_delta / c.size
+    
+        logger.info(f"Completed NUFFT computations for ireciprocal_space: {ireciprocal_space}")
+    
+        return (ireciprocal_space['id'], element, q_space_grid, q_amplitudes, q_amplitudes_av_final)
+
+
 
     #@delayed
     def process_chunk_id(
@@ -503,15 +553,26 @@ def compute_amplitudes_delta(
     rifft_amplitudes_chunk_n = np.array([])
     for ireciprocal_space in reciprocal_space_intervals:
         ireciprocal_space_element_tasks = []
-        for element in unique_elements:
-            task = process_ireciprocal_space_element(
-                ireciprocal_space=ireciprocal_space,
-                element=element,
-                B_=B_,
-                mask_strategy=MaskStrategy,  # <-- Pass the MaskStrategy instance
-                mask_parameters=MaskStrategyParameters
-            )
-            ireciprocal_space_element_tasks.append(task)
+        if "coeff" in parameters:
+            for element in unique_elements:
+                task = process_ireciprocal_space_coeff(
+                    ireciprocal_space=ireciprocal_space,
+                    coeff=parameters["coeff"],
+                    B_=B_,
+                    mask_strategy=MaskStrategy,  # <-- Pass the MaskStrategy instance
+                    mask_parameters=MaskStrategyParameters
+                )
+                ireciprocal_space_element_tasks.append(task)  
+        else:
+            for element in unique_elements:
+                task = process_ireciprocal_space_element(
+                    ireciprocal_space=ireciprocal_space,
+                    element=element,
+                    B_=B_,
+                    mask_strategy=MaskStrategy,  # <-- Pass the MaskStrategy instance
+                    mask_parameters=MaskStrategyParameters
+                )
+                ireciprocal_space_element_tasks.append(task)
         
                 # Extract from the first tuple in the list
         # ireciprocal_space_id = ireciprocal_space_element_tasks[0][0]     # from the first element
