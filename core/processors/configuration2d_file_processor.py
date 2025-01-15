@@ -124,3 +124,15 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
             pd.Series: Series containing reference numbers.
         """
         return self.data['RefNumber']
+    
+    def get_coeff(self) -> pd.Series or None:
+        """
+        Returns the 'Coeff' column if present; otherwise returns None.
+        
+        Returns:
+           pd.Series or None: The Coeff column if present, else None.
+        """
+        if 'Coeff' in self.data.columns:
+            return self.data['Coeff']
+        return None
+
