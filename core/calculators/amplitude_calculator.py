@@ -57,9 +57,9 @@ def compute_amplitudes_delta(
             ff_calculator = FormFactorFactoryProducer.get_factory('default').create_calculator(method='default')
             ff = ff_calculator.calculate(q_space_grid, un_element)
 
-            q_amplitudes = ff * execute_nufft(original_coords[mask_elements], c, q_space_grid, eps=1e-5)
-            q_amplitudes_av = execute_nufft(average_coords[mask_elements], c, q_space_grid, eps=1e-5)
-            q_amplitudes_delta = execute_nufft(original_coords[mask_elements] - average_coords[mask_elements], c, q_space_grid, eps=1e-5)
+            q_amplitudes = ff * execute_nufft(original_coords[mask_elements], c, q_space_grid, eps=1e-12)
+            q_amplitudes_av = execute_nufft(average_coords[mask_elements], c, q_space_grid, eps=1e-12)
+            q_amplitudes_delta = execute_nufft(original_coords[mask_elements] - average_coords[mask_elements], c, q_space_grid, eps=1e-12)
 
             q_amplitudes_av *= ff * q_amplitudes_av * q_amplitudes_delta / c.size
             return q_space_grid, q_amplitudes, q_amplitudes_av
