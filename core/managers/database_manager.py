@@ -24,7 +24,38 @@ class DatabaseManager:
         self.connection = sqlite3.connect(self.db_path)
         self.cursor = self.connection.cursor()
         self._initialize_database()
+    def get_point_data_for_chunk(self, chunk_id):
+        """
+        Retrieves all point data for a given chunk ID.
 
+        Args:
+            chunk_id (int): The chunk ID to retrieve data for.
+
+        Returns:
+            List[Dict]: List of point data dictionaries for the chunk.
+        """
+        try:
+            self.cursor.execute("""
+                SELECT central_point_id, coordinates, dist_from_atom_center, step_in_frac, chunk_id, grid_amplitude_initialized
+                FROM PointData
+                WHERE chunk_id = ?
+            """, (chunk_id,))
+            rows = self.cursor.fetchall()
+            point_data_list = []
+            for row in rows:
+                point_data = {
+                    'central_point_id': row[0],
+                    'coordinates': json.loads(row[1]),
+                    'dist_from_atom_center': json.loads(row[2]),
+                    'step_in_frac': json.loads(row[3]),
+                    'chunk_id': row[4],
+                    'grid_amplitude_initialized': row[5]
+                }
+                point_data_list.append(point_data)
+            return point_data_list
+        except sqlite3.Error as e:
+            print(f"Error retrieving point data for chunk_id {chunk_id}: {e}")
+            return []
     def get_pending_chunk_ids(self) -> List[int]:
         """
         Retrieves unique chunk_ids from PointData that are pending processing.
