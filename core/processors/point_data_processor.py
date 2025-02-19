@@ -95,7 +95,12 @@ class PointDataProcessor:
         # Merge all grid_points and amplitudes for this chunk
         merged_grid_points = np.vstack(all_grid_data) if self.save_rifft_coordinates else None
         merged_amplitude_data = np.vstack(all_amplitude_data)
-
+        
+        
+        total_reciprocal_points_filename =  self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
+        self.data_saver.save_data({'ntotal_reciprocal_points': np.zeros([1], dtype = np.int64)}, total_reciprocal_points_filename)    
+        
+        
         # Save the data for this chunk
         self._save_chunk_data(chunk_id, merged_grid_points, merged_amplitude_data, np.zeros([1], dtype = int))
 
