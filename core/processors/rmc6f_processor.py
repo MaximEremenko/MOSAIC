@@ -35,7 +35,7 @@ class RMC6fProcessor( ):
         self.metric = None
         self.average_coordinates = None
         self.elements = None
-
+        self.cell_ids = None
     def process(self):
         # Read the file
         self.content = self.reader.read()
@@ -73,7 +73,9 @@ class RMC6fProcessor( ):
         self.average_coordinates.columns = self.data_frame[['x', 'y', 'z']].columns
         self.elements = self.data_frame['element']
         self.refNumbers = self.data_frame['refNumber']
-
+        
+        self.cell_ids = self.data_frame[['cellRefNumX', 'cellRefNumY', 'cellRefNumZ']]
+        
     def get_coordinates(self) -> pd.DataFrame:
         if self.original_coordinates is not None:
             return self.original_coordinates
@@ -91,6 +93,9 @@ class RMC6fProcessor( ):
 
     def get_elements(self) -> pd.Series:
         return self.elements
+    
+    def get_cell_ids(self) -> pd.Series:
+        return self.cell_ids
     
     def get_refnumbers(self) -> pd.Series:
         return self.refNumbers
