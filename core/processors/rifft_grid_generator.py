@@ -48,7 +48,7 @@ class GridGenerator1D(RIFFTGridGenerator):
         if dist_from_atom_center == 0:
             return np.array([[central_point]])  # Only the central point
 
-        step = self.step_in_frac
+        step = np.array(self.step_in_frac)
         if step <= 0 or dist_from_atom_center <= step:
             return np.array([[central_point]])  # Single-point grid
 
