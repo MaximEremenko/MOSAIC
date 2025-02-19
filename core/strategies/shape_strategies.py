@@ -13,7 +13,7 @@ from interfaces.shape_strategy import ShapeStrategy
 from itertools import product
 import numpy as np
 
-from numba import njit
+from numba import njit, prange
 from typing import Dict, Any
 
 @njit
@@ -104,47 +104,118 @@ def find_val_in_interval(coord_min, coord_max, a):
     # Unique and round
     solutions = unique_sorted_rounded(solutions)
     return solutions
-
 @njit
-def compute_mask(data_points, special_radii, special_coords, coord_min, coord_max):
-    # data_points: (N,3)
-    # special_radii: (M,)
-    # special_coords: (M,3)
-    # Returns a boolean mask of length N.
+def flatten_candidate_centers(sols_x, sols_y, sols_z):
+    """
+    Given three 1D arrays of candidate coordinates, builds an (L, 3) array
+    of candidate centers for L = len(sols_x)*len(sols_y)*len(sols_z).
+    """
+    nx = sols_x.shape[0]
+    ny = sols_y.shape[0]
+    nz = sols_z.shape[0]
+    L = nx * ny * nz
+    centers = np.empty((L, 3), dtype=sols_x.dtype)
+    idx = 0
+    for i in range(nx):
+        cx = sols_x[i]
+        for j in range(ny):
+            cy = sols_y[j]
+            for k in range(nz):
+                cz = sols_z[k]
+                centers[idx, 0] = cx
+                centers[idx, 1] = cy
+                centers[idx, 2] = cz
+                idx += 1
+    return centers
 
+@njit(parallel=True)
+def compute_mask(data_points, special_radii, special_coords, coord_min, coord_max):
+    """
+    data_points:    (N, 3) array of point coordinates.
+    special_radii:  (M,) array of radii.
+    special_coords: (M, 3) array of sphere center coordinates.
+    coord_min:      (3,) lower bounds for periodic domain.
+    coord_max:      (3,) upper bounds for periodic domain.
+
+    Returns:
+      mask: Boolean array of length N indicating whether each point is inside
+            any sphere (including periodic copies).
+    """
     N = data_points.shape[0]
     mask = np.zeros(N, dtype=np.bool_)
-
+    
+    # Loop over each special sphere (usually only one or two).
     for m in range(special_radii.shape[0]):
         radius = special_radii[m]
+        radius_sq = radius * radius  # use squared radius for comparison
         base_coord = special_coords[m]
-
-        solutions_x = find_val_in_interval(coord_min[0], coord_max[0], base_coord[0])
-        solutions_y = find_val_in_interval(coord_min[1], coord_max[1], base_coord[1])
-        solutions_z = find_val_in_interval(coord_min[2], coord_max[2], base_coord[2])
-
-        # Nested loops instead of product
-        for i in range(len(solutions_x)):
-            cx = solutions_x[i]
-            for j in range(len(solutions_y)):
-                cy = solutions_y[j]
-                for k in range(len(solutions_z)):
-                    cz = solutions_z[k]
-
-                    # Compute distances: (x - cx)^2 + (y - cy)^2 + (z - cz)^2
-                    dx = data_points[:, 0] - cx
-                    dy = data_points[:, 1] - cy
-                    dz = data_points[:, 2] - cz
-                    dist_sq = dx*dx + dy*dy + dz*dz
-                    # Compare with radius^2 to avoid sqrt
-                    within = dist_sq <= radius*radius
-
-                    # Update mask
-                    for idx in range(N):
-                        if within[idx]:
-                            mask[idx] = True
-
+        
+        # Compute the periodic solutions for x, y, and z.
+        sols_x = find_val_in_interval(coord_min[0], coord_max[0], base_coord[0])
+        sols_y = find_val_in_interval(coord_min[1], coord_max[1], base_coord[1])
+        sols_z = find_val_in_interval(coord_min[2], coord_max[2], base_coord[2])
+        
+        # Flatten the three nested loops into one array of candidate centers.
+        candidate_centers = flatten_candidate_centers(sols_x, sols_y, sols_z)
+        L = candidate_centers.shape[0]
+        
+        # Parallel loop over all data points.
+        for p in prange(N):
+            x = data_points[p, 0]
+            y = data_points[p, 1]
+            z = data_points[p, 2]
+            inside = False
+            # Check the point against every candidate sphere center.
+            for c in range(L):
+                dx = x - candidate_centers[c, 0]
+                dy = y - candidate_centers[c, 1]
+                dz = z - candidate_centers[c, 2]
+                if dx * dx + dy * dy + dz * dz <= radius_sq:
+                    inside = True
+                    break  # No need to check further candidates.
+            if inside:
+                mask[p] = True
     return mask
+# @njit
+# def compute_mask(data_points, special_radii, special_coords, coord_min, coord_max):
+#     # data_points: (N,3)
+#     # special_radii: (M,)
+#     # special_coords: (M,3)
+#     # Returns a boolean mask of length N.
+
+#     N = data_points.shape[0]
+#     mask = np.zeros(N, dtype=np.bool_)
+
+#     for m in range(special_radii.shape[0]):
+#         radius = special_radii[m]
+#         base_coord = special_coords[m]
+
+#         solutions_x = find_val_in_interval(coord_min[0], coord_max[0], base_coord[0])
+#         solutions_y = find_val_in_interval(coord_min[1], coord_max[1], base_coord[1])
+#         solutions_z = find_val_in_interval(coord_min[2], coord_max[2], base_coord[2])
+
+#         # Nested loops instead of product
+#         for i in range(len(solutions_x)):
+#             cx = solutions_x[i]
+#             for j in range(len(solutions_y)):
+#                 cy = solutions_y[j]
+#                 for k in range(len(solutions_z)):
+#                     cz = solutions_z[k]
+
+#                     # Compute distances: (x - cx)^2 + (y - cy)^2 + (z - cz)^2
+#                     dx = data_points[:, 0] - cx
+#                     dy = data_points[:, 1] - cy
+#                     dz = data_points[:, 2] - cz
+#                     dist_sq = dx*dx + dy*dy + dz*dz
+#                     # Compare with radius^2 to avoid sqrt
+#                     within = dist_sq <= radius*radius
+
+#                     # Update mask
+#                     for idx in range(N):
+#                         if within[idx]:
+#                             mask[idx] = True
+
+#     return mask
 
 class SphereShapeStrategy(ShapeStrategy):
     def __init__(self, spetial_points_param: Dict[str, Any]):
@@ -217,7 +288,42 @@ class EllipsoidShapeStrategy(ShapeStrategy):
         ])
         return R_theta @ R_phi
     
-    
+@njit
+def compute_1d_mask(data_points, radii, centers, coord_min, coord_max):
+    """
+    Computes a 1D mask for points within multiple intervals.
+
+    Args:
+        data_points (np.ndarray): Array of shape (N,).
+        radii (np.ndarray): Radii of the intervals, shape (M,). Here, radius corresponds to half the interval length.
+        centers (np.ndarray): Interval centers, shape (M,).
+        coord_min (float): Minimum coordinate bound.
+        coord_max (float): Maximum coordinate bound.
+
+    Returns:
+        np.ndarray: Boolean mask of shape (N,).
+    """
+    N = data_points.shape[0]
+    M = radii.shape[0]
+    mask = np.zeros(N, dtype=np.bool_)
+
+    for m in range(M):
+        radius = radii[m]
+        center = centers[m]
+
+        # Define step size based on radius for sampling points
+        step = radius / 2.0
+
+        solutions = find_val_in_interval(coord_min, coord_max, center)
+
+        for c in solutions:
+            dx = data_points[:, 0] - c
+            dist = dx
+            within = (dist <= radius) 
+            mask |= within
+
+    return mask
+   
 @njit
 def compute_2d_mask(data_points, radii, centers, coord_min, coord_max):
     """
@@ -281,6 +387,48 @@ class CircleShapeStrategy(ShapeStrategy):
         plt.xlabel('x')
         plt.ylabel('y')
         plt.title('Filtered Points (mask)')
+        plt.grid(True)
+        plt.show()
+        return mask
+    
+class IntervalShapeStrategy(ShapeStrategy):
+    def __init__(self, special_points_param: Dict[str, Any]):
+        self.special_points_param = special_points_param
+
+    def apply(self, data_points: np.ndarray, central_points: np.ndarray) -> np.ndarray:
+        """
+        Applies a 1D interval mask to the data points.
+
+        Args:
+            data_points (np.ndarray): Array of shape (N,).
+            central_points (np.ndarray): Array of central points, shape (M,).
+
+        Returns:
+            np.ndarray: Boolean mask of shape (N,).
+        """
+    
+        coord_min = np.min(data_points) - 1
+        coord_max = np.max(data_points) + 1
+
+        special_points = self.special_points_param["specialPoints"]
+        num_intervals = len(special_points)
+
+        radii = np.empty(num_intervals, dtype=np.float64)
+        centers = np.empty(num_intervals, dtype=np.float64)
+        for i, sp in enumerate(special_points):
+            radii[i] = sp["radius"]
+            centers[i] = central_points[i]
+
+        mask = compute_1d_mask(data_points, radii, centers, coord_min, coord_max)
+        filtered_data = data_points[mask]
+        
+        # Plotting the filtered 1D points
+        plt.figure(figsize=(10, 2))
+        plt.scatter(filtered_data, np.zeros_like(filtered_data), c='green', marker='o', label='Filtered Points')
+        plt.xlabel('X-axis')
+        plt.title('Filtered Points Within Intervals')
+        plt.yticks([])  # Hide y-axis ticks for 1D visualization
+        plt.legend()
         plt.grid(True)
         plt.show()
         return mask
