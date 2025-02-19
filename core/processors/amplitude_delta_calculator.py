@@ -71,6 +71,7 @@ def compute_amplitudes_delta(
     """
 
     # Extract inputs from parameters
+    reciprocal_space_intervals_all = parameters["reciprocal_space_intervals_all"]
     reciprocal_space_intervals = parameters["reciprocal_space_intervals"]
     point_data_list = parameters["point_data_list"]
     original_coords = parameters["original_coords"]  # Shape: (N, D)
@@ -195,7 +196,7 @@ def compute_amplitudes_delta(
         rifft_saver: RIFFTInDataSaver,
         point_data_list: list,  # Now includes 'id's
         rifft_amplitudes_chunk_n: np.ndarray,
-        #nreciprocal_space_points : np.ndarray,
+        total_reciprocal_points : np.ndarray,
         #nmasked_reciprocal_space_points : np.ndarray
     ):
         """
@@ -237,13 +238,31 @@ def compute_amplitudes_delta(
         masked_reciprocal_space_points = q_space_grid.shape[0]
         # Generate filename based on chunk_id
         filename = point_data_processor.data_saver.generate_filename(chunk_id, suffix='_amplitudes')
+        
+        print(f"total_reciprocal_points = {total_reciprocal_points}")
+        total_reciprocal_points_filename =  point_data_processor.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
+        existing_data_tpp = point_data_processor.data_saver.load_data(total_reciprocal_points_filename) 
+        ntotal_reciprocal_points = existing_data_tpp.get('ntotal_reciprocal_points', np.zeros([1], dtype = int))
+        if (ntotal_reciprocal_points == 0):
+            point_data_processor.data_saver.save_data({'ntotal_reciprocal_points': total_reciprocal_points}, total_reciprocal_points_filename)        
+            print(f"ntotal_reciprocal_points = {ntotal_reciprocal_points}")
+        
+        
+        
         nreciprocal_space_points_filename = point_data_processor.data_saver.generate_filename(chunk_id, suffix='_amplitudes_nreciprocal_space_points')
+        
         # Load existing rifft amplitudes if file exists
         try:
             existing_data = point_data_processor.data_saver.load_data(filename)
             rifft_amplitudes_chunk = existing_data.get('amplitudes', np.array([]))
-            existing_data_tpp = point_data_processor.data_saver.load_data(nreciprocal_space_points_filename) 
-            nreciprocal_space_points = existing_data_tpp.get('nreciprocal_space_points', np.zeros([1], dtype = int))
+            existing_data_npp = point_data_processor.data_saver.load_data(nreciprocal_space_points_filename) 
+            nreciprocal_space_points = existing_data_npp.get('nreciprocal_space_points', np.zeros([1], dtype = int))
+            
+            
+            
+            
+
+            
             if(rifft_amplitudes_chunk_n.shape[0]<1):
                 rifft_amplitudes_chunk_n = rifft_amplitudes_chunk*0.0
             if (q_space_grid.shape[1] > 2):
@@ -272,6 +291,47 @@ def compute_amplitudes_delta(
         logger.info(f"Updated saved status for chunk_id: {chunk_id} and ireciprocal_space_id: {ireciprocal_space_id}")
         return(rifft_amplitudes_chunk)
     #@delayed
+    def reciprocal_space_points_counter(
+        ireciprocal_space: dict,
+        supercell: np.ndarray
+    ) -> np.ndarray:
+        """
+        Generates the q-space grid for a given ireciprocal_space interval, applying masking.
+
+        Args:
+            ireciprocal_space (dict): HKL interval information.
+            B_ (np.ndarray): Reciprocal space matrix B_.
+            mask_parameters (dict): Parameters for mask generation.
+            mask_strategy (MaskStrategy): Instance of mask strategy.
+
+        Returns:
+            np.ndarray: Masked q-space grid coordinates.
+        """
+        # Generate h, k, l ranges
+        h_start, h_end = ireciprocal_space['h_start'] , ireciprocal_space['h_end']
+        k_start, k_end = ireciprocal_space['k_start'] , ireciprocal_space['k_end']
+        l_start, l_end = ireciprocal_space['l_start'] , ireciprocal_space['l_end']
+        supercell = np.array(supercell)
+        step = 1/supercell
+
+        # Create ranges
+        h_vals = np.arange(h_start, h_end + step[0], step[0]) if h_end > h_start else np.array([h_start])
+        k_vals = np.arange(k_start, k_end + step[1], step[1]) if k_end > k_start else np.array([k_start])
+        l_vals = np.arange(l_start, l_end + step[2], step[2]) if l_end > l_start else np.array([l_start])
+        
+        if(supercell.shape[0]>2):
+          if (ireciprocal_space['l_start'] == 0 and  ireciprocal_space['l_end'] == 0):
+                
+                total_points =  h_vals.shape[0]*k_vals.shape[0]*l_vals.shape[0]
+          else:
+                total_points =  2*h_vals.shape[0]*k_vals.shape[0]*l_vals.shape[0]
+        elif(supercell.shape[0]>1):
+            total_points =  h_vals.shape[0]*k_vals.shape[0]
+        else:
+            total_points =  h_vals.shape[0]
+        
+        return total_points
+    
     def generate_q_space_grid(
         ireciprocal_space: dict,
         B_: np.ndarray,
@@ -496,7 +556,19 @@ def compute_amplitudes_delta(
             np.ndarray: RIFFT grid coordinates (M, D).
         """
         return compute(generate_rifft_grid(chunk_data, supercell))[0]
-
+    total_reciprocal_points = np.zeros(1, dtype = np.int64)
+    for ireciprocal_space in reciprocal_space_intervals_all:
+        reciprocal_space_interval = {
+            'h_start': ireciprocal_space['h_range'][0],
+            'h_end':   ireciprocal_space['h_range'][1],
+            'k_start': ireciprocal_space['k_range'][0],
+            'k_end':   ireciprocal_space['k_range'][1],
+            'l_start': ireciprocal_space['l_range'][0],
+            'l_end':   ireciprocal_space['l_range'][1]
+        }
+        total_reciprocal_points = total_reciprocal_points +  reciprocal_space_points_counter(reciprocal_space_interval, supercell) 
+        print(f"total_reciprocal_points {total_reciprocal_points}")
+    
     # Collect all delayed tasks and execute
     rifft_amplitudes_chunk_n = np.array([])
     for ireciprocal_space in reciprocal_space_intervals:
@@ -589,6 +661,10 @@ def compute_amplitudes_delta(
             #    continue  # Skip if ireciprocal_space_result is None
             ireciprocal_space_id, element, q_space_grid, q_amplitudes, q_amplitudes_av = reciprocal_space_intervals_task
             for chunk_id in chunk_ids:
+                
+                
+                
+                
                 rifft_amplitudes_chunk_n = process_chunk_id(
                     chunk_id=chunk_id,
                     ireciprocal_space_id=ireciprocal_space_id,
@@ -598,7 +674,7 @@ def compute_amplitudes_delta(
                     rifft_saver=rifft_saver,
                     point_data_list=point_data_list,
                     rifft_amplitudes_chunk_n = rifft_amplitudes_chunk_n,
-                    #nreciprocal_space_points = nreciprocal_space_points,
+                    total_reciprocal_points = total_reciprocal_points,
                     #nmasked_reciprocal_space_points = nmasked_reciprocal_space_points
                 )
                 #chunk_id_tasks.append(chunk_task)
