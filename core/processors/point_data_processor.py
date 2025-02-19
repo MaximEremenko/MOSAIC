@@ -97,7 +97,7 @@ class PointDataProcessor:
         merged_amplitude_data = np.vstack(all_amplitude_data)
 
         # Save the data for this chunk
-        self._save_chunk_data(chunk_id, merged_grid_points, merged_amplitude_data)
+        self._save_chunk_data(chunk_id, merged_grid_points, merged_amplitude_data, np.zeros([1], dtype = int))
 
         # Mark all points in this chunk as initialized
         self.point_data.grid_amplitude_initialized[mask] = True
@@ -121,7 +121,7 @@ class PointDataProcessor:
         self.logger.debug(f"Chunk {chunk_id}: Generating grid for central_point_id={central_point_id} with step_in_frac={step_in_frac} and dist={dist}")
 
         grid_generator = self.grid_generator_factory(dimensionality, step_in_frac)
-        grid_points = grid_generator.generate_grid_around_point(central_point, dist)
+        grid_points = grid_generator.generate_grid_around_point(np.array(central_point), np.array(dist))
         self.logger.debug(f"Chunk {chunk_id}: Generated {grid_points.shape[0]} grid points for central_point_id={central_point_id}")
 
         return grid_points
@@ -152,7 +152,7 @@ class PointDataProcessor:
 
         return amplitude_data
 
-    def _save_chunk_data(self, chunk_id: int, grid_points: Optional[np.ndarray], amplitude_data: np.ndarray):
+    def _save_chunk_data(self, chunk_id: int, grid_points: Optional[np.ndarray], amplitude_data: np.ndarray, nreciprocal_space_points: [np.ndarray]):
         """
         Saves the grid points and amplitude data for a chunk.
 
@@ -168,6 +168,8 @@ class PointDataProcessor:
 
         amplitude_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes')
         self.data_saver.save_data({'amplitudes': amplitude_data}, amplitude_filename)
+        nreciprocal_space_points_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_nreciprocal_space_points')
+        self.data_saver.save_data({'nreciprocal_space_points': nreciprocal_space_points}, nreciprocal_space_points_filename)
         self.logger.info(f"Chunk {chunk_id}: Amplitudes saved to {amplitude_filename}")
 
     def grid_generator_factory(self, dimensionality, step_in_frac):
