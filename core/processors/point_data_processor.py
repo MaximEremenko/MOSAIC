@@ -85,7 +85,7 @@ class PointDataProcessor:
             step = step_in_frac[i]
             central_point_id = central_point_ids[i]
 
-            grid_points = self._generate_grid(chunk_id, dimensionality, step, central_point, dist, central_point_id)
+            grid_points, grid_shapeNd = self._generate_grid(chunk_id, dimensionality, step, central_point, dist, central_point_id)
             amplitude_data = self._generate_amplitude(chunk_id, central_point_id, grid_points)
 
             # Collect data for this chunk
@@ -126,10 +126,10 @@ class PointDataProcessor:
         self.logger.debug(f"Chunk {chunk_id}: Generating grid for central_point_id={central_point_id} with step_in_frac={step_in_frac} and dist={dist}")
 
         grid_generator = self.grid_generator_factory(dimensionality, step_in_frac)
-        grid_points = grid_generator.generate_grid_around_point(np.array(central_point), np.array(dist))
+        grid_points, grid_shapeNd  = grid_generator.generate_grid_around_point(np.array(central_point), np.array(dist))
         self.logger.debug(f"Chunk {chunk_id}: Generated {grid_points.shape[0]} grid points for central_point_id={central_point_id}")
 
-        return grid_points
+        return grid_points, grid_shapeNd
 
     def _generate_amplitude(self, chunk_id: int, central_point_id, grid_points):
         """

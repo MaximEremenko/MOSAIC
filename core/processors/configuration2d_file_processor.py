@@ -44,6 +44,13 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
         self.metric = self.cell_calculator.calculate_metric(self.vectors)
         self.data[['X', 'Y']]      = (self.data[['X', 'Y']].values).dot(self.vectors)
         self.data[['Xav', 'Yav']]  = (self.data[['Xav', 'Yav']].values).dot(self.vectors)
+        
+    def get_cells_origin(self) -> pd.DataFrame:
+        cells_origin = self.data[['Xav', 'Yav']].copy()
+        cells_origin.columns = ['x', 'y']
+        return cells_origin
+
+    
     def get_metadata(self):
         """
         Returns metadata extracted from the file.
@@ -132,7 +139,7 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
         Returns:
            pd.Series or None: The Coeff column if present, else None.
         """
-        if 'Coeff' in self.data.columns:
-            return self.data['Coeff']
+        if 'coeff' in self.data.columns:
+            return self.data['coeff']
         return None
 

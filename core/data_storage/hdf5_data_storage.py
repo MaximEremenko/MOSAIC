@@ -35,7 +35,7 @@ class HDF5ConfigDataSaver(IConfigDataSaver):
             
             with h5py.File(self.hdf5_file_path, 'w') as hdf5_file:
                 # Save original_coords and average_coords
-                for key in ['original_coords', 'average_coords']:
+                for key in ['original_coords', 'average_coords', 'cells_origin']:
                     coords = data[key]
                     print(f"Creating '{key}' dataset with shape {coords.shape}")
                     hdf5_file.create_dataset(key, data=coords.to_numpy())
@@ -67,7 +67,11 @@ class HDF5ConfigDataSaver(IConfigDataSaver):
                 # Save supercell
                 print("Creating 'supercell' dataset")
                 hdf5_file.create_dataset('supercell', data=data['supercell'])
-
+                
+                # Save coeff
+                print("Creating 'coeff' dataset")
+                hdf5_file.create_dataset('coeff', data=data['coeff'])
+                
             print(f"Data successfully saved to {self.hdf5_file_path}")
         except Exception as e:
             print(f"Failed to save data to HDF5 file: {e}")
@@ -101,7 +105,11 @@ class HDF5ConfigDataLoader(IConfigDataLoader):
                 average_coords_data = hdf5_file['average_coords'][:]
                 average_coords = pd.DataFrame(average_coords_data, columns=get_column_names(average_coords_data.shape))
                 print("Loaded 'average_coords'")
-
+                
+                cells_origin_data = hdf5_file['cells_origin'][:]
+                cells_origin = pd.DataFrame(cells_origin_data, columns=get_column_names(cells_origin_data.shape))
+                print("Loaded 'cells_origin'")
+                
                 # Load elements
                 elements = pd.Series(
                     [elem.decode('utf-8') for elem in hdf5_file['elements'][:]],
@@ -129,16 +137,20 @@ class HDF5ConfigDataLoader(IConfigDataLoader):
                 # Load supercell
                 supercell = hdf5_file['supercell'][:]
                 print("Loaded 'supercell'")
-
+                
+                coeff = hdf5_file['coeff'][:]
+                print("Loaded 'coeff'")
             print(f"Data successfully loaded from {self.hdf5_file_path}")
             return {
                 'original_coords': original_coords,
                 'average_coords': average_coords,
+                'cells_origin' : cells_origin,
                 'elements': elements,
                 'refnumbers': refnumbers,
                 'vectors': vectors,
                 'metric': metric,
-                'supercell': supercell
+                'supercell': supercell,
+                'coeff': coeff
             }
         except Exception as e:
             print(f"Failed to load data from HDF5 file: {e}")

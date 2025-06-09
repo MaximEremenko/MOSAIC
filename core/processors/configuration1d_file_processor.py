@@ -27,7 +27,9 @@ class ConfigurationFileProcessor1D(IConfigurationFileProcessor):
         self.data = None
         self.vectors = None
         self.metric = None
+        
 
+    
     def process(self):
         """
         Reads the file, parses metadata and data, and computes lattice vectors and metrics.
@@ -46,7 +48,11 @@ class ConfigurationFileProcessor1D(IConfigurationFileProcessor):
         # Transform X and Xav based on the lattice vectors
         self.data[['X']] = (self.data[['X']].values).dot(self.vectors)
         self.data[['Xav']] = (self.data[['Xav']].values).dot(self.vectors)
-
+        
+    def get_cells_origin(self) -> pd.DataFrame:
+        cells_origin = self.data[['Xav']].copy()
+        cells_origin.columns = ['x']
+        return cells_origin
     def get_metadata(self):
         """
         Returns metadata extracted from the file.

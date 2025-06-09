@@ -5,13 +5,13 @@ Created on Tue Dec  3 15:11:22 2024
 @author: Maksim Eremenko
 """
 
-# utilities/nufft_wrapper.py
+# utilities/cunufft_wrapper.py
 
-import finufft
-
+import cufinufft
+import cupy as cp
 import numpy as np
 
-def execute_nufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, eps=1e-12):
+def execute_cunufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, eps=1e-12):
     """
     Executes the appropriate finufft nufftXd3 routine based on dimensionality.
     
@@ -30,13 +30,21 @@ def execute_nufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, 
         # x in real space, s in q space
         x = real_coords[:, 0].astype(np.float64, order='C')
         s = q_coords[:, 0].astype(np.float64, order='C')
-        return finufft.nufft1d3(x, c, s, eps=eps)
+        return cp.asnumpy(cufinufft.nufft1d3(cp.asarray(x), 
+                                             cp.asarray(c),
+                                             cp.asarray(s), 
+                                             eps=eps))
     elif D == 2:
         x = real_coords[:, 0].astype(np.float64, order='C')
         y = real_coords[:, 1].astype(np.float64, order='C')
         s = q_coords[:, 0].astype(np.float64, order='C')
         t = q_coords[:, 1].astype(np.float64, order='C')
-        return finufft.nufft2d3(x, y, c, s, t, eps=eps)
+        return cp.asnumpy(cufinufft.nufft2d3(cp.asarray(x),
+                                             cp.asarray(y), 
+                                             cp.asarray(c), 
+                                             cp.asarray(s), 
+                                             cp.asarray(t),
+                                             eps=eps))
     elif D == 3:
         x = real_coords[:,0].astype(np.float64, order='C')
         y = real_coords[:,1].astype(np.float64, order='C')
@@ -44,11 +52,18 @@ def execute_nufft(real_coords: np.ndarray, c: np.ndarray, q_coords: np.ndarray, 
         s = q_coords[:,0].astype(np.float64, order='C')
         t = q_coords[:,1].astype(np.float64, order='C')
         u = q_coords[:,2].astype(np.float64, order='C')
-        return finufft.nufft3d3(x, y, z, c, s, t, u, eps=eps)
+        return cp.asnumpy(cufinufft.nufft3d3(cp.asarray(x),
+                                             cp.asarray(y),
+                                             cp.asarray(z),
+                                             cp.asarray(c),
+                                             cp.asarray(s),
+                                             cp.asarray(t),
+                                             cp.asarray(u), 
+                                             eps=eps))
     else:
         raise ValueError(f"Unsupported dimensionality {D}. Only 1D,2D,3D supported.")
 
-def execute_inverse_nufft(q_coords: np.ndarray, c: np.ndarray, real_coords: np.ndarray, eps=1e-12):
+def execute_inverse_cunufft(q_coords: np.ndarray, c: np.ndarray, real_coords: np.ndarray, eps=1e-12):
     """
     Executes the inverse NUFFT based on dimensionality.
     
@@ -66,13 +81,21 @@ def execute_inverse_nufft(q_coords: np.ndarray, c: np.ndarray, real_coords: np.n
     if D == 1:
         s = -q_coords[:, 0].astype(np.float64, order='C')
         x = real_coords[:, 0].astype(np.float64, order='C')
-        return finufft.nufft1d3(s, c, x, eps=eps)
+        return cp.asnumpy(cufinufft.nufft1d3(cp.asarray(s), 
+                                  cp.asarray(c),
+                                  cp.asarray(x),
+                                  eps=eps))
     elif D == 2:
         s = -q_coords[:, 0].astype(np.float64, order='C')
         t = -q_coords[:, 1].astype(np.float64, order='C')
         x = real_coords[:, 0].astype(np.float64, order='C')
         y = real_coords[:, 1].astype(np.float64, order='C')
-        return finufft.nufft2d3(s, t, c, x, y, eps=eps)
+        return cp.asnumpy(cufinufft.nufft2d3(cp.asarray(s),
+                                  cp.asarray(t),
+                                  cp.asarray(c),
+                                  cp.asarray(x),
+                                  cp.asarray(y),
+                                  eps=eps))
     elif D == 3:
         s = -q_coords[:, 0].astype(np.float64, order='C')
         t = -q_coords[:, 1].astype(np.float64, order='C')
@@ -80,6 +103,13 @@ def execute_inverse_nufft(q_coords: np.ndarray, c: np.ndarray, real_coords: np.n
         x = real_coords[:, 0].astype(np.float64, order='C')
         y = real_coords[:, 1].astype(np.float64, order='C')
         z = real_coords[:, 2].astype(np.float64, order='C')
-        return finufft.nufft3d3(s, t, u, c, x, y, z, eps=eps)
+        return cp.asnumpy(cufinufft.nufft3d3(cp.asarray(s),
+                                  cp.asarray(t),
+                                  cp.asarray(u), 
+                                  cp.asarray(c), 
+                                  cp.asarray(x), 
+                                  cp.asarray(y), 
+                                  cp.asarray(z), 
+                                  eps=eps))
     else:
         raise ValueError(f"Unsupported dimensionality {D}. Only 1D, 2D, 3D supported.")

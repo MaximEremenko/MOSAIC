@@ -10,32 +10,24 @@ Created on Wed Nov 27 19:11:58 2024
 from abc import ABC, abstractmethod
 import numpy as np
 
-class MaskStrategy(ABC):
-    @abstractmethod
-    def generate_mask(self, data_points: np.ndarray, parameters: dict) -> np.ndarray:
-        """
-        Generates a boolean mask for the given data_points using the provided parameters.
-
-        Args:
-            data_points (np.ndarray): An array of data points (1D, 2D, or 3D).
-            parameters (dict): Parameters for mask generation.
-
-        Returns:
-            np.ndarray: A boolean array representing the mask.
-        """
-        pass
+class IMaskStrategy(ABC):
+    """
+    Strategy interface for generating a boolean mask over a collection of points.
+    """
 
     @abstractmethod
-    def apply_mask(self, mask: np.ndarray, data_array: np.ndarray, parameters: dict) -> np.ndarray:
+    def generate_mask(self, data: np.ndarray) -> np.ndarray:
         """
-        Applies the mask to the data array.
+        Compute a boolean mask for the given points.
 
         Args:
-            mask (np.ndarray): A boolean array.
-            data_array (np.ndarray): The data array to mask.
-            parameters (dict): Parameters that may affect mask application.
+            data (np.ndarray):
+                - If you have an hkl grid, shape should be (N, 3).
+                - If you have 1D data, shape should be (N,).
+                - Any other shape you choose, as long as your implementation
+                  knows how to interpret it.
 
         Returns:
-            np.ndarray: The masked data array.
+            mask (np.ndarray): A 1D boolean array of length N.
         """
         pass

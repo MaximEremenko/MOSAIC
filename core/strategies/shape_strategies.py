@@ -8,7 +8,7 @@ Created on Wed Nov 27 19:13:01 2024
 # strategies/shape_strategies.py
 import matplotlib.pyplot as plt
 import numpy as np
-from interfaces.shape_strategy import ShapeStrategy
+from interfaces.mask_strategy import IMaskStrategy
 
 from itertools import product
 import numpy as np
@@ -47,8 +47,8 @@ def unique_sorted_rounded(arr):
             result[idx] = arr[i]
     return result
 
-@njit
-def find_val_in_interval(coord_min, coord_max, a):
+#@njit
+def find_val_in_interval(coord_min, coord_max, a, tol=1.0):
     # Largest integer <= coord_min
     coord_min_int = np.int32(np.floor(coord_min))
     # Smallest integer >= coord_max
@@ -61,11 +61,11 @@ def find_val_in_interval(coord_min, coord_max, a):
     # max_solutions: let's assume the range is not too large. We'll pick a safe upper bound.
     max_solutions = (coord_max_int - coord_min_int + 4)  # a bit more than needed
     # Actually, to be safe, let's allow up to 200.
-    max_solutions = 200
+    #max_solutions = 200
     solutions = np.empty(max_solutions, dtype=np.float64)
     count = 0
 
-    for n_val in range(coord_min_int - 1, coord_max_int + 2):
+    for n_val in range(coord_min_int - 2, coord_max_int + 2):
         if n_val == 0:
             # Check both +a and -a
             # We'll first check the extended condition (coord_min-1 <= ... <= coord_max+1)
@@ -76,23 +76,23 @@ def find_val_in_interval(coord_min, coord_max, a):
             # If both +a and -a fit in expanded range:
             if (coord_min - 1 <= a <= coord_max + 1) and (coord_min - 1 <= -a <= coord_max + 1):
                 # Check if they lie within the stricter [coord_min, coord_max]
-                if coord_min <= neg_a <= coord_max:
+                if (coord_min - tol) <= neg_a <= (coord_max + tol):
                     solutions[count] = neg_a
                     count += 1
-                if coord_min <= pos_a <= coord_max:
+                if (coord_min - tol) <= pos_a <= (coord_max + tol):
                     solutions[count] = pos_a
                     count += 1
             else:
                 # Check individually
-                if coord_min <= pos_a <= coord_max:
+                if (coord_min) <= pos_a <= (coord_max):
                     solutions[count] = pos_a
                     count += 1
-                if coord_min <= neg_a <= coord_max:
+                if (coord_min) <= neg_a <= (coord_max):
                     solutions[count] = neg_a
                     count += 1
         else:
             expr_val = corresponding_value(n_val, a)
-            if coord_min <= expr_val <= coord_max:
+            if (coord_min) <= expr_val <= (coord_max):
                 solutions[count] = expr_val
                 count += 1
 
@@ -128,7 +128,7 @@ def flatten_candidate_centers(sols_x, sols_y, sols_z):
                 idx += 1
     return centers
 
-@njit(parallel=True)
+#@njit(parallel=True)
 def compute_mask(data_points, special_radii, special_coords, coord_min, coord_max):
     """
     data_points:    (N, 3) array of point coordinates.
@@ -217,13 +217,13 @@ def compute_mask(data_points, special_radii, special_coords, coord_min, coord_ma
 
 #     return mask
 
-class SphereShapeStrategy(ShapeStrategy):
+class SphereShapeStrategy(IMaskStrategy):
     def __init__(self, spetial_points_param: Dict[str, Any]):
         self.spetial_points_param = spetial_points_param
 
-    def apply(self, data_points: np.ndarray, spetial_points: np.ndarray) -> np.ndarray:
-        coord_min = np.min(data_points, axis=0)
-        coord_max = np.max(data_points, axis=0)
+    def generate_mask(self, data: np.ndarray) -> np.ndarray:
+        coord_min = np.min(data, axis=0)
+        coord_max = np.max(data, axis=0)
 
         # Extract special points info into Numba-friendly arrays
         specialPoints = self.spetial_points_param["specialPoints"]
@@ -235,17 +235,18 @@ class SphereShapeStrategy(ShapeStrategy):
             special_coords[i, :] = sp["coordinate"]
 
         # Call the Numba-optimized function
-        mask = compute_mask(data_points, special_radii, special_coords, coord_min, coord_max)
+        mask = compute_mask(data, special_radii, special_coords, coord_min, coord_max)
         return mask
 
     
         
-class EllipsoidShapeStrategy(ShapeStrategy):
-    def __init__(self, axes: np.ndarray, theta: float, phi: float):
+class EllipsoidShapeStrategy(IMaskStrategy):
+    def __init__(self, spetial_points: np.ndarray, axes: np.ndarray, theta: float, phi: float):
         self.axes = axes
         self.rotation_matrix = self._create_rotation_matrix(theta, phi)
-
-    def apply(self, data_points: np.ndarray, spetial_points: np.ndarray) -> np.ndarray:
+        self.spetial_points = spetial_points
+        
+    def generate_mask(self, data_points: np.ndarray) -> np.ndarray:
         """
         Generates a mask for points within multiple ellipsoids.
 
@@ -257,7 +258,7 @@ class EllipsoidShapeStrategy(ShapeStrategy):
             np.ndarray: Boolean mask array.
         """
         mask = np.zeros(len(data_points), dtype=bool)
-        for spetial_point in spetial_points:
+        for spetial_point in self.spetial_points:
             shifted_points = data_points - spetial_point
             rotated_points = shifted_points @ self.rotation_matrix.T
             scaled_points = rotated_points / self.axes
@@ -288,7 +289,7 @@ class EllipsoidShapeStrategy(ShapeStrategy):
         ])
         return R_theta @ R_phi
     
-@njit
+#@njit
 def compute_1d_mask(data_points, radii, centers, coord_min, coord_max):
     """
     Computes a 1D mask for points within multiple intervals.
@@ -317,14 +318,14 @@ def compute_1d_mask(data_points, radii, centers, coord_min, coord_max):
         solutions = find_val_in_interval(coord_min, coord_max, center)
 
         for c in solutions:
-            dx = data_points[:, 0] - c
+            dx = np.abs(data_points[:, 0] - c)
             dist = dx
             within = (dist <= radius) 
             mask |= within
 
     return mask
    
-@njit
+#@njit
 def compute_2d_mask(data_points, radii, centers, coord_min, coord_max):
     """
     Computes a 2D mask for points within multiple circles.
@@ -363,11 +364,11 @@ def compute_2d_mask(data_points, radii, centers, coord_min, coord_max):
 
     return mask
 
-class CircleShapeStrategy(ShapeStrategy):
+class CircleShapeStrategy(IMaskStrategy):
     def __init__(self, special_points_param: Dict[str, Any]):
         self.special_points_param = special_points_param
 
-    def apply(self, data_points: np.ndarray, central_points: np.ndarray) -> np.ndarray:
+    def generate_mask(self, data_points: np.ndarray) -> np.ndarray:
         coord_min = np.min(data_points, axis=0)-1
         coord_max = np.max(data_points, axis=0)+1
 
@@ -391,11 +392,11 @@ class CircleShapeStrategy(ShapeStrategy):
         plt.show()
         return mask
     
-class IntervalShapeStrategy(ShapeStrategy):
+class IntervalShapeStrategy(IMaskStrategy):
     def __init__(self, special_points_param: Dict[str, Any]):
         self.special_points_param = special_points_param
-
-    def apply(self, data_points: np.ndarray, central_points: np.ndarray) -> np.ndarray:
+        
+    def generate_mask(self, data_points: np.ndarray) -> np.ndarray:
         """
         Applies a 1D interval mask to the data points.
 
@@ -417,14 +418,14 @@ class IntervalShapeStrategy(ShapeStrategy):
         centers = np.empty(num_intervals, dtype=np.float64)
         for i, sp in enumerate(special_points):
             radii[i] = sp["radius"]
-            centers[i] = central_points[i]
+            centers[i] = np.array(sp["coordinate"])#self.central_points[i]
 
         mask = compute_1d_mask(data_points, radii, centers, coord_min, coord_max)
         filtered_data = data_points[mask]
         
         # Plotting the filtered 1D points
         plt.figure(figsize=(10, 2))
-        plt.scatter(filtered_data, np.zeros_like(filtered_data), c='green', marker='o', label='Filtered Points')
+        plt.scatter(filtered_data[:,0], np.zeros_like(filtered_data[:,0]), c='green', marker='o', label='Filtered Points')
         plt.xlabel('X-axis')
         plt.title('Filtered Points Within Intervals')
         plt.yticks([])  # Hide y-axis ticks for 1D visualization
