@@ -57,7 +57,8 @@ class GridGenerator1D(RIFFTGridGenerator):
         start = -dist_from_atom_center
         stop = dist_from_atom_center + step - epsilon
         grid = np.arange(start, stop, step)
-        return (grid + central_point).reshape(-1, 1)  # Shape: (N, 1)
+        grid_shapeNd = grid.shape
+        return (grid + central_point).reshape(-1, 1), grid_shapeNd  # Shape: (N, 1)
 
 
 class GridGenerator2D(RIFFTGridGenerator):
@@ -95,8 +96,9 @@ class GridGenerator2D(RIFFTGridGenerator):
 
         # Generate meshgrid and combine
         mesh_x, mesh_y = np.meshgrid(*grids, indexing='ij')
+        grid_shapeNd = np.array(mesh_x.shape)
         grid_points = np.vstack([mesh_x.flatten(), mesh_y.flatten()]).T + central_point
-        return grid_points  # Shape: (N, 2)
+        return grid_points, grid_shapeNd  # Shape: (N, 2)
 
 # class GridGenerator3D(RIFFTGridGenerator):
 #     def generate_grid_around_point(self, central_point, dist_from_atom_center):
@@ -191,9 +193,10 @@ class GridGenerator3D(RIFFTGridGenerator):
     
         # Now form the meshgrid from the possibly mixed-dimensional grids
         mesh = np.meshgrid(*grids, indexing='ij')
+        grid_shapeNd = np.array(mesh[0].shape)
         grid_points = np.vstack([m.flatten() for m in mesh]).T + central_point
     
         self.logger.debug(f"Generated grid points shape: {grid_points.shape}")
         self.logger.debug(f"First few grid points:\n{grid_points[:5]}")
     
-        return grid_points
+        return grid_points, grid_shapeNd

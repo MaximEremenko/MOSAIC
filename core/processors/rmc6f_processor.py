@@ -75,7 +75,10 @@ class RMC6fProcessor( ):
         self.refNumbers = self.data_frame['refNumber']
         
         self.cell_ids = self.data_frame[['cellRefNumX', 'cellRefNumY', 'cellRefNumZ']]
-        
+        self.cell_ids = self.data_frame[['cellRefNumX', 'cellRefNumY', 'cellRefNumZ']].rename(
+                            columns={'cellRefNumX': 'x', 'cellRefNumY': 'y', 'cellRefNumZ': 'z'}
+        )
+
     def get_coordinates(self) -> pd.DataFrame:
         if self.original_coordinates is not None:
             return self.original_coordinates
@@ -84,7 +87,12 @@ class RMC6fProcessor( ):
 
     def get_average_coordinates(self) -> pd.DataFrame:
         return self.average_coordinates[['x', 'y', 'z']]
-
+  
+    def get_cells_origin (self) -> pd.DataFrame:
+        cells_origin = (self.cell_ids/self.supercell)@self.vectors
+        cells_origin.columns = ['x', 'y', 'z']
+        return cells_origin
+    
     def get_supercell(self) -> np.ndarray:
         if self.supercell is not None:
             return self.supercell

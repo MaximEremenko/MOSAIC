@@ -42,3 +42,6 @@ class HDF5Processor(IConfigurationFileProcessor):
     
     def get_coeff(self) -> np.ndarray:
         return self.data['coeff']
+        
+    def get_cells_origin(self) -> pd.DataFrame:
+        return self.data['cells_origin']
