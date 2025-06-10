@@ -131,9 +131,9 @@ def compute_amplitudes_delta(
             logger.warning(f"No points found for element: {element}")
             return None
         # Perform NUFFT calculations
-        q_amplitudes = ff * execute_nufft(original_coords[mask_elements], c[mask_elements]*0.0+1.0, q_space_grid, eps=1e-12)
-        q_amplitudes_av = execute_nufft(cells_origin, c*0.0+1.0, q_space_grid, eps=1e-12)
-        q_amplitudes_delta = execute_nufft(original_coords[mask_elements] - cells_origin[mask_elements], c[mask_elements]*0.0+1.0, q_space_grid, eps=1e-12)
+        q_amplitudes = ff * execute_cunufft(original_coords[mask_elements], c[mask_elements]*0.0+1.0, q_space_grid, eps=1e-12)
+        q_amplitudes_av = execute_cunufft(cells_origin, c*0.0+1.0, q_space_grid, eps=1e-12)
+        q_amplitudes_delta = execute_cunufft(original_coords[mask_elements] - cells_origin[mask_elements], c[mask_elements]*0.0+1.0, q_space_grid, eps=1e-12)
         # Final computation
         q_amplitudes_av_final = ff * q_amplitudes_av * q_amplitudes_delta / c.size
  
@@ -174,9 +174,9 @@ def compute_amplitudes_delta(
         # Extract mask for elements
     
         # Perform NUFFT calculations
-        q_amplitudes = execute_nufft(original_coords, c_, q_space_grid, eps=1e-12)
-        q_amplitudes_av = execute_nufft(cells_origin, c_*0.0+1.0, q_space_grid, eps=1e-12)
-        q_amplitudes_delta = execute_nufft((original_coords - cells_origin), c_, q_space_grid, eps=1e-12)
+        q_amplitudes = execute_cunufft(original_coords, c_, q_space_grid, eps=1e-12)
+        q_amplitudes_av = execute_cunufft(cells_origin, c_*0.0+1.0, q_space_grid, eps=1e-12)
+        q_amplitudes_delta = execute_cunufft((original_coords - cells_origin), c_, q_space_grid, eps=1e-12)
     
         # Final computation
         q_amplitudes_av_final = q_amplitudes_av * q_amplitudes_delta / c.size
@@ -230,7 +230,7 @@ def compute_amplitudes_delta(
             return
     
         # Perform inverse NUFFT
-        r_amplitudes_partial = execute_inverse_nufft(
+        r_amplitudes_partial = execute_inverse_cunufft(
             q_coords=q_space_grid,
             c=q_amplitudes - q_amplitudes_av,
             real_coords=rifft_space_grid,
