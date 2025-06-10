@@ -1,0 +1,41 @@
+{
+    "structInfo": {
+		"dimension": 1,
+        "working_directory": ".\sample_1d",
+        "filename": "sample_1d.f1d"
+    },
+    "peakInfo": {
+        "reciprocal_space_limits": [
+            {
+                "limit": [40.0],
+                "subvolume_step": [40.0]
+            }
+        ],
+        "specialPoints": [
+            {   
+                "spaceGroupSymmetry": "F d -3 m",
+                "coordinate": [0.0],
+                "shape": "interval",
+                "radius": 0.101
+            }
+        ]
+    },
+    "rspace_info": {
+        "num_chunks": 1,
+        "fresh_start": false,
+        "method": "central",
+       
+        "filter_type": "Chebyshev",
+        "save_rifft_coordinates": false,
+        "smooth_intensities": true,
+        "print_intensities": false,
+        "rspace_parallel_processing": false,
+        "points": [
+            {
+                "filename": "../tests/config_1d/central_points.txt",
+                "distFromAtomCenter": [160.0],
+                "stepInAngstrom": [0.0125]
+            }
+        ]
+    }
+}
