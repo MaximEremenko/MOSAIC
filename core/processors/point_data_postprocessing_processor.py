@@ -142,7 +142,7 @@ class PointDataPostprocessingProcessor:
                     window0 = filtWin(size_aver[0] // 2, 100)
                     window1 = filtWin(size_aver[1] // 2, 100)
                     window2 = filtWin(size_aver[2] // 2, 100)
-                    chebWin = self.filter_from_window(window0, 3, window1, window2, size_aver=size_aver)
+                    filtWin = self.filter_from_window(window0, 3, window1, window2, size_aver=size_aver)
 
                 else:
                     raise ValueError("Unsupported dimensionality: {}".format(dimensionality))
