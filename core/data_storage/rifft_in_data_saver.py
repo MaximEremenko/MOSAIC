@@ -122,7 +122,7 @@ class RIFFTInDataSaver:
         file_path = os.path.join(self.output_dir, filename)
     
         if not os.path.exists(file_path):
-            self.logger.error(f"File not found: {file_path}")
+            self.logger.info(f"File not found: {file_path}")
             raise FileNotFoundError(f"File not found: {file_path}")
     
         if self.file_extension == 'hdf5':

@@ -34,40 +34,43 @@ class CentralPointProcessor(IPointParametersProcessor):
             if self.load_point_data_from_hdf5(self.hdf5_file_path):
                 logger.info(f"Loaded point data from {self.hdf5_file_path}")
                 return
-
+    
         # Generate PointData from parameters
         rspace_info = self.parameters.get('rspace_info', {})
         points_params = rspace_info.get('points', [])
         all_coordinates, all_distances, all_steps, all_ids = [], [], [], []
-
+    
         for point_info in points_params:
             file_name = point_info.get('filename')
             distances = point_info.get('distFromAtomCenter')
             steps = point_info.get('stepInAngstrom')
-
+    
             if not file_name or distances is None or steps is None:
                 logger.error("Missing required point parameters.")
                 continue
-
+    
             if not os.path.exists(file_name):
                 logger.error(f"Central points file not found: {file_name}")
                 continue
-
+    
             central_points = self._read_central_points(file_name)
             if central_points.size == 0:
                 logger.warning(f"No central points loaded from {file_name}")
                 continue
-
-            fractional_coords = angstrom_to_fractional(central_points, self.vectors)
+    
+            try:
+                fractional_coords = angstrom_to_fractional(central_points, self.vectors)
+            except ValueError as e:
+                logger.error(f"Error converting to fractional coordinates: {e}")
+                continue
+    
             num_points = fractional_coords.shape[0]
-
             all_coordinates.append(fractional_coords)
             all_distances.append(np.tile(distances, (num_points, 1)))
             all_steps.append(np.tile(steps, (num_points, 1)))
             all_ids.extend(range(len(all_coordinates[-1])))
-
+    
         if all_coordinates:
-            # Aggregate data into a single PointData instance
             self.point_data = PointData(
                 coordinates=np.vstack(all_coordinates),
                 dist_from_atom_center=np.vstack(all_distances),
@@ -76,29 +79,24 @@ class CentralPointProcessor(IPointParametersProcessor):
                 chunk_ids=np.zeros(len(all_ids), dtype=int),
                 grid_amplitude_initialized=np.zeros(len(all_ids), dtype=bool),
             )
-            # Assign chunk IDs
             self._assign_chunk_ids()
-            # Save PointData to HDF5
             self.save_point_data_to_hdf5(self.hdf5_file_path)
+            logger.info(f"Point data generated and saved to {self.hdf5_file_path}")
         else:
             logger.error("No point data generated.")
 
-    def _read_central_points(self, file_name: str) -> np.ndarray:
-        """
-        Reads central points from a file.
-
-        Args:
-            file_name (str): Path to the file containing central points.
-
-        Returns:
-            np.ndarray: Central points array.
-        """
+    def _read_central_points(self, filename: str) -> np.ndarray:
         try:
-            points = np.loadtxt(file_name)
-            return points if points.ndim > 1 else np.expand_dims(points, axis=0)
+            coords = np.loadtxt(filename, ndmin=2)  # Always at least 2D
+    
+            # If we are in 1D and data is shape (1, N), transpose to (N, 1)
+            if self.vectors.shape == (1, 1) and coords.shape[0] == 1 and coords.shape[1] > 1:
+                coords = coords.T
+    
+            return coords
         except Exception as e:
-            logger.error(f"Failed to read central points from file {file_name}: {e}")
-            return np.array([])
+            logger.error(f"Failed to read central points from {filename}: {e}")
+            return np.empty((0, self.vectors.shape[0]))
 
     def _assign_chunk_ids(self):
         """
