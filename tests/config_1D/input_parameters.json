@@ -1,7 +1,7 @@
 {
     "structInfo": {
 		"dimension": 1,
-        "working_directory": ".\sample_1d",
+        "working_directory": "./sample_1d",
         "filename": "sample_1d.f1d"
     },
     "peakInfo": {
@@ -24,7 +24,6 @@
         "num_chunks": 1,
         "fresh_start": false,
         "method": "central",
-       
         "filter_type": "Chebyshev",
         "save_rifft_coordinates": false,
         "smooth_intensities": true,
