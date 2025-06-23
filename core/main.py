@@ -141,6 +141,8 @@ recip_h5 = os.path.join(out_dir, "point_reciprocal_space_data.hdf5")
 r_mgr = ReciprocalSpaceIntervalManager(recip_h5, parameters, supercell)
 r_mgr.process_reciprocal_space_intervals()
 
+
+
 compact_rs = []
 for d in r_mgr.reciprocal_space_intervals:
     entry = {"h_range": d["h_range"]}
@@ -150,6 +152,14 @@ for d in r_mgr.reciprocal_space_intervals:
 
 rs_ids = db.insert_reciprocal_space_interval_batch(compact_rs)
 db.associate_point_reciprocal_space_batch([(pid, rid) for pid in point_ids for rid in rs_ids])
+
+unique_chunks = np.unique(pgrid.chunk_ids)
+db.insert_interval_chunk_status_batch(
+    [(rs_id, int(chunk), 0)                 # saved = 0
+     for rs_id in rs_ids
+     for chunk  in unique_chunks]
+)
+
 
 padded_rs = [pad_interval(d, dim) for d in compact_rs]
 
