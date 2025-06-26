@@ -13,6 +13,15 @@ import json
 import logging
 from typing import List, Dict, Tuple
 
+from pathlib import Path
+
+def create_db_manager_for_thread(db_path: str | Path, dimension: int = 3) -> "DatabaseManager":
+    """
+    Return a fresh DatabaseManager with its own SQLite connection.
+    Thread-safe because each call opens a *new* sqlite3.Connection.
+    """
+    return DatabaseManager(str(db_path), dimension)
+
 
 class DatabaseManager:
     # ------------------------------------------------------------------ #
@@ -353,6 +362,64 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error("update_saved_status_batch failed: %s", e)
 
+    # def update_saved_status_for_chunk_or_point(
+    #     self,
+    #     reciprocal_space_id: int,
+    #     point_id: int | None = None,
+    #     chunk_id: int | None = None,
+    #     saved: int = 0,
+    # ):
+    #     """
+    #     Mark associations as saved/unsaved.
+
+    #     Parameters
+    #     ----------
+    #     reciprocal_space_id : int
+    #         ID in ReciprocalSpaceInterval.
+    #     point_id : int | None
+    #         If given, update only this point.
+    #     chunk_id : int | None
+    #         If given (and point_id is None), update *all* points that
+    #         belong to this chunk.
+    #     saved : int
+    #         0 = not saved, 1 = saved.
+    #     """
+    #     try:
+    #         self.connection.execute("BEGIN")
+
+    #         if point_id is not None:
+    #             self.cursor.execute(
+    #                 """
+    #                 UPDATE Point_ReciprocalSpace_Association
+    #                 SET saved = ?
+    #                 WHERE point_id = ? AND reciprocal_space_id = ?
+    #                 """,
+    #                 (saved, point_id, reciprocal_space_id),
+    #             )
+
+    #         elif chunk_id is not None:
+    #             # Fetch every point belonging to this chunk
+    #             self.cursor.execute(
+    #                 "SELECT id FROM PointData WHERE chunk_id = ?", (chunk_id,)
+    #             )
+    #             ids = [row[0] for row in self.cursor.fetchall()]
+
+    #             self.cursor.executemany(
+    #                 """
+    #                 UPDATE Point_ReciprocalSpace_Association
+    #                 SET saved = ?
+    #                 WHERE point_id = ? AND reciprocal_space_id = ?
+    #                 """,
+    #                 [(saved, pid, reciprocal_space_id) for pid in ids],
+    #             )
+
+    #         self.connection.commit()
+
+    #     except sqlite3.Error as e:
+    #         self.logger.error(
+    #             "update_saved_status_for_chunk_or_point failed: %s", e
+    #         )
+    #         self.connection.rollback()
     def update_saved_status_for_chunk_or_point(
         self,
         reciprocal_space_id: int,
@@ -360,57 +427,52 @@ class DatabaseManager:
         chunk_id: int | None = None,
         saved: int = 0,
     ):
-        """
-        Mark associations as saved/unsaved.
-
-        Parameters
-        ----------
-        reciprocal_space_id : int
-            ID in ReciprocalSpaceInterval.
-        point_id : int | None
-            If given, update only this point.
-        chunk_id : int | None
-            If given (and point_id is None), update *all* points that
-            belong to this chunk.
-        saved : int
-            0 = not saved, 1 = saved.
-        """
         try:
-            self.connection.execute("BEGIN")
-
-            if point_id is not None:
-                self.cursor.execute(
-                    """
-                    UPDATE Point_ReciprocalSpace_Association
-                    SET saved = ?
-                    WHERE point_id = ? AND reciprocal_space_id = ?
-                    """,
-                    (saved, point_id, reciprocal_space_id),
-                )
-
-            elif chunk_id is not None:
-                # Fetch every point belonging to this chunk
-                self.cursor.execute(
-                    "SELECT id FROM PointData WHERE chunk_id = ?", (chunk_id,)
-                )
-                ids = [row[0] for row in self.cursor.fetchall()]
-
-                self.cursor.executemany(
-                    """
-                    UPDATE Point_ReciprocalSpace_Association
-                    SET saved = ?
-                    WHERE point_id = ? AND reciprocal_space_id = ?
-                    """,
-                    [(saved, pid, reciprocal_space_id) for pid in ids],
-                )
-
-            self.connection.commit()
-
+            with self.connection:                             # ← autocommit, handles BEGIN/COMMIT
+                if point_id is not None:
+                    # ① make sure the (point, interval) link exists
+                    self.cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO Point_ReciprocalSpace_Association
+                        (point_id, reciprocal_space_id, saved)
+                        VALUES (?, ?, 0)
+                        """,
+                        (point_id, reciprocal_space_id),
+                    )
+                    # ② then flip the flag
+                    self.cursor.execute(
+                        """
+                        UPDATE Point_ReciprocalSpace_Association
+                        SET saved = ?
+                        WHERE point_id = ? AND reciprocal_space_id = ?
+                        """,
+                        (saved, point_id, reciprocal_space_id),
+                    )
+    
+                elif chunk_id is not None:
+                    # ① bulk-ensure *all* points of this chunk have a row
+                    self.cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO Point_ReciprocalSpace_Association
+                        (point_id, reciprocal_space_id, saved)
+                        SELECT id, ?, 0
+                        FROM   PointData
+                        WHERE  chunk_id = ?
+                        """,
+                        (reciprocal_space_id, chunk_id),
+                    )
+                    # ② now update them in a single statement
+                    self.cursor.execute(
+                        """
+                        UPDATE Point_ReciprocalSpace_Association
+                        SET saved = ?
+                        WHERE reciprocal_space_id = ?
+                          AND point_id IN (SELECT id FROM PointData WHERE chunk_id = ?)
+                        """,
+                        (saved, reciprocal_space_id, chunk_id),
+                    )
         except sqlite3.Error as e:
-            self.logger.error(
-                "update_saved_status_for_chunk_or_point failed: %s", e
-            )
-            self.connection.rollback()
+            self.logger.error("update_saved_status_for_chunk_or_point failed: %s", e)
 
     # ------------------------------------------------------------------ #
     #  UNSAVED QUERY                                                     #
