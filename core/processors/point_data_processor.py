@@ -7,6 +7,7 @@ from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 from data_structures.point_data import PointData
 from typing import Optional, List
 import h5py
+import os
 
 class PointDataProcessor:
     """
@@ -27,7 +28,47 @@ class PointDataProcessor:
         self.max_chunk_size = max_chunk_size
         self.logger = logging.getLogger(self.__class__.__name__)
         self.point_data: Optional[PointData] = None
-
+        
+    def _sync_initialisation_from_disk(self) -> None:
+            """
+            Make sure self.point_data.grid_amplitude_initialized is consistent
+            with the bitmap stored in the HDF-5 file.
+    
+            • If the dataset is missing  →  create it (all-zero) on disk **and**
+              in memory.
+            • If it exists but the size mismatches the current PointData length
+              (rare, e.g. point cloud changed) → recreate it from scratch.
+            """
+            path = self.data_saver.hdf5_file_path
+            n_points = len(self.point_data.coordinates)
+    
+            # --- ensure the HDF-5 file exists -----------------------------------
+            if not os.path.isfile(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with h5py.File(path, "w"):
+                    pass                      # empty file
+    
+            with h5py.File(path, "a") as h5:
+                if "grid_amplitude_initialized" in h5:
+                    saved = h5["grid_amplitude_initialized"][...]
+                    if saved.size != n_points:            # size mismatch
+                        self.logger.warning(
+                            "Existing bitmap size %d ≠ current point count %d → "
+                            "re-initialising.", saved.size, n_points)
+                        del h5["grid_amplitude_initialized"]
+                        saved = np.zeros(n_points, dtype=np.int8)
+                        h5.create_dataset("grid_amplitude_initialized",
+                                          data=saved, chunks=True, compression="gzip")
+                else:
+                    # first ever run – create all-false dataset
+                    saved = np.zeros(n_points, dtype=np.int8)
+                    h5.create_dataset("grid_amplitude_initialized",
+                                      data=saved, chunks=True, compression="gzip")
+    
+            # mirror to the in-memory structure (as **bool**)
+            self.point_data.grid_amplitude_initialized = saved.astype(bool)
+            self.logger.info("grid_amplitude_initialized synced (%d points).",
+                             n_points)
     def process_point_data(self, point_data: PointData):
         """
         Processes the point data by generating grid points and amplitudes for chunks that haven't been processed.
@@ -36,7 +77,9 @@ class PointDataProcessor:
             point_data (PointData): The point data to process.
         """
         self.point_data = point_data
-
+        
+        self._sync_initialisation_from_disk()
+        
         # Identify unique chunk_ids
         unique_chunk_ids = np.unique(self.point_data.chunk_ids)
         self.logger.info(f"Found {len(unique_chunk_ids)} unique chunk_ids.")
