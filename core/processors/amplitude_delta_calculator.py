@@ -739,10 +739,39 @@ def _save_amplitudes_and_meta(
     logger.info("write-HDF5 | chunk %d | iv %d took %.3f s",
                 chunk_id, task.irecip_id, TIMER() - t0)
 
+
+# ---------------------------------------------------------------------------
+# Build one compact np.recarray from the original Python list
+# ---------------------------------------------------------------------------
+def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
+    """
+    Convert the slow-to-pickle   list[dict]   into one contiguous NumPy
+    structured array.  Each field is a *fixed-size* NumPy column, so
+    serialisation is 5-10 × faster and the Dask scheduler no longer chokes.
+    """
+    # ---- describe the structure ------------------------------------------
+    dtype = np.dtype([
+        ("chunk_id",             "<i4"),        # int32
+        ("coordinates",          "<f8",  (3,)), # 3×float64
+        ("dist_from_atom_center","<f8",  (3,)),
+        ("step_in_frac",         "<f8",  (3,)),
+    ])
+
+    out = np.empty(len(point_data_list), dtype=dtype)
+
+    # ---- fill it ----------------------------------------------------------
+    for i, pd in enumerate(point_data_list):
+        out["chunk_id"][i]              = pd["chunk_id"]
+        out["coordinates"][i]           = pd["coordinates"]
+        out["dist_from_atom_center"][i] = pd["dist_from_atom_center"]
+        out["step_in_frac"][i]          = pd["step_in_frac"]
+
+    return out.view(np.recarray)   # convenient attribute-style access
+
 def _process_chunk_id(
     chunk_id: int,
     iv_path: Path,
-    chunk_data: list[dict],          # ← already filtered, comes from scatter
+    atoms: np.recarray,              # **slice already filtered by the caller**
     total_reciprocal_points: int,
     point_data_processor: PointDataProcessor,
     db_path: str,
@@ -750,29 +779,34 @@ def _process_chunk_id(
 
     t_total = TIMER()
 
-    # --- load cached interval (.npz – tiny) -------------------------------
+    # ---------- load interval (.npz – tiny) -------------------------------
     dat  = np.load(iv_path, mmap_mode="r")
     task = IntervalTask(int(dat["irecip_id"]), str(dat["element"]),
                         dat["q_grid"], dat["q_amp"], dat["q_amp_av"])
 
-    # --- build RIFFT grid -------------------------------------------------
+    # ---------- build RIFFT grid -----------------------------------------
     t0 = TIMER()
-    rifft_grid, grid_shape_nd = _process_chunk(chunk_data)      # local
+    rifft_grid, grid_shape_nd = _process_chunk([
+        dict(coordinates          = atoms.coordinates[i],
+             dist_from_atom_center= atoms.dist_from_atom_center[i],
+             step_in_frac         = atoms.step_in_frac[i])
+        for i in range(atoms.shape[0])
+    ])
     logger.info("RIFFT-grid   | chunk %d | iv %d took %.3f s",
                 chunk_id, task.irecip_id, TIMER() - t0)
 
-    # --- inverse NUFFT ----------------------------------------------------
+    # ---------- inverse NUFFT --------------------------------------------
     t1 = TIMER()
     amplitudes_delta = execute_inverse_cunufft(
-        q_coords=task.q_grid,
-        c=task.q_amp - task.q_amp_av,
-        real_coords=rifft_grid,
-        eps=1e-12,
+        q_coords = task.q_grid,
+        c        = task.q_amp - task.q_amp_av,
+        real_coords = rifft_grid,
+        eps = 1e-12,
     )
     logger.info("inv-NUFFT    | chunk %d | iv %d took %.3f s",
                 chunk_id, task.irecip_id, TIMER() - t1)
 
-    # --- HDF5 + DB --------------------------------------------------------
+    # ---------- save / update --------------------------------------------
     _save_amplitudes_and_meta(
         chunk_id               = chunk_id,
         task                   = task,
@@ -787,45 +821,43 @@ def _process_chunk_id(
                  chunk_id, task.irecip_id, TIMER() - t_total)
 
 
-
 # ---------------------------------------------------------------------------
-# 3️⃣  Build & execute the Stage-2 graph
+# Build & launch stage-2 graph  –  uses the recarray helper above
 # ---------------------------------------------------------------------------
 def process_chunks_with_intervals(
     interval_files          : Iterable[Path],
     *,                                    # keyword-only
     chunk_ids               : Iterable[int],
     total_reciprocal_points : int,
-    point_data_list         : List[dict],
+    point_data_list         : list[dict],
     point_data_processor    : PointDataProcessor,
     db_manager              : DatabaseManager,
 ) -> None:
 
     client = ensure_dask_client()
 
-    # 1️⃣  scatter atom data ONCE per chunk (~10-100 kB each)
+    # 1️⃣  pack everything into *one* compact block
+    rec = _point_list_to_recarray(point_data_list)
+
+    # 2️⃣  scatter only the slice that belongs to each chunk
     chunk_futs = {
-        cid: client.scatter(
-                [pd for pd in point_data_list if pd["chunk_id"] == cid],
-                broadcast=False,
-                hash=False)                 # skip expensive sha-hash
+        cid: client.scatter(rec[rec.chunk_id == cid], broadcast=False, hash=False)
         for cid in chunk_ids
     }
 
-    # 2️⃣  scatter every .npz Path (trivial size)
+    # 3️⃣  scatter paths (trivial) & create tasks
     iv_futs = {p: client.scatter(p, broadcast=False) for p in interval_files}
 
-    # 3️⃣  submit one task per (chunk, interval) pair
     tasks = [
         client.submit(
             _process_chunk_id,
             cid,
             iv_futs[p],
-            chunk_futs[cid],
+            chunk_futs[cid],               # ← tiny: just that chunk’s atoms
             total_reciprocal_points,
             point_data_processor,
             db_manager.db_path,
-            pure=False                     # each call unique
+            pure=False                     # every call is unique
         )
         for cid in chunk_ids
         for p   in interval_files
