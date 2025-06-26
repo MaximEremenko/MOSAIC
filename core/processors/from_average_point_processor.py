@@ -231,24 +231,47 @@ class FromAveragePointProcessor(IPointParametersProcessor):
         return self.point_data
 
     def save_point_data_to_hdf5(self, hdf5_file_path: str):
-        try:
-            # Prepare the data to be saved
-            data_to_save = {
-                'coordinates': self.point_data.coordinates,
-                'dist_from_atom_center': self.point_data.dist_from_atom_center,
-                'step_in_frac': self.point_data.step_in_frac,
-                'central_point_ids': self.point_data.central_point_ids,
-                'chunk_ids': self.point_data.chunk_ids,
-                'grid_amplitude_initialized': self.point_data.grid_amplitude_initialized.astype(int)  # Save as integers (0 or 1)
+            """
+            Append / update the PointData table in *hdf5_file_path*.
+    
+            • Existing datasets are extended (maxshape=None on first creation)
+            • The boolean bitmap grid_amplitude_initialized is **NOT reset**;
+              we only append the new part that corresponds to the rows we add
+              in this call.
+            """
+            pd = self.point_data
+            data_dict = {
+                "coordinates"              : pd.coordinates,
+                "dist_from_atom_center"    : pd.dist_from_atom_center,
+                "step_in_frac"             : pd.step_in_frac,
+                "central_point_ids"        : pd.central_point_ids,
+                "chunk_ids"                : pd.chunk_ids,
+                "grid_amplitude_initialized":
+                      pd.grid_amplitude_initialized.astype(np.int8)   # store 0 / 1
             }
-
-            # Save data to HDF5
-            with h5py.File(hdf5_file_path, 'w') as h5file:
-                for key, value in data_to_save.items():
-                    h5file.create_dataset(key, data=value)
-            self.logger.info(f"Point data saved to {hdf5_file_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to save point data to HDF5 file: {e}")
+    
+            # open for append – creates the file if absent
+            with h5py.File(hdf5_file_path, "a") as h5:
+                for key, arr in data_dict.items():
+                    if key not in h5:
+                        # first time → create an extensible dataset
+                        maxshape = (None,) + arr.shape[1:]   # unlimited along axis-0
+                        h5.create_dataset(key, data=arr,
+                                          maxshape=maxshape,
+                                          chunks=True,
+                                          compression="gzip")
+                    else:
+                        ds = h5[key]
+                        n_old = ds.shape[0]
+                        n_new = arr.shape[0] - n_old
+                        if n_new <= 0:
+                            # nothing to append for this dataset
+                            continue
+                        # extend and write the tail
+                        ds.resize(n_old + n_new, axis=0)
+                        ds[n_old:] = arr[n_old:]
+    
+            self.logger.info("Point data appended/updated in %s", hdf5_file_path)
 
     def load_point_data_from_hdf5(self, hdf5_file_path: str) -> bool:
         try:
