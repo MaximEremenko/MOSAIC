@@ -48,30 +48,31 @@ def _timed(label: str):
     finally:
         logger.info("%s took %.3f s", label, perf_counter() - t0)
 
-def ensure_dask_client(max_threads: int = 8) -> Client:
+def ensure_dask_client(max_workers: int = 8,
+                   *,
+                   processes: bool = True,
+                   threads_per_worker: int = 4) -> Client:
     """
-    Re-use the existing dask client or spin up a local one.
-    On Windows interactive sessions we fall back to threads
-    (processes=True would hit the spawn RuntimeError).
+    Get (or create) a Dask Client with at least `max_workers` *process* workers
+    unless `processes=False` is explicitly requested.
     """
     try:
-        return get_client()
-    except ValueError:
-        use_processes = (
-            platform.system() != "Windows"            # everything except Windows
-            or (not hasattr(sys, "ps1")               # Windows but *not* interactive
-                and __name__ == "__main__")           # i.e., run from a script
-        )
-
+        client = get_client()
+        cluster = client.cluster
+        if isinstance(cluster, LocalCluster) and len(cluster.workers) < max_workers:
+            cluster.scale(max_workers)
+        return client
+    except ValueError:        # no running client
         cluster = LocalCluster(
-            n_workers=max_threads,
-            threads_per_worker=1,
-            processes=use_processes,
-            silence_logs=True,
+            n_workers=max_workers,
+            threads_per_worker=threads_per_worker,
+            processes=processes,
+            protocol="tcp",   
+            #silence_logs="error",
         )
         return Client(cluster)
 
-client = ensure_dask_client(2)
+# client = ensure_dask_client(2)
  
 def chunk_mutex(chunk_id: int) -> Lock:
     """
@@ -472,7 +473,7 @@ def precompute_intervals(
     dask-mpi / PBS / Slurm just the same.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    #client   = ensure_dask_client(2)
+    client   = ensure_dask_client(2)
     retries  = int(parameters.get("interval_retries", DEFAULT_INTERVAL_RETRIES))
     use_coeff = "coeff" in parameters
     coeff_val = parameters.get("coeff")
@@ -967,6 +968,7 @@ def compute_amplitudes_delta(
     db_manager: DatabaseManager,
     output_dir: str,
     point_data_processor: PointDataProcessor,
+    client
 ):
     """
     Entry-point function with the same signature the rest of MOSAIC expects.

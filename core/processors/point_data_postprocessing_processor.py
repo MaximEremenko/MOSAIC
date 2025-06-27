@@ -16,6 +16,211 @@ from scipy.signal import convolve
 from scipy.signal.windows import  chebwin, lanczos
 from math import sqrt, log
 import logging
+import sys, platform
+from dask.distributed import get_client, Client, LocalCluster
+
+from numba import set_num_threads
+
+set_num_threads(32)
+
+def _build_kernel(dim, size_aver, window0, window1=None, window2=None):
+    """Returns an ND convolution kernel normalised to sum-to-1."""
+    if dim == 1:
+        return window0 / window0.sum()
+
+    if dim == 2:
+        win = np.outer(window0, window1)
+        return win / win.sum()
+
+    if dim == 3:
+        win = (window0[:, None, None] *
+               window1[None, :, None] *
+               window2[None, None, :])
+        return win / win.sum()
+
+    raise ValueError("Unsupported dimensionality")
+
+# def ensure_dask_client(
+#         max_workers: int = 8,
+#         *,
+#         processes: bool | None = None,
+#         threads_per_worker: int = 1) -> Client:
+#     """
+#     Return a Dask Client with at least `max_workers` workers.
+
+#     If a client already exists and is backed by a LocalCluster, scale it
+#     up on the fly.  Otherwise create a new LocalCluster.
+#     """
+#     try:
+#         client = get_client()
+#         cluster = client.cluster
+#         # Only LocalCluster supports .scale in a portable way
+#         if isinstance(cluster, LocalCluster):
+#             n_current = len(cluster.workers)
+#             if n_current < max_workers:
+#                 cluster.scale(max_workers)          # grow in-place
+#         return client
+
+#     except ValueError:                              # no running client
+#         # -------- choose process / thread mode --------------------------
+#         if processes is None:
+#             import platform, sys
+#             interactive = hasattr(sys, "ps1")
+#             processes = not (platform.system() == "Windows" and interactive)
+
+#         cluster = LocalCluster(
+#             n_workers=max_workers,
+#             threads_per_worker=threads_per_worker,
+#             processes=processes,
+#             silence_logs="error",
+#         )
+#         return Client(cluster)
+# def ensure_dask_client(max_workers: int = 8,
+#                    *,
+#                    processes: bool = True,
+#                    threads_per_worker: int = 4) -> Client:
+#     """
+#     Get (or create) a Dask Client with at least `max_workers` *process* workers
+#     unless `processes=False` is explicitly requested.
+#     """
+#     try:
+#         client = get_client()
+#         cluster = client.cluster
+#         if isinstance(cluster, LocalCluster) and len(cluster.workers) < max_workers:
+#             cluster.scale(max_workers)
+#         return client
+#     except ValueError:        # no running client
+#         cluster = LocalCluster(
+#             n_workers=max_workers,
+#             threads_per_worker=threads_per_worker,
+#             processes=processes,
+#             protocol="tcp",   
+#             silence_logs="error",
+#         )
+#         return Client(cluster)
+def filter_kernel(window0,
+                  dimensionality: int,
+                  window1=None,
+                  window2=None,
+                  size_aver=None):
+    """
+    Stand-alone, picklable replacement for
+    PointDataPostprocessingProcessor.filter_from_window.
+    """
+
+    import numpy as np
+    from  scipy.fft import fft, fftshift
+
+    # ---- robust handling of the argument ---------------------------------
+    if size_aver is None:
+        raise ValueError("size_aver must be provided")
+    size_aver = np.asarray(size_aver, dtype=int)      # ← no 'or []'
+
+    # ----------------------------------------------------------------------
+    if dimensionality == 1:
+        fd0  = fft(window0, size_aver[0]) / (len(window0) / 2.0)
+        k0   = np.abs(fftshift(fd0 / np.abs(fd0).max()))
+        return k0 / k0.sum()
+
+    if dimensionality == 2:
+        fd0 = fft(window0, size_aver[0]) / (len(window0) / 2.0)
+        fd1 = fft(window1, size_aver[1]) / (len(window1) / 2.0)
+        k0  = np.abs(fftshift(fd0 / np.abs(fd0).max()))
+        k1  = np.abs(fftshift(fd1 / np.abs(fd1).max()))
+        kern = k0[:, None] * k1[None, :]
+        return kern / kern.sum()
+
+    if dimensionality == 3:
+        fd0 = fft(window0, size_aver[0]) / (len(window0) / 2.0)
+        fd1 = fft(window1, size_aver[1]) / (len(window1) / 2.0)
+        fd2 = fft(window2, size_aver[2]) / (len(window2) / 2.0)
+        k0  = np.abs(fftshift(fd0 / np.abs(fd0).max()))
+        k1  = np.abs(fftshift(fd1 / np.abs(fd1).max()))
+        k2  = np.abs(fftshift(fd2 / np.abs(fd2).max()))
+        kern = k0[:, None, None] * k1[None, :, None] * k2[None, None, :]
+        return kern / kern.sum()
+
+    raise ValueError(f"Unsupported dimensionality {dimensionality}")
+
+def _process_one_id(
+    cid          : int,
+    amp_full     : np.ndarray,          # broadcast Future → ndarray
+    grid_full    : np.ndarray,          # broadcast Future → ndarray
+    indices      : np.ndarray,          # 1-D int view selecting this cid
+    shape_nd     : np.ndarray,          # grid shape for this id
+    dim          : int,
+    size_aver    : np.ndarray,
+    filtr_fun,                          # plain function  (filter_kernel)
+    comp_max_fun,                       # plain functions on class
+    comp_min_fun,
+) -> str:
+    """
+    Build **one** output line for central-point *cid*.
+
+    Everything that is large (amp_full, grid_full) arrives by reference
+    (no re-serialisation).  Only *indices* – a few kB at most – is sent
+    per task.
+    """
+    import numpy as np
+    from scipy.signal.windows import chebwin
+    from scipy.signal import convolve
+
+    if indices.size == 0:                         # safety net
+        return ""
+
+    # ---------- slice the big arrays ----------------------------------------
+    r_val_delta = np.real(amp_full[indices][:, 1])
+    grid_pts    = grid_full[indices, :-1]
+
+    # ---------- convolution kernel ------------------------------------------
+    if dim == 1:
+        w0   = chebwin(size_aver[0] // 2, 100)
+        filt = filtr_fun(w0, 1, size_aver=size_aver)
+        filtered_r = convolve(r_val_delta, filt, mode="same")
+
+    elif dim == 2:
+        w0, w1 = (chebwin(size_aver[i] // 2, 100) for i in (0, 1))
+        filt   = filtr_fun(w0, 2, w1, size_aver=size_aver)
+        filtered_r = convolve(r_val_delta.reshape(shape_nd),
+                              filt, mode="same").ravel()
+
+    elif dim == 3:
+        w0, w1, w2 = (chebwin(size_aver[i] // 2, 100) for i in (0, 1, 2))
+        filt = filtr_fun(w0, 3, w1, w2, size_aver=size_aver)
+        filtered_r = convolve(r_val_delta.reshape(shape_nd),
+                              filt, mode="same").ravel()
+    else:
+        raise ValueError(f"Unsupported dimensionality {dim}")
+
+    # ---------- extrema -----------------------------------------------------
+    pmax_coord, pmax_idx, pmax_flat, amp_max_w = comp_max_fun(filtered_r, grid_pts)
+    pmin_coord, pmin_idx, pmin_flat, amp_min_w = comp_min_fun(filtered_r, grid_pts)
+
+    # graceful fall-backs
+    if pmax_coord is None:
+        pmax_coord = [float("nan")] * dim
+        pmax_idx   = pmax_flat = -1
+        amp_max_w  = float("nan")
+    if pmin_coord is None:
+        pmin_coord = [float("nan")] * dim
+        pmin_idx   = pmin_flat = -1
+        amp_min_w  = float("nan")
+
+    displ_vec = (
+        [float("nan")] * dim
+        if -1 in (pmax_idx, pmin_idx)
+        else grid_pts[pmax_idx] - grid_pts[pmin_idx]
+    )
+
+    # ---------- ready-to-write line -----------------------------------------
+    return (
+        f"{cid} {pmin_idx} {pmax_idx} "
+        f"{' '.join(map(str, pmax_coord))} "
+        f"{' '.join(map(str, pmin_coord))} "
+        f"{' '.join(map(str, displ_vec))} "
+        f"{amp_min_w} {amp_max_w} "
+        f"{pmin_flat} {pmax_flat}\n"
+    )
 
 class PointDataPostprocessingProcessor:
     def __init__(self, db_manager, point_data_processor, parameters):
@@ -23,7 +228,7 @@ class PointDataPostprocessingProcessor:
         self.point_data_processor = point_data_processor
         self.parameters = parameters
 
-    def process_chunk(self, chunk_id, rifft_saver, output_dir):
+    def process_chunk(self, chunk_id, rifft_saver, client, output_dir):
         # Retrieve all point data associated with this chunk_id
         point_data_list = self.db_manager.get_point_data_for_chunk(chunk_id)
         if not point_data_list:
@@ -37,7 +242,7 @@ class PointDataPostprocessingProcessor:
             return None
 
         # Process each grid around central points and calculate weighted averages
-        self.calculate_and_save_positions(chunk_id, rifft_space_grid, amplitudes, grids_shapeNd, output_dir)
+        self.calculate_and_save_positions(chunk_id, rifft_space_grid, amplitudes, grids_shapeNd, client, output_dir)
 
     def load_amplitudes_and_generate_grid(self, chunk_id, point_data_list, rifft_saver):
         filename = rifft_saver.generate_filename(chunk_id, suffix='_amplitudes')
@@ -181,106 +386,177 @@ class PointDataPostprocessingProcessor:
     #                )
     
     # ------------------------------------------------------------------
+    # def calculate_and_save_positions(
+    #         self,
+    #         chunk_id        : int,
+    #         rifft_space_grid: np.ndarray,
+    #         amplitudes      : np.ndarray,
+    #         grids_shapeNd   : np.ndarray,
+    #         output_dir      : str) -> None:
+    #     """
+    #     Write one *.dat* file per chunk.
+
+    #     The function is tolerant to missing extrema: whenever the maximum or
+    #     minimum lobe cannot be located the corresponding fields are filled
+    #     with NaN / -1 placeholders instead of raising an exception.
+    #     """
+    #     # 0️⃣   housekeeping --------------------------------------------------
+    #     os.makedirs(output_dir, exist_ok=True)
+    #     outfile = os.path.join(output_dir, f"output_chunk_{chunk_id}.dat")
+    #     log     = logging.getLogger(__name__)
+
+    #     unique_ids = np.unique(rifft_space_grid[:, -1]).astype(int)
+    #     shape_for_id = {int(cid): grids_shapeNd[i]
+    #                     for i, cid in enumerate(unique_ids)}
+
+    #     # 1️⃣   header --------------------------------------------------------
+    #     with open(outfile, "w") as f:
+    #         self.write_header(f, dimensionality=rifft_space_grid.shape[1] - 1)
+
+    #         dim       = rifft_space_grid.shape[1] - 1
+    #         size_aver = np.asarray(self.parameters["supercell"])
+
+    #         # 2️⃣   loop over every central-point id --------------------------
+    #         for cid in unique_ids:
+    #             mask = rifft_space_grid[:, -1] == cid
+    #             if not np.any(mask):
+    #                 continue
+
+    #             grid_pts   = rifft_space_grid[mask, :-1]
+    #             shape_nd   = shape_for_id[cid]
+    #             r_val_delta = np.real(amplitudes[mask][:, 1])
+
+    #             # -------- window & convolution ------------------------------
+    #             if dim == 1:
+    #                 w0   = chebwin(size_aver[0] // 2, 100)
+    #                 filt = self.filter_from_window(w0, 1, size_aver=size_aver)
+    #                 filtered_r = convolve(r_val_delta, filt, mode="same")
+    #             elif dim == 2:
+    #                 w0, w1 = (chebwin(size_aver[i] // 2, 100) for i in (0, 1))
+    #                 filt   = self.filter_from_window(w0, 2, w1,
+    #                                                  size_aver=size_aver)
+    #                 filtered_r = convolve(r_val_delta.reshape(shape_nd),
+    #                                       filt, mode="same").ravel()
+    #             elif dim == 3:
+    #                 w0, w1, w2 = (chebwin(size_aver[i] // 2, 100)
+    #                               for i in (0, 1, 2))
+    #                 filt = self.filter_from_window(w0, 3, w1, w2,
+    #                                                size_aver=size_aver)
+    #                 filtered_r = convolve(r_val_delta.reshape(shape_nd),
+    #                                       filt, mode="same").ravel()
+    #             else:
+    #                 raise ValueError(f"Unsupported dimensionality: {dim}")
+
+    #             # -------- extrema -------------------------------------------
+    #             (pos_max_coord, pos_max_idx, pos_max_flat,
+    #              amp_max_wgt) = self.compute_weighted_positions_max(
+    #                                filtered_r, grid_pts)
+
+    #             (pos_min_coord, pos_min_idx, pos_min_flat,
+    #              amp_min_wgt) = self.compute_weighted_positions_min(
+    #                                filtered_r, grid_pts)
+
+    #             # if an extremum is missing → fill placeholders
+    #             if pos_max_coord is None:
+    #                 pos_max_coord = [float("nan")] * dim
+    #                 pos_max_idx   = -1
+    #                 pos_max_flat  = -1
+    #                 amp_max_wgt   = float("nan")
+    #             if pos_min_coord is None:
+    #                 pos_min_coord = [float("nan")] * dim
+    #                 pos_min_idx   = -1
+    #                 pos_min_flat  = -1
+    #                 amp_min_wgt   = float("nan")
+
+    #             # displacement makes sense only if both coords are real
+    #             if -1 in (pos_max_idx, pos_min_idx):
+    #                 displ_vec = [float("nan")] * dim
+    #             else:
+    #                 displ_vec = (grid_pts[pos_max_idx] -
+    #                              grid_pts[pos_min_idx])
+
+    #             # -------- write --------------------------------------------
+    #             f.write(
+    #                 f"{cid} {pos_min_idx} {pos_max_idx} "
+    #                 f"{' '.join(map(str, pos_max_coord))} "
+    #                 f"{' '.join(map(str, pos_min_coord))} "
+    #                 f"{' '.join(map(str, displ_vec))} "
+    #                 f"{amp_min_wgt} {amp_max_wgt} "
+    #                 f"{pos_min_flat} {pos_max_flat}\n"
+    #             )
+    #             f.flush()      # safeguard after every ID
+
+    
+    
     def calculate_and_save_positions(
             self,
             chunk_id        : int,
             rifft_space_grid: np.ndarray,
             amplitudes      : np.ndarray,
             grids_shapeNd   : np.ndarray,
+            client,
             output_dir      : str) -> None:
         """
-        Write one *.dat* file per chunk.
-
-        The function is tolerant to missing extrema: whenever the maximum or
-        minimum lobe cannot be located the corresponding fields are filled
-        with NaN / -1 placeholders instead of raising an exception.
+        One *.dat* file per `chunk_id`.
+    
+        Heavy arrays (amplitudes, grid) are scattered **once** and shared
+        among workers.  Each worker receives only a *tiny* index vector that
+        selects its slice.
         """
-        # 0️⃣   housekeeping --------------------------------------------------
+        import os, logging, dask
+        from dask.distributed import wait
+    
+        # ────────────────── bookkeeping ───────────────────────────────────────
         os.makedirs(output_dir, exist_ok=True)
         outfile = os.path.join(output_dir, f"output_chunk_{chunk_id}.dat")
-        log     = logging.getLogger(__name__)
-
-        unique_ids = np.unique(rifft_space_grid[:, -1]).astype(int)
-        shape_for_id = {int(cid): grids_shapeNd[i]
-                        for i, cid in enumerate(unique_ids)}
-
-        # 1️⃣   header --------------------------------------------------------
+    
+        # 0️⃣  basic shapes / look-ups
+        dim         = rifft_space_grid.shape[1] - 1
+        size_aver   = np.asarray(self.parameters["supercell"])
+        unique_ids, inv = np.unique(
+            rifft_space_grid[:, -1].astype(int), return_inverse=True
+        )
+        shape_for_id = {cid: grids_shapeNd[i] for i, cid in enumerate(unique_ids)}
+        id2indices   = {cid: np.where(inv == i)[0] for i, cid in enumerate(unique_ids)}
+    
+        # 1️⃣  cluster client (scale up if needed)
+        #client = ensure_dask_client(max_workers=8, processes=True)
+    
+        # 2️⃣  scatter the *big* arrays ONCE (broadcast=True → one copy only)
+        amp_future  = client.scatter(amplitudes,       broadcast=True, hash=False)
+        grid_future = client.scatter(rifft_space_grid, broadcast=True, hash=False)
+    
+        # 3️⃣  build the tiny per-ID tasks
+        tasks = [
+            dask.delayed(_process_one_id)(
+                int(cid),
+                amp_future,
+                grid_future,
+                id2indices[cid],        # 1-D int view, a few dozen bytes
+                shape_for_id[cid],
+                dim,
+                size_aver,
+                filter_kernel,          # plain, picklable helpers
+                self.compute_weighted_positions_max,
+                self.compute_weighted_positions_min,
+            )
+            for cid in unique_ids
+        ]
+    
+        # 4️⃣  compute & gather
+        futures = client.compute(tasks)
+        wait(futures)
+        lines = client.gather(futures)
+    
+        # 5️⃣  write the result file
         with open(outfile, "w") as f:
-            self.write_header(f, dimensionality=rifft_space_grid.shape[1] - 1)
-
-            dim       = rifft_space_grid.shape[1] - 1
-            size_aver = np.asarray(self.parameters["supercell"])
-
-            # 2️⃣   loop over every central-point id --------------------------
-            for cid in unique_ids:
-                mask = rifft_space_grid[:, -1] == cid
-                if not np.any(mask):
-                    continue
-
-                grid_pts   = rifft_space_grid[mask, :-1]
-                shape_nd   = shape_for_id[cid]
-                r_val_delta = np.real(amplitudes[mask][:, 1])
-
-                # -------- window & convolution ------------------------------
-                if dim == 1:
-                    w0   = chebwin(size_aver[0] // 2, 100)
-                    filt = self.filter_from_window(w0, 1, size_aver=size_aver)
-                    filtered_r = convolve(r_val_delta, filt, mode="same")
-                elif dim == 2:
-                    w0, w1 = (chebwin(size_aver[i] // 2, 100) for i in (0, 1))
-                    filt   = self.filter_from_window(w0, 2, w1,
-                                                     size_aver=size_aver)
-                    filtered_r = convolve(r_val_delta.reshape(shape_nd),
-                                          filt, mode="same").ravel()
-                elif dim == 3:
-                    w0, w1, w2 = (chebwin(size_aver[i] // 2, 100)
-                                  for i in (0, 1, 2))
-                    filt = self.filter_from_window(w0, 3, w1, w2,
-                                                   size_aver=size_aver)
-                    filtered_r = convolve(r_val_delta.reshape(shape_nd),
-                                          filt, mode="same").ravel()
-                else:
-                    raise ValueError(f"Unsupported dimensionality: {dim}")
-
-                # -------- extrema -------------------------------------------
-                (pos_max_coord, pos_max_idx, pos_max_flat,
-                 amp_max_wgt) = self.compute_weighted_positions_max(
-                                   filtered_r, grid_pts)
-
-                (pos_min_coord, pos_min_idx, pos_min_flat,
-                 amp_min_wgt) = self.compute_weighted_positions_min(
-                                   filtered_r, grid_pts)
-
-                # if an extremum is missing → fill placeholders
-                if pos_max_coord is None:
-                    pos_max_coord = [float("nan")] * dim
-                    pos_max_idx   = -1
-                    pos_max_flat  = -1
-                    amp_max_wgt   = float("nan")
-                if pos_min_coord is None:
-                    pos_min_coord = [float("nan")] * dim
-                    pos_min_idx   = -1
-                    pos_min_flat  = -1
-                    amp_min_wgt   = float("nan")
-
-                # displacement makes sense only if both coords are real
-                if -1 in (pos_max_idx, pos_min_idx):
-                    displ_vec = [float("nan")] * dim
-                else:
-                    displ_vec = (grid_pts[pos_max_idx] -
-                                 grid_pts[pos_min_idx])
-
-                # -------- write --------------------------------------------
-                f.write(
-                    f"{cid} {pos_min_idx} {pos_max_idx} "
-                    f"{' '.join(map(str, pos_max_coord))} "
-                    f"{' '.join(map(str, pos_min_coord))} "
-                    f"{' '.join(map(str, displ_vec))} "
-                    f"{amp_min_wgt} {amp_max_wgt} "
-                    f"{pos_min_flat} {pos_max_flat}\n"
-                )
-                f.flush()      # safeguard after every ID
-
+            self.write_header(f, dimensionality=dim)
+            f.writelines(lines)
+    
+        logging.getLogger(__name__).info(
+            "chunk %d – wrote %d central-point records → %s",
+            chunk_id, len(lines), outfile,
+        )
 
     def write_header(self, file, dimensionality):
          header = [
