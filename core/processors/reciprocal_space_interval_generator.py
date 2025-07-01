@@ -246,7 +246,7 @@ class ReciprocalSpaceIntervalGenerator:
                 end = l_sub
             else:
                 start = i * l_sub + grid_step
-                end = (i + 1) * l_sub + grid_step
+                end = (i + 1) * l_sub #+ grid_step
             if end > l_max:
                 end = l_max
             intervals.append((start, end))
