@@ -39,10 +39,10 @@ from multiprocessing import freeze_support
 
 from dask.distributed import Client, LocalCluster, get_client
 
-def ensure_dask_client(max_workers: int = 8,
+def ensure_dask_client(max_workers: int = 1,
                    *,
                    processes: bool = True,
-                   threads_per_worker: int = 4) -> Client:
+                   threads_per_worker: int = 1) -> Client:
     """
     Get (or create) a Dask Client with at least `max_workers` *process* workers
     unless `processes=False` is explicitly requested.
@@ -86,7 +86,7 @@ def shutdown_dask():
     
 def main():   
     #shutdown_dask()
-    client = ensure_dask_client(8)              # <-- ONLY HERE
+    client = ensure_dask_client(1)              # <-- ONLY HERE
     #shutdown_dask()
     setup_logging()
     log = logging.getLogger("app")    
@@ -354,7 +354,7 @@ def main():
 
     
     
-    client = ensure_dask_client(max_workers=8, processes=True)
+    client = ensure_dask_client(max_workers=1, processes=True)
     #client.run(lambda: __import__("numba").set_num_threads(32))
     
     for c in range(parameters["rspace_info"]["num_chunks"]):
