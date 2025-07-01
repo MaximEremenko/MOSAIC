@@ -14,7 +14,7 @@ import logging
 from typing import List, Dict, Tuple
 
 from pathlib import Path
-
+from itertools import chain
 def create_db_manager_for_thread(db_path: str | Path, dimension: int = 3) -> "DatabaseManager":
     """
     Return a fresh DatabaseManager with its own SQLite connection.
@@ -22,6 +22,8 @@ def create_db_manager_for_thread(db_path: str | Path, dimension: int = 3) -> "Da
     """
     return DatabaseManager(str(db_path), dimension)
 
+_PRECISION = 6           # digits to keep in ranges
+_CHUNK_SIZE = 150        # 150 × 6 = 900 placeholders per statement
 
 class DatabaseManager:
     # ------------------------------------------------------------------ #
@@ -170,6 +172,7 @@ class DatabaseManager:
                     h_start REAL, h_end REAL,
                     k_start REAL, k_end REAL,
                     l_start REAL, l_end REAL,
+                    precomputed INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(h_start, h_end, k_start, k_end, l_start, l_end)
                 );
 
@@ -268,44 +271,103 @@ class DatabaseManager:
             self.logger.error("insert_point_data_batch failed: %s", e)
             return point_ids
 
+    # def insert_reciprocal_space_interval_batch(
+    #     self, interval_list: List[Dict]
+    # ) -> List[int]:
+    #     """
+    #     Batch-insert ReciprocalSpaceInterval records and return their DB IDs
+    #     in the same order as `interval_list`.
+    #     """
+    #     rs_ids: List[int] = []
+    #     if not interval_list:
+    #         return rs_ids
+
+    #     try:
+    #         # Prepare tuples with zeroed components for lower dimensions
+    #         tuples = []
+    #         for iv in interval_list:
+    #             h_start, h_end = iv["h_range"]
+    #             if self.dimension > 1:
+    #                 k_start, k_end = iv["k_range"]
+    #             else:
+    #                 k_start = k_end = 0.0
+    #             if self.dimension > 2:
+    #                 l_start, l_end = iv["l_range"]
+    #             else:
+    #                 l_start = l_end = 0.0
+    #             tuples.append((h_start, h_end, k_start, k_end, l_start, l_end))
+
+    #         with self.connection:
+    #             self.cursor.executemany(
+    #                 """
+    #                 INSERT OR IGNORE INTO ReciprocalSpaceInterval
+    #                 (h_start, h_end, k_start, k_end, l_start, l_end)
+    #                 VALUES (?, ?, ?, ?, ?, ?)
+    #                 """,
+    #                 tuples,
+    #             )
+
+    #             # Fetch IDs
+    #             placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(tuples))
+    #             self.cursor.execute(
+    #                 f"""
+    #                 SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
+    #                 FROM   ReciprocalSpaceInterval
+    #                 WHERE  (h_start, h_end, k_start, k_end, l_start, l_end)
+    #                        IN ({placeholders})
+    #                 """,
+    #                 [val for t in tuples for val in t],
+    #             )
+    #             id_map = {tuple(r[1:]): r[0] for r in self.cursor.fetchall()}
+    #             rs_ids = [id_map[t] for t in tuples]
+    #         return rs_ids
+    #     except sqlite3.Error as e:
+    #         self.logger.error("insert_reciprocal_space_interval_batch failed: %s", e)
+    #         return rs_ids
+
+
+    def _pad_ranges(self, iv: Dict) -> Tuple[float, float, float, float, float, float]:
+        """Return a 6-tuple [h_start, h_end, k_start, k_end, l_start, l_end]."""
+        h_start, h_end = (round(x, _PRECISION) for x in iv["h_range"])
+        if self.dimension > 1:
+            k_start, k_end = (round(x, _PRECISION) for x in iv["k_range"])
+        else:
+            k_start = k_end = 0.0
+        if self.dimension > 2:
+            l_start, l_end = (round(x, _PRECISION) for x in iv["l_range"])
+        else:
+            l_start = l_end = 0.0
+        return (h_start, h_end, k_start, k_end, l_start, l_end)
+
+
+
+# ---------------------------------------------------------------------------
+    
     def insert_reciprocal_space_interval_batch(
         self, interval_list: List[Dict]
     ) -> List[int]:
         """
-        Batch-insert ReciprocalSpaceInterval records and return their DB IDs
-        in the same order as `interval_list`.
+        Return DB-ids for `interval_list` in the original order, without ever
+        burning gaps in AUTOINCREMENT.  Strategy:
+    
+        1.  Canonicalise every interval → 6-tuple (rounded).
+        2.  In CHUNK_SIZE blocks ask SQLite which tuples already exist.
+        3.  Insert only the missing tuples (again in chunks).
+        4.  Fetch ids for the newly inserted tuples, build a single mapping,
+            and return ids preserving the caller’s order.
         """
-        rs_ids: List[int] = []
         if not interval_list:
-            return rs_ids
-
-        try:
-            # Prepare tuples with zeroed components for lower dimensions
-            tuples = []
-            for iv in interval_list:
-                h_start, h_end = iv["h_range"]
-                if self.dimension > 1:
-                    k_start, k_end = iv["k_range"]
-                else:
-                    k_start = k_end = 0.0
-                if self.dimension > 2:
-                    l_start, l_end = iv["l_range"]
-                else:
-                    l_start = l_end = 0.0
-                tuples.append((h_start, h_end, k_start, k_end, l_start, l_end))
-
-            with self.connection:
-                self.cursor.executemany(
-                    """
-                    INSERT OR IGNORE INTO ReciprocalSpaceInterval
-                    (h_start, h_end, k_start, k_end, l_start, l_end)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    tuples,
-                )
-
-                # Fetch IDs
-                placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(tuples))
+            return []
+    
+        tuples = [self._pad_ranges(iv) for iv in interval_list]
+        existing: dict[Tuple[float, ...], int] = {}
+    
+        # -- 1) find already-present intervals ----------------------------------
+        with self.connection:          # one transaction for everything
+    
+            for ofs in range(0, len(tuples), _CHUNK_SIZE):
+                chunk = tuples[ofs : ofs + _CHUNK_SIZE]
+                placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(chunk))
                 self.cursor.execute(
                     f"""
                     SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
@@ -313,14 +375,42 @@ class DatabaseManager:
                     WHERE  (h_start, h_end, k_start, k_end, l_start, l_end)
                            IN ({placeholders})
                     """,
-                    [val for t in tuples for val in t],
+                    list(chain.from_iterable(chunk)),
                 )
-                id_map = {tuple(r[1:]): r[0] for r in self.cursor.fetchall()}
-                rs_ids = [id_map[t] for t in tuples]
-            return rs_ids
-        except sqlite3.Error as e:
-            self.logger.error("insert_reciprocal_space_interval_batch failed: %s", e)
-            return rs_ids
+                existing.update({tuple(r[1:]): r[0] for r in self.cursor.fetchall()})
+    
+            # -- 2) insert the truly new ones -----------------------------------
+            missing = [t for t in tuples if t not in existing]
+    
+            for ofs in range(0, len(missing), _CHUNK_SIZE):
+                chunk = missing[ofs : ofs + _CHUNK_SIZE]
+                self.cursor.executemany(
+                    """
+                    INSERT INTO ReciprocalSpaceInterval
+                      (h_start, h_end, k_start, k_end, l_start, l_end)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    chunk,
+                )
+    
+            # -- 3) fetch ids for the new rows ----------------------------------
+            if missing:
+                for ofs in range(0, len(missing), _CHUNK_SIZE):
+                    chunk = missing[ofs : ofs + _CHUNK_SIZE]
+                    placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(chunk))
+                    self.cursor.execute(
+                        f"""
+                        SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
+                        FROM   ReciprocalSpaceInterval
+                        WHERE  (h_start, h_end, k_start, k_end, l_start, l_end)
+                               IN ({placeholders})
+                        """,
+                        list(chain.from_iterable(chunk)),
+                    )
+                    existing.update({tuple(r[1:]): r[0] for r in self.cursor.fetchall()})
+    
+        # -- 4) return ids in caller’s order -------------------------------------
+        return [existing[t] for t in tuples]
 
     # ------------------------------------------------------------------ #
     #  ASSOCIATION + SAVED FLAG                                          #
@@ -574,7 +664,20 @@ class DatabaseManager:
         except sqlite3.Error as e:
             self.logger.error("get_unsaved_interval_chunks failed: %s", e)
             return []
-
+    def mark_interval_precomputed(self, interval_id: int, done: bool = True):
+        with self.connection:
+            self.cursor.execute(
+                "UPDATE ReciprocalSpaceInterval SET precomputed=? WHERE id=?",
+                (1 if done else 0, interval_id)
+            )
+            
+    def is_interval_precomputed(self, interval_id: int) -> bool:
+        self.cursor.execute(
+            "SELECT precomputed FROM ReciprocalSpaceInterval WHERE id=?",
+            (interval_id,)
+        )
+        row = self.cursor.fetchone()
+        return bool(row and row[0])        
     # -------------------------------------------------------------- #
     #  CLOSE                                                         #
     # -------------------------------------------------------------- #

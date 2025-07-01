@@ -48,10 +48,90 @@ def _timed(label: str):
     finally:
         logger.info("%s took %.3f s", label, perf_counter() - t0)
 
-def ensure_dask_client(max_workers: int = 8,
+
+def handle_interval_worker(
+        iv: dict,
+        *,
+        B_: np.ndarray,
+        mask_params: dict,
+        MaskStrategy,
+        supercell: np.ndarray,
+        original_coords: np.ndarray,
+        cells_origin: np.ndarray,
+        elements_arr: np.ndarray,
+        charge: float,
+        use_coeff: bool,
+        coeff_val: np.ndarray | None,
+        unique_elements: list[str],
+        ff_factory,
+        out_dir: str,
+        db_path: str,
+) -> str | None:
+    """
+    Heavy NUFFT for one interval.
+    Returns the final .npz *path* (as a string) or None if skipped.
+    """
+    from managers.database_manager import create_db_manager_for_thread
+    db = create_db_manager_for_thread(db_path)
+
+    # already done?
+    if db.is_interval_precomputed(iv["id"]):
+        p = Path(out_dir) / f"interval_{iv['id']}.npz"
+        if p.exists():
+            return str(p)
+
+    q_grid = generate_q_space_grid_sync(
+        iv, B_, mask_params, MaskStrategy, supercell
+    )
+    if q_grid.size == 0:
+        return None                                # fully masked
+
+    tasks: list[tuple] = []
+    if use_coeff:
+        tasks.append(
+            _process_interval_coeff(iv, q_grid, coeff_val,
+                                    original_coords, cells_origin)
+        )
+    else:
+        for el in unique_elements:
+            t = _process_interval_element(
+                iv, q_grid, el,
+                original_coords, cells_origin,
+                elements_arr, charge, ff_factory,
+            )
+            if t is not None:
+                tasks.append(t)
+
+    if not tasks:
+        return None
+
+    task = aggregate_interval_tasks(tasks, use_coeff)
+
+    out_p = Path(out_dir) / f"interval_{task.irecip_id}.npz"
+    with tempfile.NamedTemporaryFile(dir=out_dir,
+                                     prefix=f"interval_{task.irecip_id}_",
+                                     suffix=".npz",
+                                     delete=False) as tf:
+        np.savez_compressed(
+            tf,
+            irecip_id=task.irecip_id,
+            element=task.element,
+            q_grid=task.q_grid,
+            q_amp=task.q_amp,
+            q_amp_av=task.q_amp_av,
+        )
+    Path(tf.name).replace(out_p)
+
+    db.mark_interval_precomputed(task.irecip_id, True)
+    logger.debug("Saved interval %s → %s", task.irecip_id, out_p)
+    db.close()
+    return str(out_p)
+
+
+def ensure_dask_client(max_workers: int = 1,
                    *,
                    processes: bool = True,
-                   threads_per_worker: int = 4) -> Client:
+                   threads_per_worker: int = 2) -> Client:
     """
     Get (or create) a Dask Client with at least `max_workers` *process* workers
     unless `processes=False` is explicitly requested.
@@ -462,7 +542,7 @@ def precompute_intervals(
     cells_origin: np.ndarray,
     elements_arr: np.ndarray,
     charge: float,
-    ff_factory,
+    ff_factory, db: DatabaseManager
 ) -> List[Path]:
     """
     Heavy NUFFT stage.  Generates **one compressed .npz per interval** and
@@ -477,83 +557,113 @@ def precompute_intervals(
     retries  = int(parameters.get("interval_retries", DEFAULT_INTERVAL_RETRIES))
     use_coeff = "coeff" in parameters
     coeff_val = parameters.get("coeff")
-
+    todo, cached = [], []
+    for iv in reciprocal_space_intervals:
+        iv_id = iv["id"]
+        path  = out_dir / f"interval_{iv_id}.npz"
+        if db.is_interval_precomputed(iv_id) and path.exists():
+            cached.append(path)          # already done last run
+        else:
+            todo.append(iv)              # still to compute
     # ------------------------------------------------------------------ task body
-    def _handle_interval(iv: dict) -> Path | None:
-        """Executed on a worker; returns final .npz path or None if skipped."""
-        for attempt in range(retries + 1):
-            try:
-                # ---- build q-grid with masking --------------------------------
-                q_grid = generate_q_space_grid_sync(iv, B_, mask_params, MaskStrategy, supercell)
-                if q_grid.size == 0:
-                    logger.debug("Interval %s masked out – skipped", iv.get("id", "?"))
-                    return None
+    # def _handle_interval(iv: dict) -> Path | None:
+    #     """Executed on a worker; returns final .npz path or None if skipped."""
+    #     for attempt in range(retries + 1):
+    #         try:
+    #             # ---- build q-grid with masking --------------------------------
+    #             q_grid = generate_q_space_grid_sync(iv, B_, mask_params, MaskStrategy, supercell)
+    #             if q_grid.size == 0:
+    #                 logger.debug("Interval %s masked out – skipped", iv.get("id", "?"))
+    #                 return None
 
-                # ---- element/coeff NUFFT --------------------------------------
-                results: List[tuple] = []
-                if use_coeff:
-                    results.append(
-                        _process_interval_coeff(iv, q_grid, coeff_val, original_coords, cells_origin)
-                    )
-                else:
-                    for el in unique_elements:
-                        t = _process_interval_element(
-                            iv, q_grid, el,
-                            original_coords, cells_origin,
-                            elements_arr, charge, ff_factory,
-                        )
-                        if t is not None:
-                            results.append(t)
+    #             # ---- element/coeff NUFFT --------------------------------------
+    #             results: List[tuple] = []
+    #             if use_coeff:
+    #                 results.append(
+    #                     _process_interval_coeff(iv, q_grid, coeff_val, original_coords, cells_origin)
+    #                 )
+    #             else:
+    #                 for el in unique_elements:
+    #                     t = _process_interval_element(
+    #                         iv, q_grid, el,
+    #                         original_coords, cells_origin,
+    #                         elements_arr, charge, ff_factory,
+    #                     )
+    #                     if t is not None:
+    #                         results.append(t)
 
-                if not results:
-                    return None
+    #             if not results:
+    #                 return None
 
-                task = aggregate_interval_tasks(results, use_coeff)
+    #             task = aggregate_interval_tasks(results, use_coeff)
 
-                # ---- atomic save ----------------------------------------------
-                final_path = out_dir / f"interval_{task.irecip_id}.npz"
-                with tempfile.NamedTemporaryFile(
-                    dir=out_dir,
-                    prefix=f"interval_{task.irecip_id}_",
-                    suffix=".npz",
-                    delete=False,
-                ) as tf:
-                    tmp_path = Path(tf.name)
-                    np.savez_compressed(
-                        tf,
-                        irecip_id=task.irecip_id,
-                        element=task.element,
-                        q_grid=task.q_grid,
-                        q_amp=task.q_amp,
-                        q_amp_av=task.q_amp_av,
-                    )
-                tmp_path.replace(final_path)
-                logger.debug("Saved interval %s → %s", task.irecip_id, final_path)
-                return final_path
+    #             # ---- atomic save ----------------------------------------------
+    #             final_path = out_dir / f"interval_{task.irecip_id}.npz"
+    #             with tempfile.NamedTemporaryFile(
+    #                 dir=out_dir,
+    #                 prefix=f"interval_{task.irecip_id}_",
+    #                 suffix=".npz",
+    #                 delete=False,
+    #             ) as tf:
+    #                 tmp_path = Path(tf.name)
+    #                 np.savez_compressed(
+    #                     tf,
+    #                     irecip_id=task.irecip_id,
+    #                     element=task.element,
+    #                     q_grid=task.q_grid,
+    #                     q_amp=task.q_amp,
+    #                     q_amp_av=task.q_amp_av,
+    #                 )
+    #             tmp_path.replace(final_path)
+    #             db.mark_interval_precomputed(iv["id"], True)
+    #             logger.debug("Saved interval %s → %s", task.irecip_id, final_path)
+    #             return final_path
 
-            except Exception as exc:
-                logger.warning(
-                    "Interval %s failed (attempt %d/%d): %s",
-                    iv.get("id", "?"), attempt + 1, retries + 1, exc,
-                )
-                if attempt == retries:
-                    logger.error("Interval %s exhausted retries – skipping.", iv.get("id", "?"))
-                    return None
-                # else retry
+    #         except Exception as exc:
+    #             logger.warning(
+    #                 "Interval %s failed (attempt %d/%d): %s",
+    #                 iv.get("id", "?"), attempt + 1, retries + 1, exc,
+    #             )
+    #             if attempt == retries:
+    #                 logger.error("Interval %s exhausted retries – skipping.", iv.get("id", "?"))
+    #                 return None
+    #             # else retry
 
     # ------------------------------------------------------------------ dispatch
-    futures = [client.submit(_handle_interval, iv, pure=False)  # pure=False → keep retries independent
-               for iv in reciprocal_space_intervals]
-
+    #futures = [client.submit(_handle_interval, iv, pure=False)  # pure=False → keep retries independent
+    #           for iv in reciprocal_space_intervals]
+    futures = [
+          client.submit(
+             handle_interval_worker,
+             iv,
+             B_=B_,
+             mask_params=mask_params,
+             MaskStrategy=MaskStrategy,
+             supercell=supercell,
+             original_coords=original_coords,
+             cells_origin=cells_origin,
+             elements_arr=elements_arr,
+             charge=charge,
+             use_coeff=use_coeff,
+             coeff_val=coeff_val,
+             unique_elements=list(unique_elements),
+             ff_factory=ff_factory,
+             out_dir=str(out_dir),
+             db_path=db.db_path,
+             pure=False,
+         )
+         for iv in todo
+     ]
     # gather results back to driver
-    paths = client.gather(futures)
+    #paths = client.gather(futures)
 
-    written_files = [p for p in paths if p is not None]
+    written_files = [Path(p) for p in client.gather(futures) if p]
+
     logger.info(
-        "Stage-1 complete: %d interval files written (%d skipped)",
-        len(written_files), len(paths) - len(written_files),
+        "Stage-1 complete: %d written, %d cached, %d skipped",
+        len(written_files), len(cached), len(todo) - len(written_files),
     )
-    return written_files
+    return cached + written_files
 
 
 
@@ -787,12 +897,13 @@ def _process_chunk_id(
 
     # ---------- build RIFFT grid -----------------------------------------
     t0 = TIMER()
-    rifft_grid, grid_shape_nd = _process_chunk([
-        dict(coordinates          = atoms.coordinates[i],
-             dist_from_atom_center= atoms.dist_from_atom_center[i],
-             step_in_frac         = atoms.step_in_frac[i])
+    chunk_data = [
+        dict(coordinates          = atoms["coordinates"][i],
+             dist_from_atom_center= atoms["dist_from_atom_center"][i],
+             step_in_frac         = atoms["step_in_frac"][i])
         for i in range(atoms.shape[0])
-    ])
+    ]
+    rifft_grid, grid_shape_nd = _process_chunk(chunk_data)
     logger.info("RIFFT-grid   | chunk %d | iv %d took %.3f s",
                 chunk_id, task.irecip_id, TIMER() - t0)
 
@@ -997,7 +1108,7 @@ def compute_amplitudes_delta(
 
     # ------------------ Stage-1: precompute intervals ----------------------- #
     interval_dir = Path(output_dir) / "precomputed_intervals"
-    max_threads = int(2)
+    max_threads = int(1)
 
     #with dask.config.set(scheduler="threads", num_workers=max_threads):
     interval_files = precompute_intervals(
@@ -1014,6 +1125,7 @@ def compute_amplitudes_delta(
         elements_arr=elements_arr,
         charge=charge,
         ff_factory=FormFactorFactoryProducer,
+        db=db_manager,
     )
 
     # ------------------ Stage-2: per-chunk accumulation -------------------- #
