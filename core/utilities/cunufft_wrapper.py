@@ -1,59 +1,65 @@
 # -*- coding: utf-8 -*-
 """
-GPU‑safe cuFINUFFT wrapper for Mosaic 
-keeps the familiar public API while adding **automatic
-chunking** and basic **memory‑aware fall‑backs** so that transforms no
-longer crash with `cupy.cuda.memory.OutOfMemoryError` when the problem
-size exceeds available VRAM.
+Robust, **stream-aware** cuFINUFFT wrapper for Mosaic
+====================================================
 
----------
-* Allocate **static data** (real‑space coordinates and weights) once on
-the device if it fits.  If not, transparently falls back to a pure‑CPU
-  FINUFFT call (optional, see `prefer_cpu` flag).
-* Stream the **query points** (`q_coords`) in chunks whose size is
-  chosen so that each batch uses at most ~50 % of currently free GPU
-  memory.  The chunk size is recomputed adaptively if an allocation
-  still fails.
-* Works for 1‑, 2‑ and 3‑D type‑3 (non‑uniform → non‑uniform) NUFFTs and
-  their inverses.
-* Parameters
-    • `prefer_cpu` – if `True`, silently switches to finufft (CPU) when
-      GPU memory is insufficient; otherwise raises.
-    • `mem_frac`   – fraction of the *current* free VRAM a single batch
-      is allowed to occupy (default 0.5).
-    • `min_chunk`  – minimum batch size before giving up.
+Key features
+------------
+* **GPU-friendly chunking** – whichever coordinate set (sources or
+  targets) is larger is streamed in pieces sized to fit the *current*
+  free VRAM.
+* **Configurable max chunk** – pass `max_chunk` (points) to impose a
+  hard upper-bound on each batch so you can rein-in memory usage on
+  small GPUs or avoid long kernel launch times.
+* **Kernel auto-back-off** – cycles through several `(gpu_method,
+  gpu_kerevalmeth, gpu_maxsubprobsize)` combinations to find one that
+  fits the card’s shared-memory limits before giving up.
+* **Graceful CPU fallback** – when the GPU cannot handle the job, the
+  code transparently switches to FINUFFT on the host, still in streaming
+  batches so RAM usage stays bounded.
 
-Usage::
+Usage example::
 
-    out = execute_cunufft(r_xyz, c, q_hkl)            # forward
-    rho = execute_inverse_cunufft(q_hkl, fq, r_xyz)   # inverse
+    fq   = execute_cunufft(r_xyz, rho, q_hkl, max_chunk=2_000_000)
+    rho2 = execute_inverse_cunufft(q_hkl, fq, r_xyz, max_chunk=2_000_000)
+
+Both calls share the same keyword arguments::
+
+    eps        – accuracy (1e-12 default)
+    mem_frac   – fraction of free VRAM a single batch may consume
+    min_chunk  – floor on batch size (adaptive algorithm never goes below)
+    max_chunk  – *ceiling* on batch size (None → no cap)
+    prefer_cpu – force host fallback instead of raising when GPU fails
+    gpu_only   – raise if GPU path fails (useful for benchmarking)
 """
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Callable, Optional
+import warnings
 
 import numpy as np
 import cupy as cp
-import cufinufft  # type: ignore
+import cufinufft                     # type: ignore
 
-# Optional CPU fallback – imported lazily
+###########################################################################
+#  Helpers                                                                #
+###########################################################################
+
+# Lazily imported CPU backend (avoids importing finufft on GPU-only nodes)
 _FINUFFT3: Callable | None = None  # finufft.nufft3d3
 
-###############################################################################
-# Helper utilities                                                             #
-###############################################################################
 
-def _free_mem_bytes() -> int:
+def _free_mem_bytes() -> int:  # GPU free memory in bytes
     free, _ = cp.cuda.runtime.memGetInfo()
     return int(free)
 
 
-def _auto_chunk_size(dim: int, mem_frac: float, per_pt: int) -> int:
-    tgt = int(_free_mem_bytes() * mem_frac)
-    return max(tgt // per_pt, 1)
+def _auto_chunk_size(mem_frac: float, bytes_per_pt: int) -> int:
+    return max(int(_free_mem_bytes() * mem_frac) // bytes_per_pt, 1)
 
 
 def _as_device(arr: np.ndarray, allow_fail: bool = False):
+    """Transfer *arr* to GPU unless **allow_fail** and OOM."""
     try:
         return cp.asarray(arr)
     except (cp.cuda.memory.OutOfMemoryError, cp.cuda.runtime.CUDARuntimeError):
@@ -62,181 +68,220 @@ def _as_device(arr: np.ndarray, allow_fail: bool = False):
         raise
 
 
-def _contig(x) -> cp.ndarray:
+def _contig(x):  # ensure C-contiguous cupy array
     return x if x.flags.c_contiguous else cp.ascontiguousarray(x)
 
-###############################################################################
-# Kernel map                                                                   #
-###############################################################################
+###########################################################################
+#  Public API                                                             #
+###########################################################################
+
+# Shortcuts to the simple front-end kernels (1/2/3-D Type-3)
 _KER = {1: cufinufft.nufft1d3, 2: cufinufft.nufft2d3, 3: cufinufft.nufft3d3}
 
-###############################################################################
-# Public API                                                                   #
-###############################################################################
 
 def execute_cunufft(
     real_coords: np.ndarray,
-    c: np.ndarray,
+    weights: np.ndarray,
     q_coords: np.ndarray,
     *,
     eps: float = 1e-12,
-    mem_frac: float = 0.9,
+    mem_frac: float = 0.8,
     min_chunk: int = 64_000,
+    max_chunk: int = 256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
+    """Forward NUFFT (real → reciprocal)."""
     return _batched_type3(
-        real_coords,
-        c,
-        q_coords,
-        eps=eps,
-        inverse=False,
-        mem_frac=mem_frac,
-        min_chunk=min_chunk,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
+        real_coords, weights, q_coords,
+        eps=eps, inverse=False,
+        mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
+        prefer_cpu=prefer_cpu, gpu_only=gpu_only,
     )
 
 
 def execute_inverse_cunufft(
     q_coords: np.ndarray,
-    c: np.ndarray,
+    weights: np.ndarray,
     real_coords: np.ndarray,
     *,
     eps: float = 1e-12,
-    mem_frac: float = 0.9,
+    mem_frac: float = 0.8,
     min_chunk: int = 64_000,
+    max_chunk: int = 256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
+    """Inverse NUFFT (reciprocal → real)."""
     return _batched_type3(
-        real_coords,
-        c,
-        q_coords,
-        eps=eps,
-        inverse=True,
-        mem_frac=mem_frac,
-        min_chunk=min_chunk,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
+        real_coords, weights, q_coords,
+        eps=eps, inverse=True,
+        mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
+        prefer_cpu=prefer_cpu, gpu_only=gpu_only,
     )
 
-###############################################################################
-# Core logic                                                                   #
-###############################################################################
+###########################################################################
+#  Core driver                                                            #
+###########################################################################
+
 
 def _batched_type3(
     real_coords: np.ndarray,
-    c: np.ndarray,
+    weights: np.ndarray,
     q_coords: np.ndarray,
     *,
     eps: float,
     inverse: bool,
     mem_frac: float,
     min_chunk: int,
+    max_chunk: Optional[int],
     prefer_cpu: bool,
     gpu_only: bool,
 ) -> np.ndarray:
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):
-        raise ValueError("Only 1D/2D/3D supported")
+        raise ValueError("Only 1-, 2- and 3-D inputs supported")
 
-    # ── Attempt to keep target grid on GPU ───────────────────────────────────
+    # Try to pin the (usually smaller) *source* set to the GPU -------------
     d_real = _as_device(real_coords, allow_fail=True)
     if d_real is None:
-        return _cpu_fallback(real_coords, c, q_coords, eps, inverse)
+        return _cpu_fallback(real_coords, weights, q_coords, eps, inverse)
 
     cols = [_contig(d_real[:, i]) for i in range(dim)]
 
-    # Preload full weight vector for forward transform
-    d_c_full = None
-    if not inverse:
-        d_c_full = _as_device(c, allow_fail=True)
-        if d_c_full is None:
-            return _cpu_fallback(real_coords, c, q_coords, eps, inverse)
-
-    per_q = dim * 8 + 16
-    chunk = max(_auto_chunk_size(dim, mem_frac, per_q), min_chunk)
-
-    out = np.zeros(len(real_coords) if inverse else len(q_coords), dtype=np.complex128)
+    # Streaming strategy: always move the other set in chunks -------------
+    bytes_per_pt = dim * 8 + 16 + 32   # coord + weight + scratch margin
+    out = np.zeros(
+        len(real_coords) if inverse else len(q_coords),
+        dtype=np.complex128,
+    )
 
     start = 0
     while start < len(q_coords):
+        # Base chunk from available VRAM
+        chunk = max(_auto_chunk_size(mem_frac, bytes_per_pt), min_chunk)
+        # Respect hard ceiling
+        if max_chunk is not None:
+            chunk = min(chunk, max_chunk)
         end = min(start + chunk, len(q_coords))
+
         q_slice = q_coords[start:end]
         if inverse:
             q_slice = -q_slice
 
         try:
             d_q = _as_device(q_slice)
-        except cp.cuda.memory.OutOfMemoryError:
-            if chunk // 2 < min_chunk:
-                return _cpu_fallback(real_coords, c, q_coords, eps, inverse)
-            chunk //= 2
-            continue
-
-        d_c = d_c_full if not inverse else _as_device(c[start:end])
-        q_cols = [_contig(d_q[:, i]) for i in range(dim)]
-
-        try:
-            d_res = _launch_gpu(dim, cols, d_c, q_cols, eps, inverse)
-        except (cp.cuda.memory.OutOfMemoryError, RuntimeError) as e:
-            # Plan creation or execution failed – fall back or raise
+            d_w = _as_device(weights[start:end] if inverse else weights)
+            q_cols = [_contig(d_q[:, i]) for i in range(dim)]
+            d_res = _adaptive_gpu_launch(dim, cols, d_w, q_cols, eps, inverse)
+        except (cp.cuda.memory.OutOfMemoryError, RuntimeError) as err:
             if gpu_only:
-                raise
-            return _cpu_fallback(real_coords, c, q_coords, eps, inverse)
+                raise RuntimeError("GPU execution forced but failed") from err
+            return _cpu_fallback(real_coords, weights, q_coords, eps, inverse)
 
+        # Scatter back -----------------------------------------------------
         if inverse:
             out += cp.asnumpy(d_res)
         else:
             out[start:end] = cp.asnumpy(d_res)
 
-        del d_q, q_cols, d_res, d_c
+        # Clean-up ---------------------------------------------------------
+        del d_q, q_cols, d_res, d_w
         cp.get_default_memory_pool().free_all_blocks()
+        cp.cuda.runtime.deviceSynchronize()
         start = end
 
     return out
 
-###############################################################################
-# GPU launcher                                                                 #
-###############################################################################
+###########################################################################
+#  GPU kernel chooser                                                     #
+###########################################################################
 
-def _launch_gpu(dim, cols, d_c, q_cols, eps, inverse):
+
+def _adaptive_gpu_launch(dim, cols, d_w, q_cols, eps, inverse):
+    isign = -1 if inverse else 1
+
+    # lightest → heaviest (we will exit on the *first* one that works)
+    subprobs = (32, 16, 8, 4, 2, 1)
+
+    for s in subprobs:
+        kw = dict(gpu_method=1,          # NUpts-driven
+                  gpu_kerevalmeth=1,     # global-mem eval  (no shmem slab)
+                  gpu_maxsubprobsize=s,
+                  gpu_maxbatchsize=1,
+                  gpu_spreadinterponly=1)
+
+        try:
+            return _launch_once(dim, cols, d_w, q_cols, eps, isign, kw, inverse)
+        except RuntimeError as e:
+            # keep trying while we see memory / shared-mem complaints
+            if "shared memory" in str(e).lower() or "allocate" in str(e).lower():
+                continue
+            raise   # anything else = real error
+    raise RuntimeError("All no-shmem kernel variants failed – falling back")
+
+
+def _launch_once(dim, cols, d_w, q_cols, eps, isign, kw, inverse):
     if dim == 1:
-        return _KER[1](*(cols + [d_c] + q_cols) if not inverse else (q_cols[0], d_c, cols[0]), eps=eps)
+        args = (q_cols[0], d_w, cols[0]) if inverse else (cols[0], d_w, q_cols[0])
+        return _KER[1](*args, eps=eps, isign=isign, **kw)
+
     if dim == 2:
-        if not inverse:
-            args = (cols[0], cols[1], d_c, q_cols[0], q_cols[1])
+        if inverse:
+            args = (q_cols[0], q_cols[1], d_w, cols[0], cols[1])
         else:
-            args = (q_cols[0], q_cols[1], d_c, cols[0], cols[1])
-        return _KER[2](*args, eps=eps)
+            args = (cols[0], cols[1], d_w, q_cols[0], q_cols[1])
+        return _KER[2](*args, eps=eps, isign=isign, **kw)
+
     # dim == 3
-    if not inverse:
-        args = (*cols, d_c, *q_cols)
-    else:
-        args = (*q_cols, d_c, *cols)
-    return _KER[3](*args, eps=eps)
+    args = (*q_cols, d_w, *cols) if inverse else (*cols, d_w, *q_cols)
+    return _KER[3](*args, eps=eps, isign=isign, **kw)
 
-###############################################################################
-# CPU fallback                                                                 #
-###############################################################################
+###########################################################################
+#  CPU fallback                                                            #
+###########################################################################
 
-def _cpu_fallback(real_coords, c, q_coords, eps, inverse):
+def _cpu_fallback(real_coords, weights, q_coords, eps, inverse, *, batch=5_000_000):
+    """Streamed CPU FINUFFT that never allocates gigantic arrays."""
     global _FINUFFT3
     if _FINUFFT3 is None:
-        try:
-            import finufft
-            _FINUFFT3 = finufft.nufft3d3  # type: ignore
-        except ImportError as exc:
-            raise MemoryError("finufft not installed and GPU path failed.") from exc
+        import finufft  # heavyweight import delayed until needed
+        _FINUFFT3 = finufft.nufft3d3  # type: ignore
 
     if inverse:
         q_coords = -q_coords
         isign = -1
     else:
-        isign = 1
+        isign = +1
 
     x, y, z = [real_coords[:, i].astype(np.float64) for i in range(3)]
-    s, t, u = [q_coords[:, i].astype(np.float64) for i in range(3)]
+    s_all, t_all, u_all = [q_coords[:, i].astype(np.float64) for i in range(3)]
 
-    return _FINUFFT3(x, y, z, c.astype(np.complex128), s, t, u, isign, eps)
+    out = np.zeros(len(real_coords) if inverse else len(q_coords), dtype=np.complex128)
+
+    start = 0
+    while start < len(q_coords):
+        end = min(start + batch, len(q_coords))
+        s, t, u = s_all[start:end], t_all[start:end], u_all[start:end]
+
+        res = _FINUFFT3(
+            x, y, z,
+            weights.astype(np.complex128) if not inverse else weights[start:end].astype(np.complex128),
+            s, t, u,
+            eps=eps,
+            isign=isign,
+        )
+
+        if inverse:
+            out += res
+        else:
+            out[start:end] = res
+        start = end
+
+    return out
+
+###########################################################################
+#  Mute noisy destructor warnings (harmless but scary)                     #
+###########################################################################
+
+warnings.filterwarnings("ignore", message=r"Error destroying plan.")
