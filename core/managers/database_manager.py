@@ -2,7 +2,6 @@
 """
 SQLite helper for point–interval bookkeeping
 -------------------------------------------
-• Slimmer Point_ReciprocalSpace_Association (composite PK, WITHOUT ROWID).
 • Same public API as before – no call-site changes required.
 """
 
@@ -177,19 +176,6 @@ class DatabaseManager:
                     precomputed INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(h_start, h_end, k_start, k_end, l_start, l_end)
                 );
-
-                -----------------------------------------------------------
-                -- POINT ↔ INTERVAL LINKS
-                -----------------------------------------------------------
-                CREATE TABLE IF NOT EXISTS Point_ReciprocalSpace_Association (
-                    point_id            INTEGER NOT NULL,
-                    reciprocal_space_id INTEGER NOT NULL,
-                    saved               INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (point_id, reciprocal_space_id),
-                    FOREIGN KEY (point_id)            REFERENCES PointData(id),
-                    FOREIGN KEY (reciprocal_space_id) REFERENCES ReciprocalSpaceInterval(id)
-                ) WITHOUT ROWID;
-
                 -----------------------------------------------------------
                 -- NEW:  INTERVAL ↔ CHUNK STATUS
                 -----------------------------------------------------------
@@ -206,10 +192,6 @@ class DatabaseManager:
                 -----------------------------------------------------------
                 CREATE INDEX IF NOT EXISTS idx_pointdata_cpid
                     ON PointData (central_point_id);
-
-                CREATE INDEX IF NOT EXISTS idx_assoc_unsaved
-                    ON Point_ReciprocalSpace_Association(reciprocal_space_id, point_id)
-                    WHERE saved = 0;
 
                 CREATE INDEX IF NOT EXISTS idx_intervalchunk_unsaved
                     ON Interval_Chunk_Status(reciprocal_space_id, chunk_id)
@@ -436,199 +418,6 @@ class DatabaseManager:
         # -- 4) return ids in caller’s order -------------------------------------
         return [existing[t] for t in tuples]
 
-    # ------------------------------------------------------------------ #
-    #  ASSOCIATION + SAVED FLAG                                          #
-    # ------------------------------------------------------------------ #
-    def associate_point_reciprocal_space_batch(
-        self, associations: List[Tuple[int, int]]
-    ):
-        if not associations:
-            return
-        try:
-            with self.connection:
-                self.cursor.executemany(
-                    """
-                    INSERT OR IGNORE INTO Point_ReciprocalSpace_Association
-                    (point_id, reciprocal_space_id, saved)
-                    VALUES (?, ?, 0)
-                    """,
-                    associations,
-                )
-        except sqlite3.Error as e:
-            self.logger.error("associate batch failed: %s", e)
-
-    def update_saved_status_batch(self, updates: List[Tuple[int, int, int]]):
-        """
-        updates = [(saved_flag, point_id, reciprocal_space_id), …]
-        """
-        if not updates:
-            return
-        try:
-            with self.connection:
-                self.cursor.executemany(
-                    """
-                    UPDATE Point_ReciprocalSpace_Association
-                    SET saved = ?
-                    WHERE point_id = ? AND reciprocal_space_id = ?
-                    """,
-                    updates,
-                )
-        except sqlite3.Error as e:
-            self.logger.error("update_saved_status_batch failed: %s", e)
-
-    # def update_saved_status_for_chunk_or_point(
-    #     self,
-    #     reciprocal_space_id: int,
-    #     point_id: int | None = None,
-    #     chunk_id: int | None = None,
-    #     saved: int = 0,
-    # ):
-    #     """
-    #     Mark associations as saved/unsaved.
-
-    #     Parameters
-    #     ----------
-    #     reciprocal_space_id : int
-    #         ID in ReciprocalSpaceInterval.
-    #     point_id : int | None
-    #         If given, update only this point.
-    #     chunk_id : int | None
-    #         If given (and point_id is None), update *all* points that
-    #         belong to this chunk.
-    #     saved : int
-    #         0 = not saved, 1 = saved.
-    #     """
-    #     try:
-    #         self.connection.execute("BEGIN")
-
-    #         if point_id is not None:
-    #             self.cursor.execute(
-    #                 """
-    #                 UPDATE Point_ReciprocalSpace_Association
-    #                 SET saved = ?
-    #                 WHERE point_id = ? AND reciprocal_space_id = ?
-    #                 """,
-    #                 (saved, point_id, reciprocal_space_id),
-    #             )
-
-    #         elif chunk_id is not None:
-    #             # Fetch every point belonging to this chunk
-    #             self.cursor.execute(
-    #                 "SELECT id FROM PointData WHERE chunk_id = ?", (chunk_id,)
-    #             )
-    #             ids = [row[0] for row in self.cursor.fetchall()]
-
-    #             self.cursor.executemany(
-    #                 """
-    #                 UPDATE Point_ReciprocalSpace_Association
-    #                 SET saved = ?
-    #                 WHERE point_id = ? AND reciprocal_space_id = ?
-    #                 """,
-    #                 [(saved, pid, reciprocal_space_id) for pid in ids],
-    #             )
-
-    #         self.connection.commit()
-
-    #     except sqlite3.Error as e:
-    #         self.logger.error(
-    #             "update_saved_status_for_chunk_or_point failed: %s", e
-    #         )
-    #         self.connection.rollback()
-    def update_saved_status_for_chunk_or_point(
-        self,
-        reciprocal_space_id: int,
-        point_id: int | None = None,
-        chunk_id: int | None = None,
-        saved: int = 0,
-    ):
-        try:
-            with self.connection:                             # ← autocommit, handles BEGIN/COMMIT
-                if point_id is not None:
-                    # ① make sure the (point, interval) link exists
-                    self.cursor.execute(
-                        """
-                        INSERT OR IGNORE INTO Point_ReciprocalSpace_Association
-                        (point_id, reciprocal_space_id, saved)
-                        VALUES (?, ?, 0)
-                        """,
-                        (point_id, reciprocal_space_id),
-                    )
-                    # ② then flip the flag
-                    self.cursor.execute(
-                        """
-                        UPDATE Point_ReciprocalSpace_Association
-                        SET saved = ?
-                        WHERE point_id = ? AND reciprocal_space_id = ?
-                        """,
-                        (saved, point_id, reciprocal_space_id),
-                    )
-    
-                elif chunk_id is not None:
-                    # ① bulk-ensure *all* points of this chunk have a row
-                    self.cursor.execute(
-                        """
-                        INSERT OR IGNORE INTO Point_ReciprocalSpace_Association
-                        (point_id, reciprocal_space_id, saved)
-                        SELECT id, ?, 0
-                        FROM   PointData
-                        WHERE  chunk_id = ?
-                        """,
-                        (reciprocal_space_id, chunk_id),
-                    )
-                    # ② now update them in a single statement
-                    self.cursor.execute(
-                        """
-                        UPDATE Point_ReciprocalSpace_Association
-                        SET saved = ?
-                        WHERE reciprocal_space_id = ?
-                          AND point_id IN (SELECT id FROM PointData WHERE chunk_id = ?)
-                        """,
-                        (saved, reciprocal_space_id, chunk_id),
-                    )
-        except sqlite3.Error as e:
-            self.logger.error("update_saved_status_for_chunk_or_point failed: %s", e)
-
-    # ------------------------------------------------------------------ #
-    #  UNSAVED QUERY                                                     #
-    # ------------------------------------------------------------------ #
-    def get_unsaved_associations(self) -> List[Tuple[int, int]]:
-        try:
-            self.cursor.execute(
-                """
-                SELECT pd.chunk_id,
-                       pra.reciprocal_space_id,
-                       COUNT(*)          AS total_cnt,
-                       SUM(pra.saved=0)  AS unsaved_cnt
-                FROM   Point_ReciprocalSpace_Association pra
-                JOIN   PointData pd ON pra.point_id = pd.id
-                GROUP  BY pd.chunk_id, pra.reciprocal_space_id
-                """
-            )
-            fully_unsaved = [
-                (r[0], r[1]) for r in self.cursor.fetchall() if r[2] == r[3] and r[2] > 0
-            ]
-            if not fully_unsaved:
-                return []
-
-            conds, params = [], []
-            for chunk_id, rsid in fully_unsaved:
-                conds.append("(pd.chunk_id = ? AND pra.reciprocal_space_id = ?)")
-                params.extend([chunk_id, rsid])
-
-            self.cursor.execute(
-                f"""
-                SELECT pra.point_id, pra.reciprocal_space_id
-                FROM   Point_ReciprocalSpace_Association pra
-                JOIN   PointData pd ON pra.point_id = pd.id
-                WHERE  pra.saved = 0 AND ({' OR '.join(conds)})
-                """,
-                params,
-            )
-            return self.cursor.fetchall()
-        except sqlite3.Error as e:
-            self.logger.error("get_unsaved_associations failed: %s", e)
-            return []
-
     def insert_interval_chunk_status_batch(
             self, status_list: List[Tuple[int, int, int | bool]]
         ):
@@ -650,7 +439,73 @@ class DatabaseManager:
                     )
             except sqlite3.Error as e:
                 self.logger.error("insert_interval_chunk_status_batch failed: %s", e)
+    def associate_point_reciprocal_space_batch(
+        self, associations: list[tuple[int, int]]
+    ) -> None:
+        """Kept for API compatibility – no longer needed."""
+        return
 
+
+    def update_saved_status_for_chunk_or_point(
+        self,
+        reciprocal_space_id: int,
+        point_id: int | None = None,
+        chunk_id: int | None = None,
+        saved: int = 0,
+    ) -> None:
+        """
+        Flip the *chunk-level* flag.  If the caller still passes `point_id`
+        we simply look up its chunk and forward the request.
+        """
+        try:
+            if point_id is not None and chunk_id is None:
+                self.cursor.execute("SELECT chunk_id FROM PointData WHERE id = ?", (point_id,))
+                row = self.cursor.fetchone()
+                if row:
+                    chunk_id = row[0]
+    
+            if chunk_id is None:          # nothing to do
+                return
+    
+            self.update_interval_chunk_status(reciprocal_space_id, chunk_id, saved)
+    
+        except sqlite3.Error as exc:
+            self.logger.error("update_saved_status_for_chunk_or_point failed: %s", exc)
+    
+    
+    def get_unsaved_associations(self) -> list[tuple[int, int]]:
+        """
+        Return *every* (central_point_id, interval_id) pair that still needs
+        to be processed, but **construct it on-the-fly** from chunk metadata.
+        """
+        try:
+            # ① all (interval, chunk) that are still incomplete
+            self.cursor.execute(
+                """
+                SELECT reciprocal_space_id, chunk_id
+                FROM   Interval_Chunk_Status
+                WHERE  saved = 0
+                """
+            )
+            todo_pairs = self.cursor.fetchall()       # list[(interval_id, chunk_id)]
+    
+            if not todo_pairs:
+                return []
+    
+            # ② build one big result by joining PointData once per chunk
+            result: list[tuple[int, int]] = []
+            for interval_id, chunk_id in todo_pairs:
+                self.cursor.execute(
+                    "SELECT central_point_id FROM PointData WHERE chunk_id = ?",
+                    (chunk_id,),
+                )
+                result.extend((pid, interval_id) for (pid,) in self.cursor.fetchall())
+    
+            return result
+    
+        except sqlite3.Error as exc:
+            self.logger.error("get_unsaved_associations failed: %s", exc)
+            return []
     def update_interval_chunk_status(
         self, interval_id: int, chunk_id: int, saved: int | bool = 1
     ):
