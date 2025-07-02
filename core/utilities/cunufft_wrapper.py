@@ -79,19 +79,92 @@ def _contig(x):  # ensure C-contiguous cupy array
 _KER = {1: cufinufft.nufft1d3, 2: cufinufft.nufft2d3, 3: cufinufft.nufft3d3}
 
 
+# def execute_cunufft(
+#     real_coords: np.ndarray,
+#     weights: np.ndarray,
+#     q_coords: np.ndarray,
+#     *,
+#     eps: float = 1e-12,
+#     mem_frac: float = 0.8,
+#     min_chunk: int = 64_000,
+#     max_chunk: int = 256_000,
+#     prefer_cpu: bool = False,
+#     gpu_only: bool = False,
+# ) -> np.ndarray:
+#     """Forward NUFFT (real → reciprocal)."""
+#     return _batched_type3(
+#         real_coords, weights, q_coords,
+#         eps=eps, inverse=False,
+#         mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
+#         prefer_cpu=prefer_cpu, gpu_only=gpu_only,
+#     )
+
+
+# def execute_inverse_cunufft(
+#     q_coords: np.ndarray,
+#     weights: np.ndarray,
+#     real_coords: np.ndarray,
+#     *,
+#     eps: float = 1e-12,
+#     mem_frac: float = 0.8,
+#     min_chunk: int = 32_000,
+#     max_chunk: int = 128_000,
+#     prefer_cpu: bool = False,
+#     gpu_only: bool = False,
+# ) -> np.ndarray:
+#     """Inverse NUFFT (reciprocal → real)."""
+#     return _batched_type3(
+#         real_coords, weights, q_coords,
+#         eps=eps, inverse=True,
+#         mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
+#         prefer_cpu=prefer_cpu, gpu_only=gpu_only,
+#     )
+def _resolve_weights(weights: Optional[np.ndarray], c: Optional[np.ndarray]) -> np.ndarray:
+    """Return an array to use as weights, giving priority to *weights*.
+
+    Raises
+    ------
+    ValueError
+        If neither *weights* nor *c* are provided.
+    """
+    if weights is not None:
+        return weights
+    if c is not None:
+        return c
+    raise ValueError("You must supply either 'weights' or its alias 'c'.")
+
+
+# ---------------------------------------------------------------------
+# Forward transform (real → reciprocal)
+# ---------------------------------------------------------------------
+
 def execute_cunufft(
     real_coords: np.ndarray,
-    weights: np.ndarray,
-    q_coords: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    q_coords: np.ndarray | None = None,
     *,
+    # legacy alias
+    c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
     mem_frac: float = 0.8,
     min_chunk: int = 64_000,
-    max_chunk: int = 256_000,
+    max_chunk: Optional[int] = 256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
-    """Forward NUFFT (real → reciprocal)."""
+    """Forward Type‑3 NUFFT.
+
+    Parameters
+    ----------
+    real_coords, q_coords : (M, 3) and (N, 3) float64 arrays
+        Real‑space and reciprocal‑space point clouds.
+    weights, c : (M,) complex128
+        Amplitudes attached to *real_coords*.  *c* is kept for backward‑
+        compatibility and overrides *weights* if both are given.
+    """
+    weights = _resolve_weights(weights, c)
+    if q_coords is None:
+        raise ValueError("q_coords must be supplied for the forward transform")
     return _batched_type3(
         real_coords, weights, q_coords,
         eps=eps, inverse=False,
@@ -100,26 +173,34 @@ def execute_cunufft(
     )
 
 
+# ---------------------------------------------------------------------
+# Inverse transform (reciprocal → real)
+# ---------------------------------------------------------------------
+
 def execute_inverse_cunufft(
     q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray,
+    weights: Optional[np.ndarray] = None,
+    real_coords: np.ndarray | None = None,
     *,
+    # legacy alias
+    c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
     mem_frac: float = 0.8,
     min_chunk: int = 64_000,
-    max_chunk: int = 256_000,
+    max_chunk: Optional[int] = 256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
-    """Inverse NUFFT (reciprocal → real)."""
+    """Inverse Type‑3 NUFFT with *c* alias for legacy code."""
+    weights = _resolve_weights(weights, c)
+    if real_coords is None:
+        raise ValueError("real_coords must be supplied for the inverse transform")
     return _batched_type3(
         real_coords, weights, q_coords,
         eps=eps, inverse=True,
         mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
         prefer_cpu=prefer_cpu, gpu_only=gpu_only,
     )
-
 ###########################################################################
 #  Core driver                                                            #
 ###########################################################################
