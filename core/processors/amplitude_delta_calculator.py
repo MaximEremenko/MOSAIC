@@ -498,7 +498,7 @@ def _save_amplitudes_and_meta(
     # ---------- DB flag outside the lock (thread-local connection) ----------
     from managers.database_manager import create_db_manager_for_thread
     db = create_db_manager_for_thread(db_path)
-    db.update_saved_status_for_chunk_or_point(task.irecip_id, None, chunk_id, 1)
+    db.update_interval_chunk_status(task.irecip_id, chunk_id, saved=True)
     db.close()
 
     logger.info("write-HDF5 | chunk %d | iv %d took %.3f s",
@@ -612,7 +612,7 @@ def process_chunks_with_intervals(
 
     # 3️⃣  scatter paths (trivial) & create tasks
     iv_futs = {p: client.scatter(p, broadcast=False) for p in interval_files}
-
+    unsaved = set(db_manager.get_unsaved_interval_chunks())
     tasks = [
         client.submit(
             _process_chunk_id,
@@ -626,6 +626,7 @@ def process_chunks_with_intervals(
         )
         for cid in chunk_ids
         for p   in interval_files
+        if (int(p.stem.split("_")[1]), cid) in unsaved 
     ]
 
     logger.info("Submitting %d interval×chunk tasks …", len(tasks))
