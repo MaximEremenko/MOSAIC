@@ -32,7 +32,7 @@ from form_factors.form_factor_factory_producer import FormFactorFactoryProducer
 from multiprocessing import freeze_support
 
 
-from dask.distributed import Client, LocalCluster, get_client
+#from dask.distributed import Client, LocalCluster, get_client
     
 def main():   
     #shutdown_dask()
@@ -130,7 +130,7 @@ def main():
     # ─── 5. database -------------------------------------------------------------
     db = DatabaseManager(os.path.join(out_dir, "point_reciprocal_space_associations.db"), dim)
     
-    point_ids = db.insert_point_data_batch([{
+    _ = db.insert_point_data_batch([{
         "central_point_id": int(pgrid.central_point_ids[i]),
         "coordinates":      pgrid.coordinates[i].tolist(),
         "dist_from_atom_center": pgrid.dist_from_atom_center[i].tolist(),
@@ -152,7 +152,7 @@ def main():
         compact_rs.append(entry)
     
     rs_ids = db.insert_reciprocal_space_interval_batch(compact_rs)
-    db.associate_point_reciprocal_space_batch([(pid, rid) for pid in point_ids for rid in rs_ids])
+    #db.associate_point_reciprocal_space_batch([(pid, rid) for pid in point_ids for rid in rs_ids])
     
     unique_chunks = np.unique(pgrid.chunk_ids)
     db.insert_interval_chunk_status_batch(
@@ -165,11 +165,14 @@ def main():
     padded_rs = [pad_interval(d, dim) for d in compact_rs]
     
     # ─── 7. Δ-amplitude stage ----------------------------------------------------
-    unsaved = db.get_unsaved_associations()
-    
-    pt_need = list({p for p, _ in unsaved})
-    rs_need = list({r for _, r in unsaved})
-    pt_rows = db.get_point_data_for_point_ids(pt_need)
+    # chunk-level bookkeeping
+    unsaved = db.get_unsaved_interval_chunks()          # [(interval_id, chunk_id), …]
+    ch_need = sorted({c for _, c in unsaved})            # chunks to process
+    rs_need = sorted({r for r, _ in unsaved})            # intervals to process
+
+    pt_rows = []
+    for c in ch_need:
+        pt_rows.extend(db.get_point_data_for_chunk(c))
     
     placeholders = ",".join("?" * len(rs_need))
     db.cursor.execute(f"SELECT * FROM ReciprocalSpaceInterval WHERE id IN ({placeholders})",
