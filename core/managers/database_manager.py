@@ -1,503 +1,565 @@
 # managers/database_manager.py
+"""
+SQLite helper for point–interval bookkeeping
+-------------------------------------------
+• Same public API as before – no call-site changes required.
+"""
+
+from __future__ import annotations
 
 import sqlite3
 import json
-import os
 import logging
 from typing import List, Dict, Tuple
 
-class DatabaseManager:
-    def __init__(self, db_path: str, dimension: int = 3):
-        """
-        Initializes the DatabaseManager.
+from pathlib import Path
+from itertools import chain
+def create_db_manager_for_thread(db_path: str | Path, dimension: int = 3) -> "DatabaseManager":
+    """
+    Return a fresh DatabaseManager with its own SQLite connection.
+    Thread-safe because each call opens a *new* sqlite3.Connection.
+    """
+    return DatabaseManager(str(db_path), dimension)
 
-        Args:
-            db_path (str): Path to the SQLite database file.
-            dimension (int): Dimension of data (1, 2, or 3).
-                1D: Only h_range is used.
-                2D: h_range and k_range are used.
-                3D: h_range, k_range, and l_range are used.
-        """
+_PRECISION = 6           # digits to keep in ranges
+_CHUNK_SIZE = 150        # 150 × 6 = 900 placeholders per statement
+
+_SQL_IN_CHUNK = 150              # 150 × 6 columns = 900 bound variables
+
+class DatabaseManager:
+    # ------------------------------------------------------------------ #
+    #  INIT & PRAGMAS                                                    #
+    # ------------------------------------------------------------------ #
+    def __init__(self, db_path: str, dimension: int = 3):
         self.db_path = db_path
         self.dimension = dimension
         self.logger = logging.getLogger(self.__class__.__name__)
         self.connection = sqlite3.connect(self.db_path)
         self.cursor = self.connection.cursor()
+
+        self.cursor.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous  = NORMAL;
+            """
+        )
+
         self._initialize_database()
-    def get_point_data_for_chunk(self, chunk_id):
-        """
-        Retrieves all point data for a given chunk ID.
 
-        Args:
-            chunk_id (int): The chunk ID to retrieve data for.
-
-        Returns:
-            List[Dict]: List of point data dictionaries for the chunk.
-        """
+    # ------------------------------------------------------------------ #
+    #  PUBLIC READ HELPERS (unchanged signatures)                        #
+    # ------------------------------------------------------------------ #
+    def get_point_data_for_chunk(self, chunk_id: int) -> List[Dict]:
         try:
-            self.cursor.execute("""
-                SELECT central_point_id, coordinates, dist_from_atom_center, step_in_frac, chunk_id, grid_amplitude_initialized
+            self.cursor.execute(
+                """
+                SELECT central_point_id,
+                       coordinates,
+                       dist_from_atom_center,
+                       step_in_frac,
+                       chunk_id,
+                       grid_amplitude_initialized
                 FROM PointData
                 WHERE chunk_id = ?
-            """, (chunk_id,))
-            rows = self.cursor.fetchall()
-            point_data_list = []
-            for row in rows:
-                point_data = {
-                    'central_point_id': row[0],
-                    'coordinates': json.loads(row[1]),
-                    'dist_from_atom_center': json.loads(row[2]),
-                    'step_in_frac': json.loads(row[3]),
-                    'chunk_id': row[4],
-                    'grid_amplitude_initialized': row[5]
+                """,
+                (chunk_id,),
+            )
+            return [
+                {
+                    "central_point_id": r[0],
+                    "coordinates": json.loads(r[1]),
+                    "dist_from_atom_center": json.loads(r[2]),
+                    "step_in_frac": json.loads(r[3]),
+                    "chunk_id": r[4],
+                    "grid_amplitude_initialized": r[5],
                 }
-                point_data_list.append(point_data)
-            return point_data_list
+                for r in self.cursor.fetchall()
+            ]
         except sqlite3.Error as e:
-            print(f"Error retrieving point data for chunk_id {chunk_id}: {e}")
+            self.logger.error("Error retrieving chunk %s: %s", chunk_id, e)
             return []
+
     def get_pending_chunk_ids(self) -> List[int]:
-        """
-        Retrieves unique chunk_ids from PointData that are pending processing.
-
-        Returns:
-            List[int]: List of unique chunk_ids.
-        """
         try:
-            self.cursor.execute("""
-                SELECT DISTINCT chunk_id
-                FROM PointData
-            """)
-            rows = self.cursor.fetchall()
-            chunk_ids = [row[0] for row in rows]
-            self.logger.debug(f"Retrieved {len(chunk_ids)} unique chunk_ids for processing.")
-            return chunk_ids
+            self.cursor.execute("SELECT DISTINCT chunk_id FROM PointData")
+            ids = [r[0] for r in self.cursor.fetchall()]
+            self.logger.debug("Found %d distinct chunk_ids", len(ids))
+            return ids
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to retrieve chunk_ids: {e}")
+            self.logger.error("get_pending_chunk_ids failed: %s", e)
             return []
-        
-    def get_pending_parts(self) -> List[Dict]:
-        """
-        Retrieves pending ReciprocalSpaceInterval entries that need processing.
 
-        Based on the dimension, we only return the ranges that apply.
-        
-        Returns:
-            List[Dict]: List of interval dictionaries with dimension-appropriate keys.
-        """
+    def get_pending_parts(self) -> List[Dict]:
         try:
-            self.cursor.execute("""
+            self.cursor.execute(
+                """
                 SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
                 FROM ReciprocalSpaceInterval
-            """)
-            rows = self.cursor.fetchall()
-            pending_parts = []
-            for row in rows:
-                interval_id = row[0]
-                h_range = [row[1], row[2]]
-                k_range = [row[3], row[4]] if self.dimension > 1 else [0.0, 0.0]
-                l_range = [row[5], row[6]] if self.dimension > 2 else [0.0, 0.0]
-
-                interval_dict = {'id': interval_id, 'h_range': h_range}
+                """
+            )
+            res = []
+            for r in self.cursor.fetchall():
+                entry = {"id": r[0], "h_range": [r[1], r[2]]}
                 if self.dimension > 1:
-                    interval_dict['k_range'] = k_range
+                    entry["k_range"] = [r[3], r[4]]
                 if self.dimension > 2:
-                    interval_dict['l_range'] = l_range
-                pending_parts.append(interval_dict)
-
-            self.logger.debug(f"Retrieved {len(pending_parts)} ReciprocalSpaceInterval entries for processing.")
-            return pending_parts
+                    entry["l_range"] = [r[5], r[6]]
+                res.append(entry)
+            return res
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to retrieve ReciprocalSpaceInterval entries: {e}")
+            self.logger.error("get_pending_parts failed: %s", e)
             return []
 
     def get_point_data_for_point_ids(self, point_ids: List[int]) -> List[Dict]:
-        """
-        Retrieves point data for the given list of point_ids.
-
-        Args:
-            point_ids (List[int]): List of point_ids to retrieve data for.
-
-        Returns:
-            List[Dict]: List of dictionaries containing point data.
-        """
         if not point_ids:
             return []
-
-        placeholders = ','.join(['?'] * len(point_ids))
-        query = f"""
-            SELECT central_point_id, coordinates, dist_from_atom_center, step_in_frac, chunk_id, grid_amplitude_initialized
-            FROM PointData
-            WHERE id IN ({placeholders})
-        """
-
+        placeholders = ",".join("?" * len(point_ids))
         try:
-            self.cursor.execute(query, point_ids)
-            rows = self.cursor.fetchall()
-            point_data_list = []
-            for row in rows:
-                point_data = {
-                    'central_point_id': row[0],
-                    'coordinates': json.loads(row[1]),
-                    'dist_from_atom_center': json.loads(row[2]),
-                    'step_in_frac': json.loads(row[3]),
-                    'chunk_id': row[4],
-                    'grid_amplitude_initialized': row[5],
-                    'id': row[0]  # Assuming central_point_id is unique and serves as 'id'
+            self.cursor.execute(
+                f"""
+                SELECT central_point_id,
+                       coordinates,
+                       dist_from_atom_center,
+                       step_in_frac,
+                       chunk_id,
+                       grid_amplitude_initialized
+                FROM PointData
+                WHERE id IN ({placeholders})
+                """,
+                point_ids,
+            )
+            return [
+                {
+                    "central_point_id": r[0],
+                    "coordinates": json.loads(r[1]),
+                    "dist_from_atom_center": json.loads(r[2]),
+                    "step_in_frac": json.loads(r[3]),
+                    "chunk_id": r[4],
+                    "grid_amplitude_initialized": r[5],
+                    "id": r[0],
                 }
-                point_data_list.append(point_data)
-            self.logger.debug(f"Retrieved point data for {len(point_data_list)} points.")
-            return point_data_list
+                for r in self.cursor.fetchall()
+            ]
         except sqlite3.Error as e:
-            self.logger.error(f"Failed to retrieve point data for point_ids={point_ids}: {e}")
+            self.logger.error("get_point_data_for_point_ids failed: %s", e)
             return []
 
+    # ------------------------------------------------------------------ #
+    #  SCHEMA INITIALISATION                                             #
+    # ------------------------------------------------------------------ #
     def _initialize_database(self):
-        """
-        Creates tables if they do not exist.
-        """
         try:
-            # Create PointData table
-            self.cursor.execute("""
+            self.cursor.executescript(
+                """
+                -----------------------------------------------------------
+                -- POINTS
+                -----------------------------------------------------------
                 CREATE TABLE IF NOT EXISTS PointData (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
                     central_point_id INTEGER UNIQUE,
-                    coordinates TEXT,
+                    coordinates           TEXT,
                     dist_from_atom_center TEXT,
-                    step_in_frac TEXT,
-                    chunk_id INTEGER,
+                    step_in_frac          TEXT,
+                    chunk_id              INTEGER,
                     grid_amplitude_initialized INTEGER
-                )
-            """)
+                );
 
-            # Create ReciprocalSpaceInterval table
-            self.cursor.execute("""
+                -----------------------------------------------------------
+                -- INTERVALS
+                -----------------------------------------------------------
                 CREATE TABLE IF NOT EXISTS ReciprocalSpaceInterval (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    h_start REAL,
-                    h_end REAL,
-                    k_start REAL,
-                    k_end REAL,
-                    l_start REAL,
-                    l_end REAL,
+                    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    h_start REAL, h_end REAL,
+                    k_start REAL, k_end REAL,
+                    l_start REAL, l_end REAL,
+                    precomputed INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(h_start, h_end, k_start, k_end, l_start, l_end)
-                )
-            """)
+                );
+                -----------------------------------------------------------
+                -- NEW:  INTERVAL ↔ CHUNK STATUS
+                -----------------------------------------------------------
+                CREATE TABLE IF NOT EXISTS Interval_Chunk_Status (
+                    reciprocal_space_id INTEGER NOT NULL,
+                    chunk_id            INTEGER NOT NULL,
+                    saved               INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (reciprocal_space_id, chunk_id),
+                    FOREIGN KEY (reciprocal_space_id) REFERENCES ReciprocalSpaceInterval(id)
+                ) WITHOUT ROWID;
 
-            # Create Point_ReciprocalSpace_Association table with `saved` boolean field
-            self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS Point_ReciprocalSpace_Association (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    point_id INTEGER,
-                    reciprocal_space_id INTEGER,
-                    saved INTEGER DEFAULT 0,
-                    FOREIGN KEY (point_id) REFERENCES PointData(id),
-                    FOREIGN KEY (reciprocal_space_id) REFERENCES ReciprocalSpaceInterval(id),
-                    UNIQUE(point_id, reciprocal_space_id)
-                )
-            """)
+                -----------------------------------------------------------
+                -- INDEXES
+                -----------------------------------------------------------
+                CREATE INDEX IF NOT EXISTS idx_pointdata_cpid
+                    ON PointData (central_point_id);
 
-            # Create indexes for faster lookups
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_pointdata_central_point_id ON PointData (central_point_id);")
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_reciprocal_spaceinterval_ranges ON ReciprocalSpaceInterval (h_start, h_end, k_start, k_end, l_start, l_end);")
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_association_point_id ON Point_ReciprocalSpace_Association (point_id);")
-            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_association_reciprocal_space_id ON Point_ReciprocalSpace_Association (reciprocal_space_id);")
-
-            # Commit changes
+                CREATE INDEX IF NOT EXISTS idx_intervalchunk_unsaved
+                    ON Interval_Chunk_Status(reciprocal_space_id, chunk_id)
+                    WHERE saved = 0;
+                """
+            )
             self.connection.commit()
-            self.logger.info("Database tables and indexes initialized successfully.")
+            self.logger.info("Database schema ready.")
         except sqlite3.Error as e:
-            self.logger.error(f"An error occurred initializing the database: {e}")
-
-    def update_saved_status_for_chunk_or_point(self, reciprocal_space_id: int, point_id: int = None, chunk_id: int = None, saved: int = 0):
-        """
-        Updates the `saved` status for associations based on either `chunk_id` or `point_id`, combined with `reciprocal_space_id`.
-        """
-        try:
-            # Begin transaction
-            self.connection.execute('BEGIN')
-
-            if point_id is not None:
-                self.cursor.execute("""
-                    UPDATE Point_ReciprocalSpace_Association
-                    SET saved = ?
-                    WHERE point_id = ? AND reciprocal_space_id = ?
-                """, (saved, point_id, reciprocal_space_id))
-                self.logger.debug(f"Updated saved status for PointData ID={point_id} and ReciprocalSpaceInterval ID={reciprocal_space_id}.")
-            elif chunk_id is not None:
-                # Find all point_ids associated with the given chunk_id
-                self.cursor.execute("""
-                    SELECT id FROM PointData
-                    WHERE chunk_id = ?
-                """, (chunk_id,))
-                point_ids = [row[0] for row in self.cursor.fetchall()]
-
-                # Update all associations for the given chunk_id
-                self.cursor.executemany("""
-                    UPDATE Point_ReciprocalSpace_Association
-                    SET saved = ?
-                    WHERE point_id = ? AND reciprocal_space_id = ?
-                """, [(saved, pid, reciprocal_space_id) for pid in point_ids])
-
-                self.logger.debug(f"Updated saved status for chunk_id={chunk_id} and ReciprocalSpaceInterval ID={reciprocal_space_id} for {len(point_ids)} PointData entries.")
-
-            # Commit changes
-            self.connection.commit()
-            self.logger.info("Saved status updated successfully.")
-
-        except sqlite3.Error as e:
-            self.logger.error(f"Failed to update saved status for reciprocal_space_id={reciprocal_space_id}, point_id={point_id}, chunk_id={chunk_id}: {e}")
-            self.connection.rollback()
-
-    def insert_point_data_batch(self, point_data_list: List[Dict]) -> List[int]:
-        """
-        Inserts multiple PointData entries into the database.
-        """
-        point_ids = []
-        try:
-            # Prepare data for insertion
-            insert_data = []
-            for pd in point_data_list:
-                coordinates_json = json.dumps(pd['coordinates'])
-                dist_json = json.dumps(pd['dist_from_atom_center'])
-                step_json = json.dumps(pd['step_in_frac'])
-            
-                insert_data.append((
-                    pd['central_point_id'],
-                    coordinates_json,   # Only coordinates data
-                    dist_json,          # Only dist_from_atom_center data
-                    step_json,          # Only step_in_frac data
-                    pd['chunk_id'],
-                    pd['grid_amplitude_initialized']
-                ))
-
-            # Begin transaction
-            self.connection.execute('BEGIN')
-            
-            # Insert PointData entries, ignoring duplicates
-            self.cursor.executemany("""
-                INSERT OR IGNORE INTO PointData (
-                    central_point_id,
-                    coordinates,
-                    dist_from_atom_center,
-                    step_in_frac,
-                    chunk_id,
-                    grid_amplitude_initialized
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, insert_data)
-
-            # Commit the transaction
-            self.connection.commit()
-            self.logger.debug(f"Inserted or ignored {len(insert_data)} PointData entries.")
-
-            # Retrieve IDs for all central_point_ids
-            central_point_ids = [pd['central_point_id'] for pd in point_data_list]
-            placeholders = ','.join(['?'] * len(central_point_ids))
-            query = f"SELECT central_point_id, id FROM PointData WHERE central_point_id IN ({placeholders})"
-            self.cursor.execute(query, central_point_ids)
-            results = self.cursor.fetchall()
-            point_id_map = {cp_id: pid for cp_id, pid in results}
-
-            # Map point_ids to the list
-            for cp_id in central_point_ids:
-                point_id = point_id_map.get(cp_id)
-                if point_id:
-                    point_ids.append(point_id)
-                else:
-                    self.logger.warning(f"PointData with central_point_id={cp_id} was not inserted or found.")
-
-            return point_ids
-
-        except sqlite3.Error as e:
-            self.logger.error(f"Failed to batch insert PointData: {e}")
-            self.connection.rollback()
-            return point_ids
-
-    def insert_reciprocal_space_interval_batch(self, reciprocal_space_interval_list: List[Dict]) -> List[int]:
-        """
-        Inserts multiple ReciprocalSpaceInterval entries into the database, adapted for dimension.
-
-        For dimension < 3, we store l_range as 0.0,0.0
-        For dimension < 2, we store k_range as 0.0,0.0
-        """
-        reciprocal_space_ids = []
-        try:
-            # Prepare data for insertion
-            insert_data = []
-            for interval in reciprocal_space_interval_list:
-                h_start, h_end = interval['h_range']
-                if self.dimension > 1:
-                    k_start, k_end = interval['k_range']
-                else:
-                    k_start, k_end = 0.0, 0.0
-                if self.dimension > 2:
-                    l_start, l_end = interval['l_range']
-                else:
-                    l_start, l_end = 0.0, 0.0
-
-                insert_data.append((h_start, h_end, k_start, k_end, l_start, l_end))
-
-            # Begin transaction
-            self.connection.execute('BEGIN')
-
-            # Insert ReciprocalSpaceInterval entries, ignoring duplicates
-            self.cursor.executemany("""
-                INSERT OR IGNORE INTO ReciprocalSpaceInterval (
-                    h_start, h_end, k_start, k_end, l_start, l_end
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """, insert_data)
-
-            # Commit the transaction
-            self.connection.commit()
-            self.logger.debug(f"Inserted or ignored {len(insert_data)} ReciprocalSpaceInterval entries.")
-
-            # Retrieve IDs for all inserted intervals
-            placeholders = ','.join(['(?, ?, ?, ?, ?, ?)'] * len(insert_data))
-            query = f"""
-                SELECT id, h_start, h_end, k_start, k_end, l_start, l_end FROM ReciprocalSpaceInterval
-                WHERE (h_start, h_end, k_start, k_end, l_start, l_end) IN ({placeholders})
-            """
-            flat_insert_data = [item for sublist in insert_data for item in sublist]
-            self.cursor.execute(query, flat_insert_data)
-            results = self.cursor.fetchall()
-
-            # Map interval tuples to their IDs
-            interval_map = {tuple(r[1:]): r[0] for r in results}
-
-            # Assign IDs based on the interval data
-            for interval in reciprocal_space_interval_list:
-                h_start, h_end = interval['h_range']
-                if self.dimension > 1:
-                    k_start, k_end = interval['k_range']
-                else:
-                    k_start, k_end = 0.0, 0.0
-                if self.dimension > 2:
-                    l_start, l_end = interval['l_range']
-                else:
-                    l_start, l_end = 0.0, 0.0
-
-                key = (h_start, h_end, k_start, k_end, l_start, l_end)
-                reciprocal_space_id = interval_map.get(key)
-                if reciprocal_space_id:
-                    reciprocal_space_ids.append(reciprocal_space_id)
-                else:
-                    self.logger.warning(f"ReciprocalSpaceInterval {interval} was not inserted or found.")
-
-            return reciprocal_space_ids
-
-        except sqlite3.Error as e:
-            self.logger.error(f"Failed to batch insert ReciprocalSpaceIntervals: {e}")
-            self.connection.rollback()
-            return reciprocal_space_ids
-
-    def associate_point_reciprocal_space_batch(self, associations: List[Tuple[int, int]]):
-        """
-        Associates multiple PointData entries with ReciprocalSpaceInterval entries in bulk.
-        """
-        try:
-            # Begin transaction
-            self.connection.execute('BEGIN')
-
-            # Insert associations, ignoring duplicates
-            self.cursor.executemany("""
-                INSERT OR IGNORE INTO Point_ReciprocalSpace_Association (
-                    point_id,
-                    reciprocal_space_id,
-                    saved
-                ) VALUES (?, ?, 0)
-            """, associations)
-
-            # Commit the transaction
-            self.connection.commit()
-            self.logger.debug(f"Associated {len(associations)} PointData and ReciprocalSpaceInterval pairs.")
-
-        except sqlite3.Error as e:
-            self.logger.error(f"Failed to batch associate PointData with ReciprocalSpaceIntervals: {e}")
-            self.connection.rollback()
-
-    def update_saved_status_batch(self, updates: List[Tuple[int, int, int]]):
-        """
-        Updates the saved status for multiple Point_ReciprocalSpace_Association entries in bulk.
-        """
-        try:
-            # Begin transaction
-            self.connection.execute('BEGIN')
-
-            self.cursor.executemany("""
-                UPDATE Point_ReciprocalSpace_Association
-                SET saved = ?
-                WHERE point_id = ? AND reciprocal_space_id = ?
-            """, updates)
-
-            # Commit the transaction
-            self.connection.commit()
-            self.logger.debug(f"Updated saved status for {len(updates)} associations.")
-
-        except sqlite3.Error as e:
-            self.logger.error(f"Failed to batch update saved status: {e}")
-            self.connection.rollback()
-            
-    def get_unsaved_associations(self) -> List[Tuple[int, int]]:
-        """
-        Retrieves (point_id, reciprocal_space_id) tuples for all (chunk_id, reciprocal_space_id) pairs
-        where ALL associations are unsaved (saved=0).
-        
-        Returns:
-            List[Tuple[int, int]]: A list of (point_id, reciprocal_space_id) that are fully unsaved
-            within their respective (chunk_id, reciprocal_space_id) group.
-        """
-        try:
-            # 1. Identify fully unsaved (chunk_id, reciprocal_space_id) pairs
-            self.cursor.execute("""
-                SELECT pd.chunk_id,
-                       pha.reciprocal_space_id,
-                       COUNT(*) AS total_count,
-                       SUM(CASE WHEN pha.saved = 0 THEN 1 ELSE 0 END) AS unsaved_count
-                FROM Point_ReciprocalSpace_Association pha
-                JOIN PointData pd ON pha.point_id = pd.id
-                GROUP BY pd.chunk_id, pha.reciprocal_space_id
-            """)
-            
-            rows = self.cursor.fetchall()
-            fully_unsaved_pairs = [(r[0], r[1]) for r in rows if r[2] == r[3] and r[2] > 0]
+            self.logger.error("Schema init error: %s", e)
+   # put this near the top of the module, next to _PRECISION / _CHUNK_SIZE
     
-            if not fully_unsaved_pairs:
-                self.logger.debug("No (chunk_id, reciprocal_space_id) pairs are fully unsaved.")
+    
+    # ---------------------------------------------------------------------- #
+    #  inside class DatabaseManager                                          #
+    # ---------------------------------------------------------------------- #
+    def _fetch_point_ids(self, central_ids: list[int]) -> dict[int, int]:
+        """
+        Return a mapping  {central_point_id -> row_id}  for the requested ids,
+        fetching in blocks small enough to satisfy SQLite’s 999-variable limit.
+        """
+        id_map: dict[int, int] = {}
+        for ofs in range(0, len(central_ids), _SQL_IN_CHUNK):
+            chunk = central_ids[ofs : ofs + _SQL_IN_CHUNK]
+            ph    = ",".join("?" * len(chunk))
+            self.cursor.execute(
+                f"""
+                SELECT central_point_id, id
+                FROM   PointData
+                WHERE  central_point_id IN ({ph})
+                """,
+                chunk,
+            )
+            id_map.update(dict(self.cursor.fetchall()))
+        return id_map
+
+
+    def insert_point_data_batch(self, point_data_list: list[dict]) -> list[int]:
+        """
+        Batch-insert `point_data_list` and return the *database* ids
+        that correspond to every element of the list (same order).
+        Safe for arbitrarily large batches – never exceeds SQLite’s
+        999-variable limit.
+        """
+        if not point_data_list:
+            return []
+    
+        try:
+            with self.connection:
+                # ① bulk INSERT – one row per execute, so never trips the limit
+                self.cursor.executemany(
+                    """
+                    INSERT OR IGNORE INTO PointData
+                      (central_point_id,
+                       coordinates,
+                       dist_from_atom_center,
+                       step_in_frac,
+                       chunk_id,
+                       grid_amplitude_initialized)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            pd["central_point_id"],
+                            json.dumps(pd["coordinates"]),
+                            json.dumps(pd["dist_from_atom_center"]),
+                            json.dumps(pd["step_in_frac"]),
+                            pd["chunk_id"],
+                            pd["grid_amplitude_initialized"],
+                        )
+                        for pd in point_data_list
+                    ],
+                )
+    
+                # ② fetch row-ids in chunks of _SQL_IN_CHUNK
+                central_ids = [pd["central_point_id"] for pd in point_data_list]
+                id_map      = self._fetch_point_ids(central_ids)
+    
+            # ③ build the result list in the caller’s original order
+            return [id_map.get(cid, -1) for cid in central_ids]
+    
+        except sqlite3.Error as exc:
+            self.logger.error("insert_point_data_batch failed: %s", exc)
+            return []
+
+    # def insert_reciprocal_space_interval_batch(
+    #     self, interval_list: List[Dict]
+    # ) -> List[int]:
+    #     """
+    #     Batch-insert ReciprocalSpaceInterval records and return their DB IDs
+    #     in the same order as `interval_list`.
+    #     """
+    #     rs_ids: List[int] = []
+    #     if not interval_list:
+    #         return rs_ids
+
+    #     try:
+    #         # Prepare tuples with zeroed components for lower dimensions
+    #         tuples = []
+    #         for iv in interval_list:
+    #             h_start, h_end = iv["h_range"]
+    #             if self.dimension > 1:
+    #                 k_start, k_end = iv["k_range"]
+    #             else:
+    #                 k_start = k_end = 0.0
+    #             if self.dimension > 2:
+    #                 l_start, l_end = iv["l_range"]
+    #             else:
+    #                 l_start = l_end = 0.0
+    #             tuples.append((h_start, h_end, k_start, k_end, l_start, l_end))
+
+    #         with self.connection:
+    #             self.cursor.executemany(
+    #                 """
+    #                 INSERT OR IGNORE INTO ReciprocalSpaceInterval
+    #                 (h_start, h_end, k_start, k_end, l_start, l_end)
+    #                 VALUES (?, ?, ?, ?, ?, ?)
+    #                 """,
+    #                 tuples,
+    #             )
+
+    #             # Fetch IDs
+    #             placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(tuples))
+    #             self.cursor.execute(
+    #                 f"""
+    #                 SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
+    #                 FROM   ReciprocalSpaceInterval
+    #                 WHERE  (h_start, h_end, k_start, k_end, l_start, l_end)
+    #                        IN ({placeholders})
+    #                 """,
+    #                 [val for t in tuples for val in t],
+    #             )
+    #             id_map = {tuple(r[1:]): r[0] for r in self.cursor.fetchall()}
+    #             rs_ids = [id_map[t] for t in tuples]
+    #         return rs_ids
+    #     except sqlite3.Error as e:
+    #         self.logger.error("insert_reciprocal_space_interval_batch failed: %s", e)
+    #         return rs_ids
+
+
+    def _pad_ranges(self, iv: Dict) -> Tuple[float, float, float, float, float, float]:
+        """Return a 6-tuple [h_start, h_end, k_start, k_end, l_start, l_end]."""
+        h_start, h_end = (round(x, _PRECISION) for x in iv["h_range"])
+        if self.dimension > 1:
+            k_start, k_end = (round(x, _PRECISION) for x in iv["k_range"])
+        else:
+            k_start = k_end = 0.0
+        if self.dimension > 2:
+            l_start, l_end = (round(x, _PRECISION) for x in iv["l_range"])
+        else:
+            l_start = l_end = 0.0
+        return (h_start, h_end, k_start, k_end, l_start, l_end)
+
+
+
+# ---------------------------------------------------------------------------
+    
+    def insert_reciprocal_space_interval_batch(
+        self, interval_list: List[Dict]
+    ) -> List[int]:
+        """
+        Return DB-ids for `interval_list` in the original order, without ever
+        burning gaps in AUTOINCREMENT.  Strategy:
+    
+        1.  Canonicalise every interval → 6-tuple (rounded).
+        2.  In CHUNK_SIZE blocks ask SQLite which tuples already exist.
+        3.  Insert only the missing tuples (again in chunks).
+        4.  Fetch ids for the newly inserted tuples, build a single mapping,
+            and return ids preserving the caller’s order.
+        """
+        if not interval_list:
+            return []
+    
+        tuples = [self._pad_ranges(iv) for iv in interval_list]
+        existing: dict[Tuple[float, ...], int] = {}
+    
+        # -- 1) find already-present intervals ----------------------------------
+        with self.connection:          # one transaction for everything
+    
+            for ofs in range(0, len(tuples), _CHUNK_SIZE):
+                chunk = tuples[ofs : ofs + _CHUNK_SIZE]
+                placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(chunk))
+                self.cursor.execute(
+                    f"""
+                    SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
+                    FROM   ReciprocalSpaceInterval
+                    WHERE  (h_start, h_end, k_start, k_end, l_start, l_end)
+                           IN ({placeholders})
+                    """,
+                    list(chain.from_iterable(chunk)),
+                )
+                existing.update({tuple(r[1:]): r[0] for r in self.cursor.fetchall()})
+    
+            # -- 2) insert the truly new ones -----------------------------------
+            missing = [t for t in tuples if t not in existing]
+    
+            for ofs in range(0, len(missing), _CHUNK_SIZE):
+                chunk = missing[ofs : ofs + _CHUNK_SIZE]
+                self.cursor.executemany(
+                    """
+                    INSERT INTO ReciprocalSpaceInterval
+                      (h_start, h_end, k_start, k_end, l_start, l_end)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    chunk,
+                )
+    
+            # -- 3) fetch ids for the new rows ----------------------------------
+            if missing:
+                for ofs in range(0, len(missing), _CHUNK_SIZE):
+                    chunk = missing[ofs : ofs + _CHUNK_SIZE]
+                    placeholders = ",".join(["(?, ?, ?, ?, ?, ?)"] * len(chunk))
+                    self.cursor.execute(
+                        f"""
+                        SELECT id, h_start, h_end, k_start, k_end, l_start, l_end
+                        FROM   ReciprocalSpaceInterval
+                        WHERE  (h_start, h_end, k_start, k_end, l_start, l_end)
+                               IN ({placeholders})
+                        """,
+                        list(chain.from_iterable(chunk)),
+                    )
+                    existing.update({tuple(r[1:]): r[0] for r in self.cursor.fetchall()})
+    
+        # -- 4) return ids in caller’s order -------------------------------------
+        return [existing[t] for t in tuples]
+
+    def insert_interval_chunk_status_batch(
+            self, status_list: List[Tuple[int, int, int | bool]]
+        ):
+            """
+            Bulk insert (interval_id, chunk_id, saved_flag).
+            `saved_flag` should be 0/1 or False/True.
+            """
+            if not status_list:
+                return
+            try:
+                with self.connection:
+                    self.cursor.executemany(
+                        """
+                        INSERT OR IGNORE INTO Interval_Chunk_Status
+                        (reciprocal_space_id, chunk_id, saved)
+                        VALUES (?, ?, ?)
+                        """,
+                        status_list,
+                    )
+            except sqlite3.Error as e:
+                self.logger.error("insert_interval_chunk_status_batch failed: %s", e)
+    def associate_point_reciprocal_space_batch(
+        self, associations: list[tuple[int, int]]
+    ) -> None:
+        """Kept for API compatibility – no longer needed."""
+        return
+
+
+    def update_saved_status_for_chunk_or_point(
+        self,
+        reciprocal_space_id: int,
+        point_id: int | None = None,
+        chunk_id: int | None = None,
+        saved: int = 0,
+    ) -> None:
+        """
+        Flip the *chunk-level* flag.  If the caller still passes `point_id`
+        we simply look up its chunk and forward the request.
+        """
+        try:
+            if point_id is not None and chunk_id is None:
+                self.cursor.execute("SELECT chunk_id FROM PointData WHERE id = ?", (point_id,))
+                row = self.cursor.fetchone()
+                if row:
+                    chunk_id = row[0]
+    
+            if chunk_id is None:          # nothing to do
+                return
+    
+            self.update_interval_chunk_status(reciprocal_space_id, chunk_id, saved)
+    
+        except sqlite3.Error as exc:
+            self.logger.error("update_saved_status_for_chunk_or_point failed: %s", exc)
+    
+    
+    def get_unsaved_associations(self) -> list[tuple[int, int]]:
+        """
+        Return *every* (central_point_id, interval_id) pair that still needs
+        to be processed, but **construct it on-the-fly** from chunk metadata.
+        """
+        try:
+            # ① all (interval, chunk) that are still incomplete
+            self.cursor.execute(
+                """
+                SELECT reciprocal_space_id, chunk_id
+                FROM   Interval_Chunk_Status
+                WHERE  saved = 0
+                """
+            )
+            todo_pairs = self.cursor.fetchall()       # list[(interval_id, chunk_id)]
+    
+            if not todo_pairs:
                 return []
-            
-            # 2. Retrieve all unsaved (point_id, reciprocal_space_id) for these fully unsaved pairs
-            conditions = []
-            params = []
-            for chunk_id, reciprocal_space_id in fully_unsaved_pairs:
-                conditions.append("(pd.chunk_id = ? AND pha.reciprocal_space_id = ?)")
-                params.extend([chunk_id, reciprocal_space_id])
-            
-            where_clause = " OR ".join(conditions)
-            query = f"""
-                SELECT pha.point_id, pha.reciprocal_space_id
-                FROM Point_ReciprocalSpace_Association pha
-                JOIN PointData pd ON pha.point_id = pd.id
-                WHERE pha.saved = 0
-                  AND ({where_clause})
-            """
     
-            self.cursor.execute(query, params)
-            all_unsaved_associations = self.cursor.fetchall()
+            # ② build one big result by joining PointData once per chunk
+            result: list[tuple[int, int]] = []
+            for interval_id, chunk_id in todo_pairs:
+                self.cursor.execute(
+                    "SELECT central_point_id FROM PointData WHERE chunk_id = ?",
+                    (chunk_id,),
+                )
+                result.extend((pid, interval_id) for (pid,) in self.cursor.fetchall())
     
-            self.logger.debug(
-                f"Retrieved {len(all_unsaved_associations)} unsaved associations "
-                f"for {len(fully_unsaved_pairs)} fully unsaved (chunk_id, reciprocal_space_id) pairs."
+            return result
+    
+        except sqlite3.Error as exc:
+            self.logger.error("get_unsaved_associations failed: %s", exc)
+            return []
+    def update_interval_chunk_status(
+        self, interval_id: int, chunk_id: int, saved: int | bool = 1
+    ):
+        """
+        Mark a single (interval_id, chunk_id) pair as saved / unsaved.
+        """
+        try:
+            with self.connection:
+                self.cursor.execute(
+                    """
+                    INSERT INTO Interval_Chunk_Status
+                    (reciprocal_space_id, chunk_id, saved)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(reciprocal_space_id, chunk_id)
+                    DO UPDATE SET saved = excluded.saved
+                    """,
+                    (interval_id, chunk_id, int(saved)),
+                )
+        except sqlite3.Error as e:
+            self.logger.error("update_interval_chunk_status failed: %s", e)
+
+    def get_unsaved_interval_chunks(self) -> List[Tuple[int, int]]:
+        """
+        Return every (interval_id, chunk_id) where saved = 0.
+        """
+        try:
+            self.cursor.execute(
+                """
+                SELECT reciprocal_space_id, chunk_id
+                FROM   Interval_Chunk_Status
+                WHERE  saved = 0
+                """
+            )
+            return self.cursor.fetchall()
+        except sqlite3.Error as e:
+            self.logger.error("get_unsaved_interval_chunks failed: %s", e)
+            return []
+    def mark_interval_precomputed(self, interval_id: int, done: bool = True):
+        with self.connection:
+            self.cursor.execute(
+                "UPDATE ReciprocalSpaceInterval SET precomputed=? WHERE id=?",
+                (1 if done else 0, interval_id)
             )
             
-            return all_unsaved_associations
-    
-        except sqlite3.Error as e:
-            self.logger.error(f"Database error while retrieving consistently unsaved associations: {e}")
-            return []
-
+    def is_interval_precomputed(self, interval_id: int) -> bool:
+        self.cursor.execute(
+            "SELECT precomputed FROM ReciprocalSpaceInterval WHERE id=?",
+            (interval_id,)
+        )
+        row = self.cursor.fetchone()
+        return bool(row and row[0])        
+    # -------------------------------------------------------------- #
+    #  CLOSE                                                         #
+    # -------------------------------------------------------------- #
     def close(self):
-        """
-        Closes the database connection.
-        """
         self.connection.close()
-        self.logger.info("Database connection closed.")
+        self.logger.info("DB connection closed.")
