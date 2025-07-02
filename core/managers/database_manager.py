@@ -25,6 +25,8 @@ def create_db_manager_for_thread(db_path: str | Path, dimension: int = 3) -> "Da
 _PRECISION = 6           # digits to keep in ranges
 _CHUNK_SIZE = 150        # 150 × 6 = 900 placeholders per statement
 
+_SQL_IN_CHUNK = 150              # 150 × 6 columns = 900 bound variables
+
 class DatabaseManager:
     # ------------------------------------------------------------------ #
     #  INIT & PRAGMAS                                                    #
@@ -218,26 +220,55 @@ class DatabaseManager:
             self.logger.info("Database schema ready.")
         except sqlite3.Error as e:
             self.logger.error("Schema init error: %s", e)
+   # put this near the top of the module, next to _PRECISION / _CHUNK_SIZE
+    
+    
+    # ---------------------------------------------------------------------- #
+    #  inside class DatabaseManager                                          #
+    # ---------------------------------------------------------------------- #
+    def _fetch_point_ids(self, central_ids: list[int]) -> dict[int, int]:
+        """
+        Return a mapping  {central_point_id -> row_id}  for the requested ids,
+        fetching in blocks small enough to satisfy SQLite’s 999-variable limit.
+        """
+        id_map: dict[int, int] = {}
+        for ofs in range(0, len(central_ids), _SQL_IN_CHUNK):
+            chunk = central_ids[ofs : ofs + _SQL_IN_CHUNK]
+            ph    = ",".join("?" * len(chunk))
+            self.cursor.execute(
+                f"""
+                SELECT central_point_id, id
+                FROM   PointData
+                WHERE  central_point_id IN ({ph})
+                """,
+                chunk,
+            )
+            id_map.update(dict(self.cursor.fetchall()))
+        return id_map
 
-    # ------------------------------------------------------------------ #
-    #  BATCH INSERTS – RESTORED                                          #
-    # ------------------------------------------------------------------ #
-    def insert_point_data_batch(self, point_data_list: List[Dict]) -> List[int]:
+
+    def insert_point_data_batch(self, point_data_list: list[dict]) -> list[int]:
         """
-        Batch-insert PointData. Returns list of row IDs (in DB) corresponding
-        to the provided central_point_ids (same order).
+        Batch-insert `point_data_list` and return the *database* ids
+        that correspond to every element of the list (same order).
+        Safe for arbitrarily large batches – never exceeds SQLite’s
+        999-variable limit.
         """
-        point_ids: List[int] = []
         if not point_data_list:
-            return point_ids
-
+            return []
+    
         try:
             with self.connection:
+                # ① bulk INSERT – one row per execute, so never trips the limit
                 self.cursor.executemany(
                     """
                     INSERT OR IGNORE INTO PointData
-                    (central_point_id, coordinates, dist_from_atom_center,
-                     step_in_frac, chunk_id, grid_amplitude_initialized)
+                      (central_point_id,
+                       coordinates,
+                       dist_from_atom_center,
+                       step_in_frac,
+                       chunk_id,
+                       grid_amplitude_initialized)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     [
@@ -252,24 +283,17 @@ class DatabaseManager:
                         for pd in point_data_list
                     ],
                 )
-
-                # Map central_point_id → id
-                cids = [pd["central_point_id"] for pd in point_data_list]
-                placeholders = ",".join("?" * len(cids))
-                self.cursor.execute(
-                    f"""
-                    SELECT central_point_id, id
-                    FROM PointData
-                    WHERE central_point_id IN ({placeholders})
-                    """,
-                    cids,
-                )
-                id_map = {cp: pid for cp, pid in self.cursor.fetchall()}
-                point_ids = [id_map.get(cp, -1) for cp in cids]
-            return point_ids
-        except sqlite3.Error as e:
-            self.logger.error("insert_point_data_batch failed: %s", e)
-            return point_ids
+    
+                # ② fetch row-ids in chunks of _SQL_IN_CHUNK
+                central_ids = [pd["central_point_id"] for pd in point_data_list]
+                id_map      = self._fetch_point_ids(central_ids)
+    
+            # ③ build the result list in the caller’s original order
+            return [id_map.get(cid, -1) for cid in central_ids]
+    
+        except sqlite3.Error as exc:
+            self.logger.error("insert_point_data_batch failed: %s", exc)
+            return []
 
     # def insert_reciprocal_space_interval_batch(
     #     self, interval_list: List[Dict]

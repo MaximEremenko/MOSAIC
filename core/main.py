@@ -7,86 +7,36 @@ Created on Mon Jun  9 14:40:08 2025
 
 # unified_main.py  – works for 1-D, 2-D and 3-D
 # -----------------------------------------------------------------------------
-import os, json, logging, numpy as np, copy, contextlib, itertools
-#os.chdir("../core")                       # repo root
-#os.environ["OMP_NUM_THREADS"] = "32"
+import os, json, logging
+import numpy as np
 
 # ─── common imports ----------------------------------------------------------
 from utilities.logger_config import setup_logging
+from utilities.dask_helpres import ensure_dask_client, shutdown_dask
 from utilities.rmc_neutron_scl import rmc_neutron_scl_
 from utilities.utils import determine_configuration_file_type
-
 from factories.configuration_processor_factory import ConfigurationProcessorFactoryProvider
 from factories.parameters_processor_factory import ParametersProcessorFactoryProvider
 from factories.point_processor_factory import PointProcessorFactory
-
 from data_storage.rifft_in_data_saver import RIFFTInDataSaver
 from processors.point_data_processor import PointDataProcessor
 from processors.point_data_reciprocal_space_manager import ReciprocalSpaceIntervalManager
 from managers.database_manager import DatabaseManager
 from processors.point_data_postprocessing_processor import PointDataPostprocessingProcessor
 from processors.amplitude_delta_calculator import compute_amplitudes_delta
-
 # shape / mask per dimension
 from strategies.shape_strategies import IntervalShapeStrategy, CircleShapeStrategy
 from strategies.mask_strategies import EqBasedStrategy
 from form_factors.form_factor_factory_producer import FormFactorFactoryProducer
-# -----------------------------------------------------------------------------
-
 # ─── logging -----------------------------------------------------------------
 from multiprocessing import freeze_support
 
 
 from dask.distributed import Client, LocalCluster, get_client
-
-def ensure_dask_client(max_workers: int = 1,
-                   *,
-                   processes: bool = True,
-                   threads_per_worker: int = 1) -> Client:
-    """
-    Get (or create) a Dask Client with at least `max_workers` *process* workers
-    unless `processes=False` is explicitly requested.
-    """
-    try:
-        client = get_client()
-        cluster = client.cluster
-        if isinstance(cluster, LocalCluster) and len(cluster.workers) < max_workers:
-            cluster.scale(max_workers)
-        return client
-    except ValueError:        # no running client
-        cluster = LocalCluster(
-            n_workers=max_workers,
-            threads_per_worker=threads_per_worker,
-            processes=processes,
-            protocol="tcp",   
-            #silence_logs="error",
-        )
-        return Client(cluster)
-    
-    
-def shutdown_dask():
-    """
-    Close the current Dask `Client` (and its underlying cluster) **if** one
-    exists.  Safe to call multiple times – it becomes a no-op when no client
-    is active.
-    """
-    try:
-        client = get_client()      # raises ValueError when there is no client
-        # First close the client (disconnects workers & scheduler) …
-        client.close()             # <- frees sockets, tasks, futures
-        # … then the cluster itself (optional, but frees ports & temp dirs)
-        if hasattr(client, "cluster"):
-            client.cluster.close()
-        print("✅ Dask client closed.")
-    except ValueError:
-        # Nothing to do – no client was running
-        print("ℹ️  No active Dask client.")
-    
-    #shutdown_dask()
     
 def main():   
     #shutdown_dask()
-    client = ensure_dask_client(1)              # <-- ONLY HERE
+    client = ensure_dask_client(2)              # <-- ONLY HERE
     #shutdown_dask()
     setup_logging()
     log = logging.getLogger("app")    
@@ -194,8 +144,6 @@ def main():
     r_mgr = ReciprocalSpaceIntervalManager(recip_h5, parameters, supercell)
     r_mgr.process_reciprocal_space_intervals()
     
-    
-    
     compact_rs = []
     for d in r_mgr.reciprocal_space_intervals:
         entry = {"h_range": d["h_range"]}
@@ -255,7 +203,7 @@ def main():
         params["coeff"] = coeff.to_numpy()
     
     
-    
+    client = ensure_dask_client(max_workers=1, backend="cuda-local")
     if unsaved:
         mask_strategy = build_mask_strategy(dim, parameters["peakInfo"])
         ff_calc = FormFactorFactoryProducer.get_factory("neutron").create_calculator("default")
@@ -267,136 +215,14 @@ def main():
 
     # %%
     post = PointDataPostprocessingProcessor(db, pdp, params)
-    
-    #os.environ.setdefault("OMP_NUM_THREADS",  "1")
-    #os.environ.setdefault("MKL_NUM_THREADS",  "1")
-    #os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    #os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    
-    # import platform, sys
-    
-    # def ensure_dask_client(max_workers: int = os.cpu_count() or 8,
-    #                        *,
-    #                        processes: bool | None = None,
-    #                        threads_per_worker: int = 1,
-    #                        dashboard: bool = False) -> Client:
-    #     """
-    #     Get an existing distributed.Client or spin up a LocalCluster that
-    #     has *process* workers (so every worker can occupy its own CPU core).
-    #     """
-    #     try:
-    #         client = get_client()
-    #         clus   = client.cluster
-    #         if isinstance(clus, LocalCluster) and len(clus.workers) < max_workers:
-    #             clus.scale(max_workers)
-    #         return client
-    
-    #     except ValueError:                                               # no client
-    #         if processes is None:
-    #             # use process workers unless the user runs *interactively* on Windows
-    #             processes = not (platform.system() == "Windows" and hasattr(sys, "ps1"))
-    
-    #         cluster = LocalCluster(
-    #             n_workers=max_workers,
-    #             threads_per_worker=threads_per_worker,
-    #             processes=processes,
-    #             silence_logs="error",
-    #             protocol="tcp",              # ←■■ force real processes
-    #             dashboard_address=":8787" if dashboard else None,
-    #             memory_limit="auto",
-    #         )
-    #         return Client(cluster)
-    
-    # # ─────────────────────────────────────────────────────────────────────────────
-    # # 3. helper executed on each worker – unchanged except for imports inside
-    # # ─────────────────────────────────────────────────────────────────────────────
-    # def _run_process_chunk(db_path: str,
-    #                        params_blob: bytes,
-    #                        chunk_id: int,
-    #                        saver_blob: bytes,
-    #                        out_dir: str) -> str:
-    #     """
-    #     Re-create light objects on the worker and run
-    #     PointDataPostprocessingProcessor.process_chunk for one chunk.
-    #     """
-    #     import pickle
-    #     from managers.database_manager import DatabaseManager
-    #     from processors.point_data_postprocessing_processor import \
-    #          PointDataPostprocessingProcessor
-    #     from processors.point_data_processor import PointDataProcessor
-    
-    #     params = pickle.loads(params_blob)
-    #     saver  = pickle.loads(saver_blob)
-    
-    #     dim = int(params["vectors"].shape[1])
-    #     db  = DatabaseManager(db_path, dim)           # read-only open
-    
-    #     pd_proc = PointDataProcessor(saver, False)
-    #     post    = PointDataPostprocessingProcessor(db, pd_proc, params)
-    
-    #     post.process_chunk(chunk_id, saver, output_dir=out_dir)
-    #     db.close()
-    #     return f"chunk {chunk_id} ✔"
-    
-    # # ─────────────────────────────────────────────────────────────────────────────
-    # # 4. driver – build and submit one task per chunk
-    # # ─────────────────────────────────────────────────────────────────────────────
-    # import pickle, dask
-    # from dask.distributed import wait
-    
-    # n_chunks   = parameters["rspace_info"]["num_chunks"]
-    # db_path    = os.path.join(out_dir, "point_reciprocal_space_associations.db")
-    
-    # params_blob = pickle.dumps(params, protocol=pickle.HIGHEST_PROTOCOL)
-    # saver_blob  = pickle.dumps(saver,  protocol=pickle.HIGHEST_PROTOCOL)
-    
-    #client = ensure_dask_client(max_workers=n_chunks, processes=True)
 
-    
-    
-    client = ensure_dask_client(max_workers=1, processes=True)
-    #client.run(lambda: __import__("numba").set_num_threads(32))
-    
+    client = ensure_dask_client(max_workers=2, processes=True)
+   
     for c in range(parameters["rspace_info"]["num_chunks"]):
         post.process_chunk(c, saver, client, output_dir=out_dir)
-    
     db.close()
+    shutdown_dask()
     log.info("âœ“ %d-D workflow finished", dim)
 if __name__ == "__main__":
     freeze_support()          # makes .exe builds happy
     main()
-# client = ensure_dask_client(max_workers=n_chunks, processes=True)
-
-# # ─── NEW: wait until all workers are up (with a safety timeout) ──────────
-# client.wait_for_workers(n_workers=n_chunks, timeout="60s")
-
-# # ---- quick sanity checks ------------------------------------------------
-# info   = client.scheduler_info()
-# pids   = client.run(lambda: os.getpid())   # {worker-addr: PID, …}
-# print(" Workers live:", list(info["workers"]))
-# print(" Distinct PIDs:", set(pids.values()))
-# print(" nthreads per worker:", client.nthreads())     # {addr: 1, …}
-
-# print("Workers online →", list(client.scheduler_info()["workers"]))
-
-# print("Workers:", client.scheduler_info()["workers"].keys())
-
-# futs = [
-#     client.submit(
-#         _run_process_chunk,
-#         db_path,
-#         params_blob,
-#         cid,
-#         saver_blob,
-#         out_dir,
-#         pure=False,          # ensure every chunk is executed
-#     )
-#     for cid in range(n_chunks)
-# ]
-
-# wait(futs)                      # block until all tasks finished
-# for f in futs:
-#     log.info(f.result())        # e.g. “chunk 5 ✔”
-
-# db.close()
-# log.info("✓ %d-D workflow finished", dim)
