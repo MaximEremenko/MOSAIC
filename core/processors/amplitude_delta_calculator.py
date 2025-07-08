@@ -279,7 +279,60 @@ def _process_chunk(chunk_data: List[dict]) -> Tuple[np.ndarray, np.ndarray]:
         shapes.append(s)
 
     return np.vstack(grids), np.vstack(shapes)
+# def _generate_grid(
+#     dimensionality: int,
+#     step_sizes: np.ndarray,
+#     central_point: np.ndarray,
+#     dist_from_atom_center: np.ndarray,
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     """
+#     Build a rectangular grid around *central_point*.
 
+#     * For the first *dimensionality* axes we step from
+#       –dist … +dist (inclusive) with *step_sizes*.
+#     * Remaining axes stay frozen at the central-point coordinate.
+#     * Works for 1-, 2- and 3-D **and** still returns a full xyz grid so
+#       downstream code that treats everything as 3-D keeps working.
+
+#     Returns
+#     -------
+#     pts : (N, 3) float64
+#         Cartesian fractional coordinates of all grid points.
+#     shape_nd : (3,) int64
+#         Number of samples along x, y, z (1 where the axis is frozen).
+#     """
+#     eps = 1e-8
+#     axes: list[np.ndarray] = []
+
+#     # --- varying axes ------------------------------------------------------
+#     for i in range(dimensionality):
+#         step = float(step_sizes[i])
+#         dist = float(dist_from_atom_center[i])
+
+#         if step <= 0.0 or dist <= step:
+#             axes.append(np.array([0.0]))
+#         else:
+#             axis = np.arange(-dist, dist + step - eps, step, dtype=np.float64)
+#             axes.append(axis if axis.size else np.array([0.0]))
+
+#     # --- frozen axes (pad to 3) -------------------------------------------
+#     while len(axes) < 3:
+#         axes.append(np.array([0.0], dtype=np.float64))
+
+#     # quick sanity-check – avoid accidental petabyte explosions
+#     n_pts = int(np.prod([a.size for a in axes]))
+#     bytes_needed = n_pts * 3 * 8  # xyz float64
+#     if bytes_needed > 2 << 30:    # 2 GiB safety cap; adjust if you like
+#         raise MemoryError(
+#             f"Requested grid has {n_pts:,} points "
+#             f"({bytes_needed/1e9:,.1f} GB) – too large."
+#         )
+
+#     mesh = np.meshgrid(*axes, indexing="ij", sparse=False)
+#     pts = np.vstack([m.ravel() for m in mesh]).T + central_point
+#     shape_nd = np.array([a.size for a in axes], dtype=np.int64)
+
+#     return pts, shape_nd
 
 def generate_rifft_grid(chunk_data: List[dict]):
     return _process_chunk(chunk_data)
@@ -508,30 +561,74 @@ def _save_amplitudes_and_meta(
 # ---------------------------------------------------------------------------
 # Build one compact np.recarray from the original Python list
 # ---------------------------------------------------------------------------
+# def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
+#     """
+#     Convert the slow-to-pickle   list[dict]   into one contiguous NumPy
+#     structured array.  Each field is a *fixed-size* NumPy column, so
+#     serialisation is 5-10 × faster and the Dask scheduler no longer chokes.
+#     """
+#     # ---- describe the structure ------------------------------------------
+#     dtype = np.dtype([
+#         ("chunk_id",             "<i4"),        # int32
+#         ("coordinates",          "<f8",  (3,)), # 3×float64
+#         ("dist_from_atom_center","<f8",  (3,)),
+#         ("step_in_frac",         "<f8",  (3,)),
+#     ])
+
+#     out = np.empty(len(point_data_list), dtype=dtype)
+
+#     # ---- fill it ----------------------------------------------------------
+#     for i, pd in enumerate(point_data_list):
+#         out["chunk_id"][i]              = pd["chunk_id"]
+#         out["coordinates"][i]           = pd["coordinates"]
+#         out["dist_from_atom_center"][i] = pd["dist_from_atom_center"]
+#         out["step_in_frac"][i]          = pd["step_in_frac"]
+
+#     return out.view(np.recarray)   # convenient attribute-style access
+# --------------------------------------------------------------------------- #
 def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
     """
-    Convert the slow-to-pickle   list[dict]   into one contiguous NumPy
-    structured array.  Each field is a *fixed-size* NumPy column, so
-    serialisation is 5-10 × faster and the Dask scheduler no longer chokes.
+    Convert Python ``list[dict]`` coming from the database into one
+    *contiguous* NumPy structured array that Dask can scatter quickly.
+
+    The vector fields (coordinates etc.) are now sized **at runtime**
+    according to the dimensionality of the first entry, so the function
+    works for 1-, 2- and 3-D data.
     """
-    # ---- describe the structure ------------------------------------------
+    if not point_data_list:
+        raise ValueError("point_data_list is empty")
+
+    # ── infer dimensionality from the first element ───────────────────────
+    dim = len(point_data_list[0]["coordinates"])
+    if dim not in (1, 2, 3):
+        raise ValueError(f"Unsupported dimensionality: {dim}")
+
+    # sanity-check everything has the same length
+    for pd in point_data_list:
+        if len(pd["coordinates"]) != dim:
+            raise ValueError("Mixed dimensionalities in point_data_list")
+
+    vect_shape: tuple[int, ...] = (dim,)
+
     dtype = np.dtype([
-        ("chunk_id",             "<i4"),        # int32
-        ("coordinates",          "<f8",  (3,)), # 3×float64
-        ("dist_from_atom_center","<f8",  (3,)),
-        ("step_in_frac",         "<f8",  (3,)),
+        ("chunk_id",              "<i4"),            # int32
+        ("coordinates",           "<f8", vect_shape),
+        ("dist_from_atom_center", "<f8", vect_shape),
+        ("step_in_frac",          "<f8", vect_shape),
     ])
 
     out = np.empty(len(point_data_list), dtype=dtype)
 
-    # ---- fill it ----------------------------------------------------------
+    # ── fill the array -----------------------------------------------------
     for i, pd in enumerate(point_data_list):
         out["chunk_id"][i]              = pd["chunk_id"]
         out["coordinates"][i]           = pd["coordinates"]
         out["dist_from_atom_center"][i] = pd["dist_from_atom_center"]
         out["step_in_frac"][i]          = pd["step_in_frac"]
 
-    return out.view(np.recarray)   # convenient attribute-style access
+    # return as a recarray for attribute-style access
+    return out.view(np.recarray)
+
 
 def _process_chunk_id(
     chunk_id: int,
@@ -613,6 +710,33 @@ def process_chunks_with_intervals(
     # 3️⃣  scatter paths (trivial) & create tasks
     iv_futs = {p: client.scatter(p, broadcast=False) for p in interval_files}
     unsaved = set(db_manager.get_unsaved_interval_chunks())
+    # debug = True
+    # debug_n =None
+    # if debug:
+    #     logger.warning("DEBUG mode: running tasks synchronously")
+    #     done = 0
+    #     for cid in chunk_ids:
+    #         atoms_slice = rec[rec.chunk_id == cid]
+    #         for p in interval_files:
+    #             key = (int(p.stem.split("_")[1]), cid)
+    #             if key not in db_manager.get_unsaved_interval_chunks():
+    #                 continue
+    #             _process_chunk_id(  # <-- direct call, not via Dask
+    #                 cid,
+    #                 p,
+    #                 atoms_slice,
+    #                 total_reciprocal_points,
+    #                 point_data_processor,
+    #                 db_manager.db_path,
+    #             )
+    #             done += 1
+    #             if debug_n is not None and done >= debug_n:
+    #                 logger.info("DEBUG mode: processed %d tasks, quitting", done)
+    #                 return
+    #     logger.info("DEBUG mode finished (%d tasks)", done)
+    #     return
+    
+    
     tasks = [
         client.submit(
             _process_chunk_id,

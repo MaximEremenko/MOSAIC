@@ -78,47 +78,6 @@ def _contig(x):  # ensure C-contiguous cupy array
 # Shortcuts to the simple front-end kernels (1/2/3-D Type-3)
 _KER = {1: cufinufft.nufft1d3, 2: cufinufft.nufft2d3, 3: cufinufft.nufft3d3}
 
-
-# def execute_cunufft(
-#     real_coords: np.ndarray,
-#     weights: np.ndarray,
-#     q_coords: np.ndarray,
-#     *,
-#     eps: float = 1e-12,
-#     mem_frac: float = 0.8,
-#     min_chunk: int = 64_000,
-#     max_chunk: int = 256_000,
-#     prefer_cpu: bool = False,
-#     gpu_only: bool = False,
-# ) -> np.ndarray:
-#     """Forward NUFFT (real → reciprocal)."""
-#     return _batched_type3(
-#         real_coords, weights, q_coords,
-#         eps=eps, inverse=False,
-#         mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
-#         prefer_cpu=prefer_cpu, gpu_only=gpu_only,
-#     )
-
-
-# def execute_inverse_cunufft(
-#     q_coords: np.ndarray,
-#     weights: np.ndarray,
-#     real_coords: np.ndarray,
-#     *,
-#     eps: float = 1e-12,
-#     mem_frac: float = 0.8,
-#     min_chunk: int = 32_000,
-#     max_chunk: int = 128_000,
-#     prefer_cpu: bool = False,
-#     gpu_only: bool = False,
-# ) -> np.ndarray:
-#     """Inverse NUFFT (reciprocal → real)."""
-#     return _batched_type3(
-#         real_coords, weights, q_coords,
-#         eps=eps, inverse=True,
-#         mem_frac=mem_frac, min_chunk=min_chunk, max_chunk=max_chunk,
-#         prefer_cpu=prefer_cpu, gpu_only=gpu_only,
-#     )
 def _resolve_weights(weights: Optional[np.ndarray], c: Optional[np.ndarray]) -> np.ndarray:
     """Return an array to use as weights, giving priority to *weights*.
 
@@ -322,36 +281,69 @@ def _launch_once(dim, cols, d_w, q_cols, eps, isign, kw, inverse):
 #  CPU fallback                                                            #
 ###########################################################################
 
-def _cpu_fallback(real_coords, weights, q_coords, eps, inverse, *, batch=5_000_000):
-    """Streamed CPU FINUFFT that never allocates gigantic arrays."""
-    global _FINUFFT3
-    if _FINUFFT3 is None:
-        import finufft  # heavyweight import delayed until needed
-        _FINUFFT3 = finufft.nufft3d3  # type: ignore
+def _cpu_fallback(
+    real_coords: np.ndarray,
+    weights:    np.ndarray,
+    q_coords:   np.ndarray,
+    eps: float,
+    inverse: bool,
+    *,
+    batch: int = 5_000_000,
+) -> np.ndarray:
+    """
+    Streamed FINUFFT fallback that works for 1-, 2- **and** 3-D type-3
+    transforms.  Keeps memory use bounded by processing *q_coords* in
+    batches.
+    """
+    dim = real_coords.shape[1]
+    if dim not in (1, 2, 3):
+        raise ValueError(f"Unsupported dimensionality: {dim}")
 
-    if inverse:
-        q_coords = -q_coords
-        isign = -1
-    else:
-        isign = +1
+    # ── import FINUFFT lazily and cache the per-dim functions ──────────────
+    global _FINUFFT3            # old cache name stays valid
+    if isinstance(_FINUFFT3, dict):
+        cache = _FINUFFT3
+    elif _FINUFFT3 is None:
+        cache = {}
+    else:                        # legacy value from earlier imports
+        cache = {3: _FINUFFT3}
 
-    x, y, z = [real_coords[:, i].astype(np.float64) for i in range(3)]
-    s_all, t_all, u_all = [q_coords[:, i].astype(np.float64) for i in range(3)]
+    if dim not in cache:
+        import finufft
+        fn = {1: finufft.nufft1d3,
+              2: finufft.nufft2d3,
+              3: finufft.nufft3d3}[dim]
+        cache[dim] = fn
+    _FINUFFT3 = cache            # store back
 
-    out = np.zeros(len(real_coords) if inverse else len(q_coords), dtype=np.complex128)
+    nufft = cache[dim]
+    isign = -1 if inverse else +1
 
+    # ── split coords per dimension ─────────────────────────────────────────
+    real_split = [real_coords[:, i].astype(np.float64) for i in range(dim)]
+    recip_split = [q_coords[:, i].astype(np.float64) for i in range(dim)]
+
+    # ── allocate output on host ────────────────────────────────────────────
+    out = np.zeros(
+        len(real_coords) if inverse else len(q_coords),
+        dtype=np.complex128,
+    )
+
+    # ── streamed execution so RAM never explodes ───────────────────────────
     start = 0
     while start < len(q_coords):
         end = min(start + batch, len(q_coords))
-        s, t, u = s_all[start:end], t_all[start:end], u_all[start:end]
+        recip_chunk = [a[start:end] for a in recip_split]
 
-        res = _FINUFFT3(
-            x, y, z,
-            weights.astype(np.complex128) if not inverse else weights[start:end].astype(np.complex128),
-            s, t, u,
-            eps=eps,
-            isign=isign,
-        )
+        if inverse:
+            recip_chunk = [-a for a in recip_chunk]
+
+        # assemble argument list:  [x, y, z,]  c   [s, t, u]
+        args = (*real_split,                       # real-space pts
+                weights if not inverse else weights[start:end],
+                *recip_chunk)                      # reciprocal pts
+
+        res = nufft(*args, eps=eps, isign=isign)
 
         if inverse:
             out += res
