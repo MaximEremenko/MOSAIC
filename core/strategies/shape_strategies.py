@@ -829,12 +829,12 @@ class CircleShapeStrategy(IMaskStrategy):
         mask = compute_2d_mask(data_points, radii, centers, coord_min, coord_max)
         filtered_data = data_points[mask] 
         
-        plt.scatter(filtered_data[:, 0], filtered_data[:, 1], c='blue', marker='o')
-        plt.xlabel('x')
-        plt.ylabel('y')
-        plt.title('Filtered Points (mask)')
-        plt.grid(True)
-        plt.show()
+        # plt.scatter(filtered_data[:, 0], filtered_data[:, 1], c='blue', marker='o')
+        # plt.xlabel('x')
+        # plt.ylabel('y')
+        # plt.title('Filtered Points (mask)')
+        # plt.grid(True)
+        # plt.show()
         return mask
     
 class IntervalShapeStrategy(IMaskStrategy):
