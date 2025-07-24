@@ -13,6 +13,7 @@ import numpy as np
 # ─── common imports ----------------------------------------------------------
 from utilities.logger_config import setup_logging
 from utilities.dask_helpres import ensure_dask_client, shutdown_dask
+from utilities.dask_client import get_client
 from utilities.rmc_neutron_scl import rmc_neutron_scl_
 from utilities.utils import determine_configuration_file_type
 from factories.configuration_processor_factory import ConfigurationProcessorFactoryProvider
@@ -35,42 +36,29 @@ from multiprocessing import freeze_support
 #from dask.distributed import Client, LocalCluster, get_client
     
 def main():   
-    #shutdown_dask()
-    # client = ensure_dask_client(
-    # max_workers=int(os.getenv("DASK_MAX_WORKERS", 4)),
-    # backend=os.getenv("DASK_BACKEND"),   # "sge", "cuda-local", …
-    # gpu=int(os.getenv("GPUS_PER_JOB", 1)),
-    # python="/data/mve/venvs/mosaic/bin/python",
-    # scheduler_options={"host": "0.0.0.0"}, 
-    # job_extra_directives=[
-    #     "-l h=host1,h=host3",   # <-- the magic line
-    # ],
-    # queue=os.getenv("SGE_QUEUE", "all.q"),   # transparently forwarded
-    # )             # <-- ONLY HERE
-    # "-l gpu=1 -pe smp 4 -l h=host1|host3"  →  ["-l","gpu=1","-pe","smp","4",...]
-    LOG_DIR = "/data/mve/MOSAIC_wsl/tests/config_3D"
-    job_extra = [
-    "-cwd",
-    "-V",
-    os.environ["DASK_GPU"],
-    os.environ["DASK_PE"],
-    os.environ["DASK_HOST"],
-    f"-o {LOG_DIR}/worker.o.$JOB_ID.$TASK_ID",
-    f"-e {LOG_DIR}/worker.e.$JOB_ID.$TASK_ID",
-    ]
+    # LOG_DIR = "/data/mve/MOSAIC_wsl/tests/config_3D"
+    # job_extra = [
+    # "-cwd",
+    # "-V",
+    # os.environ["DASK_GPU"],
+    # os.environ["DASK_PE"],
+    # os.environ["DASK_HOST"],
+    # f"-o {LOG_DIR}/worker.o.$JOB_ID.$TASK_ID",
+    # f"-e {LOG_DIR}/worker.e.$JOB_ID.$TASK_ID",
+    # ]
     
-    client = ensure_dask_client(
-    backend=os.getenv("DASK_BACKEND", "sge"),
-    max_workers=int(os.getenv("DASK_MAX_WORKERS", 4)),
-    threads_per_worker=int(os.getenv("DASK_THREADS_PER_WORKER", 4)),
-    gpu=int(os.getenv("GPUS_PER_JOB", 1)),
-    worker_dashboard=False,
-    job_extra_directives=job_extra,
-    python="/data/mve/venvs/mosaic/bin/python",
-    scheduler_options={"host": "0.0.0.0"},
-    )
+    # client = ensure_dask_client(
+    # backend=os.getenv("DASK_BACKEND", "sge"),
+    # max_workers=int(os.getenv("DASK_MAX_WORKERS", 4)),
+    # threads_per_worker=int(os.getenv("DASK_THREADS_PER_WORKER", 4)),
+    # gpu=int(os.getenv("GPUS_PER_JOB", 1)),
+    # worker_dashboard=False,
+    # job_extra_directives=job_extra,
+    # python="/data/mve/venvs/mosaic/bin/python",
+    # scheduler_options={"host": "0.0.0.0"},
+    # )
+    client = get_client()
 
-    #shutdown_dask()
     setup_logging()
     log = logging.getLogger("app")    
     # ─── helpers -----------------------------------------------------------------
