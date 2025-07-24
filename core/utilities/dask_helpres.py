@@ -1,176 +1,214 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Jul  2 10:53:33 2025
-
-@author: Maksim Eremenko
-"""
 # utilities/dask_helpers.py
+# ======================================================================
+# Create (or reuse) a Dask Client for local, cuda-local, or job-queue
+# back-ends.  Works with dask-cuda ≥ 25.06 — no "--resources" flag.
+# Robust across clusters where NIC names differ host-to-host.
+# ======================================================================
+
 from __future__ import annotations
 
 import os
-from typing import Literal, Optional
+import socket
+from typing import Literal, Optional, Dict, Any, List
 
 from dask.distributed import Client, LocalCluster, get_client
 
-_BACKENDS = Literal[
-    "local",            # LocalCluster – default
-    "cuda-local",       # LocalCUDACluster     (single-node, many GPUs)
-    "sge", "slurm", "pbs", "lsf", "oar",  # dask-jobqueue families
-    "mpi"               # dask-mpi
-]
+_BACKENDS = Literal["local", "cuda-local", "sge", "slurm", "pbs", "lsf", "oar", "mpi"]
 
+
+# ---------------------------------------------------------------------- #
 def ensure_dask_client(
     max_workers: int = 2,
     *,
     threads_per_worker: int = 2,
     processes: bool = True,
-    backend: _BACKENDS | str | None = None,
-    gpu: int | None = None,           # how many GPUs **per worker job**
+    backend: _BACKENDS | None = None,
+    gpu: int | None = None,               # GPUs **per job**
     dashboard: bool = True,
-    **cluster_kw,                     # forwarded verbatim to the Cluster ctor
+    worker_dashboard: bool | None = None,
+    use_sge_gpu_complex: bool = False,    # add "-l gpu=N" only if True
+    **cluster_kw: Any,
 ) -> Client:
     """
-    Return an existing Dask `Client` or create a new one.
+    Return an existing Dask Client or spin up one automatically.
 
-    Parameters
-    ----------
-    backend
-        `"local"` (default), `"cuda-local"`, `"sge"`, `"slurm"`, `"pbs"`,
-        `"lsf"`, `"oar"`, `"mpi"`.
-        If *None* we try to auto-detect (`SLURM_JOB_ID`, `SGE_ROOT`, MPI env…).
-    gpu
-        Number of GPUs per **worker**.  For SLURM we emit
-        ``#SBATCH --gpus={gpu}``; for SGE we stick it in ``resource_spec``;
-        for local CUDA we select that many devices automatically.
-    cluster_kw
-        Any keyword accepted by the selected Cluster class, e.g.
-        ``queue="gpu"`` (SLURM/SGE), ``walltime="04:00:00"``,
-        ``memory="24GB"`` …  These override the defaults below.
+    Key behavior change vs. earlier versions:
+    -----------------------------------------
+    * We no longer force a specific network interface (ib0/eth0/etc.).
+      Each worker binds to whatever local address it naturally uses
+      when connecting to the scheduler's published IP. This tolerates
+      heterogeneous NIC naming across nodes.
+    * Scheduler is pinned to a stable, routable IP:PORT (default 8786).
     """
-    try:                         # already inside a running client?
+
+    # 0. Are we already inside a client?
+    try:
         return get_client()
     except ValueError:
-        pass                     # => need to create one
-
-    # ------------------------------------------------------------------ #
-    # 1. pick a backend (explicit > env-var > quick auto-detect > local)
-    # ------------------------------------------------------------------ #
+        pass
+    if worker_dashboard is None:
+         worker_dashboard = dashboard
     backend = (
-        backend
-        or os.getenv("DASK_BACKEND")     # user can export DASK_BACKEND=sge …
-        or _auto_detect_backend()
-        or "local"
+        backend or os.getenv("DASK_BACKEND") or _auto_backend() or "local"
     ).lower()
 
-    # ------------------------------------------------------------------ #
-    # 2. create the appropriate Cluster object
-    # ------------------------------------------------------------------ #
+    # ────────── single-node back-ends ──────────
     if backend == "local":
-        cluster = LocalCluster(
-            n_workers=max_workers,
-            threads_per_worker=threads_per_worker,
-            processes=processes,
-            dashboard_address=":8787" if dashboard else None,
-            **cluster_kw,
+        return Client(
+            LocalCluster(
+                n_workers=max_workers,
+                threads_per_worker=threads_per_worker,
+                processes=processes,
+                dashboard_address=":8787" if dashboard else None,
+                worker_dashboard=worker_dashboard,
+                **cluster_kw,
+            )
         )
 
-    elif backend == "cuda-local":
-        from dask_cuda import LocalCUDACluster  # pip/conda install dask-cuda
-        cluster = LocalCUDACluster(
-            n_workers=max_workers,
-            threads_per_worker=threads_per_worker,
-            dashboard_address=":8787" if dashboard else None,
-            CUDA_VISIBLE_DEVICES=os.getenv("CUDA_VISIBLE_DEVICES"),
-            **cluster_kw,
+    if backend == "cuda-local":
+        from dask_cuda import LocalCUDACluster
+        return Client(
+            LocalCUDACluster(
+                n_workers=max_workers,
+                threads_per_worker=threads_per_worker,
+                dashboard_address=":8787" if dashboard else None,
+                worker_dashboard=worker_dashboard,
+                CUDA_VISIBLE_DEVICES=os.getenv("CUDA_VISIBLE_DEVICES"),
+                **cluster_kw,
+            )
         )
 
-    elif backend in {"sge", "slurm", "pbs", "lsf", "oar"}:
+    # ────────── job-queue family (SGE / SLURM / PBS / LSF / OAR) ──────────
+    if backend in {"sge", "slurm", "pbs", "lsf", "oar"}:
         from dask_jobqueue import (
             SGECluster, SLURMCluster, PBSCluster, LSFCluster, OARCluster
         )
-        _JOBQUEUE_MAP = {
-            "sge":   SGECluster,
+        _MAP: Dict[str, Any] = {
+            "sge": SGECluster,
             "slurm": SLURMCluster,
-            "pbs":   PBSCluster,
-            "lsf":   LSFCluster,
-            "oar":   OARCluster,
+            "pbs": PBSCluster,
+            "lsf": LSFCluster,
+            "oar": OARCluster,
         }
-        C = _JOBQUEUE_MAP[backend]
+        Cluster = _MAP[backend]
 
-        # sensible fall-backs that you can always override via **cluster_kw
-        defaults = dict(
-            processes=1,                       # 1 worker process per *job*
+        defaults: Dict[str, Any] = dict(
+            processes=1,
             cores=threads_per_worker,
-            memory="4GB",
+            memory="0",
             walltime="02:00:00",
-            interface="ib0"                    # <-- customise per site
+            local_directory=os.getenv("TMPDIR", "/tmp"),
         )
-        if gpu:                               # add GPU directives
+
+        # GPU tweaks — NO "--resources" flag any more
+        if gpu:
             if backend == "slurm":
-                defaults["job_extra_directives"] = [f"--gpus={gpu}"]
-            elif backend == "sge":
-                defaults["resource_spec"] = f"gpu={gpu}"
-            # PBS/LSF/OAR have their own syntax – pass via **cluster_kw
+                _append(defaults, "job_extra_directives", f"--gpus={gpu}")
+            elif backend == "sge" and use_sge_gpu_complex:
+                _append(defaults, "job_extra_directives", f"-l gpu={gpu}")
+            defaults["python"] = "dask-cuda-worker"
 
-            # make every worker a CUDAWorker so CuPy / RAPIDS works out-of-box
-            defaults["worker_extra_args"] = ["--worker-class", "dask_cuda.CUDAWorker"]
+        # -------------------------------------------------- #
+        # Fixed scheduler endpoint (IP:8786) + dashboard     #
+        # -------------------------------------------------- #
+        sched_ip = _choose_scheduler_ip(backend)
+        sched_opts = defaults.setdefault("scheduler_options", {})
+        # DON'T stomp user overrides already in cluster_kw
+        sched_opts.setdefault("host", f"{sched_ip}:8786")
+        sched_opts.setdefault("port", 8786)
+        if dashboard:
+            sched_opts.setdefault("dashboard_address", ":8787")
 
-        # user-supplied kwargs win over our defaults
-        defaults.update(cluster_kw)
+        # Merge user overrides *after* our defaults so user wins
+        merged = {**defaults, **cluster_kw}
+        merged.pop("resources", None)  # hard-remove if user passed it
 
-        cluster = C(**defaults)
+        cluster = Cluster(**merged)
         cluster.scale(jobs=max_workers)
+        return Client(cluster)
 
-    elif backend == "mpi":
-        # Must run *inside* an mpirun/mpiexec allocation
-        from dask_mpi import initialize          # pip/conda install dask-mpi
+    # ────────── dask-mpi ──────────
+    if backend == "mpi":
+        from dask_mpi import initialize
         initialize(
             nthreads=threads_per_worker,
-            memory_limit="0",                    # disable nanny memory checks
+            memory_limit="0",
+            worker_dashboard=worker_dashboard,
             local_directory=os.getenv("TMPDIR", "/tmp"),
-            worker_class="dask_cuda.CUDAWorker" if gpu else None,
+            python="dask-cuda-worker" if gpu else None,
         )
-        # at this point Scheduler, workers, and *this* rank are all up
-        return Client()                         # nothing else to do
+        return Client()
 
-    else:
-        raise ValueError(f"Unknown backend '{backend}'")
-
-    return Client(cluster)
+    raise ValueError(f"Unknown backend '{backend}'")
 
 
 # ---------------------------------------------------------------------- #
-#                   helpers (internal use only)                          #
+# helpers                                                                #
 # ---------------------------------------------------------------------- #
-def _auto_detect_backend() -> Optional[str]:
-    """Infer a sensible default backend from environment variables."""
+def _auto_backend() -> Optional[str]:
     env = os.environ
-    if "SLURM_JOB_ID" in env:
-        return "slurm"
-    if "SGE_ROOT" in env or env.get("JOB_ID"):
-        return "sge"
-    if "PBS_JOBID" in env:
-        return "pbs"
-    if "LSB_JOBID" in env:
-        return "lsf"
+    if "SLURM_JOB_ID" in env:                 return "slurm"
+    if "SGE_ROOT" in env or env.get("JOB_ID"):return "sge"
+    if "PBS_JOBID" in env:                    return "pbs"
+    if "LSB_JOBID" in env:                    return "lsf"
     if "OMPI_COMM_WORLD_RANK" in env or "PMI_RANK" in env:
         return "mpi"
     return None
 
-def shutdown_dask():
+
+def _choose_scheduler_ip(backend: str) -> str:
     """
-    Close the current Dask Client (and its underlying cluster) **if** one
-    exists.  Safe to call multiple times – it becomes a no-op when no client
-    is active.
+    Pick an IP address reachable from all compute nodes.
+
+    Priority:
+      1. $DASK_SCHEDULER_IP (user override)
+      2. $SGE_O_HOST   (when backend == 'sge')
+      3. First non-loopback IPv4 attached to the current host
     """
+    env = os.environ
+    user = env.get("DASK_SCHEDULER_IP")
+    if user:
+        return _resolve(user)
+
+    if backend == "sge":
+        sge_host = env.get("SGE_O_HOST")
+        if sge_host:
+            try:
+                return _resolve(sge_host)
+            except OSError:
+                pass
+
+    # fallback: first non-loopback IPv4
     try:
-        client = get_client()      # raises ValueError when there is no client
-        # First close the client (disconnects workers & scheduler) …
-        client.close()             # <- frees sockets, tasks, futures
-        # … then the cluster itself (optional, but frees ports & temp dirs)
-        if hasattr(client, "cluster"):
-            client.cluster.close()
-        print("✅ Dask client closed.")
+        # getaddrinfo returns (family, socktype, proto, canonname, sockaddr)
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+        for *_, sockaddr in infos:
+            ip = sockaddr[0]
+            if not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    # absolute worst case: loopback
+    return "127.0.0.1"
+
+
+def _resolve(host: str) -> str:
+    return socket.gethostbyname(host)
+
+
+def _append(d: Dict[str, Any], key: str, *items: str) -> None:
+    lst: List[str] = list(d.get(key, []))
+    lst += [it for it in items if it not in lst]
+    d[key] = lst
+
+
+# ---------------------------------------------------------------------- #
+def shutdown_dask() -> None:
+    try:
+        client = get_client()
+        client.close()
+        getattr(client, "cluster", None) and client.cluster.close()
+        print("✅  Dask client closed.")
     except ValueError:
-        # Nothing to do – no client was running
         print("ℹ️  No active Dask client.")
