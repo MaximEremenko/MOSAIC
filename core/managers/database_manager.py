@@ -34,14 +34,20 @@ class DatabaseManager:
         self.db_path = db_path
         self.dimension = dimension
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.connection = sqlite3.connect(self.db_path)
+        #self.connection = sqlite3.connect(self.db_path)
+        self.connection = sqlite3.connect(
+        self.db_path,
+        timeout=60,            # wait longer instead of ‘database is locked’
+        check_same_thread=False,
+        )
         self.cursor = self.connection.cursor()
 
         self.cursor.executescript(
             """
             PRAGMA foreign_keys = ON;
-            PRAGMA journal_mode = WAL;
+            PRAGMA journal_mode = DELETE;
             PRAGMA synchronous  = NORMAL;
+            PRAGMA busy_timeout = 60000;
             """
         )
 

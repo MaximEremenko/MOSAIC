@@ -36,7 +36,40 @@ from multiprocessing import freeze_support
     
 def main():   
     #shutdown_dask()
-    client = ensure_dask_client(2)              # <-- ONLY HERE
+    # client = ensure_dask_client(
+    # max_workers=int(os.getenv("DASK_MAX_WORKERS", 4)),
+    # backend=os.getenv("DASK_BACKEND"),   # "sge", "cuda-local", …
+    # gpu=int(os.getenv("GPUS_PER_JOB", 1)),
+    # python="/data/mve/venvs/mosaic/bin/python",
+    # scheduler_options={"host": "0.0.0.0"}, 
+    # job_extra_directives=[
+    #     "-l h=host1,h=host3",   # <-- the magic line
+    # ],
+    # queue=os.getenv("SGE_QUEUE", "all.q"),   # transparently forwarded
+    # )             # <-- ONLY HERE
+    # "-l gpu=1 -pe smp 4 -l h=host1|host3"  →  ["-l","gpu=1","-pe","smp","4",...]
+    LOG_DIR = "/data/mve/MOSAIC_wsl/tests/config_3D"
+    job_extra = [
+    "-cwd",
+    "-V",
+    os.environ["DASK_GPU"],
+    os.environ["DASK_PE"],
+    os.environ["DASK_HOST"],
+    f"-o {LOG_DIR}/worker.o.$JOB_ID.$TASK_ID",
+    f"-e {LOG_DIR}/worker.e.$JOB_ID.$TASK_ID",
+    ]
+    
+    client = ensure_dask_client(
+    backend=os.getenv("DASK_BACKEND", "sge"),
+    max_workers=int(os.getenv("DASK_MAX_WORKERS", 4)),
+    threads_per_worker=int(os.getenv("DASK_THREADS_PER_WORKER", 4)),
+    gpu=int(os.getenv("GPUS_PER_JOB", 1)),
+    worker_dashboard=False,
+    job_extra_directives=job_extra,
+    python="/data/mve/venvs/mosaic/bin/python",
+    scheduler_options={"host": "0.0.0.0"},
+    )
+
     #shutdown_dask()
     setup_logging()
     log = logging.getLogger("app")    
@@ -206,7 +239,7 @@ def main():
         params["coeff"] = coeff.to_numpy()
     
     
-    client = ensure_dask_client(max_workers=1, backend="cuda-local")
+    #client = ensure_dask_client(max_workers=3, backend="cuda-local")
     if unsaved:
         mask_strategy = build_mask_strategy(dim, parameters["peakInfo"])
         ff_calc = FormFactorFactoryProducer.get_factory("neutron").create_calculator("default")
@@ -219,7 +252,7 @@ def main():
     # %%
     post = PointDataPostprocessingProcessor(db, pdp, params)
 
-    client = ensure_dask_client(max_workers=2, processes=True)
+    #client = ensure_dask_client(max_workers=2, processes=True)
    
     for c in range(parameters["rspace_info"]["num_chunks"]):
         post.process_chunk(c, saver, client, output_dir=out_dir)
