@@ -26,7 +26,7 @@ from managers.database_manager import DatabaseManager
 from processors.point_data_postprocessing_processor import PointDataPostprocessingProcessor
 from processors.amplitude_delta_calculator import compute_amplitudes_delta
 # shape / mask per dimension
-from strategies.shape_strategies import IntervalShapeStrategy, CircleShapeStrategy
+from strategies.shape_strategies import IntervalShapeStrategy, CircleShapeStrategy, SphereShapeStrategy
 from strategies.mask_strategies import EqBasedStrategy
 from form_factors.form_factor_factory_producer import FormFactorFactoryProducer
 # ─── logging -----------------------------------------------------------------
@@ -58,7 +58,7 @@ def main():
     # scheduler_options={"host": "0.0.0.0"},
     # )
     client = get_client()
-
+    client.wait_for_workers(int(os.getenv("DASK_MAX_WORKERS", 4)), timeout="120s")
     setup_logging()
     log = logging.getLogger("app")    
     # ─── helpers -----------------------------------------------------------------
@@ -68,11 +68,11 @@ def main():
         if dim == 2:
             return CircleShapeStrategy(peak_info)
         else: dim == 3
-        condition = (
-            "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
-            "cos(pi*h)+cos(pi*k)+cos(pi*l) < 0.5025)"
-        )
-        return EqBasedStrategy(condition)
+        #condition = (
+        #    "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
+        #    "cos(pi*h)+cos(pi*k)+cos(pi*l) < 0.5025)"
+        #)
+        return SphereShapeStrategy(peak_info) #EqBasedStrategy(condition)
     
     def pad_interval(d, dim):
         """Return dict with BOTH styles of keys for any dimension."""
