@@ -748,8 +748,8 @@ def process_chunks_with_intervals(
             db_manager.db_path,
             pure=False                     # every call is unique
         )
-        for cid in chunk_ids
         for p   in interval_files
+        for cid in chunk_ids
         if (int(p.stem.split("_")[1]), cid) in unsaved 
     ]
 

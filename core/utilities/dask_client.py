@@ -59,14 +59,18 @@ def get_client() -> Client:
     log_dir = Path(os.getenv("MOSAIC_LOG_DIR", "dask_logs")).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    extra = {}
+    if os.getenv("DASK_BACKEND", "local") in {"sge", "slurm", "pbs", "lsf", "oar"}:
+        extra["job_extra_directives"] = _build_job_extra(log_dir)
+
     _CLIENT = ensure_dask_client(
         backend=os.getenv("DASK_BACKEND", "local"),
         max_workers=int(os.getenv("DASK_MAX_WORKERS", "4")),
         threads_per_worker=int(os.getenv("DASK_THREADS_PER_WORKER", "4")),
         gpu=int(os.getenv("GPUS_PER_JOB", "0")),
         worker_dashboard=bool(int(os.getenv("DASK_WORKER_DASHBOARD", "0"))),
-        job_extra_directives=_build_job_extra(log_dir),
         python=os.getenv("DASK_PYTHON", sys.executable),
         scheduler_options={"host": os.getenv("DASK_SCHEDULER_HOST", "0.0.0.0")},
+        **extra,                         # ← only present for job‑queue back‑ends
     )
     return _CLIENT

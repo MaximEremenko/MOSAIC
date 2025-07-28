@@ -174,6 +174,9 @@ def ensure_dask_client(
     # ────────── single‑node back‑ends ──────────
     if backend == "local":
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
+        cluster_kw.pop("job_extra_directives", None)
+        cluster_kw.pop("python", None)
+        cluster_kw.pop("scheduler_options", None)
         return Client(
             LocalCluster(
                 n_workers=max_workers,
@@ -188,14 +191,17 @@ def ensure_dask_client(
 
     if backend == "cuda-local":
         from dask_cuda import LocalCUDACluster
-
+        cluster_kw.pop("job_extra_directives", None)
+        cluster_kw.pop("python", None)
+        cluster_kw.pop("scheduler_options", None)
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
         return Client(
             LocalCUDACluster(
                 n_workers=max_workers,
+                protocol=os.getenv("DASK_COMM_PROTOCOL", "tcp"),
                 threads_per_worker=threads_per_worker,
                 dashboard_address=":8787" if dashboard else None,
-                worker_dashboard=worker_dashboard,
+#worker_dashboard=worker_dashboard,
                 local_directory=local_directory,
                 CUDA_VISIBLE_DEVICES=os.getenv("CUDA_VISIBLE_DEVICES"),
                 **cluster_kw,
