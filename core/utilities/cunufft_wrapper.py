@@ -8,11 +8,11 @@ Key features
 * **GPU-friendly chunking** – whichever coordinate set (sources or
   targets) is larger is streamed in pieces sized to fit the *current*
   free VRAM.
-* **Configurable max chunk** – pass `max_chunk` (points) to impose a
+* **Configurable max chunk** – pass max_chunk (points) to impose a
   hard upper-bound on each batch so you can rein-in memory usage on
   small GPUs or avoid long kernel launch times.
-* **Kernel auto-back-off** – cycles through several `(gpu_method,
-  gpu_kerevalmeth, gpu_maxsubprobsize)` combinations to find one that
+* **Kernel auto-back-off** – cycles through several (gpu_method,
+  gpu_kerevalmeth, gpu_maxsubprobsize) combinations to find one that
   fits the card’s shared-memory limits before giving up.
 * **Graceful CPU fallback** – when the GPU cannot handle the job, the
   code transparently switches to FINUFFT on the host, still in streaming
@@ -70,6 +70,16 @@ def _as_device(arr: np.ndarray, allow_fail: bool = False):
 
 def _contig(x):  # ensure C-contiguous cupy array
     return x if x.flags.c_contiguous else cp.ascontiguousarray(x)
+    
+def _estimate_grid_bytes(real: np.ndarray, recip: np.ndarray) -> int:
+    """
+    Upper‑bound on the fine‑grid buffer cuFINUFFT will cudaMalloc.
+    FINUFFT rounds each nf up to a multiple of 16; the grid is complex128.
+    """
+    xyz = np.abs(np.vstack((real, recip))).max(axis=0)
+    nf  = ((2 * np.ceil(xyz) + 2 + 15) // 16) * 16     # round like FINUFFT
+    return int(nf.prod()) * 16                         # 16 B per value
+
 
 ###########################################################################
 #  Public API                                                             #
@@ -105,9 +115,9 @@ def execute_cunufft(
     # legacy alias
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
-    mem_frac: float = 0.8,
-    min_chunk: int = 64_000,
-    max_chunk: Optional[int] = 256_000,
+    mem_frac: float = 0.9,
+    min_chunk: int = 32_000,
+    max_chunk: Optional[int] = 128_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
@@ -144,9 +154,9 @@ def execute_inverse_cunufft(
     # legacy alias
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
-    mem_frac: float = 0.8,
-    min_chunk: int = 64_000,
-    max_chunk: Optional[int] = 256_000,
+    mem_frac: float = 0.9,
+    min_chunk: int = 32_000,
+    max_chunk: Optional[int] = 128_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
@@ -239,6 +249,15 @@ def _batched_type3(
 
 
 def _adaptive_gpu_launch(dim, cols, d_w, q_cols, eps, inverse):
+    # ---------- plan‑grid sanity check ---------------------------------
+    need = _estimate_grid_bytes(
+        np.column_stack([c.get() for c in cols]),
+        np.column_stack([c.get() for c in q_cols]),
+    )
+    if need > _free_mem_bytes() * 0.90:        # keep 20 % head room
+        raise RuntimeError("fine grid exceeds available GPU memory")
+    # -------------------------------------------------------------------
+
     isign = -1 if inverse else 1
 
     # lightest → heaviest (we will exit on the *first* one that works)
