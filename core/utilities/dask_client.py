@@ -71,6 +71,7 @@ def get_client() -> Client:
         worker_dashboard=bool(int(os.getenv("DASK_WORKER_DASHBOARD", "0"))),
         python=os.getenv("DASK_PYTHON", sys.executable),
         scheduler_options={"host": os.getenv("DASK_SCHEDULER_HOST", "0.0.0.0")},
+        resources={"nufft": 1},
         **extra,                         # ← only present for job‑queue back‑ends
     )
     return _CLIENT
