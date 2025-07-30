@@ -14,18 +14,149 @@ import inspect
 import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, NamedTuple, Tuple
+import time
+import tempfile
+import gc
+from contextlib import contextmanager
+import atexit 
+import numpy as np
+import cupy as cp
+from dask.distributed import (
+    Client,
+    Lock,
+    WorkerPlugin,
+    as_completed,
+    wait,
+    get_client,
+    progress,
+)
+
+from utilities.cunufft_wrapper import execute_cunufft, execute_inverse_cunufft
+from managers.database_manager import DatabaseManager
+from processors.point_data_processor import PointDataProcessor
+#from utilities.dask_helpers import ensure_dask_client  # ← fixed typo
+from utilities.dask_helpres import ensure_dask_client
+
+
+import inspect
+import logging
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, NamedTuple, Tuple
 import numpy as np
 from utilities.cunufft_wrapper import execute_cunufft, execute_inverse_cunufft
 from managers.database_manager import DatabaseManager
 from processors.point_data_processor import PointDataProcessor
-from dask.distributed import Client, LocalCluster, Lock, get_client
+from dask.distributed import Client, LocalCluster, Lock, get_client, progress, as_completed
 from dask import delayed
 import time
-
+import cupy as cp
+import atexit 
 from time import perf_counter
 from contextlib import contextmanager
 from utilities.dask_helpres import ensure_dask_client
+import warnings, multiprocessing.resource_tracker
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Globals & helpers
+# ──────────────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+TIMER = time.perf_counter  # monotonic clock alias
+
+
+@contextmanager
+def _timed(label: str):
+    t0 = TIMER()
+    try:
+        yield
+    finally:
+        logger.info("%s took %.3f s", label, TIMER() - t0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Worker‑side clean‑up (silences leaked‑shared_memory warnings)  ##############
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _final_cleanup():
+    """Free CuPy pools *and* unlink any remaining shared‑memory blocks."""
+    try:
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass  # CPU‑only worker or CuPy not imported
+
+    try:
+        from multiprocessing import resource_tracker, shared_memory
+
+        for shm_name in list(shared_memory._SHARED_MEMORY_BLOCKS):
+            try:
+                shared_memory.SharedMemory(name=shm_name).unlink()
+            except FileNotFoundError:
+                pass
+            resource_tracker.unregister(shm_name, "shared_memory")
+    except Exception:
+        pass
+
+
+class CuPyCleanup(WorkerPlugin):
+    """Run `_final_cleanup` when a worker process shuts down."""
+
+    name = "cupy-cleanup"
+
+    def teardown(self, worker):  # noqa: D401  (imperative mood required)
+        _final_cleanup()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Small helper structures & utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class IntervalTask(NamedTuple):
+    """Cached data for a reciprocal‑space interval after the heavy NUFFT pass."""
+
+    irecip_id: int
+    element: str
+    q_grid: np.ndarray
+    q_amp: np.ndarray
+    q_amp_av: np.ndarray
+
+
+# ————————————————————————————————————————————————————————————————
+# Misc. utility functions (unchanged logic – only formatting edits)
+# ————————————————————————————————————————————————————————————————
+
+def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:
+    """Translate flexible JSON/HDF5 interval to flat {h_start, h_end, …}."""
+
+    out: Dict[str, float] = {}
+    for ax in ("h", "k", "l"):
+        rng = iv.get(f"{ax}_range")
+        if rng is not None:
+            out[f"{ax}_start"], out[f"{ax}_end"] = rng
+    return out
+
+
+def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.ndarray) -> int:
+    """How many integer HKL points are inside *interval* for *supercell*."""
+
+    supercell = np.asarray(supercell, dtype=float)
+    step = 1.0 / supercell
+    dim = len(supercell)
+
+    def npts(start: float, end: float, st: float) -> int:
+        return int(np.floor((end - start) / st + 0.5)) + 1
+
+    h_n = npts(interval["h_start"], interval["h_end"], step[0])
+    k_n = npts(interval.get("k_start", 0.0), interval.get("k_end", 0.0), step[1]) if dim > 1 else 1
+    l_n = npts(interval.get("l_start", 0.0), interval.get("l_end", 0.0), step[2]) if dim > 2 else 1
+
+    tot = h_n * k_n * l_n
+    if dim > 2 and not (interval["l_start"] == 0 and interval["l_end"] == 0):
+        tot *= 2  # original mirror rule
+    return tot
+
+
+atexit.register(_final_cleanup)
 
 # --------------------------------------------------------------------------- #
 logger = logging.getLogger(__name__)
@@ -123,34 +254,6 @@ def chunk_mutex(chunk_id: int) -> Lock:
     Call ensure_dask_client() once before tasks are built.
     """
     return Lock(f"chunk-{chunk_id}")
-
-# ════════════════════════════════════════════════════════════════════════════
-#  Small helper structures & utilities
-# ════════════════════════════════════════════════════════════════════════════
-class IntervalTask(NamedTuple):
-    """
-    What we cache per reciprocal-space interval after the heavy NUFFT pass.
-    """
-
-    irecip_id: int
-    element: str
-    q_grid: np.ndarray
-    q_amp: np.ndarray
-    q_amp_av: np.ndarray
-
-
-# ------------------------------------------------------------------------- #
-def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Translate flexible JSON/HDF5 description into flat {h_start, h_end, …}.
-    """
-
-    res: Dict[str, float] = {}
-    for axis in ("h", "k", "l"):
-        rng = iv.get(f"{axis}_range")
-        if rng is not None:
-            res[f"{axis}_start"], res[f"{axis}_end"] = rng
-    return res
 
 
 # ------------------------------------------------------------------------- #
@@ -367,6 +470,71 @@ def _process_interval_element(
     q_av_final = ff * q_av * q_del / orig_coords.shape[0]
     return (iv["id"], el, q_grid, q_amp, q_av_final)
 
+def _process_chunk_id(
+    chunk_id: int,
+    iv_path: Path,
+    atoms: np.recarray,
+    total_reciprocal_points: int,
+    point_data_processor: PointDataProcessor,
+    db_path: str,
+) -> None:
+    """Compute Δ‑amplitudes for one (interval, chunk) pair – executes on worker."""
+    t_total = TIMER()
+    recip_id = None
+    try:
+        with np.load(iv_path, mmap_mode="r") as dat:
+            task = IntervalTask(
+                int(dat["irecip_id"]),
+                str(dat["element"]),
+                dat["q_grid"],
+                dat["q_amp"],
+                dat["q_amp_av"],
+            )
+        recip_id = task.irecip_id
+
+        # Build RIFFT grid
+        chunk_data = [
+            {
+                "coordinates": atoms["coordinates"][i],
+                "dist_from_atom_center": atoms["dist_from_atom_center"][i],
+                "step_in_frac": atoms["step_in_frac"][i],
+            }
+            for i in range(atoms.shape[0])
+        ]
+        rifft_grid, grid_shape = _process_chunk(chunk_data)
+
+        # inverse NUFFT for ΔF
+        amplitudes_delta = execute_inverse_cunufft(
+            q_coords=task.q_grid,
+            c=task.q_amp - task.q_amp_av,
+            real_coords=rifft_grid,
+            eps=1e-12,
+        )
+
+        _save_amplitudes_and_meta(
+            chunk_id=chunk_id,
+            task=task,
+            grid_shape_nd=grid_shape,
+            total_reciprocal_points=total_reciprocal_points,
+            amplitudes_delta=amplitudes_delta,
+            point_data_processor=point_data_processor,
+            db_path=db_path,
+        )
+
+    finally:
+        try:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+        except ImportError:
+            pass
+        gc.collect()
+        logger.info(
+            "TOTAL task | chunk %d | iv %s took %.3f s",
+            chunk_id,
+            recip_id if recip_id is not None else "n/a",
+            TIMER() - t_total,
+        )
+
 
 def _process_interval_coeff(
     iv: dict,
@@ -468,12 +636,13 @@ def precompute_intervals(
              out_dir=str(out_dir),
              db_path=db.db_path,
              pure=False,
+             resources={"nufft": 1},
          )
          for iv in todo
      ]
     # gather results back to driver
     written_files = [Path(p) for p in client.gather(futures) if p]
-
+    progress(futures)
     logger.info(
         "Stage-1 complete: %d written, %d cached, %d skipped",
         len(written_files), len(cached), len(todo) - len(written_files),
@@ -587,179 +756,132 @@ def _save_amplitudes_and_meta(
 #     return out.view(np.recarray)   # convenient attribute-style access
 # --------------------------------------------------------------------------- #
 def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
-    """
-    Convert Python ``list[dict]`` coming from the database into one
-    *contiguous* NumPy structured array that Dask can scatter quickly.
+    """Compact list[dict] → contiguous NumPy recarray (runtime‑dimension)."""
 
-    The vector fields (coordinates etc.) are now sized **at runtime**
-    according to the dimensionality of the first entry, so the function
-    works for 1-, 2- and 3-D data.
-    """
     if not point_data_list:
         raise ValueError("point_data_list is empty")
 
-    # ── infer dimensionality from the first element ───────────────────────
     dim = len(point_data_list[0]["coordinates"])
-    if dim not in (1, 2, 3):
-        raise ValueError(f"Unsupported dimensionality: {dim}")
-
-    # sanity-check everything has the same length
     for pd in point_data_list:
         if len(pd["coordinates"]) != dim:
             raise ValueError("Mixed dimensionalities in point_data_list")
 
-    vect_shape: tuple[int, ...] = (dim,)
-
+    vect = (dim,)
     dtype = np.dtype([
-        ("chunk_id",              "<i4"),            # int32
-        ("coordinates",           "<f8", vect_shape),
-        ("dist_from_atom_center", "<f8", vect_shape),
-        ("step_in_frac",          "<f8", vect_shape),
+        ("chunk_id", "<i4"),
+        ("coordinates", "<f8", vect),
+        ("dist_from_atom_center", "<f8", vect),
+        ("step_in_frac", "<f8", vect),
     ])
 
     out = np.empty(len(point_data_list), dtype=dtype)
-
-    # ── fill the array -----------------------------------------------------
     for i, pd in enumerate(point_data_list):
-        out["chunk_id"][i]              = pd["chunk_id"]
-        out["coordinates"][i]           = pd["coordinates"]
-        out["dist_from_atom_center"][i] = pd["dist_from_atom_center"]
-        out["step_in_frac"][i]          = pd["step_in_frac"]
-
-    # return as a recarray for attribute-style access
+        out[i] = (
+            pd["chunk_id"],
+            pd["coordinates"],
+            pd["dist_from_atom_center"],
+            pd["step_in_frac"],
+        )
     return out.view(np.recarray)
 
 
-def _process_chunk_id(
-    chunk_id: int,
-    iv_path: Path,
-    atoms: np.recarray,              # **slice already filtered by the caller**
-    total_reciprocal_points: int,
-    point_data_processor: PointDataProcessor,
-    db_path: str,
-) -> None:
+# ————————————————————————————————————————————————————————————————
+#  Core streaming submission function (FIXED)
+# ————————————————————————————————————————————————————————————————
 
-    t_total = TIMER()
-
-    # ---------- load interval (.npz – tiny) -------------------------------
-    dat  = np.load(iv_path, mmap_mode="r")
-    task = IntervalTask(int(dat["irecip_id"]), str(dat["element"]),
-                        dat["q_grid"], dat["q_amp"], dat["q_amp_av"])
-
-    # ---------- build RIFFT grid -----------------------------------------
-    t0 = TIMER()
-    chunk_data = [
-        dict(coordinates          = atoms["coordinates"][i],
-             dist_from_atom_center= atoms["dist_from_atom_center"][i],
-             step_in_frac         = atoms["step_in_frac"][i])
-        for i in range(atoms.shape[0])
-    ]
-    rifft_grid, grid_shape_nd = _process_chunk(chunk_data)
-    logger.info("RIFFT-grid   | chunk %d | iv %d took %.3f s",
-                chunk_id, task.irecip_id, TIMER() - t0)
-
-    # ---------- inverse NUFFT --------------------------------------------
-    t1 = TIMER()
-    amplitudes_delta = execute_inverse_cunufft(
-        q_coords = task.q_grid,
-        c        = task.q_amp - task.q_amp_av,
-        real_coords = rifft_grid,
-        eps = 1e-12,
-    )
-    logger.info("inv-NUFFT    | chunk %d | iv %d took %.3f s",
-                chunk_id, task.irecip_id, TIMER() - t1)
-
-    # ---------- save / update --------------------------------------------
-    _save_amplitudes_and_meta(
-        chunk_id               = chunk_id,
-        task                   = task,
-        grid_shape_nd          = grid_shape_nd,
-        total_reciprocal_points= total_reciprocal_points,
-        amplitudes_delta       = amplitudes_delta,
-        point_data_processor   = point_data_processor,
-        db_path                = db_path,
-    )
-
-    logger.debug("TOTAL task   | chunk %d | iv %d took %.3f s",
-                 chunk_id, task.irecip_id, TIMER() - t_total)
-
-
-# ---------------------------------------------------------------------------
-# Build & launch stage-2 graph  –  uses the recarray helper above
-# ---------------------------------------------------------------------------
 def process_chunks_with_intervals(
-    interval_files          : Iterable[Path],
-    *,                                    # keyword-only
-    chunk_ids               : Iterable[int],
-    total_reciprocal_points : int,
-    point_data_list         : list[dict],
-    point_data_processor    : PointDataProcessor,
-    db_manager              : DatabaseManager,
-    client
+    interval_files: Iterable[Path],
+    *,
+    chunk_ids: Iterable[int],
+    total_reciprocal_points: int,
+    point_data_list: list[dict],
+    point_data_processor: PointDataProcessor,
+    db_manager: DatabaseManager,
+    client: Client,
+    max_inflight: int = 5_000,
 ) -> None:
+    """Stage‑2: read cached intervals & accumulate ΔF chunk‑wise (streaming).
 
-    # 1️⃣  pack everything into *one* compact block
+    The streaming approach caps the number of *live* tasks, so the
+    scheduler’s RSS stays flat even for 10^5–10^6 total tasks.
+    """
+
+    # 1️⃣  Pack once, then slice per chunk
     rec = _point_list_to_recarray(point_data_list)
 
-    # 2️⃣  scatter only the slice that belongs to each chunk
     chunk_futs = {
         cid: client.scatter(rec[rec.chunk_id == cid], broadcast=False, hash=False)
         for cid in chunk_ids
     }
 
-    # 3️⃣  scatter paths (trivial) & create tasks
-    iv_futs = {p: client.scatter(p, broadcast=False) for p in interval_files}
+    # Broadcast heavy immutable objects (replaced by a 64‑bit key in each task)
+    pd_future = client.scatter(point_data_processor, broadcast=True)
+    db_path = db_manager.db_path  # plain string is tiny
+
     unsaved = set(db_manager.get_unsaved_interval_chunks())
-    # debug = True
-    # debug_n =None
-    # if debug:
-    #     logger.warning("DEBUG mode: running tasks synchronously")
-    #     done = 0
-    #     for cid in chunk_ids:
-    #         atoms_slice = rec[rec.chunk_id == cid]
-    #         for p in interval_files:
-    #             key = (int(p.stem.split("_")[1]), cid)
-    #             if key not in db_manager.get_unsaved_interval_chunks():
-    #                 continue
-    #             _process_chunk_id(  # <-- direct call, not via Dask
-    #                 cid,
-    #                 p,
-    #                 atoms_slice,
-    #                 total_reciprocal_points,
-    #                 point_data_processor,
-    #                 db_manager.db_path,
-    #             )
-    #             done += 1
-    #             if debug_n is not None and done >= debug_n:
-    #                 logger.info("DEBUG mode: processed %d tasks, quitting", done)
-    #                 return
-    #     logger.info("DEBUG mode finished (%d tasks)", done)
-    #     return
-    
-    
-    tasks = [
-        client.submit(
-            _process_chunk_id,
-            cid,
-            iv_futs[p],
-            chunk_futs[cid],               # ← tiny: just that chunk’s atoms
-            total_reciprocal_points,
-            point_data_processor,
-            db_manager.db_path,
-            pure=False                     # every call is unique
-        )
-        for p   in interval_files
-        for cid in chunk_ids
-        if (int(p.stem.split("_")[1]), cid) in unsaved 
-    ]
 
-    logger.info("Submitting %d interval×chunk tasks …", len(tasks))
-    client.gather(tasks)                   # block until everything finishes
-    logger.info("Stage-2 finished")
+    flying: set = set()
+    submitted = 0
 
-# ════════════════════════════════════════════════════════════════════════════
-#  PUBLIC ENTRY POINT
-# ════════════════════════════════════════════════════════════════════════════
+    for p in interval_files:
+        iv_id = int(p.stem.split("_")[1])
+        iv_path_future = client.scatter(p, broadcast=False)
+
+        for cid in chunk_ids:
+            if (iv_id, cid) not in unsaved:
+                continue
+
+            fut = client.submit(
+                _process_chunk_id,
+                cid,
+                iv_path_future,
+                chunk_futs[cid],
+                total_reciprocal_points,
+                pd_future,
+                db_path,
+                pure=False,
+                resources={"nufft": 1},
+            )
+            flying.add(fut)
+            submitted += 1
+
+            # throttle
+            if len(flying) >= max_inflight:
+                _drain_some(flying)
+
+    # drain remaining tasks
+    _drain_some(flying, drain_all=True)
+    logger.info("Stage‑2 finished – %d tasks submitted", submitted)
+
+
+from dask.distributed import as_completed
+
+def _drain_some(flying: set, *, drain_all: bool = False):
+    """
+    Remove completed futures from *flying*.
+
+    If *drain_all* is True, block until every future is done.
+    Otherwise, wait until at least one finishes.
+    """
+    if not flying:
+        return
+
+    if drain_all:
+        for _ in as_completed(flying):   # drains everything
+            pass
+        flying.clear()
+    else:
+        # wait until the first one completes, then pop all ready futures
+        for f in as_completed(flying, with_results=False):
+            flying.discard(f)
+            break
+
+
+
+# ###########################################################################
+#  Public entry point (adds plugin registration)                 #############
+# ###########################################################################
+
 def compute_amplitudes_delta(
     parameters: Dict[str, Any],
     FormFactorFactoryProducer,
@@ -768,13 +890,17 @@ def compute_amplitudes_delta(
     db_manager: DatabaseManager,
     output_dir: str,
     point_data_processor: PointDataProcessor,
-    client
+    client: Client,
 ):
-    """
-    Entry-point function with the same signature the rest of MOSAIC expects.
-    """
+    """API entry identical to legacy version; registers WorkerPlugin & runs."""
 
-    # ------------------------ unpack parameters ----------------------------- #
+    # Ensure the cleanup plugin is active (idempotent)
+    try:
+        client.register_worker_plugin(CuPyCleanup(), name="cupy-cleanup")
+    except ValueError:  # already registered in this session
+        pass
+
+    # ——— unpack parameters (verbatim) ————————————————————————
     reciprocal_space_intervals_all = parameters["reciprocal_space_intervals_all"]
     reciprocal_space_intervals = parameters["reciprocal_space_intervals"]
     point_data_list = parameters["point_data_list"]
@@ -788,17 +914,16 @@ def compute_amplitudes_delta(
     B_ = np.linalg.inv(vectors / supercell)
     unique_elements = np.unique(elements_arr)
 
-    # ------------------ Stage-0: total point count -------------------------- #
+    # ——— Stage‑0: total HKL count ——————————————————————————
     total_pts = sum(
         reciprocal_space_points_counter(_to_interval_dict(iv), supercell)
         for iv in reciprocal_space_intervals_all
     )
-    logger.info("Total reciprocal-space integer points: %s", total_pts)
+    logger.info("Total reciprocal‑space integer points: %s", total_pts)
 
-    # ------------------ Stage-1: precompute intervals ----------------------- #
+    # ——— Stage‑1: heavy NUFFT / interval caching ————————————————
     interval_dir = Path(output_dir) / "precomputed_intervals"
 
-    #with dask.config.set(scheduler="threads", num_workers=max_threads):
     interval_files = precompute_intervals(
         reciprocal_space_intervals,
         B_=B_,
@@ -814,10 +939,10 @@ def compute_amplitudes_delta(
         charge=charge,
         ff_factory=FormFactorFactoryProducer,
         db=db_manager,
-        client = client
+        client=client,
     )
 
-    # ------------------ Stage-2: per-chunk accumulation -------------------- #
+    # ——— Stage‑2: accumulate ΔF chunk‑wise (streaming) ———————————
     chunk_ids = db_manager.get_pending_chunk_ids()
     process_chunks_with_intervals(
         interval_files,
@@ -825,8 +950,8 @@ def compute_amplitudes_delta(
         total_reciprocal_points=total_pts,
         point_data_list=point_data_list,
         point_data_processor=point_data_processor,
-        db_manager=db_manager, 
-        client = client
+        db_manager=db_manager,
+        client=client,
     )
 
-    logger.info("Completed compute_amplitudes_delta (refactored)")
+    logger.info("Completed compute_amplitudes_delta (refactored + fixed)")
