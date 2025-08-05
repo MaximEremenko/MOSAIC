@@ -708,7 +708,7 @@ def _save_amplitudes_and_meta(
             nrec    = task.q_grid.shape[0]
         else:
             # 3-D symmetry: double count the non-zero-l plane
-            if task.q_grid.shape[1] > 2 and np.all(np.round(task.q_grid[:, 2], 8) != 0):
+            if task.q_grid.shape[1] > 2 and np.all(np.round(task.q_grid[:, 2], 6) != 0):
                 current[:, 1] += amplitudes_delta + np.conj(amplitudes_delta)
                 nrec += task.q_grid.shape[0] * 2
             else:
