@@ -8,11 +8,11 @@ Key features
 * **GPU-friendly chunking** – whichever coordinate set (sources or
   targets) is larger is streamed in pieces sized to fit the *current*
   free VRAM.
-* **Configurable max chunk** – pass `max_chunk` (points) to impose a
+* **Configurable max chunk** – pass max_chunk (points) to impose a
   hard upper-bound on each batch so you can rein-in memory usage on
   small GPUs or avoid long kernel launch times.
-* **Kernel auto-back-off** – cycles through several `(gpu_method,
-  gpu_kerevalmeth, gpu_maxsubprobsize)` combinations to find one that
+* **Kernel auto-back-off** – cycles through several (gpu_method,
+  gpu_kerevalmeth, gpu_maxsubprobsize) combinations to find one that
   fits the card’s shared-memory limits before giving up.
 * **Graceful CPU fallback** – when the GPU cannot handle the job, the
   code transparently switches to FINUFFT on the host, still in streaming
@@ -41,10 +41,10 @@ import numpy as np
 import cupy as cp
 import cufinufft                     # type: ignore
 
+#cp.memory.set_pinned_memory_allocator(None)
 ###########################################################################
 #  Helpers                                                                #
 ###########################################################################
-
 # Lazily imported CPU backend (avoids importing finufft on GPU-only nodes)
 _FINUFFT3: Callable | None = None  # finufft.nufft3d3
 
@@ -70,6 +70,16 @@ def _as_device(arr: np.ndarray, allow_fail: bool = False):
 
 def _contig(x):  # ensure C-contiguous cupy array
     return x if x.flags.c_contiguous else cp.ascontiguousarray(x)
+    
+def _estimate_grid_bytes(real: np.ndarray, recip: np.ndarray) -> int:
+    """
+    Upper‑bound on the fine‑grid buffer cuFINUFFT will cudaMalloc.
+    FINUFFT rounds each nf up to a multiple of 16; the grid is complex128.
+    """
+    xyz = np.abs(np.vstack((real, recip))).max(axis=0)
+    nf  = ((2 * np.ceil(xyz) + 2 + 15) // 16) * 16     # round like FINUFFT
+    return int(nf.prod()) * 16                         # 16 B per value
+
 
 ###########################################################################
 #  Public API                                                             #
@@ -105,9 +115,9 @@ def execute_cunufft(
     # legacy alias
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
-    mem_frac: float = 0.8,
-    min_chunk: int = 64_000,
-    max_chunk: Optional[int] = 256_000,
+    mem_frac: float = 0.5,
+    min_chunk: int = 32_000,
+    max_chunk: Optional[int] = 64_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
@@ -144,8 +154,8 @@ def execute_inverse_cunufft(
     # legacy alias
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
-    mem_frac: float = 0.8,
-    min_chunk: int = 64_000,
+    mem_frac: float = 0.25,
+    min_chunk: int = 128_000,
     max_chunk: Optional[int] = 256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
@@ -178,19 +188,31 @@ def _batched_type3(
     prefer_cpu: bool,
     gpu_only: bool,
 ) -> np.ndarray:
+    """
+    Stream-aware cuFINUFFT / FINUFFT Type-3 driver.
+
+    If the GPU plan fails (OOM, launch failure, watchdog reset, etc.)
+    the current chunk—and all subsequent ones—are computed on CPU
+    via streamed FINUFFT so the overall job keeps running.
+    """
+    # ------------------------------------------------------------------ #
+    #  Initial sanity checks / GPU pinning                               #
+    # ------------------------------------------------------------------ #
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):
         raise ValueError("Only 1-, 2- and 3-D inputs supported")
 
-    # Try to pin the (usually smaller) *source* set to the GPU -------------
+    # Try to keep the usually smaller *source* set resident on GPU
     d_real = _as_device(real_coords, allow_fail=True)
-    if d_real is None:
+    if d_real is None or prefer_cpu:
         return _cpu_fallback(real_coords, weights, q_coords, eps, inverse)
 
     cols = [_contig(d_real[:, i]) for i in range(dim)]
 
-    # Streaming strategy: always move the other set in chunks -------------
-    bytes_per_pt = dim * 8 + 16 + 32   # coord + weight + scratch margin
+    # ------------------------------------------------------------------ #
+    #  Streaming loop over the *other* (typically larger) point cloud    #
+    # ------------------------------------------------------------------ #
+    bytes_per_pt = dim * 8 + 16 + 32          # coord + weight + scratch
     out = np.zeros(
         len(real_coords) if inverse else len(q_coords),
         dtype=np.complex128,
@@ -198,40 +220,61 @@ def _batched_type3(
 
     start = 0
     while start < len(q_coords):
-        # Base chunk from available VRAM
+        # --- determine chunk size --------------------------------------
         chunk = max(_auto_chunk_size(mem_frac, bytes_per_pt), min_chunk)
-        # Respect hard ceiling
         if max_chunk is not None:
             chunk = min(chunk, max_chunk)
         end = min(start + chunk, len(q_coords))
 
+        # --- prepare reciprocal slice ----------------------------------
         q_slice = q_coords[start:end]
         if inverse:
             q_slice = -q_slice
 
+        # ------------------------------------------------------------------
+        #  GPU phase (allocation → kernel launch → gather → cleanup)         #
+        # ------------------------------------------------------------------
         try:
-            d_q = _as_device(q_slice)
+            d_q = _as_device(q_slice)                               # H2D
             d_w = _as_device(weights[start:end] if inverse else weights)
             q_cols = [_contig(d_q[:, i]) for i in range(dim)]
+
             d_res = _adaptive_gpu_launch(dim, cols, d_w, q_cols, eps, inverse)
-        except (cp.cuda.memory.OutOfMemoryError, RuntimeError) as err:
+
+            # gather results back to host
+            if inverse:
+                out += cp.asnumpy(d_res)
+            else:
+                out[start:end] = cp.asnumpy(d_res)
+
+        # --------- anything here triggers CPU fallback --------------------
+        except (cp.cuda.memory.OutOfMemoryError,        # alloc fail
+                cp.cuda.runtime.CUDARuntimeError,       # launch/watchdog
+                RuntimeError,                           # cuFINUFFT error
+                OSError) as err:                        # Windows C++ throw
             if gpu_only:
                 raise RuntimeError("GPU execution forced but failed") from err
             return _cpu_fallback(real_coords, weights, q_coords, eps, inverse)
 
-        # Scatter back -----------------------------------------------------
-        if inverse:
-            out += cp.asnumpy(d_res)
-        else:
-            out[start:end] = cp.asnumpy(d_res)
+        # --------- always run: free GPU resources, even after crash -------
+        finally:
+            # locals might not exist if allocation failed
+            for name in ("d_q", "q_cols", "d_res", "d_w"):
+                if name in locals():
+                    del locals()[name]
 
-        # Clean-up ---------------------------------------------------------
-        del d_q, q_cols, d_res, d_w
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.cuda.runtime.deviceSynchronize()
+            try:
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.cuda.runtime.deviceSynchronize()
+            except cp.cuda.runtime.CUDARuntimeError:
+                # device lost/reset – fine, we will fall back on next loop
+                pass
+
+        # next slice
         start = end
 
     return out
+
 
 ###########################################################################
 #  GPU kernel chooser                                                     #
@@ -239,6 +282,15 @@ def _batched_type3(
 
 
 def _adaptive_gpu_launch(dim, cols, d_w, q_cols, eps, inverse):
+    # ---------- plan‑grid sanity check ---------------------------------
+    need = _estimate_grid_bytes(
+        np.column_stack([c.get() for c in cols]),
+        np.column_stack([c.get() for c in q_cols]),
+    )
+    if need > _free_mem_bytes() * 0.50:        # keep 20 % head room
+        raise RuntimeError("fine grid exceeds available GPU memory")
+    # -------------------------------------------------------------------
+
     isign = -1 if inverse else 1
 
     # lightest → heaviest (we will exit on the *first* one that works)
@@ -253,7 +305,9 @@ def _adaptive_gpu_launch(dim, cols, d_w, q_cols, eps, inverse):
 
         try:
             return _launch_once(dim, cols, d_w, q_cols, eps, isign, kw, inverse)
-        except RuntimeError as e:
+        except (RuntimeError,
+                 OSError,
+                 cp.cuda.runtime.CUDARuntimeError) as e:
             # keep trying while we see memory / shared-mem complaints
             if "shared memory" in str(e).lower() or "allocate" in str(e).lower():
                 continue
@@ -280,7 +334,6 @@ def _launch_once(dim, cols, d_w, q_cols, eps, isign, kw, inverse):
 ###########################################################################
 #  CPU fallback                                                            #
 ###########################################################################
-
 def _cpu_fallback(
     real_coords: np.ndarray,
     weights:    np.ndarray,
@@ -291,67 +344,70 @@ def _cpu_fallback(
     batch: int = 5_000_000,
 ) -> np.ndarray:
     """
-    Streamed FINUFFT fallback that works for 1-, 2- **and** 3-D type-3
-    transforms.  Keeps memory use bounded by processing *q_coords* in
-    batches.
+    Streamed FINUFFT fallback (1-, 2-, or 3-D type-3).
+
+    • Keeps memory bounded by processing *q_coords* in chunks of size **batch**.
+    • Works for both forward (real → reciprocal) and inverse (reciprocal → real)
+      type-3 transforms.
     """
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):
         raise ValueError(f"Unsupported dimensionality: {dim}")
 
-    # ── import FINUFFT lazily and cache the per-dim functions ──────────────
-    global _FINUFFT3            # old cache name stays valid
-    if isinstance(_FINUFFT3, dict):
-        cache = _FINUFFT3
-    elif _FINUFFT3 is None:
-        cache = {}
-    else:                        # legacy value from earlier imports
-        cache = {3: _FINUFFT3}
-
-    if dim not in cache:
+    # ── lazily import & cache FINUFFT wrappers ────────────────────────────
+    global _FINUFFT3
+    if not isinstance(_FINUFFT3, dict):
+        _FINUFFT3 = {}
+    if dim not in _FINUFFT3:
         import finufft
-        fn = {1: finufft.nufft1d3,
-              2: finufft.nufft2d3,
-              3: finufft.nufft3d3}[dim]
-        cache[dim] = fn
-    _FINUFFT3 = cache            # store back
+        _FINUFFT3[dim] = {1: finufft.nufft1d3,
+                          2: finufft.nufft2d3,
+                          3: finufft.nufft3d3}[dim]
+    nufft = _FINUFFT3[dim]
 
-    nufft = cache[dim]
     isign = -1 if inverse else +1
 
-    # ── split coords per dimension ─────────────────────────────────────────
-    real_split = [real_coords[:, i].astype(np.float64) for i in range(dim)]
-    recip_split = [q_coords[:, i].astype(np.float64) for i in range(dim)]
+    # ── split coordinates per dimension (x, y, z) ────────────────────────
+    real_split  = [real_coords[:, i].astype(np.float64) for i in range(dim)]
+    recip_split = [q_coords[:,  i].astype(np.float64) for i in range(dim)]
 
-    # ── allocate output on host ────────────────────────────────────────────
+    # ── output buffer ─────────────────────────────────────────────────────
     out = np.zeros(
         len(real_coords) if inverse else len(q_coords),
         dtype=np.complex128,
     )
 
-    # ── streamed execution so RAM never explodes ───────────────────────────
+    # ── streamed execution: loop over reciprocal-space chunks ─────────────
     start = 0
     while start < len(q_coords):
         end = min(start + batch, len(q_coords))
+
         recip_chunk = [a[start:end] for a in recip_split]
-
         if inverse:
+            # FINUFFT uses opposite sign convention for inverse type-3
             recip_chunk = [-a for a in recip_chunk]
+            c_chunk     = weights[start:end]            # sources’ amplitudes
 
-        # assemble argument list:  [x, y, z,]  c   [s, t, u]
-        args = (*real_split,                       # real-space pts
-                weights if not inverse else weights[start:end],
-                *recip_chunk)                      # reciprocal pts
+            #   FINUFFT signature: (x, y, z, c,   s, t, u)
+            #   Here: sources = reciprocal chunk, targets = real grid
+            args = (*recip_chunk, c_chunk, *real_split)
+        else:
+            c_chunk = weights                           # sources’ amplitudes
+
+            #   Forward transform: sources = real grid, targets = reciprocal chunk
+            args = (*real_split, c_chunk, *recip_chunk)
 
         res = nufft(*args, eps=eps, isign=isign)
 
         if inverse:
-            out += res
+            out += res                    # accumulate over q-chunks
         else:
-            out[start:end] = res
+            out[start:end] = res          # scatter into matching slice
+
         start = end
 
     return out
+
 
 ###########################################################################
 #  Mute noisy destructor warnings (harmless but scary)                     #

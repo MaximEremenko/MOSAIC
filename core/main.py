@@ -13,6 +13,7 @@ import numpy as np
 # ─── common imports ----------------------------------------------------------
 from utilities.logger_config import setup_logging
 from utilities.dask_helpres import ensure_dask_client, shutdown_dask
+from utilities.dask_client import get_client
 from utilities.rmc_neutron_scl import rmc_neutron_scl_
 from utilities.utils import determine_configuration_file_type
 from factories.configuration_processor_factory import ConfigurationProcessorFactoryProvider
@@ -25,7 +26,7 @@ from managers.database_manager import DatabaseManager
 from processors.point_data_postprocessing_processor import PointDataPostprocessingProcessor
 from processors.amplitude_delta_calculator import compute_amplitudes_delta
 # shape / mask per dimension
-from strategies.shape_strategies import IntervalShapeStrategy, CircleShapeStrategy
+from strategies.shape_strategies import IntervalShapeStrategy, CircleShapeStrategy, SphereShapeStrategy
 from strategies.mask_strategies import EqBasedStrategy
 from form_factors.form_factor_factory_producer import FormFactorFactoryProducer
 # ─── logging -----------------------------------------------------------------
@@ -35,9 +36,29 @@ from multiprocessing import freeze_support
 #from dask.distributed import Client, LocalCluster, get_client
     
 def main():   
-    #shutdown_dask()
-    client = ensure_dask_client(2)              # <-- ONLY HERE
-    #shutdown_dask()
+    # LOG_DIR = "/data/mve/MOSAIC_wsl/tests/config_3D"
+    # job_extra = [
+    # "-cwd",
+    # "-V",
+    # os.environ["DASK_GPU"],
+    # os.environ["DASK_PE"],
+    # os.environ["DASK_HOST"],
+    # f"-o {LOG_DIR}/worker.o.$JOB_ID.$TASK_ID",
+    # f"-e {LOG_DIR}/worker.e.$JOB_ID.$TASK_ID",
+    # ]
+    
+    # client = ensure_dask_client(
+    # backend=os.getenv("DASK_BACKEND", "sge"),
+    # max_workers=int(os.getenv("DASK_MAX_WORKERS", 4)),
+    # threads_per_worker=int(os.getenv("DASK_THREADS_PER_WORKER", 4)),
+    # gpu=int(os.getenv("GPUS_PER_JOB", 1)),
+    # worker_dashboard=False,
+    # job_extra_directives=job_extra,
+    # python="/data/mve/venvs/mosaic/bin/python",
+    # scheduler_options={"host": "0.0.0.0"},
+    # )
+    client = get_client()
+    client.wait_for_workers(int(os.getenv("DASK_MAX_WORKERS", 4)), timeout="120s")
     setup_logging()
     log = logging.getLogger("app")    
     # ─── helpers -----------------------------------------------------------------
@@ -47,11 +68,11 @@ def main():
         if dim == 2:
             return CircleShapeStrategy(peak_info)
         else: dim == 3
-        condition = (
-            "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
-            "cos(pi*h)+cos(pi*k)+cos(pi*l) < 0.5025)"
-        )
-        return EqBasedStrategy(condition)
+        #condition = (
+        #    "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
+        #    "cos(pi*h)+cos(pi*k)+cos(pi*l) < 0.5025)"
+        #)
+        return SphereShapeStrategy(peak_info) #EqBasedStrategy(condition)
     
     def pad_interval(d, dim):
         """Return dict with BOTH styles of keys for any dimension."""
@@ -206,7 +227,7 @@ def main():
         params["coeff"] = coeff.to_numpy()
     
     
-    client = ensure_dask_client(max_workers=1, backend="cuda-local")
+    #client = ensure_dask_client(max_workers=3, backend="cuda-local")
     if unsaved:
         mask_strategy = build_mask_strategy(dim, parameters["peakInfo"])
         ff_calc = FormFactorFactoryProducer.get_factory("neutron").create_calculator("default")
@@ -219,7 +240,7 @@ def main():
     # %%
     post = PointDataPostprocessingProcessor(db, pdp, params)
 
-    client = ensure_dask_client(max_workers=2, processes=True)
+    #client = ensure_dask_client(max_workers=2, processes=True)
    
     for c in range(parameters["rspace_info"]["num_chunks"]):
         post.process_chunk(c, saver, client, output_dir=out_dir)
