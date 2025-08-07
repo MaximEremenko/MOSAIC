@@ -26,42 +26,18 @@ from dask.distributed import (
     Lock,
     WorkerPlugin,
     as_completed,
-    wait,
-    get_client,
-    progress,
 )
-
-from utilities.cunufft_wrapper import execute_cunufft, execute_inverse_cunufft
-from managers.database_manager import DatabaseManager
-from processors.point_data_processor import PointDataProcessor
-#from utilities.dask_helpers import ensure_dask_client  # ← fixed typo
-from utilities.dask_helpres import ensure_dask_client
-
-
-import inspect
-import logging
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, NamedTuple, Tuple
-import numpy as np
-from utilities.cunufft_wrapper import execute_cunufft, execute_inverse_cunufft
-from managers.database_manager import DatabaseManager
-from processors.point_data_processor import PointDataProcessor
-from dask.distributed import Client, LocalCluster, Lock, get_client, progress, as_completed
 from dask import delayed
-import time
-import cupy as cp
-import atexit 
-from time import perf_counter
-from contextlib import contextmanager
-from utilities.dask_helpres import ensure_dask_client
-import warnings, multiprocessing.resource_tracker
-
+from utilities.cunufft_wrapper import execute_cunufft, execute_inverse_cunufft
+from managers.database_manager import DatabaseManager
+from processors.point_data_processor import PointDataProcessor
+from tqdm import tqdm
 # ──────────────────────────────────────────────────────────────────────────────
 # Globals & helpers
 # ──────────────────────────────────────────────────────────────────────────────
 logger = logging.getLogger(__name__)
 TIMER = time.perf_counter  # monotonic clock alias
-
+DEFAULT_TASK_RETRIES = 2
 
 @contextmanager
 def _timed(label: str):
@@ -136,8 +112,13 @@ def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
+
+# ------------------------------------------------------------------------- #
 def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.ndarray) -> int:
-    """How many integer HKL points are inside *interval* for *supercell*."""
+    """
+    Count how many integer HKL grid points are in *interval* for the given
+    supercell.  Includes the “×2 if l≠0” symmetry used in the legacy code.
+    """
 
     supercell = np.asarray(supercell, dtype=float)
     step = 1.0 / supercell
@@ -150,11 +131,10 @@ def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.nd
     k_n = npts(interval.get("k_start", 0.0), interval.get("k_end", 0.0), step[1]) if dim > 1 else 1
     l_n = npts(interval.get("l_start", 0.0), interval.get("l_end", 0.0), step[2]) if dim > 2 else 1
 
-    tot = h_n * k_n * l_n
+    total = h_n * k_n * l_n
     if dim > 2 and not (interval["l_start"] == 0 and interval["l_end"] == 0):
-        tot *= 2  # original mirror rule
-    return tot
-
+        total *= 2  # original “mirror” rule
+    return total
 
 atexit.register(_final_cleanup)
 
@@ -162,13 +142,6 @@ atexit.register(_final_cleanup)
 logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 TIMER = time.perf_counter          # monotonic and fast
-@contextmanager
-def _timed(label: str):
-    t0 = perf_counter()
-    try:
-        yield
-    finally:
-        logger.info("%s took %.3f s", label, perf_counter() - t0)
 
 def handle_interval_worker(
         iv: dict,
@@ -255,31 +228,6 @@ def chunk_mutex(chunk_id: int) -> Lock:
     """
     return Lock(f"chunk-{chunk_id}")
 
-
-# ------------------------------------------------------------------------- #
-def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.ndarray) -> int:
-    """
-    Count how many integer HKL grid points are in *interval* for the given
-    supercell.  Includes the “×2 if l≠0” symmetry used in the legacy code.
-    """
-
-    supercell = np.asarray(supercell, dtype=float)
-    step = 1.0 / supercell
-    dim = len(supercell)
-
-    def npts(start: float, end: float, st: float) -> int:
-        return int(np.floor((end - start) / st + 0.5)) + 1
-
-    h_n = npts(interval["h_start"], interval["h_end"], step[0])
-    k_n = npts(interval.get("k_start", 0.0), interval.get("k_end", 0.0), step[1]) if dim > 1 else 1
-    l_n = npts(interval.get("l_start", 0.0), interval.get("l_end", 0.0), step[2]) if dim > 2 else 1
-
-    total = h_n * k_n * l_n
-    if dim > 2 and not (interval["l_start"] == 0 and interval["l_end"] == 0):
-        total *= 2  # original “mirror” rule
-    return total
-
-
 # ════════════════════════════════════════════════════════════════════════════
 #  Q-space grid generator (mask-aware, matches original output)
 # ════════════════════════════════════════════════════════════════════════════
@@ -293,7 +241,6 @@ def _call_generate_mask(mask_strategy, hkl: np.ndarray, mask_params: Dict[str, A
         return mask_strategy.generate_mask(hkl)
     return mask_strategy.generate_mask(hkl, mask_params)
 
-
 def generate_q_space_grid(
     interval: Dict[str, float],
     B_: np.ndarray,
@@ -302,39 +249,40 @@ def generate_q_space_grid(
     supercell: np.ndarray,
 ) -> np.ndarray:
     """
-    Build masked q-points (in Cartesian reciprocal coordinates).
+    Build masked q-points (in Cartesian reciprocal coordinates), using integer-index
+    based HKL grid generation to ensure all intervals perfectly match symmetry
+    requirements and there are no overlaps or misses due to floating-point error.
     """
+    # Convert supercell size to integer per axis
     supercell = np.asarray(supercell, dtype=float)
-    step = 1.0 / supercell
+    int_supercell = np.round(supercell).astype(int)
 
-    h_vals = (
-        np.arange(interval["h_start"], interval["h_end"] + step[0], step[0])
-        if interval["h_end"] > interval["h_start"]
-        else np.array([interval["h_start"]])
-    )
-    k_vals = (
-        np.arange(interval["k_start"], interval["k_end"] + step[1], step[1])
-        if "k_start" in interval and interval["k_end"] > interval["k_start"]
-        else np.array([interval.get("k_start", 0.0)])
-    )
-    l_vals = (
-        np.arange(interval["l_start"], interval["l_end"] + step[2], step[2])
-        if "l_start" in interval and interval["l_end"] > interval["l_start"]
-        else np.array([interval.get("l_start", 0.0)])
-    )
+    # Helper: find start/end index for each axis
+    def get_axis_vals(ax: str, i: int):
+        start = interval.get(f"{ax}_start", 0.0)
+        end   = interval.get(f"{ax}_end",   0.0)
+        N = int_supercell[i]
+        idx0 = int(np.ceil(start * N))
+        idx1 = int(np.floor(end   * N))
+        vals = np.arange(idx0, idx1 + 1) / N
+        return vals
+
+    h_vals = get_axis_vals("h", 0)
+    k_vals = get_axis_vals("k", 1) if supercell.size > 1 else np.array([0.0])
+    l_vals = get_axis_vals("l", 2) if supercell.size > 2 else np.array([0.0])
 
     mesh = np.meshgrid(h_vals, k_vals, l_vals, indexing="ij")
     hkl = np.stack([m.ravel() for m in mesh], axis=1)
 
+    # Apply mask if mask_strategy is not None
     if mask_strategy is not None:
         mask = _call_generate_mask(mask_strategy, hkl, mask_parameters)
     else:
         mask = np.ones(len(hkl), dtype=bool)
 
     hkl_masked = hkl[mask]
-    q_coords = 2 * np.pi * (hkl_masked[:, : len(supercell)] @ B_)
+    q_coords = 2 * np.pi * (hkl_masked[:, : supercell.size] @ B_)
     return q_coords
-
 
 def generate_q_space_grid_sync(*args, **kwargs):
     return generate_q_space_grid(*args, **kwargs)
@@ -376,66 +324,12 @@ def _process_chunk(chunk_data: List[dict]) -> Tuple[np.ndarray, np.ndarray]:
     step_vec = np.array([pd["step_in_frac"] for pd in chunk_data])
 
     grids, shapes = [], []
-    for cp, dv, sv in zip(coords, dist_vec, step_vec):
-        g, s = _generate_grid(coords.shape[1], sv, cp, dv)
+    for cp_, dv, sv in zip(coords, dist_vec, step_vec):
+        g, s = _generate_grid(coords.shape[1], sv, cp_, dv)
         grids.append(g)
         shapes.append(s)
 
     return np.vstack(grids), np.vstack(shapes)
-# def _generate_grid(
-#     dimensionality: int,
-#     step_sizes: np.ndarray,
-#     central_point: np.ndarray,
-#     dist_from_atom_center: np.ndarray,
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     """
-#     Build a rectangular grid around *central_point*.
-
-#     * For the first *dimensionality* axes we step from
-#       –dist … +dist (inclusive) with *step_sizes*.
-#     * Remaining axes stay frozen at the central-point coordinate.
-#     * Works for 1-, 2- and 3-D **and** still returns a full xyz grid so
-#       downstream code that treats everything as 3-D keeps working.
-
-#     Returns
-#     -------
-#     pts : (N, 3) float64
-#         Cartesian fractional coordinates of all grid points.
-#     shape_nd : (3,) int64
-#         Number of samples along x, y, z (1 where the axis is frozen).
-#     """
-#     eps = 1e-8
-#     axes: list[np.ndarray] = []
-
-#     # --- varying axes ------------------------------------------------------
-#     for i in range(dimensionality):
-#         step = float(step_sizes[i])
-#         dist = float(dist_from_atom_center[i])
-
-#         if step <= 0.0 or dist <= step:
-#             axes.append(np.array([0.0]))
-#         else:
-#             axis = np.arange(-dist, dist + step - eps, step, dtype=np.float64)
-#             axes.append(axis if axis.size else np.array([0.0]))
-
-#     # --- frozen axes (pad to 3) -------------------------------------------
-#     while len(axes) < 3:
-#         axes.append(np.array([0.0], dtype=np.float64))
-
-#     # quick sanity-check – avoid accidental petabyte explosions
-#     n_pts = int(np.prod([a.size for a in axes]))
-#     bytes_needed = n_pts * 3 * 8  # xyz float64
-#     if bytes_needed > 2 << 30:    # 2 GiB safety cap; adjust if you like
-#         raise MemoryError(
-#             f"Requested grid has {n_pts:,} points "
-#             f"({bytes_needed/1e9:,.1f} GB) – too large."
-#         )
-
-#     mesh = np.meshgrid(*axes, indexing="ij", sparse=False)
-#     pts = np.vstack([m.ravel() for m in mesh]).T + central_point
-#     shape_nd = np.array([a.size for a in axes], dtype=np.int64)
-
-#     return pts, shape_nd
 
 def generate_rifft_grid(chunk_data: List[dict]):
     return _process_chunk(chunk_data)
@@ -469,7 +363,9 @@ def _process_interval_element(
     )
     q_av_final = ff * q_av * q_del / orig_coords.shape[0]
     return (iv["id"], el, q_grid, q_amp, q_av_final)
-
+###############################################################################
+# 1)  _process_chunk_id  (now returns True/False instead of raising)          #
+###############################################################################
 def _process_chunk_id(
     chunk_id: int,
     iv_path: Path,
@@ -477,11 +373,20 @@ def _process_chunk_id(
     total_reciprocal_points: int,
     point_data_processor: PointDataProcessor,
     db_path: str,
-) -> None:
-    """Compute Δ‑amplitudes for one (interval, chunk) pair – executes on worker."""
-    t_total = TIMER()
+) -> bool:                                  # ← return success flag
+    """Compute Δ-amplitudes for one (interval, chunk) pair – executes on worker.
+
+    Returns
+    -------
+    bool
+        True  → written & DB updated
+        False → failed (caller may retry)
+    """
+    t_total  = TIMER()
     recip_id = None
+
     try:
+        # ---------- load cached interval -----------------------------------
         with np.load(iv_path, mmap_mode="r") as dat:
             task = IntervalTask(
                 int(dat["irecip_id"]),
@@ -492,7 +397,7 @@ def _process_chunk_id(
             )
         recip_id = task.irecip_id
 
-        # Build RIFFT grid
+        # ---------- RIFFT grid ---------------------------------------------
         chunk_data = [
             {
                 "coordinates": atoms["coordinates"][i],
@@ -503,7 +408,7 @@ def _process_chunk_id(
         ]
         rifft_grid, grid_shape = _process_chunk(chunk_data)
 
-        # inverse NUFFT for ΔF
+        # ---------- inverse NUFFT ------------------------------------------
         amplitudes_delta = execute_inverse_cunufft(
             q_coords=task.q_grid,
             c=task.q_amp - task.q_amp_av,
@@ -511,6 +416,7 @@ def _process_chunk_id(
             eps=1e-12,
         )
 
+        # ---------- persist results & DB flag ------------------------------
         _save_amplitudes_and_meta(
             chunk_id=chunk_id,
             task=task,
@@ -521,11 +427,27 @@ def _process_chunk_id(
             db_path=db_path,
         )
 
+        return True                       # ← SUCCESS
+    except Exception as err:
+        logger.error(
+            "chunk %d | iv %s FAILED: %s",
+            chunk_id,
+            recip_id if recip_id is not None else "n/a",
+            err,
+            exc_info=True,
+        )
+        # Optional: reset the device so the next try starts clean
+        try:
+            import cupy as _cp
+            _cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return False                      # ← FAILURE – caller may retry
     finally:
         try:
             import cupy as _cp
             _cp.get_default_memory_pool().free_all_blocks()
-        except ImportError:
+        except Exception:
             pass
         gc.collect()
         logger.info(
@@ -578,7 +500,6 @@ def aggregate_interval_tasks(tasks: List[tuple], use_coeff: bool) -> IntervalTas
     q_av = np.sum([t[4] for t in tasks], axis=0)
     return IntervalTask(irecip_id, "All", q_grid, q_amp, q_av)
 
-import tempfile
 DEFAULT_INTERVAL_RETRIES = 2  
 def precompute_intervals(
     reciprocal_space_intervals: Iterable[dict],
@@ -640,9 +561,17 @@ def precompute_intervals(
          )
          for iv in todo
      ]
-    # gather results back to driver
-    written_files = [Path(p) for p in client.gather(futures) if p]
-    progress(futures)
+
+    from tqdm import tqdm
+    written_files = []
+    with tqdm(total=len(futures), desc="Precompute intervals", unit="interval") as pbar:
+        for future, result in zip(as_completed(futures), futures):
+            p = future.result()
+            if p:
+                written_files.append(Path(p))
+            pbar.update(1)
+    # In case you want to keep the Dask's built-in progress as well:
+    # progress(futures)
     logger.info(
         "Stage-1 complete: %d written, %d cached, %d skipped",
         len(written_files), len(cached), len(todo) - len(written_files),
@@ -708,7 +637,7 @@ def _save_amplitudes_and_meta(
             nrec    = task.q_grid.shape[0]
         else:
             # 3-D symmetry: double count the non-zero-l plane
-            if task.q_grid.shape[1] > 2 and np.all(np.round(task.q_grid[:, 2], 6) != 0):
+            if task.q_grid.shape[1] > 2 and np.max(np.abs(task.q_grid[:, 2])) > 1e-7:
                 current[:, 1] += amplitudes_delta + np.conj(amplitudes_delta)
                 nrec += task.q_grid.shape[0] * 2
             else:
@@ -726,35 +655,6 @@ def _save_amplitudes_and_meta(
     logger.info("write-HDF5 | chunk %d | iv %d took %.3f s",
                 chunk_id, task.irecip_id, TIMER() - t0)
 
-
-# ---------------------------------------------------------------------------
-# Build one compact np.recarray from the original Python list
-# ---------------------------------------------------------------------------
-# def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
-#     """
-#     Convert the slow-to-pickle   list[dict]   into one contiguous NumPy
-#     structured array.  Each field is a *fixed-size* NumPy column, so
-#     serialisation is 5-10 × faster and the Dask scheduler no longer chokes.
-#     """
-#     # ---- describe the structure ------------------------------------------
-#     dtype = np.dtype([
-#         ("chunk_id",             "<i4"),        # int32
-#         ("coordinates",          "<f8",  (3,)), # 3×float64
-#         ("dist_from_atom_center","<f8",  (3,)),
-#         ("step_in_frac",         "<f8",  (3,)),
-#     ])
-
-#     out = np.empty(len(point_data_list), dtype=dtype)
-
-#     # ---- fill it ----------------------------------------------------------
-#     for i, pd in enumerate(point_data_list):
-#         out["chunk_id"][i]              = pd["chunk_id"]
-#         out["coordinates"][i]           = pd["coordinates"]
-#         out["dist_from_atom_center"][i] = pd["dist_from_atom_center"]
-#         out["step_in_frac"][i]          = pd["step_in_frac"]
-
-#     return out.view(np.recarray)   # convenient attribute-style access
-# --------------------------------------------------------------------------- #
 def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
     """Compact list[dict] → contiguous NumPy recarray (runtime‑dimension)."""
 
@@ -786,8 +686,20 @@ def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
 
 
 # ————————————————————————————————————————————————————————————————
-#  Core streaming submission function (FIXED)
+#  Core streaming submission function
 # ————————————————————————————————————————————————————————————————
+###############################################################################
+# 2)  process_chunks_with_intervals                                           #
+###############################################################################
+
+def _task_key(iv_id: int, chunk_id: int) -> str:
+    return f"proc-{iv_id}-{chunk_id}"
+
+
+def _parse_task_key(key: str) -> tuple[int, int]:
+    _, iv_id, cid = key.split("-", 2)
+    return int(iv_id), int(cid)
+
 
 def process_chunks_with_intervals(
     interval_files: Iterable[Path],
@@ -800,29 +712,44 @@ def process_chunks_with_intervals(
     client: Client,
     max_inflight: int = 5_000,
 ) -> None:
-    """Stage‑2: read cached intervals & accumulate ΔF chunk‑wise (streaming).
+    """Stage-2 streaming loop with retry logic (tuple-safe)."""
 
-    The streaming approach caps the number of *live* tasks, so the
-    scheduler’s RSS stays flat even for 10^5–10^6 total tasks.
-    """
-
-    # 1️⃣  Pack once, then slice per chunk
     rec = _point_list_to_recarray(point_data_list)
-
     chunk_futs = {
         cid: client.scatter(rec[rec.chunk_id == cid], broadcast=False, hash=False)
         for cid in chunk_ids
     }
 
-    # Broadcast heavy immutable objects (replaced by a 64‑bit key in each task)
     pd_future = client.scatter(point_data_processor, broadcast=True)
-    db_path = db_manager.db_path  # plain string is tiny
+    db_path   = db_manager.db_path
 
-    unsaved = set(db_manager.get_unsaved_interval_chunks())
+    unsaved       = set(db_manager.get_unsaved_interval_chunks())
+    retries_left  = {key: DEFAULT_TASK_RETRIES for key in unsaved}
+    flying: set   = set()
+    submitted     = 0
+    total_tasks   = len(unsaved)
 
-    flying: set = set()
-    submitted = 0
+    pbar = tqdm(total=total_tasks, desc="Stage 2 (chunks × intervals)", unit="tasks")
 
+    # helper --------------------------------------------------------------
+    def _submit(iv_path_future, iv_id, cid):
+        nonlocal submitted
+        fut = client.submit(
+            _process_chunk_id,
+            cid,
+            iv_path_future,
+            chunk_futs[cid],
+            total_reciprocal_points,
+            pd_future,
+            db_path,
+            key=_task_key(iv_id, cid),
+            pure=False,
+            resources={"nufft": 1},
+        )
+        flying.add(fut)
+        submitted += 1
+
+    # main loop -----------------------------------------------------------
     for p in interval_files:
         iv_id = int(p.stem.split("_")[1])
         iv_path_future = client.scatter(p, broadcast=False)
@@ -830,56 +757,33 @@ def process_chunks_with_intervals(
         for cid in chunk_ids:
             if (iv_id, cid) not in unsaved:
                 continue
+            _submit(iv_path_future, iv_id, cid)
 
-            fut = client.submit(
-                _process_chunk_id,
-                cid,
-                iv_path_future,
-                chunk_futs[cid],
-                total_reciprocal_points,
-                pd_future,
-                db_path,
-                pure=False,
-                resources={"nufft": 1},
-            )
-            flying.add(fut)
-            submitted += 1
-
-            # throttle
+            # throttle ----------------------------------------------------
             if len(flying) >= max_inflight:
-                _drain_some(flying)
+                for fut, ok in as_completed(flying, with_results=True):
+                    pbar.update(1)
+                    flying.discard(fut)
 
-    # drain remaining tasks
-    _drain_some(flying, drain_all=True)
-    logger.info("Stage‑2 finished – %d tasks submitted", submitted)
+                    if not ok:
+                        iv, ch = _parse_task_key(fut.key)
+                        if retries_left[(iv, ch)] > 0:
+                            retries_left[(iv, ch)] -= 1
+                            _submit(iv_path_future, iv, ch)
+                    break   # processed one finished task
 
+    # drain remaining -----------------------------------------------------
+    for fut, ok in as_completed(flying, with_results=True):
+        pbar.update(1)
+        if not ok:
+            iv, ch = _parse_task_key(fut.key)
+            logger.error("GAVE UP after retries | iv %d | chunk %d", iv, ch)
 
-from dask.distributed import as_completed
-
-def _drain_some(flying: set, *, drain_all: bool = False):
-    """
-    Remove completed futures from *flying*.
-
-    If *drain_all* is True, block until every future is done.
-    Otherwise, wait until at least one finishes.
-    """
-    if not flying:
-        return
-
-    if drain_all:
-        for _ in as_completed(flying):   # drains everything
-            pass
-        flying.clear()
-    else:
-        # wait until the first one completes, then pop all ready futures
-        for f in as_completed(flying, with_results=False):
-            flying.discard(f)
-            break
-
-
+    pbar.close()
+    logger.info("Stage-2 finished – %d tasks submitted", submitted)
 
 # ###########################################################################
-#  Public entry point (adds plugin registration)                 #############
+#  Public entry point                                                       #
 # ###########################################################################
 
 def compute_amplitudes_delta(
