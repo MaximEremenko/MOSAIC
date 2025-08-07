@@ -183,7 +183,7 @@ def ensure_dask_client(
                 threads_per_worker=threads_per_worker,
                 processes=processes,
                 dashboard_address=":8787" if dashboard else None,
-                worker_dashboard=worker_dashboard,
+               # worker_dashboard=worker_dashboard,
                 local_directory=local_directory,
                 **cluster_kw,
             )
