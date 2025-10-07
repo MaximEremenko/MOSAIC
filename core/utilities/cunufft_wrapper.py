@@ -159,7 +159,7 @@ def execute_cunufft(
     eps: float = 1e-12,
     mem_frac: float = 0.5,
     min_chunk: int = 32_000,
-    max_chunk: Optional[int] = 64_000,
+    max_chunk: Optional[int] = 8*64_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
@@ -182,9 +182,9 @@ def execute_inverse_cunufft(
     *,
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
-    mem_frac: float = 0.25,
-    min_chunk: int = 128_000,
-    max_chunk: Optional[int] = 256_000,
+    mem_frac: float = 0.50,
+    min_chunk: int = 32_000,
+    max_chunk: Optional[int] = 32*256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
@@ -248,7 +248,7 @@ def _batched_type3(
     out = np.zeros(M if inverse else len(q_coords), dtype=np.complex128)
 
     # clamp mem_frac to sane range
-    mem_frac = float(np.clip(mem_frac, 0.05, 0.95))
+    mem_frac = float(np.clip(mem_frac, 0.05, 0.5))
 
     start = 0
     while start < len(q_coords):
@@ -362,7 +362,7 @@ def _cpu_fallback(
     eps: float,
     inverse: bool,
     *,
-    batch: int = 5_000_000,
+    batch: int = 2_000_000,
 ) -> np.ndarray:
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):

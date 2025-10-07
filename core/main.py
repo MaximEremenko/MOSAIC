@@ -57,10 +57,19 @@ def main():
     # python="/data/mve/venvs/mosaic/bin/python",
     # scheduler_options={"host": "0.0.0.0"},
     # )
+    os.environ["DASK_WORKER_DASHBOARD"] = "0"
+    #os.environ["DASK_BACKEND"] =  "local"
+    os.environ["DASK_BACKEND"]  = "single-threaded"
+    #os.environ["DASK_MAX_WORKERS"] =  "2"
+    os.environ["DASK_THREADS_PER_WORKER"] =  "16" 
+    os.environ["DASK_PROCESSES"] = "0"   # or make sure ensure_dask_client uses processes=False
+    
     client = get_client()
-    client.wait_for_workers(int(os.getenv("DASK_MAX_WORKERS", 4)), timeout="120s")
+    if client is not None:
+        client.wait_for_workers(int(os.getenv("DASK_MAX_WORKERS", 1)), timeout="120s")
     setup_logging()
-    log = logging.getLogger("app")    
+    log = logging.getLogger("app")  
+    #client.config.set(scheduler="synchronous")
     # ─── helpers -----------------------------------------------------------------
     def build_mask_strategy(dim, peak_info):
         if dim == 1:
@@ -68,11 +77,25 @@ def main():
         if dim == 2:
             return CircleShapeStrategy(peak_info)
         else: dim == 3
-        #condition = (
-        #    "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
-        #    "cos(pi*h)+cos(pi*k)+cos(pi*l) < 0.5025)"
-        #)
-        return SphereShapeStrategy(peak_info) #EqBasedStrategy(condition)
+        r_val = float(peak_info.get("r", peak_info.get("radius", 0.0)))
+        # condition = """
+        # ( Min(Abs(Mod(Abs(h),2) - 1.5), 2 - Abs(Mod(Abs(h),2) - 1.5))**2
+        # + Min(Abs(Mod(Abs(k),2) - 0.5), 2 - Abs(Mod(Abs(k),2) - 0.5))**2 >=  ({r})**2 )
+        # |
+        # ( Min(Abs(Mod(Abs(h),2) - 0.5), 2 - Abs(Mod(Abs(h),2) - 0.5))**2
+        # + Min(Abs(Mod(Abs(k),2) - 1.5), 2 - Abs(Mod(Abs(k),2) - 1.5))**2 >=  ({r})**2 )
+        # """.strip().format(r=r_val)
+        
+        
+        condition = """
+        (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) >= ({r})**2) """.strip().format(r=r_val)
+        
+        # condition = (
+        #     "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
+        #     "cos(pi*h)+cos(pi*k)+cos(pi*l) < 0.5025)"
+        # )
+        return EqBasedStrategy(condition)
+        #return SphereShapeStrategy(peak_info) #EqBasedStrategy(condition)
     
     def pad_interval(d, dim):
         """Return dict with BOTH styles of keys for any dimension."""
@@ -100,9 +123,10 @@ def main():
     p_json = os.path.join(working_path, "input_parameters.json")
     p_h5   = os.path.join(working_path, "parameters.hdf5")
     pfactory = ParametersProcessorFactoryProvider().get_factory()
-    pproc = (pfactory.create_processor(p_h5,  source_type="hdf5", hdf5_file_path=p_h5)
-             if False #os.path.exists(p_h5)
-             else pfactory.create_processor(p_json, source_type="file",  hdf5_file_path=p_h5))
+    #pproc = (pfactory.create_processor(p_h5,  source_type="hdf5", hdf5_file_path=p_h5)
+    #         if False #os.path.exists(p_h5)
+    #         else 
+    pproc = pfactory.create_processor(p_json, source_type="file",  hdf5_file_path=p_h5)
     pproc.process()
     parameters = pproc.get_parameters()
     
@@ -126,7 +150,7 @@ def main():
     refnumbers   = cfg_proc.get_refnumbers()
     cells_origin = cfg_proc.get_cells_origin()
     coeff        = elements.apply(lambda el: rmc_neutron_scl_(el)[0])
-    
+    cell_ids = cfg_proc.get_cell_ids()
     # ─── 4. point grid -----------------------------------------------------------
     work_dir = struct["working_directory"]
     out_dir  = os.path.join(working_path, work_dir, "processed_point_data")
@@ -139,7 +163,7 @@ def main():
         rspace["method"], parameters,
         average_structure=dict(average_coords=avg_coords, elements=elements,
                                refnumbers=refnumbers, vectors=vectors,
-                               metric=metric, supercell=supercell))
+                               metric=metric, supercell=supercell, cell_ids=cell_ids))
     pt_proc.process_parameters()
     pgrid = pt_proc.get_point_data()
     
@@ -227,7 +251,6 @@ def main():
         params["coeff"] = coeff.to_numpy()
     
     
-    #client = ensure_dask_client(max_workers=3, backend="cuda-local")
     if unsaved:
         mask_strategy = build_mask_strategy(dim, parameters["peakInfo"])
         ff_calc = FormFactorFactoryProducer.get_factory("neutron").create_calculator("default")

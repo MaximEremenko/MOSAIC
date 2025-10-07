@@ -29,6 +29,7 @@ from dask.distributed import (
 )
 from dask import delayed
 from utilities.cunufft_wrapper import execute_cunufft, execute_inverse_cunufft
+from utilities.cunufft_wrapper import set_cpu_only
 from managers.database_manager import DatabaseManager
 from processors.point_data_processor import PointDataProcessor
 from tqdm import tqdm
@@ -436,26 +437,45 @@ def _process_chunk_id(
             err,
             exc_info=True,
         )
-        # Optional: reset the device so the next try starts clean
+        # --- GPU quarantine on the worker itself ------------------------
+        try:
+            # 1) Detect likely GPU/CUDA errors (best-effort filter)
+            _msg = str(err).lower()
+            is_gpu_err = any(
+                kw in _msg for kw in (
+                    "cuda", "cudart", "cufft", "cufinufft", "cupy",
+                    "device-side assert", "illegal memory access",
+                    "out of memory", "driver shutting down"
+                )
+            )
+            if is_gpu_err:
+                from distributed import get_worker
+                from utilities.cunufft_wrapper import set_cpu_only
+
+                w = get_worker()
+                # 2) Flip this worker to CPU-only for the rest of the process lifetime
+                try:
+                    set_cpu_only(True)
+                    logger.warning("Worker %s set to CPU-only after GPU error", w.address)
+                except Exception:
+                    pass
+
+                # 3) Increment a per-worker failure counter we can inspect from the client
+                try:
+                    cnt = getattr(w, "gpu_fail_count", 0)
+                    setattr(w, "gpu_fail_count", int(cnt) + 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Optional: free pools
         try:
             import cupy as _cp
             _cp.get_default_memory_pool().free_all_blocks()
         except Exception:
             pass
-        return False                      # ← FAILURE – caller may retry
-    finally:
-        try:
-            import cupy as _cp
-            _cp.get_default_memory_pool().free_all_blocks()
-        except Exception:
-            pass
-        gc.collect()
-        logger.info(
-            "TOTAL task | chunk %d | iv %s took %.3f s",
-            chunk_id,
-            recip_id if recip_id is not None else "n/a",
-            TIMER() - t_total,
-        )
+        return False
 
 
 def _process_interval_coeff(
@@ -598,21 +618,37 @@ def _save_amplitudes_and_meta(
     db_path: str,
 ) -> None:
     """
-    Accumulate ΔF into the on-disk HDF-5 for this chunk and update DB flags.
-    Serialised with a cluster-wide `Lock("chunk-<id>")` to avoid races.
+    Idempotent accumulation of ΔF into on-disk HDF5 for this chunk and DB flagging.
+
+    Key properties:
+    - Serialized by a cluster-wide Lock("chunk-<id>") to avoid races.
+    - Tracks which interval_ids have already been applied for this chunk in a side file
+      "<chunk>_applied_interval_ids" so re-runs never double-add.
+    - If an interval was already applied, we skip accumulation and only update the DB flag.
+
+    Files (by suffix):
+        _amplitudes
+        _shapeNd
+        _amplitudes_ntotal_reciprocal_space_points
+        _amplitudes_nreciprocal_space_points
+        _applied_interval_ids              <-- new (idempotency ledger)
     """
     t0 = TIMER()
     lock: Lock = Lock(f"chunk-{chunk_id}")
 
-    with lock:
-        # ---------- filenames ------------------------------------------------
-        fn_amp   = point_data_processor.data_saver.generate_filename(chunk_id, "_amplitudes")
-        fn_shape = point_data_processor.data_saver.generate_filename(chunk_id, "_shapeNd")
-        fn_tot   = point_data_processor.data_saver.generate_filename(
-            chunk_id, "_amplitudes_ntotal_reciprocal_space_points")
-        fn_nrec  = point_data_processor.data_saver.generate_filename(
-            chunk_id, "_amplitudes_nreciprocal_space_points")
+    # Filenames (stable across runs)
+    fn_amp   = point_data_processor.data_saver.generate_filename(chunk_id, "_amplitudes")
+    fn_shape = point_data_processor.data_saver.generate_filename(chunk_id, "_shapeNd")
+    fn_tot   = point_data_processor.data_saver.generate_filename(
+        chunk_id, "_amplitudes_ntotal_reciprocal_space_points")
+    fn_nrec  = point_data_processor.data_saver.generate_filename(
+        chunk_id, "_amplitudes_nreciprocal_space_points")
+    fn_applied = point_data_processor.data_saver.generate_filename(
+        chunk_id, "_applied_interval_ids")
 
+    already_applied = False
+
+    with lock:
         # ---------- one-off metadata -----------------------------------------
         try:
             point_data_processor.data_saver.load_data(fn_shape)
@@ -625,35 +661,67 @@ def _save_amplitudes_and_meta(
             point_data_processor.data_saver.save_data(
                 {"ntotal_reciprocal_points": total_reciprocal_points}, fn_tot)
 
-        # ---------- accumulate amplitudes ------------------------------------
+        # ---------- read / init the idempotency ledger -----------------------
         try:
-            current = point_data_processor.data_saver.load_data(fn_amp)["amplitudes"]
-            nrec    = point_data_processor.data_saver.load_data(fn_nrec)["nreciprocal_space_points"]
+            applied_arr = point_data_processor.data_saver.load_data(fn_applied)["ids"]
+            applied_set = set(int(x) for x in np.array(applied_arr).ravel().tolist())
         except FileNotFoundError:
-            current, nrec = None, 0
+            applied_set = set()
 
-        if current is None:
-            current = amplitudes_delta
-            nrec    = task.q_grid.shape[0]
+        if int(task.irecip_id) in applied_set:
+            # This interval was already accumulated into this chunk previously.
+            # We skip any modification to amplitudes/nrec and only flip the DB flag below.
+            already_applied = True
         else:
-            # 3-D symmetry: double count the non-zero-l plane
-            if task.q_grid.shape[1] > 2 and np.max(np.abs(task.q_grid[:, 2])) > 1e-7:
-                current[:, 1] += amplitudes_delta + np.conj(amplitudes_delta)
-                nrec += task.q_grid.shape[0] * 2
-            else:
-                current[:, 1] += amplitudes_delta
-                nrec += task.q_grid.shape[0]
+            # ---------- load current state -----------------------------------
+            try:
+                current = point_data_processor.data_saver.load_data(fn_amp)["amplitudes"]
+                nrec    = point_data_processor.data_saver.load_data(fn_nrec)["nreciprocal_space_points"]
+            except FileNotFoundError:
+                current, nrec = None, 0
 
-        point_data_processor._save_chunk_data(chunk_id, None, current, nrec)
+            # ---------- accumulate amplitudes --------------------------------
+            if current is None:
+                # First interval for this chunk
+                current = amplitudes_delta
+                nrec    = task.q_grid.shape[0]
+            else:
+                # 3-D symmetry: double count the non-zero-l plane
+                if task.q_grid.shape[1] > 2 and np.max(np.abs(task.q_grid[:, 2])) > 1e-7:
+                    current[:, 1] += amplitudes_delta + np.conj(amplitudes_delta)
+                    nrec += task.q_grid.shape[0] * 2
+                else:
+                    current[:, 1] += amplitudes_delta
+                    nrec += task.q_grid.shape[0]
+
+            # Persist updated HDF5 blobs (atomic via your existing saver)
+            point_data_processor._save_chunk_data(chunk_id, None, current, nrec)
+
+            # ---------- update idempotency ledger ----------------------------
+            applied_set.add(int(task.irecip_id))
+            # Store as a sorted int64 ndarray for stability
+            applied_sorted = np.array(sorted(applied_set), dtype=np.int64)
+            point_data_processor.data_saver.save_data({"ids": applied_sorted}, fn_applied)
 
     # ---------- DB flag outside the lock (thread-local connection) ----------
     from managers.database_manager import create_db_manager_for_thread
     db = create_db_manager_for_thread(db_path)
-    db.update_interval_chunk_status(task.irecip_id, chunk_id, saved=True)
-    db.close()
+    try:
+        db.update_interval_chunk_status(task.irecip_id, chunk_id, saved=True)
+    finally:
+        db.close()
 
-    logger.info("write-HDF5 | chunk %d | iv %d took %.3f s",
-                chunk_id, task.irecip_id, TIMER() - t0)
+    if already_applied:
+        logger.info(
+            "write-HDF5 | chunk %d | iv %d already applied (idempotent skip) | %.3f s",
+            chunk_id, task.irecip_id, TIMER() - t0
+        )
+    else:
+        logger.info(
+            "write-HDF5 | chunk %d | iv %d applied | %.3f s",
+            chunk_id, task.irecip_id, TIMER() - t0
+        )
+
 
 def _point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
     """Compact list[dict] → contiguous NumPy recarray (runtime‑dimension)."""
@@ -701,6 +769,10 @@ def _parse_task_key(key: str) -> tuple[int, int]:
     return int(iv_id), int(cid)
 
 
+
+
+    
+    
 def process_chunks_with_intervals(
     interval_files: Iterable[Path],
     *,
@@ -713,7 +785,19 @@ def process_chunks_with_intervals(
     max_inflight: int = 5_000,
 ) -> None:
     """Stage-2 streaming loop with retry logic (tuple-safe)."""
-
+    FAIL_STREAK, FAIL_THRESHOLD = 0, 3
+    GPU_TRIPPED = False
+    def _trip_to_cpu_only():
+        nonlocal GPU_TRIPPED, max_inflight
+        if GPU_TRIPPED:
+            return
+        # flip every worker to CPU-only immediately
+        client.run(set_cpu_only, True)
+        # reduce pressure while on CPU
+        max_inflight = min(max_inflight, 256)
+        GPU_TRIPPED = True
+        logger.warning("Circuit-breaker tripped: switching Stage-2 to CPU-only & throttling.")
+    
     rec = _point_list_to_recarray(point_data_list)
     chunk_futs = {
         cid: client.scatter(rec[rec.chunk_id == cid], broadcast=False, hash=False)
@@ -745,6 +829,7 @@ def process_chunks_with_intervals(
             key=_task_key(iv_id, cid),
             pure=False,
             resources={"nufft": 1},
+            retries=DEFAULT_TASK_RETRIES,
         )
         flying.add(fut)
         submitted += 1
@@ -764,13 +849,17 @@ def process_chunks_with_intervals(
                 for fut, ok in as_completed(flying, with_results=True):
                     pbar.update(1)
                     flying.discard(fut)
-
+                
                     if not ok:
+                        FAIL_STREAK += 1
+                        if FAIL_STREAK >= FAIL_THRESHOLD:
+                            _trip_to_cpu_only()
                         iv, ch = _parse_task_key(fut.key)
                         if retries_left[(iv, ch)] > 0:
                             retries_left[(iv, ch)] -= 1
                             _submit(iv_path_future, iv, ch)
-                    break   # processed one finished task
+                    else:
+                        FAIL_STREAK = 0
 
     # drain remaining -----------------------------------------------------
     for fut, ok in as_completed(flying, with_results=True):
@@ -800,7 +889,8 @@ def compute_amplitudes_delta(
 
     # Ensure the cleanup plugin is active (idempotent)
     try:
-        client.register_worker_plugin(CuPyCleanup(), name="cupy-cleanup")
+        if client is not None:
+            client.register_worker_plugin(CuPyCleanup(), name="cupy-cleanup")
     except ValueError:  # already registered in this session
         pass
 
