@@ -43,6 +43,9 @@ _BACKENDS = Literal[
     "lsf",
     "oar",
     "mpi",
+    "single-threaded",
+    "sync",
+    "synchronous",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -147,7 +150,13 @@ def ensure_dask_client(
         or _auto_backend()
         or "local"
     ).lower()
-
+    
+    # if backend in {"single-threaded", "sync", "synchronous"}:
+    # # Do NOT try to reuse a distributed Client; we want true in-thread execution
+    # # so that pdb/cProfile/etc. work normally.
+    #     return SyncClient()
+    if backend in {"single-threaded", "sync", "synchronous"}:
+        return SyncClient()
     # Custom scheduler options from config file / env
     sched_opts_cfg: Dict[str, Any] = cfg_file.get("scheduler_options", {})
     sched_opts_env = {
@@ -280,7 +289,99 @@ def ensure_dask_client(
 # --------------------------------------------------------------------------- #
 #  Internal helpers                                                           #
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+#  Single-threaded debug "client" (no distributed scheduler)                  #
+# --------------------------------------------------------------------------- #
+class _ImmediateFuture:
+    """Minimal future-like wrapper for sync results."""
+    __slots__ = ("_value",)
+    def __init__(self, value): self._value = value
+    def result(self, timeout=None): return self._value
+    def done(self): return True
+    def cancel(self): return False
+    def cancelled(self): return False
 
+
+class SyncClient:
+    def __init__(self):
+        import dask
+        self._dask = dask
+        self.cluster = None
+        self.config = dask.config
+        dask.config.set(scheduler="synchronous")
+
+    def wait_for_workers(self, n=1, timeout=None):
+        return True
+
+    def register_worker_plugin(self, plugin, name=None):
+        import warnings
+        warnings.warn(
+            f"[SyncClient] Ignoring worker plugin {name or plugin!r} "
+            "because backend is single-threaded.",
+            RuntimeWarning,
+        )
+        return None
+    def scatter(self, data, broadcast=False, hash=True, direct=None, **kwargs):
+            """In sync mode just return the raw data so delayed funcs see arrays, not futures."""
+            return data
+    def submit(self, func, *args, **kwargs):
+        dist_only = {"pure", "resources", "priority", "retries", "fifo_timeout"}
+        safe_kwargs = {k: v for k, v in kwargs.items() if k not in dist_only}
+        delayed_task = self._dask.delayed(func)(*args, **safe_kwargs)
+        result = delayed_task.compute(scheduler="synchronous")
+        return _ImmediateFuture(result)
+
+    def map(self, func, *iterables, **kwargs):
+        dist_only = {"pure", "resources", "priority", "retries", "fifo_timeout"}
+        safe_kwargs = {k: v for k, v in kwargs.items() if k not in dist_only}
+        if len(iterables) == 1:
+            return [_ImmediateFuture(func(x, **safe_kwargs)) for x in iterables[0]]
+        else:
+            return [_ImmediateFuture(func(*xs, **safe_kwargs)) for xs in zip(*iterables)]
+
+    def gather(self, futures, **kwargs):
+        if isinstance(futures, _ImmediateFuture):
+            return futures.result()
+        if isinstance(futures, dict):
+            return {k: self.gather(v) for k, v in futures.items()}
+        if isinstance(futures, (list, tuple)):
+            return [self.gather(f) for f in futures]
+        return futures
+
+    def compute(self, *objs, **kwargs):
+        return self._dask.compute(*objs, scheduler="synchronous", **kwargs)
+
+    def persist(self, *objs, **kwargs):
+        return self._dask.persist(*objs, scheduler="synchronous", **kwargs)
+
+    def run(self, func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def get_worker(self): return None
+    def close(self): return None
+
+
+    
+    def register_worker_plugin(self, plugin, name=None):
+        """Ignore worker plugins in sync mode."""
+        import warnings
+        warnings.warn(
+            f"[SyncClient] Ignoring register_worker_plugin({plugin!r}) "
+            "because backend is single-threaded.",
+            RuntimeWarning,
+        )
+        return None
+   
+    def run(self, func, *args, **kwargs):
+        """Simulate client.run: call the function locally once."""
+        return func(*args, **kwargs)
+   
+    def get_worker(self):
+        """No worker concept in sync mode."""
+        return None
+     
+        
+     
 def _auto_backend() -> Optional[str]:
     env = os.environ
     if "SLURM_JOB_ID" in env:

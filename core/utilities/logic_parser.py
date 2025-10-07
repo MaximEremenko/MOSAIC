@@ -16,40 +16,62 @@ symbol_map = {'h': h, 'k': k, 'l': l}
 
 # 2) The locals dict passed into sympify / lambdify
 allowed_locals = {
-    'pi':    sp.pi,
-    'E':     sp.E,
-    'I':     sp.I,
-    'oo':    sp.oo,
+    # Constants
+    'pi': sp.pi,
+    'E': sp.E,
+    'I': sp.I,
+    'oo': sp.oo,
     'infty': sp.oo,
-    'sin':   sp.sin,
-    'cos':   sp.cos,
-    'tan':   sp.tan,
-    'asin':  sp.asin,
-    'acos':  sp.acos,
-    'atan':  sp.atan,
+    
+    # Trigonometric functions
+    'sin': sp.sin,
+    'cos': sp.cos,
+    'tan': sp.tan,
+    'asin': sp.asin,
+    'acos': sp.acos,
+    'atan': sp.atan,
     'atan2': sp.atan2,
-    'sinh':  sp.sinh,
-    'cosh':  sp.cosh,
-    'tanh':  sp.tanh,
+    
+    # Hyperbolic functions
+    'sinh': sp.sinh,
+    'cosh': sp.cosh,
+    'tanh': sp.tanh,
     'asinh': sp.asinh,
     'acosh': sp.acosh,
     'atanh': sp.atanh,
-    'exp':   sp.exp,
-    'log':   sp.log,
-    'ln':    sp.log,
-    'sqrt':  sp.sqrt,
-    'abs':   sp.Abs,
-    'Abs':   sp.Abs,
+    
+    # Exponential and logarithmic functions
+    'exp': sp.exp,
+    'log': sp.log,   # natural logarithm
+    'ln': sp.log,
+    
+    # Power and roots
+    'sqrt': sp.sqrt,
+    
+    # Absolute value
+    'Abs': sp.Abs,
+    'abs': sp.Abs,
+    
+    # Rounding functions
     'floor': sp.floor,
     'ceiling': sp.ceiling,
-    'min':   min,
-    'max':   max,
-    'Rational':  sp.Rational,
+    
+    # Other common functions
+    'min': min,
+    'max': max,
+    'Rational': sp.Rational,
     'factorial': sp.factorial,
-    'gamma':     sp.gamma,
-    'erf':       sp.erf,
-    'erfc':      sp.erfc,
-    'Ei':        sp.Ei,
+    'gamma': sp.gamma,
+    
+    # Special functions
+    'erf': sp.erf,
+    'erfc': sp.erfc,
+    'Ei': sp.Ei,
+    
+    'Mod': sp.Mod,
+    'Min': sp.Min,
+    'Or':  sp.Or,
+    'And':  sp.And,
 }
 
 def preprocess(expr: str) -> str:

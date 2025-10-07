@@ -13,7 +13,7 @@ import sympy as sp
 from utilities.logic_parser import parse_logic, preprocess, allowed_locals, symbol_map
 import pandas as pd
 #from interfaces.shape_strategy import ShapeStrategy
-
+from  utilities.mask_plot_helper import plot_mask_pyvista_to_matplotlib
 class DefaultMaskStrategy(IMaskStrategy):
     def generate_mask(self, hkl_mesh: np.ndarray) -> np.ndarray:
         """
@@ -178,7 +178,7 @@ class EqBasedStrategy(IMaskStrategy):
         
         # 3) Lambdify to get a fast NumPy‐vectorized function f(h,k,l)->bool
         h, k, l = symbol_map['h'], symbol_map['k'], symbol_map['l']
-        self._f = sp.lambdify((h, k, l), expr, modules="numpy")
+        self._f = np.vectorize(sp.lambdify((h, k, l), expr, modules="numpy"))
     
     def generate_mask(self, hkl_mesh: np.ndarray) -> np.ndarray:
         """
@@ -196,6 +196,8 @@ class EqBasedStrategy(IMaskStrategy):
 
         # evaluate and ensure boolean dtype
         mask = self._f(h_vals, k_vals, l_vals)
+        #plot_mask_pyvista_to_matplotlib(hkl_mesh, mask)
+        
         return mask.astype(bool)
 
 
