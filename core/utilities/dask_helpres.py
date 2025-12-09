@@ -379,7 +379,48 @@ class SyncClient:
     def get_worker(self):
         """No worker concept in sync mode."""
         return None
-     
+    
+    def submit(self, func, *args, **kwargs):
+            # kwargs accepted by distributed.Client.submit but NOT your function
+            dist_only = {
+                "pure",
+                "resources",
+                "priority",
+                "retries",
+                "fifo_timeout",
+                "key",
+                "workers",
+                "allow_other_workers",
+                "actor",
+                "annotations",
+                "ttl",
+                "batch_size",
+            }
+            safe_kwargs = {k: v for k, v in kwargs.items() if k not in dist_only}
+            delayed_task = self._dask.delayed(func)(*args, **safe_kwargs)
+            result = delayed_task.compute(scheduler="synchronous")
+            return _ImmediateFuture(result)
+
+    def map(self, func, *iterables, **kwargs):
+        dist_only = {
+            "pure",
+            "resources",
+            "priority",
+            "retries",
+            "fifo_timeout",
+            "key",
+            "workers",
+            "allow_other_workers",
+            "actor",
+            "annotations",
+            "ttl",
+            "batch_size",
+        }
+        safe_kwargs = {k: v for k, v in kwargs.items() if k not in dist_only}
+        if len(iterables) == 1:
+            return [_ImmediateFuture(func(x, **safe_kwargs)) for x in iterables[0]]
+        else:
+            return [_ImmediateFuture(func(*xs, **safe_kwargs)) for xs in zip(*iterables)]     
         
      
 def _auto_backend() -> Optional[str]:

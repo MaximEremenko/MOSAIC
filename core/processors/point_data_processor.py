@@ -121,7 +121,7 @@ class PointDataProcessor:
 
         all_grid_data = []
         all_amplitude_data = []
-
+        all_amplitude_data_av = []
         for i in range(num_points):
             central_point = coordinates[i]
             dist = dist_from_atom_center[i]
@@ -130,22 +130,31 @@ class PointDataProcessor:
 
             grid_points, grid_shapeNd = self._generate_grid(chunk_id, dimensionality, step, central_point, dist, central_point_id)
             amplitude_data = self._generate_amplitude(chunk_id, central_point_id, grid_points)
-
+            amplitude_data_av = self._generate_amplitude(chunk_id, central_point_id, grid_points)
             # Collect data for this chunk
             all_grid_data.append(grid_points)
             all_amplitude_data.append(amplitude_data)
-
+            all_amplitude_data_av.append(amplitude_data_av)
+            
         # Merge all grid_points and amplitudes for this chunk
         merged_grid_points = np.vstack(all_grid_data) if self.save_rifft_coordinates else None
         merged_amplitude_data = np.vstack(all_amplitude_data)
+        merged_amplitude_data_av = np.vstack(all_amplitude_data_av)
         
-        
-        total_reciprocal_points_filename =  self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
-        self.data_saver.save_data({'ntotal_reciprocal_points': np.zeros([1], dtype = np.int64)}, total_reciprocal_points_filename)    
-        
+        #total_reciprocal_points_filename =  self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
+        #self.data_saver.save_data({'ntotal_reciprocal_points': np.zeros([1], dtype = np.int64)}, total_reciprocal_points_filename)    
+        total_reciprocal_points_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
+        if not os.path.exists(total_reciprocal_points_filename):
+            self.data_saver.save_data(                {
+                    'ntotal_reciprocal_space_points': np.array([-1], dtype=np.int64),
+                    # keep the legacy key too, for old readers:
+                    'ntotal_reciprocal_points': np.array([-1], dtype=np.int64),
+                },
+                total_reciprocal_points_filename
+            )
         
         # Save the data for this chunk
-        self._save_chunk_data(chunk_id, merged_grid_points, merged_amplitude_data, np.zeros([1], dtype = int))
+        self._save_chunk_data(chunk_id, merged_grid_points, merged_amplitude_data, merged_amplitude_data_av, np.zeros([1], dtype = int))
 
         # Mark all points in this chunk as initialized
         self.point_data.grid_amplitude_initialized[mask] = True
@@ -200,7 +209,7 @@ class PointDataProcessor:
 
         return amplitude_data
 
-    def _save_chunk_data(self, chunk_id: int, grid_points: Optional[np.ndarray], amplitude_data: np.ndarray, nreciprocal_space_points: [np.ndarray]):
+    def _save_chunk_data(self, chunk_id: int, grid_points: Optional[np.ndarray], amplitude_data: np.ndarray, amplitude_av_data: np.ndarray, nreciprocal_space_points: [np.ndarray]):
         """
         Saves the grid points and amplitude data for a chunk.
 
@@ -216,6 +225,10 @@ class PointDataProcessor:
 
         amplitude_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes')
         self.data_saver.save_data({'amplitudes': amplitude_data}, amplitude_filename)
+        
+        amplitude_av_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_av')
+        self.data_saver.save_data({'amplitudes_av': amplitude_av_data}, amplitude_av_filename)
+        
         nreciprocal_space_points_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_nreciprocal_space_points')
         self.data_saver.save_data({'nreciprocal_space_points': nreciprocal_space_points}, nreciprocal_space_points_filename)
         self.logger.info(f"Chunk {chunk_id}: Amplitudes saved to {amplitude_filename}")

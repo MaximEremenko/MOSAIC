@@ -205,7 +205,7 @@ class DatabaseManager:
                 """
             )
             self.connection.commit()
-            self.logger.info("Database schema ready.")
+            self.logger.debug("Database schema ready.")
         except sqlite3.Error as e:
             self.logger.error("Schema init error: %s", e)
    # put this near the top of the module, next to _PRECISION / _CHUNK_SIZE
@@ -568,4 +568,4 @@ class DatabaseManager:
     # -------------------------------------------------------------- #
     def close(self):
         self.connection.close()
-        self.logger.info("DB connection closed.")
+        self.logger.debug("DB connection closed.")

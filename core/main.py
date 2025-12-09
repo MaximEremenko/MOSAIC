@@ -58,9 +58,9 @@ def main():
     # scheduler_options={"host": "0.0.0.0"},
     # )
     os.environ["DASK_WORKER_DASHBOARD"] = "0"
-    #os.environ["DASK_BACKEND"] =  "local"
-    os.environ["DASK_BACKEND"]  = "single-threaded"
-    #os.environ["DASK_MAX_WORKERS"] =  "2"
+    os.environ["DASK_BACKEND"] =  "local"
+    #os.environ["DASK_BACKEND"]  = "single-threaded"
+    os.environ["DASK_MAX_WORKERS"] =  "2"
     os.environ["DASK_THREADS_PER_WORKER"] =  "16" 
     os.environ["DASK_PROCESSES"] = "0"   # or make sure ensure_dask_client uses processes=False
     
@@ -77,7 +77,8 @@ def main():
         if dim == 2:
             return CircleShapeStrategy(peak_info)
         else: dim == 3
-        r_val = float(peak_info.get("r", peak_info.get("radius", 0.0)))
+        r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1876)))
+        r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.2501)))
         # condition = """
         # ( Min(Abs(Mod(Abs(h),2) - 1.5), 2 - Abs(Mod(Abs(h),2) - 1.5))**2
         # + Min(Abs(Mod(Abs(k),2) - 0.5), 2 - Abs(Mod(Abs(k),2) - 0.5))**2 >=  ({r})**2 )
@@ -85,10 +86,45 @@ def main():
         # ( Min(Abs(Mod(Abs(h),2) - 0.5), 2 - Abs(Mod(Abs(h),2) - 0.5))**2
         # + Min(Abs(Mod(Abs(k),2) - 1.5), 2 - Abs(Mod(Abs(k),2) - 1.5))**2 >=  ({r})**2 )
         # """.strip().format(r=r_val)
+        # condition = """(((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2)
+        #  """.strip().format(r1=r1_val)
+            #0    
+        #rods(0.5h,0.5k,l) - spheres(0.5h,0.5k,0.5l)
+        # condition = """
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
+        # """.strip().format(r1=r1_val, r2=r2_val)
+        #     #1    
+        #spheres(0.5h,0.5k,0.5l)
+        # condition = """
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) < ({r2})**2)
+        # """.strip().format(r1=r1_val, r2=r2_val)        
         
-        
+        # #     #2    
+        # #>rods(0.5h,0.5k,l) and spheres(0.5h,0.5k,0.5l)
+        # condition = """
+        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) > ({r1})**2) &
+        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) > ({r2})**2)
+        # """.strip().format(r1=r1_val, r2=r2_val)
+        # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.0)))
+        # #     #3    
+        # #all points
+        # condition = """
+        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
+        # """.strip().format(r2=r2_val)
+
+        #     #4   
+        #>rods(0.5h,0.5k,l) and spheres(0.5h,0.5k,0.5l)
         condition = """
-        (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) >= ({r})**2) """.strip().format(r=r_val)
+             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) > ({r1})**2) |
+             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) > ({r2})**2)
+        """.strip().format(r1=r1_val, r2=r2_val)
+        
+        
+        # condition = """
+        # (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r_1})**2) and
+        # (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r_2})**2)
+        # """.strip().format(r1=r1_val)
         
         # condition = (
         #     "(cos(pi*h)+cos(pi*k)+cos(pi*l) > -0.5025 and "
