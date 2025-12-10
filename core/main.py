@@ -90,10 +90,10 @@ def main():
         #  """.strip().format(r1=r1_val)
             #0    
         #rods(0.5h,0.5k,l) - spheres(0.5h,0.5k,0.5l)
-        # condition = """
-        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
-        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
-        # """.strip().format(r1=r1_val, r2=r2_val)
+        condition = """
+            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
+            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
+        """.strip().format(r1=r1_val, r2=r2_val)
         #     #1    
         #spheres(0.5h,0.5k,0.5l)
         # condition = """
@@ -109,16 +109,19 @@ def main():
         # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.0)))
         # #     #3    
         # #all points
+        # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.0)))
         # condition = """
         #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
         # """.strip().format(r2=r2_val)
 
         #     #4   
         #>rods(0.5h,0.5k,l) and spheres(0.5h,0.5k,0.5l)
-        condition = """
-             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) > ({r1})**2) |
-             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) > ({r2})**2)
-        """.strip().format(r1=r1_val, r2=r2_val)
+        # r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1876)))
+        # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.2501)))
+        # condition = """
+        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) > ({r1})**2) |
+        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) > ({r2})**2)
+        # """.strip().format(r1=r1_val, r2=r2_val)
         
         
         # condition = """
@@ -278,6 +281,7 @@ def main():
             "id":               pd["central_point_id"],
         } for pd in pt_rows],
         "original_coords": orig_coords.to_numpy(),
+        "average_coords" : avg_coords.to_numpy(),
         "cells_origin"   : cells_origin.to_numpy(),
         "elements"       : elements.to_numpy(),
         "vectors"        : vectors,
