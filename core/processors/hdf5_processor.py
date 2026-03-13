@@ -5,8 +5,8 @@ Created on Wed Oct 30 16:34:03 2024
 @author: Maksim Eremenko
 """
 
-from interfaces.base_interfaces import IConfigurationFileProcessor
-from data_storage.hdf5_data_storage import HDF5ConfigDataLoader
+from core.data_storage.hdf5_data_storage import HDF5ConfigDataLoader
+from core.interfaces.base_interfaces import IConfigurationFileProcessor
 import pandas as pd
 from typing import Optional, Dict
 import numpy as np

@@ -4,9 +4,11 @@ import logging
 import os
 import h5py
 import numpy as np
-from interfaces.point_parameters_processor_interface import IPointParametersProcessor
-from data_structures.point_data import PointData
-from functions.angstrom_to_fractional import angstrom_to_fractional
+from core.data_structures.point_data import PointData
+from core.functions.angstrom_to_fractional import angstrom_to_fractional
+from core.interfaces.point_parameters_processor_interface import (
+    IPointParametersProcessor,
+)
 
 
 class FromAveragePointProcessor(IPointParametersProcessor):
@@ -337,7 +339,7 @@ class FromAveragePointProcessor(IPointParametersProcessor):
         Append / update the PointData table in *hdf5_file_path*.
 
         • Existing datasets are extended (maxshape=None on first creation)
-        • If an existing dataset is not chunked/extendible (legacy runs),
+        • If an existing dataset is not chunked/extendible,
           it is transparently migrated to a chunked, unlimited dataset.
         • The boolean bitmap grid_amplitude_initialized is stored as 0/1.
         """
@@ -372,7 +374,7 @@ class FromAveragePointProcessor(IPointParametersProcessor):
             if appendable:
                 return ds, n_old
 
-            # Migrate legacy non-chunked / fixed-size dataset
+            # Migrate a fixed-size dataset to an appendable layout
             old = ds[()]  # read all
             del h5[key]
             maxshape_old = (None,) + old.shape[1:]

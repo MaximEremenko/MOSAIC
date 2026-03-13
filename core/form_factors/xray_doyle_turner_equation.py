@@ -7,7 +7,7 @@ Created on Fri Nov 29 13:20:36 2024
 
 # form_factors/xray_doyle_turner_equation.py
 import numpy as np
-from form_factors.equation_strategy import  EquationStrategy
+from core.form_factors.equation_strategy import EquationStrategy
 
 class XRayDoyleTurnerEquation(EquationStrategy):
     def compute(self, q_vectors: np.ndarray, params: dict, charge: int = 0) -> np.ndarray:

@@ -6,7 +6,7 @@ Created on Tue Dec 17 13:23:08 2024
 """
 #parsers/data_2d_parser.py
 
-from interfaces.base_interfaces import IConfigurationFileParser
+from core.interfaces.base_interfaces import IConfigurationFileParser
 import pandas as pd
 import re
 from io import StringIO

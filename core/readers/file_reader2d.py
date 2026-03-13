@@ -5,7 +5,7 @@ Created on Tue Dec 17 13:21:19 2024
 @author: Maksim Eremenko
 """
 # readers/file_reader2d.py
-from interfaces.base_interfaces import IFileReader
+from core.interfaces.base_interfaces import IFileReader
 
 class FileReader2D(IFileReader):
     def __init__(self, file_path: str):

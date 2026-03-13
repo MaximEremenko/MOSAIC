@@ -7,7 +7,7 @@ Created on Tue Oct 29 16:00:59 2024
 
 # parsers/rmc6f_data_parser.py
 
-from interfaces.base_interfaces import IConfigurationFileParser
+from core.interfaces.base_interfaces import IConfigurationFileParser
 import pandas as pd
 import warnings
 from io import StringIO

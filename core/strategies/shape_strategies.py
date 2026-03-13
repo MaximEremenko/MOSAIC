@@ -8,7 +8,7 @@ Created on Wed Nov 27 19:13:01 2024
 # strategies/shape_strategies.py
 import matplotlib.pyplot as plt
 import numpy as np
-from interfaces.mask_strategy import IMaskStrategy
+from core.interfaces.mask_strategy import IMaskStrategy
 
 from itertools import product
 import numpy as np

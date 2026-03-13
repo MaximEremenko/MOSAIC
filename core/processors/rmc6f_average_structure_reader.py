@@ -7,10 +7,10 @@ Created on Tue Oct 29 14:46:24 2024
 
 # processors/rmc6f_average_structure_reader.py
 
-from interfaces.base_interfaces import IConfigurationDataProcessor
-from readers.rmc6f_file_reader import RMC6fFileReader
-from parsers.rmc6f_data_parser import RMC6fDataParser
-from utilities.rmc6f_metadata_extractor import RMC6fMetadataExtractor
+from core.interfaces.base_interfaces import IConfigurationDataProcessor
+from core.parsers.rmc6f_data_parser import RMC6fDataParser
+from core.readers.rmc6f_file_reader import RMC6fFileReader
+from core.utilities.rmc6f_metadata_extractor import RMC6fMetadataExtractor
 import pandas as pd
 import numpy as np
 

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 from dask.distributed import Client
 
-from utilities.dask_helpres import ensure_dask_client
+from core.utilities.dask_helpres import ensure_dask_client
 
 # Public symbols re‑exported for convenience
 __all__ = ["get_client"]

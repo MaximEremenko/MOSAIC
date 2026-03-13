@@ -7,13 +7,16 @@ Created on Mon Nov  4 15:03:23 2024
 
 # processors/parameters_processor.py
 
-from interfaces.parameter_interfaces import IParameterReader, IParameterParser
-from data_storage.hdf5_parameter_storage import HDF5ParameterSaver, HDF5ParameterLoader
 from typing import Optional
 
-from readers.json_parameter_reader import JSONParameterReader
-from readers.api_parameter_reader import APIParameterReader
-from parsers.json_parameter_parser import JSONParameterParser
+from core.data_storage.hdf5_parameter_storage import (
+    HDF5ParameterLoader,
+    HDF5ParameterSaver,
+)
+from core.interfaces.parameter_interfaces import IParameterParser, IParameterReader
+from core.parsers.json_parameter_parser import JSONParameterParser
+from core.readers.api_parameter_reader import APIParameterReader
+from core.readers.json_parameter_reader import JSONParameterReader
 
 class ParametersProcessor:
     def __init__(self,
@@ -28,9 +31,6 @@ class ParametersProcessor:
         self.data_saver = HDF5ParameterSaver(self.hdf5_file_path)
 
     def process(self):
-        #if self.data_loader.can_load_data():
-        #    print(f"Loading parameters from HDF5 file: {self.hdf5_file_path}")
-        #    self.data = self.data_loader.load_data()
         if self.reader:
             print("Reading parameters using the provided reader.")
             data = self.reader.read()
@@ -38,9 +38,15 @@ class ParametersProcessor:
                 self.data = self.parser.parse(data)
             else:
                 self.data = data
-            #self.data_saver.save_data(self.data)
-        else:
-            raise ValueError("No reader available to read parameters.")
+            return
+
+        if self.data_loader.can_load_data():
+            self.data = self.data_loader.load_data()
+            return
+
+        raise ValueError(
+            f"No parameter source available for '{self.hdf5_file_path}'."
+        )
 
     def get_parameters(self) -> dict:
         return self.data

@@ -7,7 +7,7 @@ Created on Mon Nov  4 14:52:04 2024
 
 # parsers/json_parameter_parser.py
 
-from interfaces.parameter_interfaces import IParameterParser
+from core.interfaces.parameter_interfaces import IParameterParser
 
 class JSONParameterParser(IParameterParser):
     def parse(self, data: dict) -> dict:

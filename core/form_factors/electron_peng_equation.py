@@ -7,7 +7,7 @@ Created on Fri Nov 29 13:21:42 2024
 
 # form_factors/electron_peng_equation.py
 import numpy as np
-from form_factors.equation_strategy import  EquationStrategy
+from core.form_factors.equation_strategy import EquationStrategy
 
 class ElectronPengEquation(EquationStrategy):
     def compute(self, q_vectors: np.ndarray, params: dict, charge: int = 0) -> np.ndarray:

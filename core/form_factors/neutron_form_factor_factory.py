@@ -6,14 +6,13 @@ Created on Fri Nov 29 13:23:38 2024
 """
 
 # form_factors/neutron_form_factor_factory.py
-from form_factors.form_factor_factory import  FormFactorFactory
-from form_factors.form_factor_factory import FormFactorFactory
-from form_factors.json_parameter_provider import JSONParameterProvider
-from form_factors.neutron_form_factor_calculator import NeutronFormFactorCalculator
-from form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
-from form_factors.parameter_provider import ParameterProvider
-from form_factors.form_factor_calculator import FormFactorCalculator
-from utilities.rmc_neutron_scl import rmc_neutron_scl_
+from core.form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
+from core.form_factors.form_factor_calculator import FormFactorCalculator
+from core.form_factors.form_factor_factory import FormFactorFactory
+from core.form_factors.json_parameter_provider import JSONParameterProvider
+from core.form_factors.neutron_form_factor_calculator import NeutronFormFactorCalculator
+from core.form_factors.parameter_provider import ParameterProvider
+from core.utilities.rmc_neutron_scl import rmc_neutron_scl_
 
 
 # Default Parameter Provider Using Hardcoded Values

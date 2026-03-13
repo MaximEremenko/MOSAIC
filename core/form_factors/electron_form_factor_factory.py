@@ -7,15 +7,17 @@ Created on Fri Nov 29 13:24:49 2024
 
 # form_factors/electron_form_factor_factory.py
 
-from form_factors.form_factor_factory import FormFactorFactory
-from form_factors.electron_form_factor_calculator import ElectronFormFactorCalculator
-from form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
-from form_factors.parameter_provider import ParameterProvider
-from form_factors.equation_strategy import EquationStrategy
-from form_factors.electron_lobato_equation import ElectronLobatoEquation
-from form_factors.electron_peng_equation import ElectronPengEquation
-from form_factors.form_factor_calculator import FormFactorCalculator
-from form_factors.json_parameter_provider import JSONParameterProvider
+from core.form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
+from core.form_factors.electron_form_factor_calculator import (
+    ElectronFormFactorCalculator,
+)
+from core.form_factors.electron_lobato_equation import ElectronLobatoEquation
+from core.form_factors.electron_peng_equation import ElectronPengEquation
+from core.form_factors.equation_strategy import EquationStrategy
+from core.form_factors.form_factor_calculator import FormFactorCalculator
+from core.form_factors.form_factor_factory import FormFactorFactory
+from core.form_factors.json_parameter_provider import JSONParameterProvider
+from core.form_factors.parameter_provider import ParameterProvider
 
 class ElectronFormFactorFactory(FormFactorFactory):
     def create_calculator(self, method: str = 'default', **kwargs) -> FormFactorCalculator:

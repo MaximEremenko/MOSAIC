@@ -6,7 +6,8 @@ Created on Mon Nov  4 15:01:28 2024
 """
 
 import requests
-from interfaces.parameter_interfaces import IParameterReader
+
+from core.interfaces.parameter_interfaces import IParameterReader
 
 class APIParameterReader(IParameterReader):
     def __init__(self, api_endpoint: str):

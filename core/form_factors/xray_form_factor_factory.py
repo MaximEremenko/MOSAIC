@@ -7,15 +7,15 @@ Created on Fri Nov 29 13:24:43 2024
 
 # form_factors/xray_form_factor_factory.py
 
-from form_factors.form_factor_factory import FormFactorFactory
-from form_factors.xray_form_factor_calculator import XRayFormFactorCalculator
-from form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
-from form_factors.parameter_provider import ParameterProvider
-from form_factors.equation_strategy import EquationStrategy
-from form_factors.xray_doyle_turner_equation import XRayDoyleTurnerEquation
-from form_factors.xray_lobato_equation import XRayLobatoEquation
-from form_factors.form_factor_calculator import FormFactorCalculator
-from form_factors.json_parameter_provider import JSONParameterProvider
+from core.form_factors.default_form_factor_calculator import DefaultFormFactorCalculator
+from core.form_factors.equation_strategy import EquationStrategy
+from core.form_factors.form_factor_calculator import FormFactorCalculator
+from core.form_factors.form_factor_factory import FormFactorFactory
+from core.form_factors.json_parameter_provider import JSONParameterProvider
+from core.form_factors.parameter_provider import ParameterProvider
+from core.form_factors.xray_doyle_turner_equation import XRayDoyleTurnerEquation
+from core.form_factors.xray_form_factor_calculator import XRayFormFactorCalculator
+from core.form_factors.xray_lobato_equation import XRayLobatoEquation
 
 class XRayFormFactorFactory(FormFactorFactory):
     def create_calculator(self, method: str = 'default', **kwargs) -> FormFactorCalculator:

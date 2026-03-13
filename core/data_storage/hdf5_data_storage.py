@@ -7,7 +7,7 @@ Created on Wed Oct 30 16:38:53 2024
 
 # data_storage/hdf5_data_storage.py
 
-from interfaces.base_interfaces import IConfigDataSaver, IConfigDataLoader
+from core.interfaces.base_interfaces import IConfigDataLoader, IConfigDataSaver
 import os
 import h5py
 import pandas as pd

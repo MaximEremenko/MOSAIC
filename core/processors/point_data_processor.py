@@ -2,9 +2,13 @@
 
 import numpy as np
 import logging
-from processors.rifft_grid_generator import GridGenerator1D, GridGenerator2D, GridGenerator3D
-from data_storage.rifft_in_data_saver import RIFFTInDataSaver
-from data_structures.point_data import PointData
+from core.data_storage.rifft_in_data_saver import RIFFTInDataSaver
+from core.data_structures.point_data import PointData
+from core.processors.rifft_grid_generator import (
+    GridGenerator1D,
+    GridGenerator2D,
+    GridGenerator3D,
+)
 from typing import Optional, List
 import h5py
 import os
@@ -147,7 +151,6 @@ class PointDataProcessor:
         if not os.path.exists(total_reciprocal_points_filename):
             self.data_saver.save_data(                {
                     'ntotal_reciprocal_space_points': np.array([-1], dtype=np.int64),
-                    # keep the legacy key too, for old readers:
                     'ntotal_reciprocal_points': np.array([-1], dtype=np.int64),
                 },
                 total_reciprocal_points_filename
@@ -159,6 +162,25 @@ class PointDataProcessor:
         # Mark all points in this chunk as initialized
         self.point_data.grid_amplitude_initialized[mask] = True
         self.logger.debug(f"Chunk {chunk_id}: All uninitialized points marked as initialized.")
+
+    def generate_grid(
+        self,
+        *,
+        chunk_id: int,
+        dimensionality,
+        step_in_frac,
+        central_point,
+        dist,
+        central_point_id,
+    ):
+        return self._generate_grid(
+            chunk_id=chunk_id,
+            dimensionality=dimensionality,
+            step_in_frac=step_in_frac,
+            central_point=central_point,
+            dist=dist,
+            central_point_id=central_point_id,
+        )
 
     def _generate_grid(self, chunk_id: int, dimensionality, step_in_frac, central_point, dist, central_point_id):
         """

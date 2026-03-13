@@ -7,17 +7,18 @@ Created on Tue Oct 29 14:50:11 2024
 
 # factories/configuration_processor_factory.py
 
-from interfaces.base_interfaces import IConfigurationProcessorFactory
-from processors.rmc6f_processor import RMC6fProcessor
-from processors.configuration2d_file_processor import ConfigurationFileProcessor2D
-from processors.configuration1d_file_processor import ConfigurationFileProcessor1D
+from core.interfaces.base_interfaces import IConfigurationProcessorFactory
+from core.processors.configuration1d_file_processor import ConfigurationFileProcessor1D
+from core.processors.configuration2d_file_processor import ConfigurationFileProcessor2D
 
-from processors.rmc6f_average_structure_calculator import RMC6fAverageStructureCalculator
-from processors.rmc6f_average_structure_reader import RMC6fAverageStructureReader
+from core.processors.rmc6f_average_structure_calculator import (
+    RMC6fAverageStructureCalculator,
+)
+from core.processors.rmc6f_average_structure_reader import RMC6fAverageStructureReader
+from core.processors.rmc6f_processor import RMC6fProcessor
 from typing import Optional
 
-from factories.hdf5_processor_factory import HDF5ProcessorFactory
-from factories.parameters_processor_factory import ParametersProcessorFactory
+from core.factories.hdf5_processor_factory import HDF5ProcessorFactory
 
 class RMC6fProcessorFactory(IConfigurationProcessorFactory):
     def create_processor(self,
@@ -49,13 +50,17 @@ class ConfigurationProcessorFactoryProvider:
         'hdf5': HDF5ProcessorFactory(),
         'f2d': Processor2DFactory(),
         'f1d': Processor1DFactory(),
-        # Add more factories for other configuration file types as needed
     }
+
+    @staticmethod
+    def register_factory(
+        file_type: str, factory: IConfigurationProcessorFactory
+    ) -> None:
+        ConfigurationProcessorFactoryProvider._factories[file_type] = factory
 
     @staticmethod
     def get_factory(file_type: str) -> IConfigurationProcessorFactory:
         factory = ConfigurationProcessorFactoryProvider._factories.get(file_type)
         if factory:
             return factory
-        else:
-            raise ValueError(f"Unsupported file type: {file_type}")
+        raise ValueError(f"Unsupported file type: {file_type}")
