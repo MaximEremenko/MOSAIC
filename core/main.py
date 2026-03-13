@@ -95,7 +95,7 @@ def main():
             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
         """.strip().format(r1=r1_val, r2=r2_val)
         #     #1    
-        #spheres(0.5h,0.5k,0.5l)
+        # #spheres(0.5h,0.5k,0.5l)
         # condition = """
         #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) < ({r2})**2)
         # """.strip().format(r1=r1_val, r2=r2_val)        
