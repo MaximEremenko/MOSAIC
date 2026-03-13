@@ -1,3 +1,4 @@
 {
-	"working_path" : "../tests/config_2D/"
+    "input_parameters_path": "../tests/config_2D/input_parameters.json",
+    "working_path": "../tests/config_2D/"
 }
