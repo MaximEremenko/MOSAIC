@@ -7,11 +7,14 @@ Created on Tue Oct 29 14:47:06 2024
 
 # processors/rmc6f_processor.py
 
-from interfaces.base_interfaces import IConfigurationFileProcessor, IConfigurationDataProcessor
-from readers.rmc6f_file_reader import RMC6fFileReader
-from parsers.rmc6f_data_parser import RMC6fDataParser
-from utilities.rmc6f_metadata_extractor import RMC6fMetadataExtractor
-from calculators.cell_calculator import CellCalculator
+from core.interfaces.base_interfaces import (
+    IConfigurationDataProcessor,
+    IConfigurationFileProcessor,
+)
+from core.parsers.rmc6f_data_parser import RMC6fDataParser
+from core.readers.rmc6f_file_reader import RMC6fFileReader
+from core.utilities.rmc6f_metadata_extractor import RMC6fMetadataExtractor
+from core.calculators.cell_calculator import CellCalculator
 import pandas as pd
 import numpy as np
 from typing import Optional, Dict

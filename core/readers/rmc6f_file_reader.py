@@ -6,7 +6,7 @@ Created on Tue Oct 29 14:57:06 2024
 """
 # readers/rmc6f_file_reader.py
 
-from interfaces.base_interfaces import IFileReader
+from core.interfaces.base_interfaces import IFileReader
 
 class RMC6fFileReader(IFileReader):
     def __init__(self, file_path: str):

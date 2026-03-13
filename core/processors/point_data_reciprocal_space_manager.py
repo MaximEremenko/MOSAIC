@@ -12,7 +12,6 @@ import numpy as np
 import h5py
 import os
 import logging
-from processors.reciprocal_space_interval_generator import ReciprocalSpaceIntervalGenerator
 
 import numpy as np
 import h5py
@@ -20,7 +19,9 @@ import os
 import logging
 
 # Make sure to import the dimension-aware ReciprocalSpaceIntervalGenerator:
-from processors.reciprocal_space_interval_generator import ReciprocalSpaceIntervalGenerator
+from core.processors.reciprocal_space_interval_generator import (
+    ReciprocalSpaceIntervalGenerator,
+)
 
 class ReciprocalSpaceIntervalManager:
     def __init__(self, hdf5_file_path: str, parameters: dict, supercell):

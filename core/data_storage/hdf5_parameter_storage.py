@@ -5,10 +5,11 @@ Created on Mon Nov  4 14:58:39 2024
 @author: Maksim Eremenko
 """
 
-import h5py
-from interfaces.base_interfaces import IConfigDataSaver, IConfigDataLoader
 import os
 import json
+import h5py
+
+from core.interfaces.base_interfaces import IConfigDataLoader, IConfigDataSaver
 # class HDF5ParameterSaver(IConfigDataSaver):
 #     def __init__(self, hdf5_file_path: str):
 #         self.hdf5_file_path = hdf5_file_path

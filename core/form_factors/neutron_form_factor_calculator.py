@@ -7,8 +7,8 @@ Created on Fri Nov 29 13:16:57 2024
 
 # form_factors/neutron_form_factor_calculator.py
 import numpy as np
-from form_factors.form_factor_calculator import  FormFactorCalculator
-from form_factors.parameter_provider import ParameterProvider
+from core.form_factors.form_factor_calculator import FormFactorCalculator
+from core.form_factors.parameter_provider import ParameterProvider
 
 class NeutronFormFactorCalculator(FormFactorCalculator):
     def __init__(self, parameter_provider: ParameterProvider):

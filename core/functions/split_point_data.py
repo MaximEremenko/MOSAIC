@@ -7,7 +7,7 @@ Created on Wed Nov 13 16:51:00 2024
 # functions/split_point_data.py
 
 import numpy as np
-from data_structures.point_data import PointData
+from core.data_structures.point_data import PointData
 from typing import List
 import math
 

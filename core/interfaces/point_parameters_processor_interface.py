@@ -8,7 +8,8 @@ Created on Tue Nov 12 15:21:35 2024
 # interfaces/point_parameters_processor_interface.py
 
 from abc import ABC, abstractmethod
-from data_structures.point_data import PointData
+
+from core.data_structures.point_data import PointData
 
 class IPointParametersProcessor(ABC):
     @abstractmethod

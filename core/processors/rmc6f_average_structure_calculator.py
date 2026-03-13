@@ -6,7 +6,7 @@ Created on Tue Oct 29 14:45:47 2024
 """
 # processors/rmc6f_average_structure_calculator.py
 
-from interfaces.base_interfaces import IConfigurationDataProcessor
+from core.interfaces.base_interfaces import IConfigurationDataProcessor
 import pandas as pd
 import numpy as np
 

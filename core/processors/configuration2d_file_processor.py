@@ -5,10 +5,10 @@ Created on Tue Dec 17 13:25:26 2024
 @author: Maksim Eremenko
 """
 #processors/configuration2d_file_processor.py
-from interfaces.base_interfaces import IConfigurationFileProcessor
-from calculators.cell_calculator import CellCalculator
-from readers.file_reader2d import FileReader2D
-from parsers.data_2d_parser import DataParser2D
+from core.calculators.cell_calculator import CellCalculator
+from core.interfaces.base_interfaces import IConfigurationFileProcessor
+from core.parsers.data_2d_parser import DataParser2D
+from core.readers.file_reader2d import FileReader2D
 import pandas as pd
 
 class ConfigurationFileProcessor2D(IConfigurationFileProcessor):

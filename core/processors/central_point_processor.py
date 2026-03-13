@@ -2,9 +2,11 @@ import logging
 import os
 import numpy as np
 import h5py
-from interfaces.point_parameters_processor_interface import IPointParametersProcessor
-from data_structures.point_data import PointData
-from functions.angstrom_to_fractional import angstrom_to_fractional
+from core.data_structures.point_data import PointData
+from core.functions.angstrom_to_fractional import angstrom_to_fractional
+from core.interfaces.point_parameters_processor_interface import (
+    IPointParametersProcessor,
+)
 
 logger = logging.getLogger(__name__)
 

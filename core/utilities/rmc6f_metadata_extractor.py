@@ -6,7 +6,7 @@ Created on Tue Oct 29 14:44:49 2024
 """
 # utilities/rmc6f_metadata_extractor.py
 
-from interfaces.base_interfaces import IMetadataExtractor
+from core.interfaces.base_interfaces import IMetadataExtractor
 from typing import List, Dict
 import numpy as np
 

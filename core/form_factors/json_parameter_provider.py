@@ -7,7 +7,7 @@ Created on Fri Nov 29 13:22:04 2024
 
 # form_factors/json_parameter_provider.py
 import json
-from form_factors.parameter_provider import ParameterProvider
+from core.form_factors.parameter_provider import ParameterProvider
 
 class JSONParameterProvider(ParameterProvider):
     def __init__(self, filename: str):

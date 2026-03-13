@@ -8,7 +8,8 @@ Created on Mon Nov  4 14:51:08 2024
 # readers/json_parameter_reader.py
 
 import json
-from interfaces.parameter_interfaces import IParameterReader
+
+from core.interfaces.parameter_interfaces import IParameterReader
 
 class JSONParameterReader(IParameterReader):
     def __init__(self, json_file_path: str):
