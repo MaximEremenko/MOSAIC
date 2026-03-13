@@ -61,7 +61,7 @@ def main():
     os.environ["DASK_BACKEND"] =  "local"
     #os.environ["DASK_BACKEND"]  = "single-threaded"
     os.environ["DASK_MAX_WORKERS"] =  "2"
-    os.environ["DASK_THREADS_PER_WORKER"] =  "16" 
+    os.environ["DASK_THREADS_PER_WORKER"] =  "14" 
     os.environ["DASK_PROCESSES"] = "0"   # or make sure ensure_dask_client uses processes=False
     
     client = get_client()
@@ -77,8 +77,8 @@ def main():
         if dim == 2:
             return CircleShapeStrategy(peak_info)
         else: dim == 3
-        r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1876)))
-        r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.2501)))
+        # r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1876)))
+        # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.202)))
         # condition = """
         # ( Min(Abs(Mod(Abs(h),2) - 1.5), 2 - Abs(Mod(Abs(h),2) - 1.5))**2
         # + Min(Abs(Mod(Abs(k),2) - 0.5), 2 - Abs(Mod(Abs(k),2) - 0.5))**2 >=  ({r})**2 )
@@ -90,16 +90,23 @@ def main():
         #  """.strip().format(r1=r1_val)
             #0    
         #rods(0.5h,0.5k,l) - spheres(0.5h,0.5k,0.5l)
-        condition = """
-            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
-            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
-        """.strip().format(r1=r1_val, r2=r2_val)
+        # condition = """
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
+        # """.strip().format(r1=r1_val, r2=r2_val)
         #     #1    
-        #spheres(0.5h,0.5k,0.5l)
+        #spheres(0.5h,0.5k,0.5l) input_parameters_LiFeO2_404040_out_antisite_swap_30_70_sph
+        # r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1876)))
+        # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.202)))
         # condition = """
         #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) < ({r2})**2)
         # """.strip().format(r1=r1_val, r2=r2_val)        
-        
+        #spheres(0.5h,0.5k,0.5l)
+        r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1576)))
+        r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.1576)))
+        condition = """
+            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) < ({r2})**2)
+        """.strip().format(r1=r1_val, r2=r2_val)    
         # #     #2    
         # #>rods(0.5h,0.5k,l) and spheres(0.5h,0.5k,0.5l)
         # condition = """
@@ -196,6 +203,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     
     rspace = parameters["rspace_info"]
+    post_mode = (
+        rspace.get("mode")
+        or rspace.get("postprocess_mode")
+        or rspace.get("postprocessing_mode")
+        or "displacement"
+    )
     parameters["hdf5_file_path"] = os.path.join(out_dir, "point_data.hdf5")
     
     pt_proc = PointProcessorFactory.create_processor(
@@ -284,8 +297,10 @@ def main():
         "average_coords" : avg_coords.to_numpy(),
         "cells_origin"   : cells_origin.to_numpy(),
         "elements"       : elements.to_numpy(),
+        "refnumbers"     : refnumbers.to_numpy(),
         "vectors"        : vectors,
         "supercell"      : supercell,
+        "postprocessing_mode": "chem",
     }
     if coeff is not None:
         params["coeff"] = coeff.to_numpy()
