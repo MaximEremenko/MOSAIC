@@ -71,7 +71,18 @@ def main():
     log = logging.getLogger("app")  
     #client.config.set(scheduler="synchronous")
     # ─── helpers -----------------------------------------------------------------
+    def _get_mask_equation(peak_info):
+        # Keep this permissive so older configs can work without edits.
+        for key in ("mask_equation", "maskEquation", "equation", "condition"):
+            val = peak_info.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return None
+
     def build_mask_strategy(dim, peak_info):
+        eq = _get_mask_equation(peak_info)
+        if eq is not None:
+            return EqBasedStrategy(eq)
         if dim == 1:
             return IntervalShapeStrategy(peak_info)
         if dim == 2:
@@ -90,23 +101,23 @@ def main():
         #  """.strip().format(r1=r1_val)
             #0    
         #rods(0.5h,0.5k,l) - spheres(0.5h,0.5k,0.5l)
-        condition = """
-            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
-            (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
-        """.strip().format(r1=r1_val, r2=r2_val)
+        # condition = """
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &
+        #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) >= ({r2})**2)
+        # """.strip().format(r1=r1_val, r2=r2_val)
         #     #1    
-        #spheres(0.5h,0.5k,0.5l)
+        # #spheres(0.5h,0.5k,0.5l)
         # condition = """
         #     (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) < ({r2})**2)
         # """.strip().format(r1=r1_val, r2=r2_val)        
         
         # #     #2    
         # #>rods(0.5h,0.5k,l) and spheres(0.5h,0.5k,0.5l)
-        # condition = """
-        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) > ({r1})**2) &
-        #      (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) > ({r2})**2)
-        # """.strip().format(r1=r1_val, r2=r2_val)
-        # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.0)))
+        condition = """
+             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) > ({r1})**2) &
+             (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2) > ({r2})**2)
+        """.strip().format(r1=r1_val, r2=r2_val)
+        r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.0)))
         # #     #3    
         # #all points
         # r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.0)))

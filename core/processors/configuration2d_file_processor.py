@@ -27,7 +27,7 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
         self.data = None
         self.vectors = None
         self.metric = None
-
+        self.cell_ids: pd.Series | None = None
     def process(self):
         """
         Reads the file, parses metadata and data, and computes lattice vectors and metrics.
@@ -86,7 +86,12 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
             dict: Metric containing reciprocal vectors and size (volume/area).
         """
         return self.metric
-
+    
+    def get_cell_ids(self) -> pd.Series | None:
+        if self.cell_ids is not None:
+            return self.cell_ids
+        return None
+    
     def get_coordinates(self) -> pd.DataFrame:
         """
         Returns the 'X' and 'Y' coordinates from the parsed data.
