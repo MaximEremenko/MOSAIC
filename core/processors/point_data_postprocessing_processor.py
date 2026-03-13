@@ -18,8 +18,8 @@ for all chunks and all sites within this run.
 All operations from A(Q) → R(r) → r_m → u_m are linear in the masked
 amplitude, so additivity over disjoint masks holds:
     u_total = u_set1 + u_set2 (up to numerical noise).
-
-Author: Maksim Eremenko (M-decoder variant)
+(M-decoder variant)
+Author: Maksim Eremenko 
 """
 
 import os
@@ -114,6 +114,9 @@ def _indices_from_axes(coords, axes_vals):
     idxs = []
     for a in range(D):
         av = axes_vals[a]
+        if len(av) == 1:
+            idxs.append(np.zeros(coords.shape[0], dtype=np.int64))
+            continue
         i = np.searchsorted(av, coords[:, a])
         i = np.clip(i, 1, len(av) - 1)
         left = np.abs(coords[:, a] - av[i - 1])
@@ -139,6 +142,8 @@ def _regrid_patch_to_c(coords, vals):
 
 def _fractional_center_index(center_val, axis_vals):
     av = np.asarray(axis_vals, float)
+    if av.size == 1:
+        return 0.0
     j = int(np.clip(np.searchsorted(av, float(center_val)), 1, av.size - 1))
     j0 = j - 1
     j1 = j
@@ -315,39 +320,6 @@ def _infer_shape_from_coords(coords):
     D = coords.shape[1]
     return tuple(int(np.unique(coords[:, a]).size) for a in range(D))
 
-
-# def _apply_rq_pipeline_local(
-#     Rvals, coords, *,
-#     q_window_kind, q_window_at_db,
-#     size_aver, hkl_max_xyz, guard_frac,
-# ):
-#     """
-#     Per-site *Q-only* processing for the linear path.
-
-#     Currently returns the raw residual Rvals (already RIFFT of the chosen
-#     ΔA(Q) mask). The PSF call is left in-place for future experimentation,
-#     but commented out in the return.
-#     """
-#     shape = _infer_shape_from_coords(coords)
-#     dim = len(shape)
-#     Rvals = np.asarray(Rvals, float).real
-
-#     # PSF in R (not used yet, but linear if enabled)
-#     _ = _qspace_psf_in_r(
-#         size_aver=np.asarray(size_aver, dtype=int),
-#         hkl_max_xyz=hkl_max_xyz,
-#         guard_frac=guard_frac,
-#         window_kind=q_window_kind,
-#         window_at_db=q_window_at_db,
-#     )
-#     # Example if you ever want to enable this:
-#     if dim == 1:
-#         r_after = convolve(Rvals, q_psf, mode="same")
-#     else:
-#         r_after = convolve(Rvals.reshape(shape), q_psf, mode="same").ravel()
-#     return r_after
-
-#    return Rvals  # current behaviour: no extra Q-stage smoothing
 def _apply_rq_pipeline_local(
     Rvals: np.ndarray,
     coords: np.ndarray,
@@ -419,6 +391,72 @@ def _write_displacements_csv(csv_path, ids, U):
         w.writerow(["central_point_id", "ux", "uy", "uz", "units=cartesian"])
         for i, (ux, uy, uz) in zip(ids.tolist(), U.tolist()):
             w.writerow([i, f"{ux:.6E}", f"{uy:.6E}", f"{uz:.6E}", "cartesian"])
+
+
+def _write_site_intensities_csv(
+    csv_path,
+    ids,
+    coords,
+    intens_real,
+    intens_imag,
+    *,
+    elements=None,
+    refnumbers=None,
+):
+    ids = np.asarray(ids).ravel()
+    coords = np.asarray(coords, float)
+    intens_real = np.asarray(intens_real, float).ravel()
+    intens_imag = np.asarray(intens_imag, float).ravel()
+
+    if coords.ndim != 2:
+        raise ValueError("coords must be a (N,D) array")
+    D = int(coords.shape[1])
+    if D < 1 or D > 3:
+        raise ValueError(f"Unsupported coordinate dimension D={D}")
+
+    # pad coords to 3 columns for a stable CSV schema
+    coords3 = np.zeros((coords.shape[0], 3), dtype=float)
+    coords3[:, :D] = coords
+
+    if elements is not None:
+        elements = np.asarray(elements, dtype=object).ravel()
+        if elements.shape[0] != ids.shape[0]:
+            raise ValueError("elements length mismatch")
+    if refnumbers is not None:
+        refnumbers = np.asarray(refnumbers).ravel()
+        if refnumbers.shape[0] != ids.shape[0]:
+            raise ValueError("refnumbers length mismatch")
+
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        header = [
+            "central_point_id",
+            "element",
+            "refnumber",
+            "x",
+            "y",
+            "z",
+            "intensity_real",
+            "intensity_imag",
+        ]
+        w.writerow(header)
+
+        for n in range(ids.shape[0]):
+            el = elements[n] if elements is not None else ""
+            rn = int(refnumbers[n]) if refnumbers is not None else ""
+            x, y, z = coords3[n].tolist()
+            w.writerow(
+                [
+                    int(ids[n]),
+                    el,
+                    rn,
+                    f"{x:.8E}",
+                    f"{y:.8E}",
+                    f"{z:.8E}",
+                    f"{float(intens_real[n]):.8E}",
+                    f"{float(intens_imag[n]):.8E}",
+                ]
+            )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -517,6 +555,30 @@ class PointDataPostprocessingProcessor:
         self.point_data_processor = point_data_processor
         self.parameters = dict(parameters or {})
 
+        # postprocessing mode
+        rspace_info = self.parameters.get("rspace_info") or {}
+        mode_raw = (
+            self.parameters.get("postprocessing_mode")
+            or self.parameters.get("postprocess_mode")
+            or self.parameters.get("mode")
+            or rspace_info.get("postprocessing_mode")
+            or rspace_info.get("postprocess_mode")
+            or rspace_info.get("mode")
+            or "displacement"
+        )
+        mode_norm = str(mode_raw).strip().lower()
+        if mode_norm in (
+            "chemical",
+            "chem",
+            "checmical",
+            "occupational",
+            "occupancy",
+            "occupantioal",
+        ):
+            self.mode = "chemical"
+        else:
+            self.mode = "displacement"
+
         # fixed linear path
         self.parameters.setdefault("normalize_amplitudes_by", "ntotal")
         self.parameters.setdefault("coords_are_fractional", False)
@@ -529,23 +591,26 @@ class PointDataPostprocessingProcessor:
         self.parameters.setdefault("q_window_at_db", 100.0)
         self.parameters.setdefault("edge_guard_frac", 0.10)
 
-        # geometry for ground-truth displacements
-        if "original_coords" not in self.parameters:
-            raise KeyError(
-                "parameters['original_coords'] is required for M-decoder."
-            )
-        if "average_coords" not in self.parameters:
-            raise KeyError(
-                "parameters['average_coords'] is required for M-decoder. "
-                "Add avg_coords.to_numpy() to params in main.py."
-            )
+        # geometry for ground-truth displacements (displacement mode only)
+        self.original_coords = None
+        self.average_coords = None
+        if self.mode == "displacement":
+            if "original_coords" not in self.parameters:
+                raise KeyError(
+                    "parameters['original_coords'] is required for displacement mode."
+                )
+            if "average_coords" not in self.parameters:
+                raise KeyError(
+                    "parameters['average_coords'] is required for displacement mode. "
+                    "Add avg_coords.to_numpy() to params in main.py."
+                )
 
-        self.original_coords = np.asarray(
-            self.parameters["original_coords"], float
-        )
-        self.average_coords = np.asarray(
-            self.parameters["average_coords"], float
-        )
+            self.original_coords = np.asarray(
+                self.parameters["original_coords"], float
+            )
+            self.average_coords = np.asarray(
+                self.parameters["average_coords"], float
+            )
  # NEW: optional precomputed displacements from config (Cartesian Å)
         self.u_true_all = None
         if "displacements_from_config" in self.parameters:
@@ -563,6 +628,15 @@ class PointDataPostprocessingProcessor:
         if not point_data_list:
             print(f"No point data found for chunk_id: {chunk_id}")
             return None
+
+        if self.mode == "chemical":
+            return self.compute_and_save_site_intensities(
+                chunk_id=chunk_id,
+                rifft_saver=rifft_saver,
+                point_data_list=point_data_list,
+                output_dir=output_dir,
+            )
+
         return self.compute_and_save_displacements(
             chunk_id=chunk_id,
             rifft_saver=rifft_saver,
@@ -974,6 +1048,171 @@ class PointDataPostprocessingProcessor:
                 f"output_chunk_{chunk_id}_amplitudes_with_displacements.h5",
             )
             rifft_saver.save_data(d_aug, h5_aug)
+
+        return out_table
+
+    def compute_and_save_site_intensities(
+        self,
+        *,
+        chunk_id,
+        rifft_saver,
+        point_data_list,
+        output_dir=None,
+    ):
+        """
+        Chemical/occupational mode:
+        - one scalar (complex) residual value per atom site, sampled at the
+          atom's center (average position).
+        """
+        log = logging.getLogger(__name__)
+
+        if output_dir is None:
+            out_by_saver = getattr(rifft_saver, "output_dir", None)
+            output_dir = out_by_saver or os.path.dirname(
+                os.path.abspath(
+                    rifft_saver.generate_filename(chunk_id, suffix="_amplitudes")
+                )
+            )
+        os.makedirs(output_dir, exist_ok=True)
+
+        # ---- load amplitudes + rifft grid ------------------------------------
+        fn_amp = rifft_saver.generate_filename(chunk_id, suffix="_amplitudes")
+        try:
+            d = rifft_saver.load_data(fn_amp)
+            amplitudes = d.get("amplitudes", None)
+            rifft_space_grid = d.get("rifft_space_grid", None)
+        except FileNotFoundError:
+            d = {}
+            amplitudes = None
+            rifft_space_grid = None
+
+        if (
+            amplitudes is None
+            or rifft_space_grid is None
+            or len(rifft_space_grid) == 0
+        ):
+            rifft_space_grid2, amplitudes2, _ = self.load_amplitudes_and_generate_grid(
+                chunk_id, point_data_list, rifft_saver
+            )
+            if amplitudes is None:
+                amplitudes = amplitudes2
+            if rifft_space_grid is None:
+                rifft_space_grid = rifft_space_grid2
+            if (
+                amplitudes is None
+                or rifft_space_grid is None
+                or len(rifft_space_grid) == 0
+            ):
+                raise RuntimeError(f"Nothing to process for chunk {chunk_id}")
+
+            amplitudes = _normalize_amplitudes_ntotal(
+                amplitudes,
+                rifft_saver=rifft_saver,
+                chunk_id=chunk_id,
+                logger=log,
+            )
+
+        # residual ΔR column (already RIFFT of masked ΔA(Q))
+        if amplitudes.ndim == 2 and amplitudes.shape[1] >= 2:
+            Rvals_all = amplitudes[:, 1]
+        else:
+            Rvals_all = np.ravel(amplitudes)
+
+        rifft_space_grid = np.asarray(rifft_space_grid)
+        D_all = rifft_space_grid.shape[1] - 1
+        coords_all = rifft_space_grid[:, :D_all]
+        ids_all = rifft_space_grid[:, -1].astype(int)
+
+        # group rows by central_point_id
+        groups = defaultdict(list)
+        for i, cid in enumerate(ids_all):
+            groups[int(cid)].append(i)
+
+        # optional metadata per atom (by central_point_id index)
+        elements_all = self.parameters.get("elements", None)
+        refnumbers_all = self.parameters.get("refnumbers", None)
+        elements_all = None if elements_all is None else np.asarray(elements_all)
+        refnumbers_all = None if refnumbers_all is None else np.asarray(refnumbers_all)
+
+        out_ids = []
+        out_coords = []
+        out_real = []
+        out_imag = []
+
+        for pd in point_data_list:
+            cid = int(pd["central_point_id"])
+            idxs = groups.get(cid, None)
+            if not idxs:
+                continue
+            idxs = np.asarray(idxs, dtype=int)
+
+            center = np.asarray(pd["coordinates"], float)[:D_all]
+            coords = coords_all[idxs, :]
+
+            # Prefer the exact central grid point when present; otherwise use nearest.
+            is_center = np.all(
+                np.isclose(coords, center[None, :], atol=1e-10, rtol=0.0),
+                axis=1,
+            )
+            if np.any(is_center):
+                pick = int(np.flatnonzero(is_center)[0])
+            else:
+                pick = int(np.argmin(np.linalg.norm(coords - center[None, :], axis=1)))
+
+            val = Rvals_all[int(idxs[pick])]
+            val = complex(val)  # robust for numpy scalar
+
+            out_ids.append(cid)
+            out_coords.append(center)
+            out_real.append(float(np.real(val)))
+            out_imag.append(float(np.imag(val)))
+
+        if not out_ids:
+            raise RuntimeError("No site intensities extracted; nothing to do.")
+
+        # stable ordering
+        order = np.argsort(np.asarray(out_ids, dtype=np.int64))
+        ids = np.asarray(out_ids, dtype=np.int64)[order]
+        coords = np.asarray(out_coords, float)[order]
+        intens_real = np.asarray(out_real, float)[order]
+        intens_imag = np.asarray(out_imag, float)[order]
+
+        out_table = {
+            "central_point_id": ids,
+            "coordinates": coords,
+            "intensity_real": intens_real,
+            "intensity_imag": intens_imag,
+        }
+
+        if (
+            elements_all is not None
+            and elements_all.ndim == 1
+            and elements_all.shape[0] > int(ids.max())
+        ):
+            out_table["element"] = np.asarray(elements_all[ids], dtype=object)
+        if (
+            refnumbers_all is not None
+            and refnumbers_all.ndim == 1
+            and refnumbers_all.shape[0] > int(ids.max())
+        ):
+            out_table["refnumber"] = np.asarray(refnumbers_all[ids])
+
+        h5_path = os.path.join(
+            output_dir, f"output_chunk_{chunk_id}_chemical_site_intensities.h5"
+        )
+        csv_path = os.path.join(
+            output_dir, f"output_chunk_{chunk_id}_chemical_site_intensities.csv"
+        )
+        rifft_saver.save_data(out_table, h5_path)
+        _write_site_intensities_csv(
+            csv_path,
+            ids,
+            coords,
+            intens_real,
+            intens_imag,
+            elements=out_table.get("element", None),
+            refnumbers=out_table.get("refnumber", None),
+        )
 
         return out_table
 
