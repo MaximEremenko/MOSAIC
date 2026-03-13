@@ -335,8 +335,13 @@ def _apply_rq_pipeline_local(
     dim   = len(shape)
     Rvals  = Rvals.real
     # Q-stage: PSF in R (sum-normalized, DC-preserving) — linear
+    size_aver = np.asarray(size_aver, dtype=int).ravel()
+    if size_aver.size < dim:
+        raise ValueError(
+            f"size_aver has {size_aver.size} dims, but local coords imply dim={dim}"
+        )
     q_psf = _qspace_psf_in_r(
-        size_aver=np.asarray(size_aver, dtype=int),
+        size_aver=size_aver[:dim],
         hkl_max_xyz=hkl_max_xyz,
         guard_frac=guard_frac,
         window_kind=q_window_kind,
@@ -386,11 +391,13 @@ def compute_hkl_max_from_intervals(intervals):
 
 
 def _write_displacements_csv(csv_path, ids, U):
+    U = np.asarray(U, float)
+    cols = ["ux", "uy", "uz"][: U.shape[1]]
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        w.writerow(["central_point_id", "ux", "uy", "uz", "units=cartesian"])
-        for i, (ux, uy, uz) in zip(ids.tolist(), U.tolist()):
-            w.writerow([i, f"{ux:.6E}", f"{uy:.6E}", f"{uz:.6E}", "cartesian"])
+        w.writerow(["central_point_id", *cols, "units=cartesian"])
+        for i, u in zip(ids.tolist(), U.tolist()):
+            w.writerow([i, *[f"{x:.6E}" for x in u], "cartesian"])
 
 
 def _write_site_intensities_csv(
@@ -517,27 +524,27 @@ def _build_feature_vector_from_patch(
         r_max = float(np.max(r)) if r.size else 1.0
         mask = (r > 0.55 * r_max).ravel("C")
 
-        N = O.size
+        # Fit and remove an odd (dipole-like) linear tilt on the outer ring
+        # using the correct dimensionality (D=1/2/3).
         if D == 1:
-            Sodd = np.vstack([s0.ravel("C"), np.zeros(N), np.zeros(N)])
+            Sodd = np.vstack([s0.ravel("C")])
         elif D == 2:
-            Sodd = np.vstack([s0.ravel("C"), s1.ravel("C"), np.zeros(N)])
+            Sodd = np.vstack([s0.ravel("C"), s1.ravel("C")])
         else:
-            Sodd = np.vstack(
-                [s0.ravel("C"), s1.ravel("C"), s2.ravel("C")]
-            )
+            Sodd = np.vstack([s0.ravel("C"), s1.ravel("C"), s2.ravel("C")])
 
         Ao = Sodd[:, mask]
         rhs = O.ravel("C")[mask]
-        Ho = Ao @ Ao.T + 1e-12 * np.eye(3)
+        Ho = Ao @ Ao.T + 1e-12 * np.eye(D)
         fo = Ao @ rhs
         b_hat = np.linalg.solve(Ho, fo)
 
-        O = O - (
-            b_hat[0] * s0
-            + (b_hat[1] * s1 if D >= 2 else 0.0)
-            + (b_hat[2] * s2 if D == 3 else 0.0)
-        )
+        if D == 1:
+            O = O - b_hat[0] * s0
+        elif D == 2:
+            O = O - (b_hat[0] * s0 + b_hat[1] * s1)
+        else:
+            O = O - (b_hat[0] * s0 + b_hat[1] * s1 + b_hat[2] * s2)
 
     # 4) radial weights (sqrt to keep scale moderate)
     W = _radial_gaussian_weights_cart(y_c.shape, steps, gamma=weight_gamma)
@@ -832,6 +839,14 @@ class PointDataPostprocessingProcessor:
 
         original_coords = self.original_coords
         average_coords = self.average_coords
+        V = np.asarray(self.parameters.get("vectors", np.eye(3)), float)
+        if V.ndim != 2 or V.shape[0] != V.shape[1]:
+            raise ValueError(f"parameters['vectors'] must be square; got shape {V.shape}")
+        D_disp = int(min(V.shape[0], original_coords.shape[1], average_coords.shape[1]))
+        if D_disp <= 0:
+            raise ValueError("Could not determine displacement dimensionality (D_disp).")
+        Vd = V[:D_disp, :D_disp]
+        Vd_inv = np.linalg.inv(Vd)
 
         # ------------------------------------------------------------------ NEW: try to load decoder M from cache
         decoder_cache_path = self._get_decoder_cache_path(output_dir)
@@ -922,13 +937,13 @@ class PointDataPostprocessingProcessor:
                     )
 
                 if self.u_true_all is not None:
-                    u_true = self.u_true_all[cid, :3]
+                    u_true = self.u_true_all[cid, :D_disp]
                 else:
                     u_true = (
-                        original_coords[cid, :3] @ np.linalg.inv(self.parameters["vectors"])
-                        - average_coords[cid, :3] @ np.linalg.inv(self.parameters["vectors"])
+                        original_coords[cid, :D_disp] @ Vd_inv
+                        - average_coords[cid, :D_disp] @ Vd_inv
                     )
-                    u_true = (u_true - np.rint(u_true)) @ self.parameters["vectors"]
+                    u_true = (u_true - np.rint(u_true)) @ Vd
 
                 features_train.append(feat)
                 u_train.append(np.asarray(u_true, float))
@@ -946,7 +961,7 @@ class PointDataPostprocessingProcessor:
                 )
 
             R_data = np.stack(features_train, axis=1)  # (P, N)
-            U_data = np.stack(u_train, axis=1)         # (3, N)
+            U_data = np.stack(u_train, axis=1)         # (D, N)
 
             P, N = R_data.shape
             log.info(
@@ -1013,10 +1028,10 @@ class PointDataPostprocessingProcessor:
         out_table = {
             "central_point_id": ids,
             "u": U,
-            "columns": np.array(["ux", "uy", "uz"], dtype=object),
+            "columns": np.array(["ux", "uy", "uz"][: U.shape[1]], dtype=object),
             "coordinate_system": np.array(["cartesian"], dtype=object),
             "units": np.array(
-                ["angstrom", "angstrom", "angstrom"], dtype=object
+                ["angstrom", "angstrom", "angstrom"][: U.shape[1]], dtype=object
             ),
         }
 
@@ -1041,7 +1056,7 @@ class PointDataPostprocessingProcessor:
             d_aug = dict(d)
             d_aug["amplitudes_with_displacement"] = aug
             d_aug["amplitudes_with_displacement_columns"] = np.array(
-                ["<orig...>", "ux", "uy", "uz"], dtype=object
+                ["<orig...>", *["ux", "uy", "uz"][: urows.shape[1]]], dtype=object
             )
             h5_aug = os.path.join(
                 output_dir,

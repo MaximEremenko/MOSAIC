@@ -158,8 +158,8 @@ def execute_cunufft(
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
     mem_frac: float = 0.5,
-    min_chunk: int = 16_000,
-    max_chunk: Optional[int] = 2*64_000,
+    min_chunk: int = 32_000,
+    max_chunk: Optional[int] = 8*64_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:
@@ -182,9 +182,9 @@ def execute_inverse_cunufft(
     *,
     c: Optional[np.ndarray] = None,
     eps: float = 1e-12,
-    mem_frac: float = 0.12,
-    min_chunk: int = 8_000,
-    max_chunk: Optional[int] = 64_000,
+    mem_frac: float = 0.50,
+    min_chunk: int = 32_000,
+    max_chunk: Optional[int] = 32*256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
 ) -> np.ndarray:

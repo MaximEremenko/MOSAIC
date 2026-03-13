@@ -27,7 +27,7 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
         self.data = None
         self.vectors = None
         self.metric = None
-
+        self.cell_ids: pd.Series | None = None
     def process(self):
         """
         Reads the file, parses metadata and data, and computes lattice vectors and metrics.
@@ -86,7 +86,12 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
             dict: Metric containing reciprocal vectors and size (volume/area).
         """
         return self.metric
-
+    
+    def get_cell_ids(self) -> pd.Series | None:
+        if self.cell_ids is not None:
+            return self.cell_ids
+        return None
+    
     def get_coordinates(self) -> pd.DataFrame:
         """
         Returns the 'X' and 'Y' coordinates from the parsed data.
@@ -139,7 +144,10 @@ class ConfigurationFileProcessor2D(IConfigurationFileProcessor):
         Returns:
            pd.Series or None: The Coeff column if present, else None.
         """
-        if 'coeff' in self.data.columns:
-            return self.data['coeff']
+        cols = {str(c).strip().lower(): c for c in self.data.columns}
+        for key in ("coeff", "Coeff", "ff", "form_factor", "formfactor"):
+            k = str(key).strip().lower()
+            if k in cols:
+                return self.data[cols[k]]
         return None
 
