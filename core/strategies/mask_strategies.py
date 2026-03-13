@@ -178,7 +178,11 @@ class EqBasedStrategy(IMaskStrategy):
         
         # 3) Lambdify to get a fast NumPy‐vectorized function f(h,k,l)->bool
         h, k, l = symbol_map['h'], symbol_map['k'], symbol_map['l']
-        self._f = np.vectorize(sp.lambdify((h, k, l), expr, modules="numpy"))
+        numpy_func_map = {
+            # Sympy's Heaviside matches NumPy's signature (x, h0)
+            "Heaviside": np.heaviside,
+        }
+        self._f = sp.lambdify((h, k, l), expr, modules=[numpy_func_map, "numpy"])
     
     def generate_mask(self, hkl_mesh: np.ndarray) -> np.ndarray:
         """
@@ -190,15 +194,29 @@ class EqBasedStrategy(IMaskStrategy):
         Returns:
             mask: np.ndarray of shape (N,), dtype=bool.
         """
-        h_vals = hkl_mesh[:, 0]
-        k_vals = hkl_mesh[:, 1]
-        l_vals = hkl_mesh[:, 2]
+        hkl_mesh = np.asarray(hkl_mesh)
+        if hkl_mesh.ndim != 2:
+            raise ValueError(f"hkl_mesh must be 2D, got shape={hkl_mesh.shape}")
 
-        # evaluate and ensure boolean dtype
+        if hkl_mesh.shape[1] >= 3:
+            h_vals = hkl_mesh[:, 0]
+            k_vals = hkl_mesh[:, 1]
+            l_vals = hkl_mesh[:, 2]
+        elif hkl_mesh.shape[1] == 2:
+            h_vals = hkl_mesh[:, 0]
+            k_vals = hkl_mesh[:, 1]
+            l_vals = np.zeros_like(h_vals)
+        elif hkl_mesh.shape[1] == 1:
+            h_vals = hkl_mesh[:, 0]
+            k_vals = np.zeros_like(h_vals)
+            l_vals = np.zeros_like(h_vals)
+        else:
+            raise ValueError(f"hkl_mesh must have at least 1 column, got shape={hkl_mesh.shape}")
+
         mask = self._f(h_vals, k_vals, l_vals)
         #plot_mask_pyvista_to_matplotlib(hkl_mesh, mask)
         
-        return mask.astype(bool)
+        return np.asarray(mask, dtype=bool).reshape(-1)
 
 
 

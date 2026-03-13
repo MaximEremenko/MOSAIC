@@ -70,8 +70,11 @@ allowed_locals = {
     
     'Mod': sp.Mod,
     'Min': sp.Min,
+    'Max': sp.Max,
     'Or':  sp.Or,
     'And':  sp.And,
+    'Heaviside': sp.Heaviside,
+    'heaviside': sp.Heaviside,
 }
 
 def preprocess(expr: str) -> str:
@@ -113,6 +116,10 @@ def parse_logic(s: str, symbols: dict, locals_dict: dict):
 
     def atom(tok):
         tok = tok.strip()
+        if tok in ("True", "true"):
+            return sp.true
+        if tok in ("False", "false"):
+            return sp.false
         # strip outer parentheses if they balance
         if tok.startswith("(") and tok.endswith(")"):
             depth = 0
@@ -124,12 +131,19 @@ def parse_logic(s: str, symbols: dict, locals_dict: dict):
             else:
                 return parse_or(tok[1:-1])
         # relational or arithmetic → sympify
-        if re.search(r"[<>=\+\-\*/]", tok):
-            return sp.sympify(tok, locals=locals_dict)
-        # single symbol
         if tok in symbols:
             return symbols[tok]
-        raise ValueError(f"Unknown token: {tok}")
+
+        merged_locals = {**locals_dict, **symbols}
+        try:
+            parsed = sp.sympify(tok, locals=merged_locals)
+        except Exception as e:
+            raise ValueError(f"Unknown token: {tok}") from e
+
+        # prevent accidental creation of new symbols via sympify("foo")
+        if isinstance(parsed, sp.Symbol) and parsed.name not in symbols:
+            raise ValueError(f"Unknown symbol: {parsed}")
+        return parsed
 
     def parse_and(expr):
         parts = split_top(expr, " and ")
