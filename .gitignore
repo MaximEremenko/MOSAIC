@@ -16,3 +16,7 @@ core/**/*.hdf5
 core/**/*.db
 core/**/*.npz
 examples/sample_1d_release/
+.codex/
+.env
+.vscode/
+dask_logs/

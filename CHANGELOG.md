@@ -7,7 +7,15 @@ baseline starting from the current scientific-stage release layout.
 
 ## [Unreleased]
 
-- No unreleased entries yet.
+### Changed
+
+- Aligned the release-facing README, example docs, and schema docs to the
+  manuscript method vocabulary: diffuse scattering amplitude, phase-preserving
+  masks, inverse Fourier transform, and residual real-space fields.
+- Clarified the supported release-candidate surface versus research-only
+  example material.
+- Replaced placeholder docs in `docs/`, `adapters/`, and `plugins/` with
+  release-facing guidance.
 
 ## [0.1.0] - 2026-03-14
 

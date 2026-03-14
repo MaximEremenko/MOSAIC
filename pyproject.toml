@@ -5,7 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mosaic"
 dynamic = ["version"]
-description = "MOSAIC scientific pipeline for scattering, residual-field, and decoding workflows."
+description = "Phase-preserving filtering of diffuse scattering amplitude for site-resolved occupancy and displacement analysis."
+keywords = [
+  "diffuse-scattering",
+  "Fourier-filtering",
+  "non-uniform-fft",
+  "materials-science",
+]
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
