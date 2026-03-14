@@ -1,5 +1,8 @@
 cff-version: 1.2.0
-message: "If you use MOSAIC, please cite the software using the metadata in this file."
+message: >-
+  If you use MOSAIC for phase-preserving filtering of diffuse scattering
+  amplitude and recovery of site-resolved occupancy or displacement fields,
+  please cite the software using the metadata in this file.
 title: "MOSAIC"
 version: "0.1.0"
 date-released: 2026-03-14
@@ -10,10 +13,14 @@ authors:
 repository-code: "https://github.com/MaximEremenko/MOSAIC"
 url: "https://github.com/MaximEremenko/MOSAIC"
 abstract: >-
-  MOSAIC is a scientific-stage pipeline for structure loading, patch-center
-  selection, q-space partitioning, scattering, residual-field materialization,
-  and decoding.
+  MOSAIC computes diffuse scattering amplitude from atomistic configurations,
+  applies phase-preserving reciprocal-space masks, and evaluates the inverse
+  Fourier transform to recover residual real-space fields used to infer
+  site-resolved chemical-order and displacement maps.
 keywords:
+  - diffuse-scattering
+  - Fourier-filtering
+  - non-uniform-FFT
   - scattering
   - reciprocal-space
   - residual-field
