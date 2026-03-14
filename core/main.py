@@ -8,10 +8,10 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-from core.entrypoints.main import main
+from core.entrypoints.main import cli, main
 
-__all__ = ["main"]
+__all__ = ["cli", "main"]
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli())

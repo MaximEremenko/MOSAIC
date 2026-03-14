@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from multiprocessing import freeze_support
@@ -10,9 +11,10 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-from core.application.configuration import ParameterLoadingService
-from core.application.workflow import WorkflowService
-from core.infrastructure.runtime import (
+from core.config import ParameterLoadingService
+from core import __version__
+from core.workflow import build_default_workflow_service
+from core.runtime import (
     get_client,
     set_log_dir_for_run,
     setup_logging,
@@ -47,7 +49,7 @@ def main(run_file: str = "run_parameters.json") -> None:
         )
 
     try:
-        WorkflowService().run(
+        build_default_workflow_service().run(
             run_settings=run_settings,
             workflow_parameters=workflow_parameters,
             client=client,
@@ -56,6 +58,31 @@ def main(run_file: str = "run_parameters.json") -> None:
         shutdown_dask()
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mosaic",
+        description="Run the MOSAIC scientific-stage workflow.",
+    )
+    parser.add_argument(
+        "run_file",
+        nargs="?",
+        default="run_parameters.json",
+        help="Path to run_parameters.json. Defaults to ./run_parameters.json.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def cli(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     freeze_support()
-    main()
+    main(args.run_file)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

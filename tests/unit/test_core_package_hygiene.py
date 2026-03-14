@@ -7,10 +7,18 @@ ALLOWED_NON_CODE = {
     "core/environment.yml",
 }
 ALLOWED_TOP_LEVEL_DIRS = {
-    "application",
-    "domain",
+    "adapters",
+    "config",
+    "decoding",
     "entrypoints",
-    "infrastructure",
+    "patch_centers",
+    "qspace",
+    "residual_field",
+    "runtime",
+    "scattering",
+    "storage",
+    "structure",
+    "workflow",
 }
 
 
@@ -36,7 +44,7 @@ def test_core_has_no_tracked_runtime_or_artifact_files():
     assert disallowed == []
 
 
-def test_core_has_only_layered_top_level_packages():
+def test_core_has_only_scientific_stage_top_level_packages():
     core_root = ROOT / "core"
     top_level_dirs = {
         path.name

@@ -1,7 +1,7 @@
-from core.infrastructure.configuration.factories.parameter_factory import (
+from core.config.factories.parameter_factory import (
     ParametersProcessorFactory,
 )
-from core.infrastructure.storage.hdf5_parameter_storage import HDF5ParameterSaver
+from core.storage.hdf5_parameter_storage import HDF5ParameterSaver
 
 
 def test_hdf5_parameter_source_is_supported(tmp_path):

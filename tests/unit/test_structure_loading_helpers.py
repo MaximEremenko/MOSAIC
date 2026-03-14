@@ -4,10 +4,11 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from core.application.structure.coefficients import (
+from core.structure.coefficients import (
     load_coefficients_from_file,
     resolve_structure_coefficients,
 )
+from core.structure.lattice import apply_lattice_vectors
 
 
 LOGGER = logging.getLogger("test.structure")
@@ -47,3 +48,29 @@ def test_load_coefficients_from_file_maps_2d_coeff_matrix(tmp_path):
     )
 
     np.testing.assert_allclose(coeff, np.array([1.0, 4.0]))
+
+
+def test_apply_lattice_vectors_handles_small_2d_and_3d_transforms_without_blas():
+    coords2 = np.array([[1.0, 2.0], [0.5, 0.25]])
+    vectors2 = np.array([[2.0, 0.0], [0.5, 3.0]])
+    transformed2 = apply_lattice_vectors(coords2, vectors2)
+    np.testing.assert_allclose(
+        transformed2,
+        np.array(
+            [
+                [3.0, 6.0],
+                [1.125, 0.75],
+            ]
+        ),
+    )
+
+    coords3 = np.array([[1.0, 2.0, 3.0]])
+    vectors3 = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.5, 2.0, 0.0],
+            [0.25, 0.75, 3.0],
+        ]
+    )
+    transformed3 = apply_lattice_vectors(coords3, vectors3)
+    np.testing.assert_allclose(transformed3, np.array([[2.75, 6.25, 9.0]]))
