@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import TYPE_CHECKING, Any, Dict, Iterable
 
 import numpy as np
-from dask.distributed import Client
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 from core.scattering.artifacts import is_interval_artifact_committed
 from core.scattering.contracts import ScatteringWorkUnit
@@ -22,19 +20,23 @@ from core.scattering.planning import (
     chunk_ids_for_work_units,
     interval_paths_for_work_units,
 )
-from core.scattering.runtime import (
-    CuPyCleanup,
+from core.runtime import (
     DEFAULT_TASK_RETRIES,
-    _is_sync_client,
-    _quiet_db_info,
-    _tqdm,
-    _yield_futures_with_results,
+    is_sync_client,
+    logging_redirect_tqdm,
+    progress_bar,
+    quiet_loggers,
+    register_cleanup_plugin,
+    yield_futures_with_results,
 )
 from core.scattering.tasks import (
     run_scattering_interval_chunk_task,
     run_scattering_interval_task,
 )
 from core.storage.database_manager import DatabaseManager
+
+if TYPE_CHECKING:
+    from dask.distributed import Client
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +65,7 @@ def run_interval_precompute(
     charge: float,
     ff_factory,
     db: DatabaseManager,
-    client: Client | None,
+    client: "Client | None",
 ) -> list[Path]:
     pending = [
         work_unit
@@ -88,7 +90,7 @@ def run_interval_precompute(
         return cached
 
     written_files: list[Path] = []
-    if (client is not None) and (not _is_sync_client(client)):
+    if (client is not None) and (not is_sync_client(client)):
         futures = [
             client.submit(
                 run_scattering_interval_task,
@@ -114,8 +116,8 @@ def run_interval_precompute(
             for work_unit in pending
         ]
         with logging_redirect_tqdm():
-            with _tqdm(len(futures), desc="Precompute intervals", unit="intervals") as pbar:
-                for future, _ in _yield_futures_with_results(futures, client):
+            with progress_bar(len(futures), desc="Precompute intervals", unit="intervals") as pbar:
+                for future, _ in yield_futures_with_results(futures, client):
                     try:
                         manifest = future.result()
                     except Exception:
@@ -134,7 +136,7 @@ def run_interval_precompute(
         )
         return cached + written_files
 
-    with _tqdm(len(pending), desc="Precompute intervals", unit="intervals") as pbar:
+    with progress_bar(len(pending), desc="Precompute intervals", unit="intervals") as pbar:
         for work_unit in pending:
             manifest = run_scattering_interval_task(
                 work_unit,
@@ -176,7 +178,7 @@ def run_interval_chunk_execution(
     total_reciprocal_points: int,
     point_data_list: list[dict],
     db_manager: DatabaseManager,
-    client: Client | None,
+    client: "Client | None",
     output_dir: str,
     max_inflight: int = 5_000,
 ) -> None:
@@ -188,7 +190,7 @@ def run_interval_chunk_execution(
     interval_paths = interval_paths_for_work_units(work_units)
     if client is None:
         rec = point_list_to_recarray(point_data_list)
-        with _tqdm(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
+        with progress_bar(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
             for work_unit in work_units:
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
                 manifest = run_scattering_interval_chunk_task(
@@ -293,7 +295,7 @@ def run_interval_chunk_execution(
                 fail_streak = 0
 
     with logging_redirect_tqdm():
-        with _tqdm(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
+        with progress_bar(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
 
             def bump() -> None:
                 pbar.update(1)
@@ -303,7 +305,7 @@ def run_interval_chunk_execution(
                 _submit(work_unit)
                 _harvest_finished_nonblocking(bump)
                 while len(flying) >= max_inflight:
-                    for future, result in _yield_futures_with_results(list(flying), client):
+                    for future, result in yield_futures_with_results(list(flying), client):
                         ok = bool(result)
                         flying.discard(future)
                         completed_work_unit = future_meta.pop(future, None)
@@ -322,7 +324,7 @@ def run_interval_chunk_execution(
                         else:
                             fail_streak = 0
 
-            for future, result in _yield_futures_with_results(list(flying), client):
+            for future, result in yield_futures_with_results(list(flying), client):
                 completed_work_unit = future_meta.pop(future, None)
                 bump()
                 if not bool(result) and completed_work_unit is not None:
@@ -343,13 +345,9 @@ def run_scattering_stage(
     db_manager: DatabaseManager,
     output_dir: str,
     point_data_processor,
-    client: Client | None,
+    client: "Client | None",
 ) -> None:
-    try:
-        if client is not None and not _is_sync_client(client):
-            client.register_worker_plugin(CuPyCleanup(), name="cupy-cleanup")
-    except ValueError:
-        pass
+    register_cleanup_plugin(client, is_sync_client=is_sync_client)
 
     reciprocal_space_intervals_all = parameters["reciprocal_space_intervals_all"]
     reciprocal_space_intervals = parameters["reciprocal_space_intervals"]
@@ -370,7 +368,7 @@ def run_scattering_stage(
         output_dir=output_dir,
     )
     interval_lookup = build_scattering_interval_lookup(reciprocal_space_intervals)
-    with _quiet_db_info():
+    with quiet_loggers("core.storage.database_manager", "DatabaseManager"):
         run_interval_precompute(
             precompute_work_units,
             interval_lookup=interval_lookup,

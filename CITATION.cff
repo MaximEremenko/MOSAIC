@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use MOSAIC, please cite the software using the metadata in this file."
+title: "MOSAIC"
+version: "0.1.0"
+date-released: 2026-03-14
+type: software
+authors:
+  - family-names: "Eremenko"
+    given-names: "Maksim"
+repository-code: "https://github.com/MaximEremenko/MOSAIC"
+url: "https://github.com/MaximEremenko/MOSAIC"
+abstract: >-
+  MOSAIC is a scientific-stage pipeline for structure loading, patch-center
+  selection, q-space partitioning, scattering, residual-field materialization,
+  and decoding.
+keywords:
+  - scattering
+  - reciprocal-space
+  - residual-field
+  - materials-science
+  - dask

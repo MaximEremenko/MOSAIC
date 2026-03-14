@@ -20,6 +20,27 @@ ALLOWED_TOP_LEVEL_DIRS = {
     "structure",
     "workflow",
 }
+EXPECTED_UNIT_STAGE_DIRS = {
+    "config",
+    "structure",
+    "patch_centers",
+    "qspace",
+    "scattering",
+    "residual_field",
+    "decoding",
+    "storage",
+    "runtime",
+}
+ALLOWED_CROSS_CUTTING_UNIT_TESTS = {
+    "test_application_services.py",
+    "test_core_package_hygiene.py",
+    "test_core_package_smoke.py",
+    "test_entrypoints.py",
+    "test_import_style_guard.py",
+    "test_no_print_guard.py",
+    "test_stage_contracts.py",
+    "test_stage_manifest_semantics.py",
+}
 
 
 def test_core_has_no_tracked_runtime_or_artifact_files():
@@ -52,3 +73,20 @@ def test_core_has_only_scientific_stage_top_level_packages():
         if path.is_dir() and path.name != "__pycache__"
     }
     assert top_level_dirs == ALLOWED_TOP_LEVEL_DIRS
+
+
+def test_unit_tests_are_grouped_by_stage_or_kept_cross_cutting():
+    unit_root = ROOT / "tests" / "unit"
+    stage_dirs = {
+        path.name
+        for path in unit_root.iterdir()
+        if path.is_dir() and path.name != "__pycache__"
+    }
+    assert EXPECTED_UNIT_STAGE_DIRS.issubset(stage_dirs)
+
+    flat_tests = {
+        path.name
+        for path in unit_root.iterdir()
+        if path.is_file() and path.name.startswith("test_") and path.suffix == ".py"
+    }
+    assert flat_tests == ALLOWED_CROSS_CUTTING_UNIT_TESTS

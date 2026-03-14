@@ -102,3 +102,8 @@ def test_parameter_loading_service_finds_examples_run_file_from_core_workdir(
     assert workflow_parameters.struct_info["filename"] == str(
         fixture_dir / "sample_1d.f1d"
     )
+
+
+def test_resolve_repo_root_points_to_repository_root():
+    expected = Path(__file__).resolve().parents[3]
+    assert configuration_service.resolve_repo_root() == expected

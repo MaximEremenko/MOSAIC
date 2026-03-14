@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from core.config.values import first_present
 from core.processing_mode import normalize_processing_mode
-from core.qspace.masking.mask_strategies import EqBasedStrategy
+from core.qspace.masking.mask_strategies import DefaultMaskStrategy, EqBasedStrategy
 from core.qspace.masking.shape_strategies import (
     CircleShapeStrategy,
     IntervalShapeStrategy,
@@ -14,6 +14,8 @@ class MaskStrategyService:
         equation = self.get_equation(peak_info)
         if equation is not None:
             return EqBasedStrategy(equation)
+        if not self.has_special_points(peak_info):
+            return DefaultMaskStrategy()
         if dim == 1:
             return IntervalShapeStrategy(peak_info)
         if dim == 2:
@@ -37,3 +39,7 @@ class MaskStrategyService:
         return first_present(
             peak_info, ("mask_equation", "maskEquation", "equation", "condition")
         )
+
+    def has_special_points(self, peak_info: dict) -> bool:
+        special_points = first_present(peak_info, ("specialPoints", "special_points"))
+        return isinstance(special_points, list) and len(special_points) > 0

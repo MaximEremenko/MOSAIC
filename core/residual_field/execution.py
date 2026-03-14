@@ -3,24 +3,27 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from typing import TYPE_CHECKING
 
 import numpy as np
-from dask.distributed import Client
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 from core.scattering.kernels import (
     point_list_to_recarray,
     reciprocal_space_points_counter,
     to_interval_dict,
 )
-from core.scattering.runtime import (
+from core.runtime import (
     DEFAULT_TASK_RETRIES,
-    _is_sync_client,
-    _tqdm,
-    _yield_futures_with_results,
+    is_sync_client,
+    logging_redirect_tqdm,
+    progress_bar,
+    yield_futures_with_results,
 )
 from core.residual_field.tasks import run_residual_field_interval_chunk_task
 from core.residual_field.contracts import ResidualFieldWorkUnit
+
+if TYPE_CHECKING:
+    from dask.distributed import Client
 
 
 logger = logging.getLogger(__name__)
@@ -75,7 +78,7 @@ def run_residual_field_stage(
     workflow_parameters,
     structure,
     artifacts,
-    client: Client | None,
+    client: "Client | None",
     max_inflight: int = 5_000,
 ) -> None:
     work_units = build_residual_field_work_units(
@@ -99,7 +102,7 @@ def run_residual_field_stage(
 
     if client is None:
         rec = point_list_to_recarray(point_data_list)
-        with _tqdm(total_tasks, desc="Residual field (chunks × intervals)", unit="pairs") as pbar:
+        with progress_bar(total_tasks, desc="Residual field (chunks × intervals)", unit="pairs") as pbar:
             for work_unit in work_units:
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
                 manifest = run_residual_field_interval_chunk_task(
@@ -205,7 +208,7 @@ def run_residual_field_stage(
                 fail_streak = 0
 
     with logging_redirect_tqdm():
-        with _tqdm(total_tasks, desc="Residual field (chunks × intervals)", unit="pairs") as pbar:
+        with progress_bar(total_tasks, desc="Residual field (chunks × intervals)", unit="pairs") as pbar:
 
             def bump() -> None:
                 pbar.update(1)
@@ -215,7 +218,7 @@ def run_residual_field_stage(
                 _submit(work_unit)
                 _harvest_finished_nonblocking(bump)
                 while len(flying) >= max_inflight:
-                    for future, result in _yield_futures_with_results(list(flying), client):
+                    for future, result in yield_futures_with_results(list(flying), client):
                         ok = bool(result)
                         flying.discard(future)
                         completed_work_unit = future_meta.pop(future, None)
@@ -234,7 +237,7 @@ def run_residual_field_stage(
                         else:
                             fail_streak = 0
 
-            for future, result in _yield_futures_with_results(list(flying), client):
+            for future, result in yield_futures_with_results(list(flying), client):
                 completed_work_unit = future_meta.pop(future, None)
                 bump()
                 if not bool(result) and completed_work_unit is not None:

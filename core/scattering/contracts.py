@@ -7,6 +7,7 @@ import numpy as np
 
 from core.contracts import (
     ArtifactRef,
+    ArtifactSchemaSpec,
     CompletionStatus,
     MergeInvariantSpec,
     RetryDisposition,
@@ -15,6 +16,41 @@ from core.contracts import (
 
 
 SCATTERING_CONTRACT_SCHEMA_VERSION = 1
+SCATTERING_INTERVAL_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
+    stage="scattering",
+    name="scattering-interval-precompute",
+    schema_version=SCATTERING_CONTRACT_SCHEMA_VERSION,
+    required_artifact_kinds=("interval-precompute",),
+    completeness_rule=(
+        "the interval artifact file must exist and SQLite must mark the interval as precomputed"
+    ),
+    resume_rule=(
+        "resume is allowed while the interval is not yet committed; replay becomes a no-op "
+        "only after both the NPZ artifact and SQLite precomputed flag are present"
+    ),
+)
+SCATTERING_CHUNK_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
+    stage="scattering",
+    name="scattering-interval-chunk",
+    schema_version=SCATTERING_CONTRACT_SCHEMA_VERSION,
+    required_artifact_kinds=(
+        "chunk-amplitudes",
+        "chunk-amplitudes-average",
+        "chunk-grid-shape",
+        "chunk-reciprocal-point-count",
+        "chunk-total-reciprocal-point-count",
+        "chunk-applied-interval-ids",
+    ),
+    completeness_rule=(
+        "all chunk artifacts must exist, SQLite must mark the (interval, chunk) pair as saved, "
+        "and _applied_interval_ids must contain the interval id"
+    ),
+    resume_rule=(
+        "resume is allowed while the upstream interval artifact is readable and the chunk is "
+        "not yet committed; duplicate replay becomes a no-op only after the committed-state "
+        "predicate above is satisfied"
+    ),
+)
 
 
 def make_scattering_retry_key(interval_id: int, chunk_id: int | None = None) -> str:
@@ -196,6 +232,14 @@ class ScatteringWorkUnit:
             ),
         )
 
+    @property
+    def artifact_schema(self) -> ArtifactSchemaSpec:
+        return (
+            SCATTERING_INTERVAL_ARTIFACT_SCHEMA
+            if self.chunk_id is None
+            else SCATTERING_CHUNK_ARTIFACT_SCHEMA
+        )
+
 
 @dataclass(frozen=True)
 class ScatteringPartialResult:
@@ -275,6 +319,29 @@ def validate_scattering_partial_result(result: ScatteringPartialResult) -> None:
         raise ValueError("reciprocal_point_count must be non-negative.")
 
 
+def validate_scattering_work_unit(work_unit: ScatteringWorkUnit) -> None:
+    if work_unit.interval_id < 0:
+        raise ValueError("interval_id must be non-negative.")
+    if work_unit.chunk_id is not None and work_unit.chunk_id < 0:
+        raise ValueError("chunk_id must be non-negative when present.")
+    if work_unit.dimension <= 0:
+        raise ValueError("dimension must be positive.")
+    if work_unit.schema_version != SCATTERING_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("Unexpected scattering work-unit schema version.")
+    if work_unit.chunk_id is None:
+        if work_unit.interval_artifact is None or work_unit.chunk_artifact_prefix is not None:
+            raise ValueError(
+                "Interval-precompute work units must have an interval artifact and no chunk prefix."
+            )
+    else:
+        if work_unit.interval_artifact is None or work_unit.chunk_artifact_prefix is None:
+            raise ValueError(
+                "Chunk-scoped scattering work units must include interval and chunk artifact identities."
+            )
+    if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
+        raise ValueError("Scattering Phase 6 assumes NO_OP replay semantics.")
+
+
 def scattering_partial_result_identity(
     *,
     chunk_id: int,
@@ -352,6 +419,7 @@ class ScatteringArtifactManifest:
     producer_stage: str = "scattering"
     consumer_stage: str | None = None
     upstream_artifacts: tuple[ArtifactRef, ...] = ()
+    artifact_schema_name: str = SCATTERING_INTERVAL_ARTIFACT_SCHEMA.name
     schema_version: int = SCATTERING_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -363,6 +431,7 @@ class ScatteringArtifactManifest:
         completion_status: CompletionStatus,
         consumer_stage: str | None = None,
     ) -> "ScatteringArtifactManifest":
+        validate_scattering_work_unit(work_unit)
         upstream = (
             (work_unit.interval_artifact,)
             if work_unit.interval_artifact is not None and work_unit.chunk_id is not None
@@ -377,11 +446,31 @@ class ScatteringArtifactManifest:
             chunk_id=work_unit.chunk_id,
             consumer_stage=consumer_stage,
             upstream_artifacts=upstream,
+            artifact_schema_name=work_unit.artifact_schema.name,
         )
+
+
+def validate_scattering_artifact_manifest(manifest: ScatteringArtifactManifest) -> None:
+    if manifest.producer_stage != "scattering":
+        raise ValueError("Scattering artifact manifests must be produced by the scattering stage.")
+    if manifest.schema_version != SCATTERING_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("Unexpected scattering artifact-manifest schema version.")
+    artifact_keys = [artifact.key for artifact in manifest.artifacts]
+    if len(set(artifact_keys)) != len(artifact_keys):
+        raise ValueError("Scattering artifact manifests must not contain duplicate artifact keys.")
+    artifact_schema = (
+        SCATTERING_INTERVAL_ARTIFACT_SCHEMA
+        if manifest.chunk_id is None
+        else SCATTERING_CHUNK_ARTIFACT_SCHEMA
+    )
+    if manifest.artifact_schema_name != artifact_schema.name:
+        raise ValueError("Scattering artifact manifest schema name does not match its scope.")
 
 
 __all__ = [
     "SCATTERING_CONTRACT_SCHEMA_VERSION",
+    "SCATTERING_CHUNK_ARTIFACT_SCHEMA",
+    "SCATTERING_INTERVAL_ARTIFACT_SCHEMA",
     "SCATTERING_PARTIAL_RESULT_MERGE_INVARIANTS",
     "ScatteringArtifactManifest",
     "ScatteringPartialResult",
@@ -392,5 +481,7 @@ __all__ = [
     "make_scattering_retry_key",
     "merge_scattering_partial_results",
     "scattering_partial_result_identity",
+    "validate_scattering_artifact_manifest",
+    "validate_scattering_work_unit",
     "validate_scattering_partial_result",
 ]

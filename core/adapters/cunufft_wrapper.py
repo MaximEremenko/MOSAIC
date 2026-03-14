@@ -53,6 +53,8 @@ else:
 
 # Lazily imported CPU backend (avoid importing finufft on GPU-only nodes)
 _FINUFFT3: dict[int, Callable] | None = None
+_DIRECT_CPU_FALLBACK_WARNED = False
+_DIRECT_CPU_FALLBACK_MAX_TARGETS = 50_000
 
 ###############################################################################
 #  Memory helpers                                                             #
@@ -383,7 +385,17 @@ def _cpu_fallback(
     if _FINUFFT3 is None:
         _FINUFFT3 = {}
     if dim not in _FINUFFT3:
-        import finufft
+        try:
+            import finufft
+        except ModuleNotFoundError:
+            _warn_direct_cpu_fallback()
+            return _direct_cpu_fallback(
+                real_coords,
+                weights,
+                q_coords,
+                inverse=inverse,
+                batch=batch,
+            )
         _FINUFFT3[dim] = {1: finufft.nufft1d3,
                           2: finufft.nufft2d3,
                           3: finufft.nufft3d3}[dim]
@@ -415,6 +427,57 @@ def _cpu_fallback(
             out += res
         else:
             out[start:end] = res
+        start = end
+
+    return out
+
+
+def _warn_direct_cpu_fallback() -> None:
+    global _DIRECT_CPU_FALLBACK_WARNED
+    if _DIRECT_CPU_FALLBACK_WARNED:
+        return
+    warnings.warn(
+        "finufft is not available; using a slow direct CPU fallback. "
+        "This path is intended for smoke-scale validation only.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    _DIRECT_CPU_FALLBACK_WARNED = True
+
+
+def _direct_cpu_fallback(
+    real_coords: np.ndarray,
+    weights: np.ndarray,
+    q_coords: np.ndarray,
+    *,
+    inverse: bool,
+    batch: int,
+) -> np.ndarray:
+    sources = np.asarray(q_coords if inverse else real_coords, dtype=np.float64)
+    targets = np.asarray(real_coords if inverse else q_coords, dtype=np.float64)
+    coeffs = np.asarray(weights, dtype=np.complex128)
+    if sources.ndim != 2 or targets.ndim != 2:
+        raise ValueError("NUFFT coordinates must be 2-D arrays.")
+    if sources.shape[1] != targets.shape[1]:
+        raise ValueError("Source and target coordinates must have matching dimensionality.")
+
+    n_sources = int(sources.shape[0])
+    n_targets = int(targets.shape[0])
+    if coeffs.shape[0] != n_sources:
+        raise ValueError("Weights length must match the source coordinate count.")
+
+    target_batch = min(int(batch), _DIRECT_CPU_FALLBACK_MAX_TARGETS)
+    target_batch = max(1, target_batch)
+    isign = -1 if inverse else 1
+    out = np.zeros(n_targets, dtype=np.complex128)
+    sources_t = np.ascontiguousarray(sources.T)
+
+    start = 0
+    while start < n_targets:
+        end = min(start + target_batch, n_targets)
+        target_chunk = targets[start:end]
+        phase = target_chunk @ sources_t
+        out[start:end] = np.exp(1j * isign * phase) @ coeffs
         start = end
 
     return out

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -13,13 +14,16 @@ from core.scattering.accumulation import (
     merge_scattering_partial_results,
 )
 from core.scattering.contracts import (
+    SCATTERING_CHUNK_ARTIFACT_SCHEMA,
+    SCATTERING_INTERVAL_ARTIFACT_SCHEMA,
     ScatteringArtifactManifest,
     ScatteringWorkUnit,
     build_chunk_artifact_refs,
+    validate_scattering_artifact_manifest,
 )
 from core.scattering.kernels import IntervalTask
-from core.scattering.runtime import TIMER
-from core.contracts import CompletionStatus
+from core.contracts import ArtifactManifestAssessment, CompletionStatus
+from core.runtime import TIMER
 from core.storage.database_manager import create_db_manager_for_thread
 from core.storage import RIFFTInDataSaver
 
@@ -28,18 +32,24 @@ logger = logging.getLogger(__name__)
 
 
 class _IntervalPrecomputeStateUpdater:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+    ) -> None:
         self.db_path = db_path
+        self.db_manager_factory = db_manager_factory
 
     def is_precomputed(self, interval_id: int) -> bool:
-        db = create_db_manager_for_thread(self.db_path)
+        db = self.db_manager_factory(self.db_path)
         try:
             return db.is_interval_precomputed(interval_id)
         finally:
             db.close()
 
     def mark_precomputed(self, interval_id: int) -> None:
-        db = create_db_manager_for_thread(self.db_path)
+        db = self.db_manager_factory(self.db_path)
         try:
             db.mark_interval_precomputed(interval_id, True)
         finally:
@@ -47,21 +57,42 @@ class _IntervalPrecomputeStateUpdater:
 
 
 class _IntervalChunkStatusUpdater:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+    ) -> None:
         self.db_path = db_path
+        self.db_manager_factory = db_manager_factory
 
     def mark_saved(self, interval_id: int, chunk_id: int) -> None:
-        db = create_db_manager_for_thread(self.db_path)
+        db = self.db_manager_factory(self.db_path)
         try:
             db.update_interval_chunk_status(interval_id, chunk_id, saved=True)
         finally:
             db.close()
 
+    def is_saved(self, interval_id: int, chunk_id: int) -> bool:
+        db = self.db_manager_factory(self.db_path)
+        try:
+            return (int(interval_id), int(chunk_id)) not in {
+                (int(iv), int(ch))
+                for iv, ch in db.get_unsaved_interval_chunks()
+            }
+        finally:
+            db.close()
+
 
 class ScatteringArtifactStore:
-    def __init__(self, output_dir: str) -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        *,
+        saver: RIFFTInDataSaver | None = None,
+    ) -> None:
         self.output_dir = output_dir
-        self.saver = RIFFTInDataSaver(output_dir, "hdf5")
+        self.saver = saver or RIFFTInDataSaver(output_dir, "hdf5")
 
     def _filename(self, chunk_id: int, suffix: str) -> str:
         return self.saver.generate_filename(chunk_id, suffix)
@@ -90,6 +121,16 @@ class ScatteringArtifactStore:
     ) -> None:
         fn_tot = self._filename(chunk_id, "_amplitudes_ntotal_reciprocal_space_points")
         val = int(total_reciprocal_points)
+
+        def _write_total_points() -> None:
+            self.saver.save_data(
+                {
+                    "ntotal_reciprocal_space_points": np.array([val], dtype=np.int64),
+                    "ntotal_reciprocal_points": np.array([val], dtype=np.int64),
+                },
+                fn_tot,
+            )
+
         try:
             data = self.saver.load_data(fn_tot)
 
@@ -109,13 +150,14 @@ class ScatteringArtifactStore:
                 data["ntotal_reciprocal_points"] = np.array([val], dtype=np.int64)
                 self.saver.save_data(data, fn_tot)
         except FileNotFoundError:
-            self.saver.save_data(
-                {
-                    "ntotal_reciprocal_space_points": np.array([val], dtype=np.int64),
-                    "ntotal_reciprocal_points": np.array([val], dtype=np.int64),
-                },
-                fn_tot,
+            _write_total_points()
+        except Exception as exc:
+            logger.warning(
+                "Recreating corrupted total reciprocal-point artifact for chunk %d: %s",
+                chunk_id,
+                exc,
             )
+            _write_total_points()
 
     def load_applied_interval_ids(self, chunk_id: int) -> set[int]:
         fn_applied = self._filename(chunk_id, "_applied_interval_ids")
@@ -193,12 +235,14 @@ def build_scattering_interval_manifest(
         if work_unit.interval_artifact is not None
         else ()
     )
-    return ScatteringArtifactManifest.from_work_unit(
+    manifest = ScatteringArtifactManifest.from_work_unit(
         work_unit,
         artifacts=artifacts,
         completion_status=completion_status,
         consumer_stage="residual_field",
     )
+    validate_scattering_artifact_manifest(manifest)
+    return manifest
 
 
 def build_scattering_chunk_manifest(
@@ -209,24 +253,164 @@ def build_scattering_chunk_manifest(
 ) -> ScatteringArtifactManifest:
     if work_unit.chunk_id is None:
         raise ValueError("Chunk-scattering manifest requires a chunk-scoped work unit.")
-    return ScatteringArtifactManifest.from_work_unit(
+    manifest = ScatteringArtifactManifest.from_work_unit(
         work_unit,
         artifacts=build_chunk_artifact_refs(output_dir, work_unit.chunk_id),
         completion_status=completion_status,
         consumer_stage="residual_field",
     )
+    validate_scattering_artifact_manifest(manifest)
+    return manifest
+
+
+def _missing_artifact_kinds(
+    manifest: ScatteringArtifactManifest,
+) -> tuple[str, ...]:
+    schema = (
+        SCATTERING_INTERVAL_ARTIFACT_SCHEMA
+        if manifest.chunk_id is None
+        else SCATTERING_CHUNK_ARTIFACT_SCHEMA
+    )
+    present_kinds = {artifact.kind for artifact in manifest.artifacts}
+    return tuple(
+        kind for kind in schema.required_artifact_kinds if kind not in present_kinds
+    )
+
+
+def _missing_artifact_paths(artifacts: tuple) -> tuple[str, ...]:
+    missing: list[str] = []
+    for artifact in artifacts:
+        if artifact.path is None or not Path(artifact.path).exists():
+            missing.append(artifact.key)
+    return tuple(sorted(missing))
+
+
+def assess_scattering_manifest(
+    manifest: ScatteringArtifactManifest,
+    *,
+    db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+) -> ArtifactManifestAssessment:
+    validate_scattering_artifact_manifest(manifest)
+    schema = (
+        SCATTERING_INTERVAL_ARTIFACT_SCHEMA
+        if manifest.chunk_id is None
+        else SCATTERING_CHUNK_ARTIFACT_SCHEMA
+    )
+    missing_kinds = _missing_artifact_kinds(manifest)
+    missing_paths = _missing_artifact_paths(manifest.artifacts)
+    all_required_artifacts_present = not missing_kinds and not missing_paths
+
+    if manifest.chunk_id is None:
+        committed_state_consistent = (
+            manifest.interval_id is not None
+            and _IntervalPrecomputeStateUpdater(
+                db_path,
+                db_manager_factory=db_manager_factory,
+            ).is_precomputed(manifest.interval_id)
+        )
+        can_resume = not (
+            all_required_artifacts_present
+            and committed_state_consistent
+            and manifest.completion_status is CompletionStatus.COMMITTED
+        )
+    else:
+        upstream_paths_missing = _missing_artifact_paths(manifest.upstream_artifacts)
+        applied_ids = ScatteringArtifactStore(
+            str(Path(manifest.artifacts[0].path).parent)
+        ).load_applied_interval_ids(manifest.chunk_id)
+        committed_state_consistent = (
+            manifest.interval_id is not None
+            and _IntervalChunkStatusUpdater(
+                db_path,
+                db_manager_factory=db_manager_factory,
+            ).is_saved(manifest.interval_id, manifest.chunk_id)
+            and manifest.interval_id in applied_ids
+        )
+        can_resume = bool(not upstream_paths_missing) and not (
+            all_required_artifacts_present
+            and committed_state_consistent
+            and manifest.completion_status is CompletionStatus.COMMITTED
+        )
+
+    is_complete = (
+        all_required_artifacts_present
+        and committed_state_consistent
+        and manifest.completion_status is CompletionStatus.COMMITTED
+    )
+    detail = (
+        "committed"
+        if is_complete
+        else schema.resume_rule if can_resume else schema.completeness_rule
+    )
+    return ArtifactManifestAssessment(
+        schema=schema,
+        artifact_key=manifest.artifact_key,
+        completion_status=manifest.completion_status,
+        missing_artifact_kinds=missing_kinds,
+        missing_artifact_paths=missing_paths,
+        all_required_artifacts_present=all_required_artifacts_present,
+        committed_state_consistent=committed_state_consistent,
+        is_complete=is_complete,
+        can_resume=can_resume,
+        detail=detail,
+    )
+
+
+def is_scattering_manifest_complete(
+    manifest: ScatteringArtifactManifest,
+    *,
+    db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+) -> bool:
+    return assess_scattering_manifest(
+        manifest,
+        db_path=db_path,
+        db_manager_factory=db_manager_factory,
+    ).is_complete
+
+
+def can_resume_scattering_work_unit(
+    work_unit: ScatteringWorkUnit,
+    *,
+    output_dir: str,
+    db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+) -> bool:
+    manifest = (
+        build_scattering_interval_manifest(
+            work_unit,
+            completion_status=CompletionStatus.COMMITTED,
+        )
+        if work_unit.chunk_id is None
+        else build_scattering_chunk_manifest(
+            work_unit,
+            output_dir=output_dir,
+            completion_status=CompletionStatus.COMMITTED,
+        )
+    )
+    return assess_scattering_manifest(
+        manifest,
+        db_path=db_path,
+        db_manager_factory=db_manager_factory,
+    ).can_resume
 
 
 def is_interval_artifact_committed(
     work_unit: ScatteringWorkUnit,
     *,
     db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> bool:
-    if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
-        return False
-    artifact_exists = Path(work_unit.interval_artifact.path).exists()
-    state_updater = _IntervalPrecomputeStateUpdater(db_path)
-    return artifact_exists and state_updater.is_precomputed(work_unit.interval_id)
+    manifest = build_scattering_interval_manifest(
+        work_unit,
+        completion_status=CompletionStatus.COMMITTED,
+    )
+    return is_scattering_manifest_complete(
+        manifest,
+        db_path=db_path,
+        db_manager_factory=db_manager_factory,
+    )
 
 
 def persist_precomputed_interval_artifact(
@@ -234,6 +418,7 @@ def persist_precomputed_interval_artifact(
     interval_task: IntervalTask,
     *,
     db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> ScatteringArtifactManifest:
     if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
         raise ValueError("Precompute work unit must include an interval artifact path.")
@@ -254,7 +439,10 @@ def persist_precomputed_interval_artifact(
             q_amp_av=interval_task.q_amp_av,
         )
     Path(handle.name).replace(out_path)
-    _IntervalPrecomputeStateUpdater(db_path).mark_precomputed(interval_task.irecip_id)
+    _IntervalPrecomputeStateUpdater(
+        db_path,
+        db_manager_factory=db_manager_factory,
+    ).mark_precomputed(interval_task.irecip_id)
     return build_scattering_interval_manifest(
         work_unit,
         completion_status=CompletionStatus.COMMITTED,
@@ -295,12 +483,14 @@ def persist_scattering_interval_chunk_result(
     output_dir: str,
     db_path: str,
     quiet_logs: bool = False,
+    artifact_store_factory: Callable[[str], ScatteringArtifactStore] = ScatteringArtifactStore,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> ScatteringArtifactManifest:
     if work_unit.chunk_id is None:
         raise ValueError("Chunk accumulation requires a chunk-scoped work unit.")
 
     t0 = TIMER()
-    store = ScatteringArtifactStore(output_dir)
+    store = artifact_store_factory(output_dir)
     store.ensure_grid_shape(work_unit.chunk_id, grid_shape_nd)
     store.ensure_total_reciprocal_points(work_unit.chunk_id, total_reciprocal_points)
 
@@ -348,7 +538,10 @@ def persist_scattering_interval_chunk_result(
         applied_set.add(work_unit.interval_id)
         store.save_applied_interval_ids(work_unit.chunk_id, applied_set)
 
-    _IntervalChunkStatusUpdater(db_path).mark_saved(work_unit.interval_id, work_unit.chunk_id)
+    _IntervalChunkStatusUpdater(
+        db_path,
+        db_manager_factory=db_manager_factory,
+    ).mark_saved(work_unit.interval_id, work_unit.chunk_id)
     manifest = build_scattering_chunk_manifest(
         work_unit,
         output_dir=output_dir,
@@ -383,9 +576,12 @@ def persist_scattering_interval_chunk_result(
 
 __all__ = [
     "ScatteringArtifactStore",
+    "assess_scattering_manifest",
     "build_scattering_chunk_manifest",
     "build_scattering_interval_manifest",
+    "can_resume_scattering_work_unit",
     "is_interval_artifact_committed",
+    "is_scattering_manifest_complete",
     "load_existing_scattering_partial_result",
     "persist_precomputed_interval_artifact",
     "persist_scattering_interval_chunk_result",

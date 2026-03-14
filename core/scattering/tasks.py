@@ -22,10 +22,9 @@ from core.scattering.kernels import (
 )
 from core.adapters.cunufft_wrapper import (
     execute_inverse_cunufft,
-    free_gpu_memory,
-    set_cpu_only,
 )
 from core.contracts import CompletionStatus
+from core.runtime import handle_worker_gpu_failure
 
 
 logger = logging.getLogger(__name__)
@@ -182,40 +181,7 @@ def run_scattering_interval_chunk_task(
             err,
             exc_info=True,
         )
-        try:
-            message = str(err).lower()
-            is_gpu_err = any(
-                keyword in message
-                for keyword in (
-                    "cuda",
-                    "cudart",
-                    "cufft",
-                    "cufinufft",
-                    "cupy",
-                    "device-side assert",
-                    "illegal memory access",
-                    "out of memory",
-                    "driver shutting down",
-                )
-            )
-            if is_gpu_err:
-                from distributed import get_worker
-
-                try:
-                    set_cpu_only(True)
-                    worker = get_worker()
-                    logger.warning("Worker %s set to CPU-only after GPU error", worker.address)
-                except Exception:
-                    pass
-                try:
-                    count = getattr(worker, "gpu_fail_count", 0)
-                    setattr(worker, "gpu_fail_count", int(count) + 1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        free_gpu_memory()
+        handle_worker_gpu_failure(err, logger=logger)
         return None
 
 

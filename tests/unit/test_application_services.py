@@ -105,6 +105,12 @@ def test_mask_strategy_service_builds_equation_strategy():
     assert mask.tolist() == [True, False]
 
 
+def test_mask_strategy_service_defaults_to_no_mask_without_definition():
+    strategy = MaskStrategyService().build(1, {})
+    mask = strategy.generate_mask(np.array([[1.0], [-1.0]]))
+    assert mask.tolist() == [True, True]
+
+
 def test_interval_reconstruction_service_loads_pending_work(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
@@ -466,6 +472,52 @@ def test_workflow_service_uses_injected_services_and_closes_artifacts(tmp_path):
         "residual_field",
         "postprocessing",
     ]
+
+
+def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
+    stale_dir = tmp_path / "workdir" / "processed_point_data"
+    stale_dir.mkdir(parents=True)
+    stale_file = stale_dir / "stale.hdf5"
+    stale_file.write_text("stale", encoding="utf-8")
+
+    class FakeStructureService:
+        def load(self, workflow_parameters, working_path):
+            return SimpleNamespace(supercell=np.array([4]))
+
+    class FakePointSelectionService:
+        def select(self, request):
+            return SimpleNamespace(chunk_ids=np.array([0]))
+
+    class FakeArtifacts:
+        output_dir = str(stale_dir)
+
+        def close(self):
+            pass
+
+    class FakeReciprocalService:
+        def prepare(self, workflow_parameters, point_data, supercell, output_dir):
+            return FakeArtifacts()
+
+    workflow_service = WorkflowService(
+        structure_loading_service=FakeStructureService(),
+        point_selection_service=FakePointSelectionService(),
+        reciprocal_space_service=FakeReciprocalService(),
+        amplitude_service=SimpleNamespace(execute=lambda **kwargs: {}),
+        residual_field_service=SimpleNamespace(execute=lambda **kwargs: {}),
+        postprocessing_service=SimpleNamespace(execute=lambda **kwargs: None),
+    )
+    workflow_parameters = _build_workflow_parameters()
+    workflow_parameters.struct_info["working_directory"] = str(tmp_path / "workdir")
+    workflow_parameters.rspace_info["fresh_start"] = True
+
+    workflow_service.run(
+        run_settings=SimpleNamespace(working_path=tmp_path),
+        workflow_parameters=workflow_parameters,
+        client=None,
+    )
+
+    assert stale_dir.exists()
+    assert stale_file.exists() is False
 
 
 def test_parameter_loading_service_returns_form_factor_selection():

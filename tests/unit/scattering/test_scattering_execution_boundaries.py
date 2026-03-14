@@ -205,3 +205,17 @@ def test_execution_serial_precompute_uses_work_units(monkeypatch, tmp_path):
     )
 
     assert paths == [tmp_path / "precomputed_intervals" / "interval_1.npz"]
+
+
+def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path):
+    store = ScatteringArtifactStore(str(tmp_path))
+    fn = tmp_path / store.saver.generate_filename(
+        0, "_amplitudes_ntotal_reciprocal_space_points"
+    )
+    fn.write_bytes(b"not-an-hdf5-file")
+
+    store.ensure_total_reciprocal_points(0, 11)
+
+    data = store.saver.load_data(fn.name)
+    assert int(np.asarray(data["ntotal_reciprocal_space_points"]).ravel()[0]) == 11
+    assert int(np.asarray(data["ntotal_reciprocal_points"]).ravel()[0]) == 11
