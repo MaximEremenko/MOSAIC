@@ -7,6 +7,7 @@ import numpy as np
 
 from core.contracts import (
     ArtifactRef,
+    ArtifactSchemaSpec,
     CompletionStatus,
     MergeInvariantSpec,
     RetryDisposition,
@@ -15,6 +16,28 @@ from core.contracts import (
 
 
 RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION = 1
+RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
+    stage="residual_field",
+    name="residual-field-interval-chunk",
+    schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+    required_artifact_kinds=(
+        "chunk-residual-values",
+        "chunk-residual-average-values",
+        "chunk-grid-shape",
+        "chunk-reciprocal-point-count",
+        "chunk-total-reciprocal-point-count",
+        "chunk-applied-interval-ids",
+    ),
+    completeness_rule=(
+        "all residual-field chunk artifacts must exist, SQLite must mark the "
+        "(interval, chunk) pair as saved, and _applied_interval_ids must contain the interval id"
+    ),
+    resume_rule=(
+        "resume is allowed while the upstream scattering artifacts are readable and the chunk "
+        "is not yet committed; duplicate replay becomes a no-op only after the committed-state "
+        "predicate above is satisfied for the same parameter digest"
+    ),
+)
 
 
 def make_residual_field_retry_key(chunk_id: int, parameter_digest: str) -> str:
@@ -73,6 +96,21 @@ def build_residual_field_source_artifacts(
         )
     )
     return tuple(artifacts)
+
+
+def build_residual_field_interval_source_artifacts(
+    output_dir: str,
+    interval_id: int,
+) -> tuple[ArtifactRef, ...]:
+    return (
+        ArtifactRef(
+            stage="scattering",
+            kind="interval-precompute",
+            key=f"scattering:interval-precompute:interval-{interval_id}",
+            path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+            schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+        ),
+    )
 
 
 def build_residual_field_output_artifacts(
@@ -197,58 +235,12 @@ class ResidualFieldWorkUnit:
         patch_scope: str | None = None,
         window_spec: str | None = None,
     ) -> "ResidualFieldWorkUnit":
-        interval_artifact = ArtifactRef(
-            stage="scattering",
-            kind="interval-precompute",
-            key=f"scattering:interval-precompute:interval-{interval_id}",
-            path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
-            schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
-        )
-        return cls(
-            chunk_id=chunk_id,
-            interval_id=interval_id,
-            parameter_digest=parameter_digest,
-            source_artifacts=(interval_artifact,),
-            patch_scope=patch_scope,
-            window_spec=window_spec,
-            artifact_key=make_residual_field_artifact_key(
-                "interval-chunk",
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-            ),
-            retry=RetryIdempotencySemantics(
-                failure_unit="residual-field-interval-chunk",
-                retry_unit="residual-field-interval-chunk",
-                idempotency_key=(
-                    f"residual-field:interval-chunk:{interval_id}:{chunk_id}:{parameter_digest}"
-                ),
-                replay_disposition=RetryDisposition.NO_OP,
-                crash_recovery_rule=(
-                    "treat the residual-field interval/chunk as committed only when "
-                    "SQLite marks the pair as saved and _applied_interval_ids contains "
-                    "the interval id"
-                ),
-            ),
-        )
-
-    @classmethod
-    def interval_chunk(
-        cls,
-        *,
-        interval_id: int,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        patch_scope: str | None = None,
-        window_spec: str | None = None,
-    ) -> "ResidualFieldWorkUnit":
         return cls(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
-            source_artifacts=build_residual_field_source_artifacts(
+            source_artifacts=build_residual_field_interval_source_artifacts(
                 output_dir,
-                chunk_id,
-                interval_id=interval_id,
+                interval_id,
             ),
             patch_scope=patch_scope,
             window_spec=window_spec,
@@ -267,12 +259,16 @@ class ResidualFieldWorkUnit:
                 ),
                 replay_disposition=RetryDisposition.NO_OP,
                 crash_recovery_rule=(
-                    "treat the residual-field interval-chunk as committed only when the "
-                    "chunk artifacts exist, SQLite marks the (interval, chunk) pair as saved, "
-                    "and _applied_interval_ids contains the interval id"
+                    "treat the residual-field interval/chunk as committed only when "
+                    "SQLite marks the pair as saved and _applied_interval_ids contains "
+                    "the interval id"
                 ),
             ),
         )
+
+    @property
+    def artifact_schema(self) -> ArtifactSchemaSpec:
+        return RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -285,6 +281,7 @@ class ResidualFieldPartialResult:
     """
 
     chunk_id: int
+    contributing_interval_ids: tuple[int, ...]
     parameter_digest: str
     output_kind: str
     source_artifacts: tuple[ArtifactRef, ...]
@@ -297,6 +294,13 @@ class ResidualFieldPartialResult:
     schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "contributing_interval_ids",
+            tuple(
+                sorted(int(interval_id) for interval_id in self.contributing_interval_ids)
+            ),
+        )
         if self.grid_shape is not None:
             object.__setattr__(self, "grid_shape", tuple(int(v) for v in self.grid_shape))
         object.__setattr__(
@@ -318,6 +322,7 @@ class ResidualFieldPartialResult:
                 "reciprocal_point_count",
                 int(self.reciprocal_point_count),
             )
+        validate_residual_field_partial_result(self)
 
 
 RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS = MergeInvariantSpec(
@@ -328,6 +333,7 @@ RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS = MergeInvariantSpec(
     associative=True,
     compatibility_checks=(
         "same chunk_id",
+        "same contributing_interval_ids only through duplicate-free merge",
         "same parameter_digest",
         "same output_kind",
         "same schema_version",
@@ -340,8 +346,9 @@ RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS = MergeInvariantSpec(
         "chunk artifacts; in-memory arrays are Phase 4 accumulation helpers only"
     ),
     duplicate_handling=(
-        "duplicate output artifact keys are forbidden in merge; duplicate source artifact "
-        "refs are deduplicated by key because they represent shared lineage"
+        "duplicate contributing interval ids and duplicate output artifact keys are forbidden "
+        "in merge; duplicate source artifact refs are deduplicated by key because they "
+        "represent shared lineage"
     ),
     ordering=(
         "artifact refs and point ids are normalized to sorted key/id order to keep the "
@@ -359,6 +366,7 @@ def residual_field_partial_result_identity(
 ) -> ResidualFieldPartialResult:
     return ResidualFieldPartialResult(
         chunk_id=chunk_id,
+        contributing_interval_ids=(),
         parameter_digest=parameter_digest,
         output_kind=output_kind,
         source_artifacts=(),
@@ -388,10 +396,50 @@ def _merge_artifact_refs(
     return tuple(merged[key] for key in sorted(merged))
 
 
+def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
+    if work_unit.chunk_id < 0:
+        raise ValueError("chunk_id must be non-negative.")
+    if work_unit.interval_id is None or work_unit.interval_id < 0:
+        raise ValueError("Residual-field Phase 6 requires interval-scoped work units.")
+    if not work_unit.parameter_digest:
+        raise ValueError("parameter_digest must be non-empty.")
+    if not work_unit.source_artifacts:
+        raise ValueError("Residual-field work units must reference at least one source artifact.")
+    source_keys = [artifact.key for artifact in work_unit.source_artifacts]
+    if len(set(source_keys)) != len(source_keys):
+        raise ValueError("Residual-field work units must not contain duplicate source artifact keys.")
+    if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
+        raise ValueError("Residual-field Phase 6 assumes NO_OP replay semantics.")
+
+
+def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -> None:
+    if len(set(result.contributing_interval_ids)) != len(result.contributing_interval_ids):
+        raise ValueError("contributing_interval_ids must be unique per residual-field partial.")
+    output_keys = [artifact.key for artifact in result.output_artifacts]
+    if len(set(output_keys)) != len(output_keys):
+        raise ValueError("output_artifacts must not contain duplicate artifact keys.")
+    if result.reciprocal_point_count is not None and result.reciprocal_point_count < 0:
+        raise ValueError("reciprocal_point_count must be non-negative.")
+    if result.residual_values is not None:
+        if result.point_ids and len(result.point_ids) != result.residual_values.shape[0]:
+            raise ValueError("residual_values must align with point_ids.")
+    if result.residual_average_values is not None:
+        if result.point_ids and len(result.point_ids) != result.residual_average_values.shape[0]:
+            raise ValueError("residual_average_values must align with point_ids.")
+    if (
+        result.residual_values is not None
+        and result.residual_average_values is not None
+        and result.residual_values.shape != result.residual_average_values.shape
+    ):
+        raise ValueError("residual_values and residual_average_values must have matching shape.")
+
+
 def merge_residual_field_partial_results(
     left: ResidualFieldPartialResult,
     right: ResidualFieldPartialResult,
 ) -> ResidualFieldPartialResult:
+    validate_residual_field_partial_result(left)
+    validate_residual_field_partial_result(right)
     if left.chunk_id != right.chunk_id:
         raise ValueError("Cannot merge residual-field partials for different chunks.")
     if left.parameter_digest != right.parameter_digest:
@@ -424,6 +472,12 @@ def merge_residual_field_partial_results(
         raise ValueError(
             "Cannot merge materialized residual-field partials with different point_ids."
         )
+    overlap = set(left.contributing_interval_ids) & set(right.contributing_interval_ids)
+    if overlap:
+        raise ValueError(
+            "Cannot merge residual-field partials with duplicate interval ids: "
+            f"{sorted(overlap)}"
+        )
     merged_point_ids = (
         left.point_ids
         if left.residual_values is not None and right.residual_values is not None
@@ -431,6 +485,9 @@ def merge_residual_field_partial_results(
     )
     return ResidualFieldPartialResult(
         chunk_id=left.chunk_id,
+        contributing_interval_ids=tuple(
+            sorted(left.contributing_interval_ids + right.contributing_interval_ids)
+        ),
         parameter_digest=left.parameter_digest,
         output_kind=left.output_kind,
         source_artifacts=_merge_artifact_refs(
@@ -475,11 +532,13 @@ class ResidualFieldArtifactManifest:
     artifacts: tuple[ArtifactRef, ...]
     completion_status: CompletionStatus
     retry: RetryIdempotencySemantics
+    interval_id: int | None
     chunk_id: int
     parameter_digest: str
     producer_stage: str = "residual_field"
     consumer_stage: str | None = "decoding"
     upstream_artifacts: tuple[ArtifactRef, ...] = ()
+    artifact_schema_name: str = RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA.name
     schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -491,28 +550,54 @@ class ResidualFieldArtifactManifest:
         completion_status: CompletionStatus,
         consumer_stage: str | None = "decoding",
     ) -> "ResidualFieldArtifactManifest":
+        validate_residual_field_work_unit(work_unit)
         return cls(
             artifact_key=work_unit.artifact_key,
             artifacts=artifacts,
             completion_status=completion_status,
             retry=work_unit.retry,
+            interval_id=work_unit.interval_id,
             chunk_id=work_unit.chunk_id,
             parameter_digest=work_unit.parameter_digest,
             consumer_stage=consumer_stage,
             upstream_artifacts=work_unit.source_artifacts,
+            artifact_schema_name=work_unit.artifact_schema.name,
         )
+
+
+def validate_residual_field_artifact_manifest(
+    manifest: ResidualFieldArtifactManifest,
+) -> None:
+    if manifest.producer_stage != "residual_field":
+        raise ValueError(
+            "Residual-field artifact manifests must be produced by the residual_field stage."
+        )
+    if manifest.schema_version != RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("Unexpected residual-field artifact-manifest schema version.")
+    artifact_keys = [artifact.key for artifact in manifest.artifacts]
+    if len(set(artifact_keys)) != len(artifact_keys):
+        raise ValueError(
+            "Residual-field artifact manifests must not contain duplicate artifact keys."
+        )
+    if manifest.artifact_schema_name != RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA.name:
+        raise ValueError("Residual-field artifact manifest schema name does not match its scope.")
 
 
 __all__ = [
     "RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION",
+    "RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA",
     "RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS",
     "ResidualFieldArtifactManifest",
     "ResidualFieldPartialResult",
     "ResidualFieldWorkUnit",
+    "build_residual_field_interval_source_artifacts",
     "build_residual_field_output_artifacts",
     "build_residual_field_source_artifacts",
     "make_residual_field_artifact_key",
     "make_residual_field_retry_key",
     "merge_residual_field_partial_results",
     "residual_field_partial_result_identity",
+    "validate_residual_field_artifact_manifest",
+    "validate_residual_field_partial_result",
+    "validate_residual_field_work_unit",
 ]

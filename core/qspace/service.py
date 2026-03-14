@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -34,6 +35,15 @@ class _ReciprocalSpaceArtifactBundle:
 
 
 class _DefaultReciprocalSpaceArtifactBuilder:
+    def __init__(
+        self,
+        *,
+        saver_factory: Callable[[str, str], RIFFTInDataSaver] = RIFFTInDataSaver,
+        db_manager_factory: Callable[[str, int], DatabaseManager] = DatabaseManager,
+    ) -> None:
+        self.saver_factory = saver_factory
+        self.db_manager_factory = db_manager_factory
+
     def create(
         self,
         *,
@@ -43,14 +53,14 @@ class _DefaultReciprocalSpaceArtifactBuilder:
     ) -> _ReciprocalSpaceArtifactBundle:
         parameters = workflow_parameters.to_payload()
         dimension = int(parameters["structInfo"]["dimension"])
-        saver = RIFFTInDataSaver(output_dir, "hdf5")
+        saver = self.saver_factory(output_dir, "hdf5")
         point_data_processor = PointDataProcessor(
             data_saver=saver,
             save_rifft_coordinates=parameters["rspace_info"].get(
                 "save_rifft_coordinates", False
             ),
         )
-        db_manager = DatabaseManager(
+        db_manager = self.db_manager_factory(
             str(Path(output_dir) / "point_reciprocal_space_associations.db"),
             dimension,
         )

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List
 
 import numpy as np
-from dask.distributed import Client
 
 from core.scattering.execution import run_interval_precompute
 from core.scattering.planning import (
@@ -12,6 +11,9 @@ from core.scattering.planning import (
     build_scattering_precompute_work_units,
 )
 from core.storage.database_manager import DatabaseManager
+
+if TYPE_CHECKING:
+    from dask.distributed import Client
 
 
 def precompute_intervals(
@@ -30,7 +32,7 @@ def precompute_intervals(
     charge: float,
     ff_factory,
     db: DatabaseManager,
-    client: Client | None,
+    client: "Client | None",
 ) -> List[Path]:
     intervals = list(reciprocal_space_intervals)
     output_dir = str(out_dir.parent)

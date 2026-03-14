@@ -8,13 +8,14 @@ accumulation / artifacts / kernels`` boundaries.
 
 from __future__ import annotations
 
-from typing import Any, Dict
-
-from dask.distributed import Client
+from typing import TYPE_CHECKING, Any, Dict
 
 from core.scattering.execution import run_scattering_stage
 from core.patch_centers.point_data import PointDataProcessor
 from core.storage.database_manager import DatabaseManager
+
+if TYPE_CHECKING:
+    from dask.distributed import Client
 
 
 execute_scattering_stage = run_scattering_stage
@@ -28,7 +29,7 @@ def compute_amplitudes_delta(
     db_manager: DatabaseManager,
     output_dir: str,
     point_data_processor: PointDataProcessor,
-    client: Client,
+    client: "Client | None",
 ):
     return execute_scattering_stage(
         parameters=parameters,

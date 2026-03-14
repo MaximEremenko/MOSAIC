@@ -5,7 +5,7 @@ from typing import Any, Dict, List, NamedTuple, Tuple
 
 import numpy as np
 
-from core.scattering.runtime import _timed
+from core.runtime.progress import timed
 
 
 class IntervalTask(NamedTuple):
@@ -140,7 +140,7 @@ def generate_rifft_grid(chunk_data: List[dict]):
 
 
 def _build_rifft_grid_locally(chunk_data: List[dict]):
-    with _timed("RIFFT grid build"):
+    with timed("RIFFT grid build"):
         return _process_chunk(chunk_data)
 
 

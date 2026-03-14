@@ -15,6 +15,7 @@ from core.residual_field.contracts import (
     ResidualFieldPartialResult,
     ResidualFieldWorkUnit,
     merge_residual_field_partial_results,
+    validate_residual_field_partial_result,
 )
 from core.contracts import ArtifactRef
 
@@ -57,14 +58,20 @@ def build_materialized_residual_field_state(
     )
     metadata = ResidualFieldPartialResult(
         chunk_id=work_unit.chunk_id,
+        contributing_interval_ids=(int(work_unit.interval_id),),
         parameter_digest=work_unit.parameter_digest,
         output_kind="residual-field-chunk",
         source_artifacts=work_unit.source_artifacts,
         output_artifacts=output_artifacts,
         grid_shape=_grid_shape_tuple(grid_shape_nd),
         point_ids=tuple(int(point_id) for point_id in payload.point_ids),
+        residual_values=payload.amplitudes_delta.copy(),
+        residual_average_values=payload.amplitudes_average.copy(),
+        reciprocal_point_count=payload.reciprocal_point_count,
     )
-    return MaterializedResidualFieldState(metadata=metadata, payload=payload)
+    return validate_materialized_residual_field_state(
+        MaterializedResidualFieldState(metadata=metadata, payload=payload)
+    )
 
 
 def build_existing_materialized_residual_field_state(
@@ -92,24 +99,61 @@ def build_existing_materialized_residual_field_state(
     )
     metadata = ResidualFieldPartialResult(
         chunk_id=chunk_id,
+        contributing_interval_ids=tuple(int(interval_id) for interval_id in applied_interval_ids),
         parameter_digest=parameter_digest,
         output_kind="residual-field-chunk",
         source_artifacts=(),
         output_artifacts=output_artifacts,
         grid_shape=_grid_shape_tuple(grid_shape_nd),
         point_ids=tuple(int(point_id) for point_id in payload.point_ids),
+        residual_values=payload.amplitudes_delta.copy(),
+        residual_average_values=payload.amplitudes_average.copy(),
+        reciprocal_point_count=payload.reciprocal_point_count,
     )
-    return MaterializedResidualFieldState(metadata=metadata, payload=payload)
+    return validate_materialized_residual_field_state(
+        MaterializedResidualFieldState(metadata=metadata, payload=payload)
+    )
+
+
+def validate_materialized_residual_field_state(
+    state: MaterializedResidualFieldState,
+) -> MaterializedResidualFieldState:
+    validate_residual_field_partial_result(state.metadata)
+    if state.metadata.chunk_id != state.payload.chunk_id:
+        raise ValueError("Residual-field metadata and payload must target the same chunk_id.")
+    payload_grid_shape = _grid_shape_tuple(state.payload.grid_shape_nd)
+    if state.metadata.grid_shape != payload_grid_shape:
+        raise ValueError("Residual-field metadata grid_shape must match the payload grid shape.")
+    payload_point_ids = tuple(int(point_id) for point_id in state.payload.point_ids)
+    if state.metadata.point_ids != payload_point_ids:
+        raise ValueError("Residual-field metadata point_ids must match the payload point_ids.")
+    if state.metadata.reciprocal_point_count != state.payload.reciprocal_point_count:
+        raise ValueError(
+            "Residual-field metadata reciprocal_point_count must match the payload."
+        )
+    if state.metadata.residual_values is None or state.metadata.residual_average_values is None:
+        raise ValueError("Residual-field metadata must materialize residual arrays in Phase 6.")
+    if not np.array_equal(state.metadata.residual_values, state.payload.amplitudes_delta):
+        raise ValueError("Residual-field metadata residual_values must match payload amplitudes_delta.")
+    if not np.array_equal(
+        state.metadata.residual_average_values,
+        state.payload.amplitudes_average,
+    ):
+        raise ValueError(
+            "Residual-field metadata residual_average_values must match payload amplitudes_average."
+        )
+    return state
 
 
 def merge_materialized_residual_field_states(
     left: MaterializedResidualFieldState,
     right: MaterializedResidualFieldState,
 ) -> MaterializedResidualFieldState:
-    return MaterializedResidualFieldState(
+    merged = MaterializedResidualFieldState(
         metadata=merge_residual_field_partial_results(left.metadata, right.metadata),
         payload=merge_scattering_partial_results(left.payload, right.payload),
     )
+    return validate_materialized_residual_field_state(merged)
 
 
 __all__ = [
@@ -118,4 +162,5 @@ __all__ = [
     "build_materialized_residual_field_state",
     "materialize_scattering_payload",
     "merge_materialized_residual_field_states",
+    "validate_materialized_residual_field_state",
 ]

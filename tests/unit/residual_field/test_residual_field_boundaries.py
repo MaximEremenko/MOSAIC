@@ -149,10 +149,10 @@ def test_residual_field_loader_reconstructs_grid_and_normalizes_values(tmp_path)
 def test_residual_field_service_delegates_to_execution(monkeypatch):
     captured = {}
 
-    def fake_execute(parameters, *, db_manager, output_dir, client):
-        captured["parameters"] = parameters
-        captured["db_manager"] = db_manager
-        captured["output_dir"] = output_dir
+    def fake_execute(*, workflow_parameters, structure, artifacts, client):
+        captured["workflow_parameters"] = workflow_parameters
+        captured["structure"] = structure
+        captured["artifacts"] = artifacts
         captured["client"] = client
 
     monkeypatch.setattr(
@@ -165,14 +165,14 @@ def test_residual_field_service_delegates_to_execution(monkeypatch):
     params = {"point_data_list": [], "supercell": np.array([4]), "reciprocal_space_intervals_all": []}
 
     result = service.execute(
-        workflow_parameters=SimpleNamespace(),
-        structure=SimpleNamespace(),
+        workflow_parameters=SimpleNamespace(name="workflow"),
+        structure=SimpleNamespace(name="structure"),
         artifacts=artifacts,
         client=None,
         scattering_parameters=params,
     )
 
     assert result is params
-    assert captured["parameters"] is params
-    assert captured["db_manager"] == "db"
-    assert captured["output_dir"] == "/tmp/out"
+    assert captured["workflow_parameters"].name == "workflow"
+    assert captured["structure"].name == "structure"
+    assert captured["artifacts"] is artifacts

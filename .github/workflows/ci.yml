@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke-and-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest
+
+      - name: Import/version smoke
+        run: |
+          python - <<'PY'
+          import core
+          print(core.__version__)
+          PY
+
+      - name: CLI help/version
+        run: |
+          python -m core.main --help
+          python -m core.main --version
+
+      - name: Canonical example smoke
+        run: |
+          python scripts/smoke_example.py
+
+      - name: Unit tests
+        run: |
+          pytest -q tests/unit

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 import logging
 
-from dask.distributed import Client, LocalCluster, get_client
+from dask.distributed import Client, LocalCluster, as_completed, get_client
 
 try:
     import yaml  # type: ignore
@@ -50,6 +50,7 @@ _BACKENDS = Literal[
 ]
 
 logger = logging.getLogger(__name__)
+DEFAULT_TASK_RETRIES = 4
 
 # --------------------------------------------------------------------------- #
 #  Configuration helpers                                                      #
@@ -287,6 +288,29 @@ def ensure_dask_client(
         return Client()
 
     raise ValueError(f"Unknown backend '{backend}'")
+
+
+def is_sync_client(client) -> bool:
+    try:
+        if client is None:
+            return True
+        cls = type(client).__name__.lower()
+        loop = getattr(client, "loop", None)
+        has_loop = (loop is not None) and (getattr(loop, "asyncio_loop", None) is not None)
+        return ("syncclient" in cls) or (not has_loop)
+    except Exception:
+        return True
+
+
+def yield_futures_with_results(futs, client: Client | None):
+    loop = getattr(client, "loop", None)
+    for future, result in as_completed(futs, with_results=True, loop=loop):
+        ok = False
+        try:
+            ok = bool(result)
+        except Exception:
+            ok = False
+        yield future, ok
 
 
 # --------------------------------------------------------------------------- #

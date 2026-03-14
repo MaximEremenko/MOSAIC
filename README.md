@@ -4,17 +4,19 @@ MOSAIC is a scientific-stage pipeline for structure loading, patch-center
 selection, q-space partitioning, scattering, residual-field materialization,
 and decoding.
 
-Release Wave 1 provides the minimum installable and documented baseline for the
-current scientific-stage architecture:
+Release Waves 1-3 provide the current release baseline for the
+scientific-stage architecture:
 
 - packaging metadata
 - a stable CLI/run path
-- one canonical smoke-scale example
+- one bounded canonical smoke-scale example
 - baseline installation and runtime notes
+- one CI workflow for smoke and unit validation
+- baseline changelog, citation, and contributing metadata
 
 This is not yet the full public-release baseline tracked in
-[RELEASE_GAPS.md](RELEASE_GAPS.md); licensing, CI, broader example curation,
-and governance files remain deferred.
+[RELEASE_GAPS.md](RELEASE_GAPS.md); licensing, broader example curation, and
+broader governance files remain deferred.
 
 ## Install
 
@@ -44,7 +46,7 @@ Documented baseline for this wave:
 
 ## Quick Start
 
-The canonical Release Wave 1 example is a small 1D run under [examples/](examples/).
+The canonical release example is a small 1D run under [examples/](examples/).
 
 From the repository root:
 
@@ -69,6 +71,16 @@ Expected output location:
 
 - `examples/sample_1d_release/processed_point_data/`
 
+Release validation smoke helper:
+
+```bash
+python scripts/smoke_example.py
+```
+
+The smoke helper is the bounded CI-facing path. It removes any prior
+`examples/sample_1d_release/` output, runs the canonical example with a hard
+timeout, and checks for the expected artifact set.
+
 ## Runtime Notes
 
 - CPU-only is the documented smoke-scale baseline.
@@ -76,12 +88,17 @@ Expected output location:
   [core/adapters/cunufft_wrapper.py](core/adapters/cunufft_wrapper.py).
 - Dask is optional. The canonical example does not require a distributed
   cluster.
+- The canonical example is pinned to one local worker and one thread in its
+  shipped runtime settings so the smoke path stays bounded and repeatable.
+- If `finufft` is unavailable, the smoke-scale path can fall back to a much
+  slower direct CPU evaluation. That fallback is for smoke validation only,
+  not production-scale runs.
 - Memory use scales mainly with reciprocal-space interval size, chunk size, and
   worker concurrency in:
   - `scattering`
   - `residual_field`
   - `decoding`
-- Larger 2D/3D examples under `examples/` are not the Release Wave 1
+- Larger 2D/3D examples under `examples/` are not the current release
   reproducibility target.
 
 ## Input and Output Overview

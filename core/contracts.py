@@ -55,8 +55,38 @@ class MergeInvariantSpec:
     ordering: str
 
 
+@dataclass(frozen=True)
+class ArtifactSchemaSpec:
+    """Durable schema contract for a stage-owned artifact manifest."""
+
+    stage: str
+    name: str
+    schema_version: int
+    required_artifact_kinds: tuple[str, ...]
+    completeness_rule: str
+    resume_rule: str
+
+
+@dataclass(frozen=True)
+class ArtifactManifestAssessment:
+    """Materialized view of completeness and replay/resume readiness."""
+
+    schema: ArtifactSchemaSpec
+    artifact_key: str
+    completion_status: CompletionStatus
+    missing_artifact_kinds: tuple[str, ...]
+    missing_artifact_paths: tuple[str, ...]
+    all_required_artifacts_present: bool
+    committed_state_consistent: bool
+    is_complete: bool
+    can_resume: bool
+    detail: str
+
+
 __all__ = [
     "ArtifactRef",
+    "ArtifactManifestAssessment",
+    "ArtifactSchemaSpec",
     "CompletionStatus",
     "MergeInvariantSpec",
     "RetryDisposition",

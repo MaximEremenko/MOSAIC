@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
-
-from dask.distributed import Client
+from typing import TYPE_CHECKING, Iterable
 
 from core.scattering.execution import run_interval_chunk_execution
 from core.scattering.planning import build_scattering_interval_chunk_work_units
+
+if TYPE_CHECKING:
+    from dask.distributed import Client
 
 
 def process_chunks_with_intervals(
@@ -17,7 +18,7 @@ def process_chunks_with_intervals(
     point_data_list: list[dict],
     point_data_processor,
     db_manager,
-    client: Client | None,
+    client: "Client | None",
     max_inflight: int = 5_000,
 ) -> None:
     del interval_files

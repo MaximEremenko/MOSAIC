@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from core.scattering.service import ScatteringExecutionService
@@ -44,7 +45,7 @@ class WorkflowService:
             Path(workflow_parameters.struct_info["working_directory"])
             / "processed_point_data"
         )
-        output_dir.mkdir(parents=True, exist_ok=True)
+        self._prepare_output_dir(output_dir, workflow_parameters)
         point_data = self.point_selection_service.select(
             PointSelectionRequest(
                 method=workflow_parameters.rspace_info["method"],
@@ -82,3 +83,11 @@ class WorkflowService:
         finally:
             if artifacts is not None:
                 artifacts.close()
+
+    def _prepare_output_dir(
+        self, output_dir: Path, workflow_parameters: WorkflowParameters
+    ) -> None:
+        fresh_start = bool(workflow_parameters.rspace_info.get("fresh_start", False))
+        if fresh_start and output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)

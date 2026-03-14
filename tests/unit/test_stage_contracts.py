@@ -1,6 +1,7 @@
 import numpy as np
 
 from core.scattering.contracts import (
+    SCATTERING_CHUNK_ARTIFACT_SCHEMA,
     SCATTERING_PARTIAL_RESULT_MERGE_INVARIANTS,
     ScatteringArtifactManifest,
     ScatteringPartialResult,
@@ -8,14 +9,17 @@ from core.scattering.contracts import (
     build_chunk_artifact_refs,
     merge_scattering_partial_results,
     scattering_partial_result_identity,
+    validate_scattering_work_unit,
 )
 from core.residual_field.contracts import (
+    RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA,
     RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS,
     ResidualFieldArtifactManifest,
     ResidualFieldPartialResult,
     ResidualFieldWorkUnit,
     merge_residual_field_partial_results,
     residual_field_partial_result_identity,
+    validate_residual_field_work_unit,
 )
 from core.contracts import CompletionStatus, RetryDisposition
 
@@ -27,6 +31,7 @@ def test_scattering_work_unit_and_manifest_are_deterministic(tmp_path):
         dimension=2,
         output_dir=str(tmp_path),
     )
+    validate_scattering_work_unit(work_unit)
 
     assert work_unit.retry.idempotency_key == "scattering:interval-chunk:7:3"
     assert work_unit.chunk_artifact_prefix.endswith("point_data_chunk_3")
@@ -44,6 +49,7 @@ def test_scattering_work_unit_and_manifest_are_deterministic(tmp_path):
     assert manifest.retry.replay_disposition is RetryDisposition.NO_OP
     assert manifest.consumer_stage == "residual_field"
     assert len(manifest.artifacts) == 6
+    assert manifest.artifact_schema_name == SCATTERING_CHUNK_ARTIFACT_SCHEMA.name
 
 
 def test_scattering_partial_result_merge_is_additive_and_rejects_duplicates():
@@ -112,12 +118,22 @@ def test_residual_field_work_unit_and_manifest_keep_seam_neutral(tmp_path):
         patch_scope="chunk",
         window_spec="cheb:100db",
     )
+    interval_work_unit = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=2,
+        chunk_id=4,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+        patch_scope="chunk",
+        window_spec="cheb:100db",
+    )
+    validate_residual_field_work_unit(interval_work_unit)
 
     assert work_unit.retry.idempotency_key == "residual-field:chunk:4:abc123"
-    assert all(artifact.stage == "scattering" for artifact in work_unit.source_artifacts)
+    assert interval_work_unit.retry.idempotency_key == "residual-field:chunk:4:abc123:interval-2"
+    assert all(artifact.stage == "scattering" for artifact in interval_work_unit.source_artifacts)
 
     manifest = ResidualFieldArtifactManifest.from_work_unit(
-        work_unit,
+        interval_work_unit,
         artifacts=(),
         completion_status=CompletionStatus.PLANNED,
     )
@@ -125,11 +141,13 @@ def test_residual_field_work_unit_and_manifest_keep_seam_neutral(tmp_path):
     assert manifest.producer_stage == "residual_field"
     assert manifest.consumer_stage == "decoding"
     assert manifest.retry.replay_disposition is RetryDisposition.NO_OP
+    assert manifest.artifact_schema_name == RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA.name
 
 
 def test_residual_field_partial_result_merge_is_metadata_oriented():
     left = ResidualFieldPartialResult(
         chunk_id=9,
+        contributing_interval_ids=(1,),
         parameter_digest="p123",
         output_kind="residual-field-chunk",
         source_artifacts=(),
@@ -139,6 +157,7 @@ def test_residual_field_partial_result_merge_is_metadata_oriented():
     )
     right = ResidualFieldPartialResult(
         chunk_id=9,
+        contributing_interval_ids=(2,),
         parameter_digest="p123",
         output_kind="residual-field-chunk",
         source_artifacts=(),
@@ -149,9 +168,27 @@ def test_residual_field_partial_result_merge_is_metadata_oriented():
 
     merged = merge_residual_field_partial_results(left, right)
 
+    assert merged.contributing_interval_ids == (1, 2)
     assert merged.point_ids == (1, 2, 3)
     assert merged.grid_shape == (4, 4)
     assert RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS.associative is True
+
+    duplicate = ResidualFieldPartialResult(
+        chunk_id=9,
+        contributing_interval_ids=(2,),
+        parameter_digest="p123",
+        output_kind="residual-field-chunk",
+        source_artifacts=(),
+        output_artifacts=(),
+        grid_shape=(4, 4),
+        point_ids=(2, 3),
+    )
+    try:
+        merge_residual_field_partial_results(merged, duplicate)
+    except ValueError as exc:
+        assert "duplicate interval ids" in str(exc)
+    else:
+        raise AssertionError("Expected duplicate interval ids to be rejected.")
 
     identity = residual_field_partial_result_identity(
         chunk_id=9,

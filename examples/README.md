@@ -1,6 +1,6 @@
 # Examples
 
-Release Wave 1 supports one canonical example:
+Release Wave 2 uses one canonical bounded smoke example:
 
 - [run_parameters.json](run_parameters.json)
 - [input_parameters.json](input_parameters.json)
@@ -12,6 +12,15 @@ Run it from the repository root:
 ```bash
 MOSAIC_NUFFT_CPU_ONLY=1 python -m core.main examples/run_parameters.json
 ```
+
+Release smoke helper:
+
+```bash
+python scripts/smoke_example.py
+```
+
+This helper is the CI-facing smoke path. It recreates the canonical output
+tree and checks for the expected artifact set under a fixed timeout.
 
 Expected output location:
 

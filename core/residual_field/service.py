@@ -17,9 +17,9 @@ class ResidualFieldExecutionService:
         if not scattering_parameters:
             return {}
         run_residual_field_stage(
-            parameters=scattering_parameters,
-            db_manager=artifacts.db_manager,
-            output_dir=artifacts.output_dir,
+            workflow_parameters=workflow_parameters,
+            structure=structure,
+            artifacts=artifacts,
             client=client,
         )
         return scattering_parameters

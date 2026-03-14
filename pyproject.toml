@@ -8,6 +8,9 @@ dynamic = ["version"]
 description = "MOSAIC scientific pipeline for scattering, residual-field, and decoding workflows."
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [
+  {name = "Maksim Eremenko"},
+]
 dependencies = [
   "dask",
   "distributed",
@@ -22,7 +25,12 @@ dependencies = [
   "PyYAML",
   "scipy",
   "sympy",
+  "tqdm",
 ]
+
+[project.urls]
+Homepage = "https://github.com/MaximEremenko/MOSAIC"
+Repository = "https://github.com/MaximEremenko/MOSAIC"
 
 [project.scripts]
 mosaic = "core.entrypoints.main:cli"
