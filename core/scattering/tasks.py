@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import numpy as np
+
+from core.scattering.artifacts import (
+    build_scattering_interval_manifest,
+    is_interval_artifact_committed,
+    persist_precomputed_interval_artifact,
+    persist_scattering_interval_chunk_result,
+)
+from core.scattering.contracts import ScatteringArtifactManifest, ScatteringWorkUnit
+from core.scattering.kernels import (
+    IntervalTask,
+    aggregate_interval_contributions,
+    build_rifft_grid_for_chunk,
+    compute_interval_coeff_contribution,
+    compute_interval_element_contribution,
+    generate_q_space_grid_sync,
+)
+from core.adapters.cunufft_wrapper import (
+    execute_inverse_cunufft,
+    free_gpu_memory,
+    set_cpu_only,
+)
+from core.contracts import CompletionStatus
+
+
+logger = logging.getLogger(__name__)
+
+
+def _lower_worker_log_levels() -> None:
+    for name in (
+        __name__,
+        "core.storage.database_manager",
+        "DatabaseManager",
+        "core.patch_centers.point_data",
+        "PointDataProcessor",
+        "RIFFTInDataSaver",
+    ):
+        try:
+            logging.getLogger(name).setLevel(logging.WARNING)
+        except Exception:
+            pass
+
+
+def load_interval_task_payload(interval_path: Path) -> IntervalTask:
+    with np.load(interval_path, mmap_mode="r") as data:
+        return IntervalTask(
+            int(data["irecip_id"]),
+            str(data["element"]),
+            data["q_grid"],
+            data["q_amp"],
+            data["q_amp_av"],
+        )
+
+
+def scattering_contribution_point_count(interval_task: IntervalTask) -> int:
+    q_grid = interval_task.q_grid
+    if q_grid.shape[1] > 2 and np.max(np.abs(q_grid[:, 2])) > 1e-7:
+        return int(q_grid.shape[0]) * 2
+    return int(q_grid.shape[0])
+
+
+def run_scattering_interval_task(
+    work_unit: ScatteringWorkUnit,
+    interval: dict,
+    *,
+    B_: np.ndarray,
+    mask_params: dict,
+    MaskStrategy,
+    supercell: np.ndarray,
+    original_coords: np.ndarray,
+    cells_origin: np.ndarray,
+    elements_arr: np.ndarray,
+    charge: float,
+    use_coeff: bool,
+    coeff_val: np.ndarray | None,
+    unique_elements: list[str],
+    ff_factory,
+    output_dir: str,
+    db_path: str,
+) -> ScatteringArtifactManifest | None:
+    if is_interval_artifact_committed(work_unit, db_path=db_path):
+        return build_scattering_interval_manifest(
+            work_unit,
+            completion_status=CompletionStatus.COMMITTED,
+        )
+
+    q_grid = generate_q_space_grid_sync(interval, B_, mask_params, MaskStrategy, supercell)
+    if q_grid.size == 0:
+        return None
+
+    contributions: list[tuple] = []
+    if use_coeff:
+        contributions.append(
+            compute_interval_coeff_contribution(
+                interval,
+                q_grid,
+                coeff_val,
+                original_coords,
+                cells_origin,
+            )
+        )
+    else:
+        for element in unique_elements:
+            contribution = compute_interval_element_contribution(
+                interval,
+                q_grid,
+                element,
+                original_coords,
+                cells_origin,
+                elements_arr,
+                charge,
+                ff_factory,
+            )
+            if contribution is not None:
+                contributions.append(contribution)
+
+    if not contributions:
+        return None
+
+    interval_task = aggregate_interval_contributions(contributions, use_coeff=use_coeff)
+    return persist_precomputed_interval_artifact(work_unit, interval_task, db_path=db_path)
+
+
+def run_scattering_interval_chunk_task(
+    work_unit: ScatteringWorkUnit,
+    interval_path: Path,
+    atoms: np.recarray,
+    *,
+    total_reciprocal_points: int,
+    output_dir: str,
+    db_path: str,
+    quiet_logs: bool = False,
+) -> ScatteringArtifactManifest | None:
+    if quiet_logs:
+        _lower_worker_log_levels()
+
+    interval_id = work_unit.interval_id
+    try:
+        interval_task = load_interval_task_payload(interval_path)
+        chunk_data = [
+            {
+                "coordinates": atoms["coordinates"][index],
+                "dist_from_atom_center": atoms["dist_from_atom_center"][index],
+                "step_in_frac": atoms["step_in_frac"][index],
+            }
+            for index in range(atoms.shape[0])
+        ]
+        rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(chunk_data)
+        amplitudes_delta = execute_inverse_cunufft(
+            q_coords=interval_task.q_grid,
+            c=interval_task.q_amp - interval_task.q_amp_av,
+            real_coords=rifft_grid,
+            eps=1e-12,
+        )
+        amplitudes_average = execute_inverse_cunufft(
+            q_coords=interval_task.q_grid,
+            c=interval_task.q_amp_av,
+            real_coords=rifft_grid,
+            eps=1e-12,
+        )
+        return persist_scattering_interval_chunk_result(
+            work_unit,
+            grid_shape_nd=grid_shape_nd,
+            total_reciprocal_points=total_reciprocal_points,
+            contribution_reciprocal_points=scattering_contribution_point_count(interval_task),
+            amplitudes_delta=amplitudes_delta,
+            amplitudes_average=amplitudes_average,
+            output_dir=output_dir,
+            db_path=db_path,
+            quiet_logs=quiet_logs,
+        )
+    except Exception as err:
+        logger.error(
+            "chunk %d | iv %s FAILED: %s",
+            int(work_unit.chunk_id) if work_unit.chunk_id is not None else -1,
+            interval_id,
+            err,
+            exc_info=True,
+        )
+        try:
+            message = str(err).lower()
+            is_gpu_err = any(
+                keyword in message
+                for keyword in (
+                    "cuda",
+                    "cudart",
+                    "cufft",
+                    "cufinufft",
+                    "cupy",
+                    "device-side assert",
+                    "illegal memory access",
+                    "out of memory",
+                    "driver shutting down",
+                )
+            )
+            if is_gpu_err:
+                from distributed import get_worker
+
+                try:
+                    set_cpu_only(True)
+                    worker = get_worker()
+                    logger.warning("Worker %s set to CPU-only after GPU error", worker.address)
+                except Exception:
+                    pass
+                try:
+                    count = getattr(worker, "gpu_fail_count", 0)
+                    setattr(worker, "gpu_fail_count", int(count) + 1)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        free_gpu_memory()
+        return None
+
+
+__all__ = [
+    "load_interval_task_payload",
+    "run_scattering_interval_chunk_task",
+    "run_scattering_interval_task",
+    "scattering_contribution_point_count",
+]

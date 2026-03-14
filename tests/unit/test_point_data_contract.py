@@ -1,6 +1,6 @@
 import numpy as np
 
-from core.domain.models import PointData
+from core.models import PointData
 
 
 def test_point_data_initializes_missing_chunk_state():

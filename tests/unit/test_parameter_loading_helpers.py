@@ -2,13 +2,13 @@ import json
 import os
 from pathlib import Path
 
-import core.application.configuration.service as configuration_service
-from core.application.configuration import ParameterLoadingService
-from core.application.configuration.run_files import (
+import core.config.service as configuration_service
+from core.config import ParameterLoadingService
+from core.config.run_files import (
     load_run_settings,
     resolve_input_parameters_path,
 )
-from core.application.configuration.schema import normalize_input_schema
+from core.config.schema import normalize_input_schema
 
 
 def test_load_run_settings_prefers_examples_when_no_local_file(tmp_path):

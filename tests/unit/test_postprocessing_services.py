@@ -1,11 +1,11 @@
 import numpy as np
 
-from core.application.postprocessing.decoder_cache import (
+from core.decoding.decoder_cache import (
     build_decoder_cache_path,
     load_decoder_cache,
     save_decoder_cache,
 )
-from core.application.postprocessing.loader import resolve_output_dir
+from core.decoding.loader import resolve_output_dir
 
 
 class _NoopLogger:

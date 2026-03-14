@@ -1,5 +1,5 @@
-from core.infrastructure.persistence.sqlite_connection import create_connection
-from core.infrastructure.persistence.sqlite_repositories import create_database_parts
+from core.storage.sqlite_connection import create_connection
+from core.storage.sqlite_repositories import create_database_parts
 
 
 def test_create_connection_sets_sqlite_pragmas(tmp_path):

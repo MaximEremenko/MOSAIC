@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic"
+dynamic = ["version"]
+description = "MOSAIC scientific pipeline for scattering, residual-field, and decoding workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "dask",
+  "distributed",
+  "dill",
+  "finufft==2.2.0",
+  "h5py",
+  "matplotlib",
+  "mrcfile==1.5.0",
+  "numba",
+  "numpy",
+  "pandas",
+  "PyYAML",
+  "scipy",
+  "sympy",
+]
+
+[project.scripts]
+mosaic = "core.entrypoints.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "core.__version__"}

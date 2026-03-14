@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from core.infrastructure.runtime.dask_client import default_log_dir, set_log_dir_for_run
+from core.runtime.dask_client import default_log_dir, set_log_dir_for_run
 
 
 def test_default_log_dir_uses_run_directory_when_env_not_set(monkeypatch, tmp_path):

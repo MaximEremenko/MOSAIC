@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "structInfo": {
+    "dimension": 1,
+    "working_directory": "./sample_1d_release",
+    "filename": "sample_1d.f1d"
+  },
+  "peakInfo": {
+    "reciprocal_space_limits": [
+      {
+        "limit": [1.0],
+        "subvolume_step": [1.0]
+      }
+    ]
+  },
+  "rspace_info": {
+    "method": "central",
+    "num_chunks": 1,
+    "fresh_start": true,
+    "points": [
+      {
+        "filename": "central_points.txt",
+        "distFromAtomCenter": [0.1],
+        "stepInAngstrom": [0.05]
+      }
+    ],
+    "run_postprocessing": false
+  },
+  "runtime_info": {
+    "form_factor": {
+      "family": "neutron",
+      "calculator": "default"
+    }
+  }
+}

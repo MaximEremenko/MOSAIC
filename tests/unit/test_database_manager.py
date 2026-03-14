@@ -1,5 +1,5 @@
-from core.domain.models import ReciprocalInterval
-from core.infrastructure.persistence.database_manager import (
+from core.models import ReciprocalInterval
+from core.storage.database_manager import (
     DatabaseManager,
     create_db_manager_for_thread,
 )

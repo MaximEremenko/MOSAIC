@@ -1,6 +1,6 @@
 import numpy as np
 
-from core.domain.masking.mask_strategies import EqBasedStrategy
+from core.qspace.masking.mask_strategies import EqBasedStrategy
 
 
 def test_eq_based_strategy_masks_points():

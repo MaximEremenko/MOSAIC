@@ -1,7 +1,7 @@
 import numpy as np
 
-from core.domain.masking.shape_cpu import compute_1d_mask, compute_2d_mask
-from core.domain.masking.shape_math import find_val_in_interval
+from core.qspace.masking.shape_cpu import compute_1d_mask, compute_2d_mask
+from core.qspace.masking.shape_math import find_val_in_interval
 
 
 def test_find_val_in_interval_returns_periodic_candidates():
