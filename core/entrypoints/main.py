@@ -10,17 +10,22 @@ if __package__ in (None, ""):
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
 
-from core.application.parameters import ParameterLoadingService
+from core.application.configuration import ParameterLoadingService
 from core.application.workflow import WorkflowService
-from core.utilities.dask_client import get_client
-from core.utilities.dask_helpres import shutdown_dask
-from core.utilities.logger_config import setup_logging
+from core.infrastructure.runtime import (
+    get_client,
+    set_log_dir_for_run,
+    setup_logging,
+    shutdown_dask,
+)
 
 
 def main(run_file: str = "run_parameters.json") -> None:
     parameter_loading_service = ParameterLoadingService()
     run_settings, workflow_parameters = parameter_loading_service.load(run_file)
     parameter_loading_service.apply_runtime_settings(run_settings.runtime)
+    run_dir = Path(workflow_parameters.struct_info["working_directory"]).resolve()
+    set_log_dir_for_run(run_dir)
 
     setup_logging()
     log = logging.getLogger("app")

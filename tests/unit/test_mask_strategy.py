@@ -1,6 +1,6 @@
 import numpy as np
 
-from core.strategies.mask_strategies import EqBasedStrategy
+from core.domain.masking.mask_strategies import EqBasedStrategy
 
 
 def test_eq_based_strategy_masks_points():
@@ -8,4 +8,3 @@ def test_eq_based_strategy_masks_points():
     mesh = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
     mask = strategy.generate_mask(mesh)
     assert mask.tolist() == [True, False]
-

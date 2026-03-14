@@ -1,5 +1,7 @@
-from core.data_storage.hdf5_parameter_storage import HDF5ParameterSaver
-from core.factories.parameters_processor_factory import ParametersProcessorFactory
+from core.infrastructure.configuration.factories.parameter_factory import (
+    ParametersProcessorFactory,
+)
+from core.infrastructure.storage.hdf5_parameter_storage import HDF5ParameterSaver
 
 
 def test_hdf5_parameter_source_is_supported(tmp_path):
@@ -22,4 +24,3 @@ def test_hdf5_parameter_source_is_supported(tmp_path):
     )
     processor.process()
     assert processor.get_parameters() == payload
-

@@ -4,3 +4,14 @@ __pycache__/
 tests/
 src/
 tmp_scripts/
+core/**/__pycache__/
+core/**/*.pyc
+core/dependencies.json
+core/dependencies.txt
+core/files/
+core/tests/
+core/dask_logs/
+core/entrypoints/dask_logs/
+core/**/*.hdf5
+core/**/*.db
+core/**/*.npz

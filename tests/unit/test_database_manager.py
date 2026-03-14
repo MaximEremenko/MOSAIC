@@ -1,5 +1,8 @@
 from core.domain.models import ReciprocalInterval
-from core.managers.database_manager import DatabaseManager, create_db_manager_for_thread
+from core.infrastructure.persistence.database_manager import (
+    DatabaseManager,
+    create_db_manager_for_thread,
+)
 
 
 def test_database_manager_uses_split_repositories(tmp_path):

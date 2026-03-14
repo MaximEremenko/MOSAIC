@@ -1,2 +1,0 @@
-"""Mask and shape strategies."""
-
