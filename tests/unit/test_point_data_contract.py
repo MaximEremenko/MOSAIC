@@ -1,6 +1,6 @@
 import numpy as np
 
-from core.data_structures.point_data import PointData
+from core.domain.models import PointData
 
 
 def test_point_data_initializes_missing_chunk_state():
@@ -14,4 +14,3 @@ def test_point_data_initializes_missing_chunk_state():
     )
     assert point_data.chunk_ids.tolist() == [0, 0]
     assert point_data.grid_amplitude_initialized.tolist() == [False, False]
-

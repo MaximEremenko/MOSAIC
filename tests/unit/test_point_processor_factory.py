@@ -1,7 +1,7 @@
 import pytest
 
-from core.factories.point_processor_factory import PointProcessorFactory
-from core.processors.full_list_point_processor import FullListPointProcessor
+from core.application.point_selection.factory import PointProcessorFactory
+from core.application.point_selection.full_list import FullListPointProcessor
 
 
 def test_point_processor_factory_creates_full_list_processor():

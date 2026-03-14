@@ -2,15 +2,22 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from core.application.amplitude import AmplitudeExecutionService
-from core.application.coefficients import CoefficientCenteringService
-from core.application.form_factor_registry import FormFactorRegistry
-from core.application.intervals import IntervalReconstructionService
-from core.application.masking import MaskStrategyService
-from core.application.parameters import ParameterLoadingService
-from core.application.postprocessing import PostprocessingService
+from core.application.amplitude.context import build_amplitude_execution_context
+from core.application.amplitude.service import AmplitudeExecutionService
+from core.application.amplitude.coefficients import CoefficientCenteringService
+from core.application.configuration import ParameterLoadingService
+from core.application.form_factors.registry import FormFactorRegistry
+from core.application.masking.service import MaskStrategyService
+from core.application.postprocessing.context import build_postprocessing_context
+from core.application.postprocessing.service import PostprocessingService
+from core.application.reciprocal_space.interval_reconstruction import (
+    IntervalReconstructionService,
+)
 from core.domain.models import ReciprocalSpaceArtifacts, StructureData, WorkflowParameters
-from core.managers.database_manager import DatabaseManager, create_db_manager_for_thread
+from core.infrastructure.persistence.database_manager import (
+    DatabaseManager,
+    create_db_manager_for_thread,
+)
 
 
 def _build_workflow_parameters() -> WorkflowParameters:
@@ -102,10 +109,15 @@ def test_interval_reconstruction_service_loads_pending_work(tmp_path):
 def test_amplitude_execution_service_builds_typed_context(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
-        context = AmplitudeExecutionService()._build_context(
+        service = AmplitudeExecutionService()
+        context = build_amplitude_execution_context(
             workflow_parameters=_build_workflow_parameters(),
             structure=_build_structure(),
             artifacts=artifacts,
+            parameter_loading_service=service.parameter_loading_service,
+            coefficient_centering_service=service.coefficient_centering_service,
+            mask_strategy_service=service.mask_strategy_service,
+            interval_reconstruction_service=service.interval_reconstruction_service,
         )
         assert context.dimension == 1
         assert context.form_factor_selection.family == "neutron"
@@ -120,7 +132,7 @@ def test_amplitude_execution_service_builds_typed_context(tmp_path):
 def test_postprocessing_service_builds_typed_context(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
-        context = PostprocessingService()._build_context(
+        context = build_postprocessing_context(
             workflow_parameters=_build_workflow_parameters(),
             structure=_build_structure(),
             artifacts=artifacts,
