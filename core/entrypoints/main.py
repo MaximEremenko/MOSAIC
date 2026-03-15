@@ -26,7 +26,7 @@ def main(run_file: str = "run_parameters.json") -> None:
     parameter_loading_service = ParameterLoadingService()
     run_settings, workflow_parameters = parameter_loading_service.load(run_file)
     parameter_loading_service.apply_runtime_settings(run_settings.runtime)
-    run_dir = Path(workflow_parameters.struct_info["working_directory"]).resolve()
+    run_dir = Path(workflow_parameters.struct_info.working_directory).resolve()
     set_log_dir_for_run(run_dir)
 
     setup_logging()

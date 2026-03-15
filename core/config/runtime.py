@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 
 from core.config.values import as_bool, first_present
-from core.models import FormFactorSelection, RuntimeSettings, WorkflowParameters
+from core.models import RuntimeSettings, WorkflowParameters
+from core.scattering.form_factors.contracts import FormFactorSelection
 
 
 def apply_runtime_settings(runtime_settings: RuntimeSettings) -> None:
@@ -17,19 +18,9 @@ def apply_runtime_settings(runtime_settings: RuntimeSettings) -> None:
 def resolve_form_factor_settings(
     workflow_parameters: WorkflowParameters,
 ) -> FormFactorSelection:
-    runtime = workflow_parameters.runtime_info or {}
-    form_factor = first_present(runtime, ("form_factor", "formFactor")) or {}
-    family = first_present(
-        form_factor,
-        ("family", "factory", "type", "form_factor_family"),
-    ) or "neutron"
-    calculator = first_present(
-        form_factor,
-        ("calculator", "method", "name", "form_factor_calculator"),
-    ) or "default"
     return FormFactorSelection(
-        family=str(family).strip().lower(),
-        calculator=str(calculator).strip(),
+        family=workflow_parameters.runtime_info.form_factor.family,
+        calculator=workflow_parameters.runtime_info.form_factor.calculator,
     )
 
 

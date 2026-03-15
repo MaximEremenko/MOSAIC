@@ -18,11 +18,11 @@ from core.config.schema import (
     normalize_parameter_paths,
 )
 from core.models import (
-    FormFactorSelection,
     RunSettings,
     RuntimeSettings,
     WorkflowParameters,
 )
+from core.scattering.form_factors.contracts import FormFactorSelection
 
 
 def resolve_repo_root() -> Path:

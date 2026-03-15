@@ -100,7 +100,7 @@ def run_residual_field_stage(
     for chunk_id in chunk_ids:
         point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
 
-    if client is None:
+    if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
         with progress_bar(total_tasks, desc="Residual field (chunks × intervals)", unit="pairs") as pbar:
             for work_unit in work_units:

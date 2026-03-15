@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from core.decoding.context import build_postprocessing_context
-from core.decoding.payloads import build_postprocessing_payload
+from core.decoding.context import build_decoding_context
+from core.decoding.payloads import build_decoding_payload
 from core.decoding.processor import PointDataPostprocessingProcessor
 from core.models import StructureData, WorkflowParameters
 
 
-def _build_postprocessing_processor(db_manager, point_data_processor, parameters):
+def build_default_decoding_processor(db_manager, point_data_processor, parameters):
     return PointDataPostprocessingProcessor(
         db_manager,
         point_data_processor,
@@ -14,8 +14,8 @@ def _build_postprocessing_processor(db_manager, point_data_processor, parameters
     )
 
 
-class DecodingService:
-    def __init__(self, *, processor_factory=_build_postprocessing_processor) -> None:
+class DecodingStage:
+    def __init__(self, *, processor_factory) -> None:
         self.processor_factory = processor_factory
 
     def execute(
@@ -25,15 +25,15 @@ class DecodingService:
         artifacts,
         client,
     ) -> None:
-        context = build_postprocessing_context(
+        context = build_decoding_context(
             workflow_parameters=workflow_parameters,
             structure=structure,
             artifacts=artifacts,
         )
-        if not bool(context.workflow_parameters.rspace_info.get("run_postprocessing", True)):
+        if not bool(context.workflow_parameters.rspace_info.run_postprocessing):
             return
 
-        postprocessing_parameters = build_postprocessing_payload(context)
+        postprocessing_parameters = build_decoding_payload(context)
         processor = self.processor_factory(
             context.artifacts.db_manager,
             context.artifacts.point_data_processor,

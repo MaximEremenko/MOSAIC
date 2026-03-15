@@ -3,11 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from core.scattering.coefficients import to_numpy
-from core.models import AmplitudeExecutionContext
+from core.scattering.context import ScatteringExecutionContext
 
 
 def build_base_amplitude_parameters(
-    context: AmplitudeExecutionContext,
+    context: ScatteringExecutionContext,
 ) -> dict[str, object]:
     return {
         "reciprocal_space_intervals": context.intervals,
@@ -29,7 +29,7 @@ def build_base_amplitude_parameters(
         "cells_origin": to_numpy(context.structure.cells_origin),
         "elements": to_numpy(context.structure.elements),
         "refnumbers": to_numpy(context.structure.refnumbers),
-        "rspace_info": context.workflow_parameters.rspace_info,
+        "rspace_info": context.workflow_parameters.rspace_info.to_mapping(),
         "vectors": context.structure.vectors,
         "supercell": context.structure.supercell,
         "postprocessing_mode": context.postprocessing_mode,
@@ -37,7 +37,7 @@ def build_base_amplitude_parameters(
 
 
 def build_amplitude_adapter_payload(
-    context: AmplitudeExecutionContext,
+    context: ScatteringExecutionContext,
     base_params: dict[str, object],
 ) -> dict[str, object]:
     amplitude_parameters = dict(base_params)

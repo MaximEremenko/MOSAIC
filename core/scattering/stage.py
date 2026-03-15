@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from core.scattering.coefficients import CoefficientCenteringService
-from core.scattering.context import build_amplitude_execution_context
+from core.scattering.context import build_scattering_execution_context
 from core.scattering.payloads import (
     build_amplitude_adapter_payload,
     build_base_amplitude_parameters,
@@ -23,28 +23,22 @@ def _compute_amplitudes(**kwargs):
     return compute_amplitudes_delta(**kwargs)
 
 
-class ScatteringExecutionService:
+class ScatteringStage:
     def __init__(
         self,
         *,
-        parameter_loading_service: ParameterLoadingService | None = None,
-        coefficient_centering_service: CoefficientCenteringService | None = None,
-        mask_strategy_service: MaskStrategyService | None = None,
-        interval_reconstruction_service: IntervalReconstructionService | None = None,
-        form_factor_registry: FormFactorRegistry | None = None,
+        parameter_loading_service: ParameterLoadingService,
+        coefficient_centering_service: CoefficientCenteringService,
+        mask_strategy_service: MaskStrategyService,
+        interval_reconstruction_service: IntervalReconstructionService,
+        form_factor_registry: FormFactorRegistry,
         compute_amplitudes=_compute_amplitudes,
     ) -> None:
-        self.parameter_loading_service = (
-            parameter_loading_service or ParameterLoadingService()
-        )
-        self.coefficient_centering_service = (
-            coefficient_centering_service or CoefficientCenteringService()
-        )
-        self.mask_strategy_service = mask_strategy_service or MaskStrategyService()
-        self.interval_reconstruction_service = (
-            interval_reconstruction_service or IntervalReconstructionService()
-        )
-        self.form_factor_registry = form_factor_registry or FormFactorRegistry()
+        self.parameter_loading_service = parameter_loading_service
+        self.coefficient_centering_service = coefficient_centering_service
+        self.mask_strategy_service = mask_strategy_service
+        self.interval_reconstruction_service = interval_reconstruction_service
+        self.form_factor_registry = form_factor_registry
         self.compute_amplitudes = compute_amplitudes
 
     def execute(
@@ -54,7 +48,7 @@ class ScatteringExecutionService:
         artifacts,
         client,
     ) -> dict[str, Any]:
-        context = build_amplitude_execution_context(
+        context = build_scattering_execution_context(
             workflow_parameters=workflow_parameters,
             structure=structure,
             artifacts=artifacts,
@@ -74,7 +68,7 @@ class ScatteringExecutionService:
             parameters=amplitude_parameters,
             FormFactorFactoryProducer=ff_calculator_impl,
             MaskStrategy=context.mask_strategy,
-            MaskStrategyParameters=context.workflow_parameters.peak_info,
+            MaskStrategyParameters=context.workflow_parameters.peak_info.to_mapping(),
             db_manager=context.artifacts.db_manager,
             output_dir=context.artifacts.output_dir,
             point_data_processor=context.artifacts.point_data_processor,

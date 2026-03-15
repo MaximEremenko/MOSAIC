@@ -10,19 +10,25 @@ from core.qspace.masking.shape_strategies import (
 
 
 class MaskStrategyService:
-    def build(self, dim: int, peak_info: dict, post_mode: str = "displacement"):
-        equation = self.get_equation(peak_info)
+    def _peak_mapping(self, peak_info) -> dict:
+        if hasattr(peak_info, "to_mapping"):
+            return peak_info.to_mapping()
+        return dict(peak_info or {})
+
+    def build(self, dim: int, peak_info, post_mode: str = "displacement"):
+        peak_info_mapping = self._peak_mapping(peak_info)
+        equation = self.get_equation(peak_info_mapping)
         if equation is not None:
             return EqBasedStrategy(equation)
-        if not self.has_special_points(peak_info):
+        if not self.has_special_points(peak_info_mapping):
             return DefaultMaskStrategy()
         if dim == 1:
-            return IntervalShapeStrategy(peak_info)
+            return IntervalShapeStrategy(peak_info_mapping)
         if dim == 2:
-            return CircleShapeStrategy(peak_info)
+            return CircleShapeStrategy(peak_info_mapping)
 
-        r1_val = float(peak_info.get("r1", peak_info.get("radius", 0.1876)))
-        r2_val = float(peak_info.get("r2", peak_info.get("radius", 0.2501)))
+        r1_val = float(peak_info_mapping.get("r1", peak_info_mapping.get("radius", 0.1876)))
+        r2_val = float(peak_info_mapping.get("r2", peak_info_mapping.get("radius", 0.2501)))
         if normalize_processing_mode(post_mode) == "displacement":
             condition = """
                 (((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2) <= ({r1})**2) &

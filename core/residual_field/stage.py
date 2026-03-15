@@ -4,7 +4,7 @@ from core.residual_field.execution import run_residual_field_stage
 from core.models import StructureData, WorkflowParameters
 
 
-class ResidualFieldExecutionService:
+class ResidualFieldStage:
     def execute(
         self,
         workflow_parameters: WorkflowParameters,
@@ -23,6 +23,3 @@ class ResidualFieldExecutionService:
             client=client,
         )
         return scattering_parameters
-
-
-ResidualFieldService = ResidualFieldExecutionService

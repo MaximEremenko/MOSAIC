@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from core.models import PointData, PointSelectionRequest
+from core.models import PointData
+from core.patch_centers.contracts import PointSelectionRequest
 from core.patch_centers.factory import PointProcessorFactory
 
 

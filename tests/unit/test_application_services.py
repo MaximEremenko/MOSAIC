@@ -2,17 +2,17 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from core.scattering.context import build_amplitude_execution_context
-from core.scattering.service import ScatteringExecutionService
+from core.scattering.context import build_scattering_execution_context
+from core.scattering.stage import ScatteringStage
 from core.scattering.coefficients import CoefficientCenteringService
 from core.config import ParameterLoadingService
 from core.scattering.form_factors.registry import FormFactorRegistry
 from core.qspace.masking.service import MaskStrategyService
 from core.patch_centers.service import PointSelectionService
-from core.decoding.context import build_postprocessing_context
-from core.decoding.service import DecodingService
+from core.decoding.context import build_decoding_context
+from core.decoding.stage import DecodingStage
 from core.qspace.service import ReciprocalSpacePreparationService
-from core.residual_field.service import ResidualFieldExecutionService
+from core.residual_field.stage import ResidualFieldStage
 from core.qspace.intervals.interval_reconstruction import (
     IntervalReconstructionService,
 )
@@ -20,11 +20,11 @@ from core.structure.service import StructureLoadingService
 from core.workflow import WorkflowService
 from core.models import (
     PointData,
-    PointSelectionRequest,
     ReciprocalSpaceArtifacts,
     StructureData,
     WorkflowParameters,
 )
+from core.patch_centers.contracts import PointSelectionRequest
 from core.storage.database_manager import (
     DatabaseManager,
     create_db_manager_for_thread,
@@ -52,6 +52,20 @@ def _build_structure() -> StructureData:
         refnumbers=np.array([1]),
         cells_origin=np.array([[0.0]]),
         coeff=np.array([2.0]),
+    )
+
+
+def _build_scattering_stage(*, compute_amplitudes=None):
+    kwargs = {}
+    if compute_amplitudes is not None:
+        kwargs["compute_amplitudes"] = compute_amplitudes
+    return ScatteringStage(
+        parameter_loading_service=ParameterLoadingService(),
+        coefficient_centering_service=CoefficientCenteringService(),
+        mask_strategy_service=MaskStrategyService(),
+        interval_reconstruction_service=IntervalReconstructionService(),
+        form_factor_registry=FormFactorRegistry(),
+        **kwargs,
     )
 
 
@@ -134,18 +148,18 @@ def test_interval_reconstruction_service_loads_pending_work(tmp_path):
         artifacts.db_manager.close()
 
 
-def test_amplitude_execution_service_builds_typed_context(tmp_path):
+def test_scattering_stage_builds_typed_context(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
-        service = ScatteringExecutionService()
-        context = build_amplitude_execution_context(
+        stage = _build_scattering_stage()
+        context = build_scattering_execution_context(
             workflow_parameters=_build_workflow_parameters(),
             structure=_build_structure(),
             artifacts=artifacts,
-            parameter_loading_service=service.parameter_loading_service,
-            coefficient_centering_service=service.coefficient_centering_service,
-            mask_strategy_service=service.mask_strategy_service,
-            interval_reconstruction_service=service.interval_reconstruction_service,
+            parameter_loading_service=stage.parameter_loading_service,
+            coefficient_centering_service=stage.coefficient_centering_service,
+            mask_strategy_service=stage.mask_strategy_service,
+            interval_reconstruction_service=stage.interval_reconstruction_service,
         )
         assert context.dimension == 1
         assert context.form_factor_selection.family == "neutron"
@@ -157,7 +171,7 @@ def test_amplitude_execution_service_builds_typed_context(tmp_path):
         artifacts.db_manager.close()
 
 
-def test_amplitude_execution_service_uses_injected_compute_callable(tmp_path):
+def test_scattering_stage_uses_injected_compute_callable(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     captured = {}
 
@@ -165,8 +179,8 @@ def test_amplitude_execution_service_uses_injected_compute_callable(tmp_path):
         captured.update(kwargs)
 
     try:
-        service = ScatteringExecutionService(compute_amplitudes=fake_compute)
-        result = service.execute(
+        stage = _build_scattering_stage(compute_amplitudes=fake_compute)
+        result = stage.execute(
             workflow_parameters=_build_workflow_parameters(),
             structure=_build_structure(),
             artifacts=artifacts,
@@ -179,10 +193,10 @@ def test_amplitude_execution_service_uses_injected_compute_callable(tmp_path):
         artifacts.db_manager.close()
 
 
-def test_postprocessing_service_builds_typed_context(tmp_path):
+def test_decoding_stage_builds_typed_context(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
-        context = build_postprocessing_context(
+        context = build_decoding_context(
             workflow_parameters=_build_workflow_parameters(),
             structure=_build_structure(),
             artifacts=artifacts,
@@ -193,7 +207,7 @@ def test_postprocessing_service_builds_typed_context(tmp_path):
         artifacts.db_manager.close()
 
 
-def test_postprocessing_service_uses_injected_processor_factory(tmp_path):
+def test_decoding_stage_uses_injected_processor_factory(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     calls = []
 
@@ -208,8 +222,8 @@ def test_postprocessing_service_uses_injected_processor_factory(tmp_path):
         return FakeProcessor()
 
     try:
-        service = DecodingService(processor_factory=processor_factory)
-        service.execute(
+        stage = DecodingStage(processor_factory=processor_factory)
+        stage.execute(
             workflow_parameters=_build_workflow_parameters(),
             structure=_build_structure(),
             artifacts=artifacts,
@@ -451,12 +465,12 @@ def test_workflow_service_uses_injected_services_and_closes_artifacts(tmp_path):
         structure_loading_service=FakeStructureService(),
         point_selection_service=FakePointSelectionService(),
         reciprocal_space_service=FakeReciprocalService(),
-        amplitude_service=FakeAmplitudeService(),
-        residual_field_service=FakeResidualFieldService(),
-        postprocessing_service=FakeDecodingService(),
+        scattering_stage=FakeAmplitudeService(),
+        residual_field_stage=FakeResidualFieldService(),
+        decoding_stage=FakeDecodingService(),
     )
     workflow_parameters = _build_workflow_parameters()
-    workflow_parameters.struct_info["working_directory"] = str(tmp_path / "workdir")
+    workflow_parameters.struct_info.working_directory = str(tmp_path / "workdir")
     workflow_service.run(
         run_settings=SimpleNamespace(working_path=tmp_path),
         workflow_parameters=workflow_parameters,
@@ -502,13 +516,13 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
         structure_loading_service=FakeStructureService(),
         point_selection_service=FakePointSelectionService(),
         reciprocal_space_service=FakeReciprocalService(),
-        amplitude_service=SimpleNamespace(execute=lambda **kwargs: {}),
-        residual_field_service=SimpleNamespace(execute=lambda **kwargs: {}),
-        postprocessing_service=SimpleNamespace(execute=lambda **kwargs: None),
+        scattering_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        residual_field_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        decoding_stage=SimpleNamespace(execute=lambda **kwargs: None),
     )
     workflow_parameters = _build_workflow_parameters()
-    workflow_parameters.struct_info["working_directory"] = str(tmp_path / "workdir")
-    workflow_parameters.rspace_info["fresh_start"] = True
+    workflow_parameters.struct_info.working_directory = str(tmp_path / "workdir")
+    workflow_parameters.rspace_info.fresh_start = True
 
     workflow_service.run(
         run_settings=SimpleNamespace(working_path=tmp_path),
@@ -532,6 +546,15 @@ def test_parameter_loading_service_returns_form_factor_selection():
     )
     assert selection.family == "xray"
     assert selection.calculator == "lobato"
+
+
+def test_workflow_parameters_wrap_section_payloads_into_typed_views():
+    workflow_parameters = _build_workflow_parameters()
+
+    assert workflow_parameters.struct_info.dimension == 1
+    assert workflow_parameters.peak_info.mask_equation == "h > 0"
+    assert workflow_parameters.rspace_info.method == "central"
+    assert workflow_parameters.runtime_info.form_factor.family == "neutron"
 
 
 def test_form_factor_registry_rejects_unknown_family():
