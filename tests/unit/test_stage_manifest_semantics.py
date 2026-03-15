@@ -17,9 +17,15 @@ from core.residual_field.artifacts import (
     ResidualFieldArtifactStore,
     assess_residual_field_manifest,
     build_residual_field_chunk_manifest,
+    build_residual_field_reducer_progress_artifact,
     persist_residual_field_interval_chunk_result,
 )
-from core.residual_field.contracts import ResidualFieldWorkUnit
+from core.residual_field.contracts import (
+    ResidualFieldReducerProgressManifest,
+    ResidualFieldWorkUnit,
+    make_residual_field_reducer_key,
+    validate_residual_field_reducer_progress_manifest,
+)
 from core.storage.database_manager import DatabaseManager
 
 
@@ -241,3 +247,46 @@ def test_residual_field_manifest_assessment_and_replay_are_explicit(tmp_path):
         assert applied == {interval_id}
     finally:
         db.close()
+
+
+def test_residual_field_reducer_progress_materialized_vs_committed_is_explicit(tmp_path):
+    materialized = ResidualFieldReducerProgressManifest(
+        artifact=build_residual_field_reducer_progress_artifact(
+            str(tmp_path),
+            chunk_id=3,
+            parameter_digest="abc123",
+        ),
+        reducer_key=make_residual_field_reducer_key(
+            chunk_id=3,
+            parameter_digest="abc123",
+        ),
+        chunk_id=3,
+        parameter_digest="abc123",
+        completion_status=CompletionStatus.MATERIALIZED,
+        incorporated_shard_keys=(),
+        incorporated_interval_ids=(),
+        reclaimable_shard_keys=(),
+        final_artifacts=(),
+        pending_shard_keys=("shard-a",),
+        pending_interval_ids=(1,),
+        cleanup_policy="off",
+    )
+    committed = ResidualFieldReducerProgressManifest(
+        artifact=materialized.artifact,
+        reducer_key=materialized.reducer_key,
+        chunk_id=3,
+        parameter_digest="abc123",
+        completion_status=CompletionStatus.COMMITTED,
+        incorporated_shard_keys=("shard-a",),
+        incorporated_interval_ids=(1,),
+        reclaimable_shard_keys=("shard-a",),
+        final_artifacts=(),
+        pending_shard_keys=(),
+        pending_interval_ids=(),
+        cleanup_policy="delete_reclaimable",
+    )
+
+    validate_residual_field_reducer_progress_manifest(materialized)
+    validate_residual_field_reducer_progress_manifest(committed)
+    assert materialized.pending_shard_keys == ("shard-a",)
+    assert committed.pending_shard_keys == ()

@@ -33,6 +33,24 @@ def test_residual_field_planning_builds_interval_chunk_work_units(tmp_path):
     assert build_residual_field_parameter_digest(parameters) == work_units[0].parameter_digest
 
 
+def test_residual_field_planning_batches_intervals_per_chunk(tmp_path):
+    parameters = {
+        "postprocessing_mode": "displacement",
+        "supercell": np.array([4]),
+        "rspace_info": {"mode": "displacement"},
+    }
+    work_units = build_residual_field_work_units(
+        [(1, 3), (2, 3), (3, 3)],
+        parameters=parameters,
+        output_dir=str(tmp_path),
+        max_intervals_per_shard=2,
+    )
+
+    assert [unit.interval_ids for unit in work_units] == [(1, 2), (3,)]
+    assert work_units[0].retry.idempotency_key.endswith("batch-1-2-n2")
+    assert work_units[1].retry.idempotency_key.endswith("interval-3")
+
+
 def test_residual_field_artifacts_preserve_current_saved_and_applied_semantics(tmp_path):
     db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
     store = ResidualFieldArtifactStore(str(tmp_path))

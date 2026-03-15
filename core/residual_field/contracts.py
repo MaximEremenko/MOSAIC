@@ -16,6 +16,23 @@ from core.contracts import (
 
 
 RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION = 1
+RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
+    stage="residual_field",
+    name="residual-field-shard-checkpoint",
+    schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+    required_artifact_kinds=(
+        "residual-shard-data",
+        "residual-shard-manifest",
+    ),
+    completeness_rule=(
+        "the shard NPZ and shard manifest JSON must both exist and agree on "
+        "chunk_id, interval_id, parameter_digest, and schema_version"
+    ),
+    resume_rule=(
+        "resume is allowed while upstream scattering artifacts are readable and the "
+        "final reduced chunk has not yet incorporated this shard's interval id"
+    ),
+)
 RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
     stage="residual_field",
     name="residual-field-interval-chunk",
@@ -38,6 +55,20 @@ RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
         "predicate above is satisfied for the same parameter digest"
     ),
 )
+RESIDUAL_FIELD_REDUCER_PROGRESS_SCHEMA = ArtifactSchemaSpec(
+    stage="residual_field",
+    name="residual-field-reducer-progress",
+    schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+    required_artifact_kinds=("residual-reducer-progress-manifest",),
+    completeness_rule=(
+        "the reducer progress manifest must exist and record the incorporated shard keys, "
+        "incorporated interval ids, final chunk artifact refs, and cleanup eligibility"
+    ),
+    resume_rule=(
+        "resume is allowed while reducer progress exists but not all discovered shard keys "
+        "have been incorporated into the final chunk artifacts"
+    ),
+)
 
 
 def make_residual_field_retry_key(chunk_id: int, parameter_digest: str) -> str:
@@ -51,6 +82,26 @@ def make_residual_field_artifact_key(
     parameter_digest: str,
 ) -> str:
     return f"residual-field:{kind}:chunk-{chunk_id}:params-{parameter_digest}"
+
+
+def make_residual_field_reducer_key(
+    *,
+    chunk_id: int,
+    parameter_digest: str,
+) -> str:
+    return make_residual_field_artifact_key(
+        "reducer",
+        chunk_id=chunk_id,
+        parameter_digest=parameter_digest,
+    )
+
+
+def make_residual_field_batch_token(interval_ids: tuple[int, ...]) -> str:
+    normalized = tuple(sorted(int(interval_id) for interval_id in interval_ids))
+    if not normalized:
+        raise ValueError("Residual-field batch token requires at least one interval id.")
+    token = f"{normalized[0]}-{normalized[-1]}-n{len(normalized)}"
+    return token
 
 
 def build_residual_field_source_artifacts(
@@ -174,6 +225,44 @@ def build_residual_field_output_artifacts(
     )
 
 
+def build_residual_field_shard_artifacts(
+    output_dir: str,
+    *,
+    chunk_id: int,
+    interval_ids: tuple[int, ...],
+    parameter_digest: str,
+) -> tuple[ArtifactRef, ...]:
+    shard_dir = Path(output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    batch_token = make_residual_field_batch_token(interval_ids)
+    base_name = f"batch_{batch_token}_params_{parameter_digest}"
+    return (
+        ArtifactRef(
+            stage="residual_field",
+            kind="residual-shard-data",
+            key=make_residual_field_artifact_key(
+                "residual-shard-data",
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            + f":batch-{batch_token}",
+            path=str(shard_dir / f"{base_name}.npz"),
+            schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+        ),
+        ArtifactRef(
+            stage="residual_field",
+            kind="residual-shard-manifest",
+            key=make_residual_field_artifact_key(
+                "residual-shard-manifest",
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            + f":batch-{batch_token}",
+            path=str(shard_dir / f"{base_name}.manifest.json"),
+            schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class ResidualFieldWorkUnit:
     """
@@ -182,6 +271,7 @@ class ResidualFieldWorkUnit:
 
     chunk_id: int
     interval_id: int | None
+    interval_ids: tuple[int, ...]
     parameter_digest: str
     source_artifacts: tuple[ArtifactRef, ...]
     patch_scope: str | None
@@ -203,6 +293,7 @@ class ResidualFieldWorkUnit:
         return cls(
             chunk_id=chunk_id,
             interval_id=None,
+            interval_ids=(),
             parameter_digest=parameter_digest,
             source_artifacts=build_residual_field_source_artifacts(output_dir, chunk_id),
             patch_scope=patch_scope,
@@ -237,6 +328,8 @@ class ResidualFieldWorkUnit:
     ) -> "ResidualFieldWorkUnit":
         return cls(
             chunk_id=chunk_id,
+            interval_id=interval_id,
+            interval_ids=(interval_id,),
             parameter_digest=parameter_digest,
             source_artifacts=build_residual_field_interval_source_artifacts(
                 output_dir,
@@ -244,12 +337,12 @@ class ResidualFieldWorkUnit:
             ),
             patch_scope=patch_scope,
             window_spec=window_spec,
-            interval_id=interval_id,
             artifact_key=make_residual_field_artifact_key(
                 "interval-chunk",
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
-            ),
+            )
+            + f":interval-{interval_id}",
             retry=RetryIdempotencySemantics(
                 failure_unit="residual-field-interval-chunk",
                 retry_unit="residual-field-interval-chunk",
@@ -259,16 +352,67 @@ class ResidualFieldWorkUnit:
                 ),
                 replay_disposition=RetryDisposition.NO_OP,
                 crash_recovery_rule=(
-                    "treat the residual-field interval/chunk as committed only when "
-                    "SQLite marks the pair as saved and _applied_interval_ids contains "
-                    "the interval id"
+                    "treat the residual-field interval/chunk map task as committed only when "
+                    "the residual shard checkpoint NPZ and manifest JSON both exist"
+                ),
+            ),
+        )
+
+    @classmethod
+    def interval_chunk_batch(
+        cls,
+        *,
+        interval_ids: tuple[int, ...] | list[int],
+        chunk_id: int,
+        parameter_digest: str,
+        output_dir: str,
+        patch_scope: str | None = None,
+        window_spec: str | None = None,
+    ) -> "ResidualFieldWorkUnit":
+        normalized = tuple(sorted(int(interval_id) for interval_id in interval_ids))
+        if not normalized:
+            raise ValueError("Residual-field batch work units require at least one interval id.")
+        batch_token = make_residual_field_batch_token(normalized)
+        return cls(
+            chunk_id=chunk_id,
+            interval_id=normalized[0],
+            interval_ids=normalized,
+            parameter_digest=parameter_digest,
+            source_artifacts=tuple(
+                artifact
+                for interval_id in normalized
+                for artifact in build_residual_field_interval_source_artifacts(
+                    output_dir,
+                    interval_id,
+                )
+            ),
+            patch_scope=patch_scope,
+            window_spec=window_spec,
+            artifact_key=make_residual_field_artifact_key(
+                "interval-batch",
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            + f":batch-{batch_token}",
+            retry=RetryIdempotencySemantics(
+                failure_unit="residual-field-interval-batch",
+                retry_unit="residual-field-interval-batch",
+                idempotency_key=(
+                    f"{make_residual_field_retry_key(chunk_id, parameter_digest)}:"
+                    f"batch-{batch_token}"
+                ),
+                replay_disposition=RetryDisposition.NO_OP,
+                crash_recovery_rule=(
+                    "treat the residual-field batch map task as committed only when "
+                    "the residual shard checkpoint NPZ and manifest JSON both exist "
+                    "for the full interval batch"
                 ),
             ),
         )
 
     @property
     def artifact_schema(self) -> ArtifactSchemaSpec:
-        return RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA
+        return RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -399,8 +543,13 @@ def _merge_artifact_refs(
 def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
     if work_unit.chunk_id < 0:
         raise ValueError("chunk_id must be non-negative.")
-    if work_unit.interval_id is None or work_unit.interval_id < 0:
-        raise ValueError("Residual-field Phase 6 requires interval-scoped work units.")
+    if work_unit.interval_ids:
+        if work_unit.interval_id is None or work_unit.interval_id != work_unit.interval_ids[0]:
+            raise ValueError("interval_id must match the first interval id in interval_ids.")
+    elif work_unit.interval_id is not None:
+        raise ValueError("chunk-scope work units must not carry interval_id without interval_ids.")
+    if work_unit.interval_ids and min(work_unit.interval_ids) < 0:
+        raise ValueError("Residual-field work units require non-negative interval ids.")
     if not work_unit.parameter_digest:
         raise ValueError("parameter_digest must be non-empty.")
     if not work_unit.source_artifacts:
@@ -549,6 +698,7 @@ class ResidualFieldArtifactManifest:
         artifacts: tuple[ArtifactRef, ...],
         completion_status: CompletionStatus,
         consumer_stage: str | None = "decoding",
+        artifact_schema_name: str | None = None,
     ) -> "ResidualFieldArtifactManifest":
         validate_residual_field_work_unit(work_unit)
         return cls(
@@ -561,7 +711,7 @@ class ResidualFieldArtifactManifest:
             parameter_digest=work_unit.parameter_digest,
             consumer_stage=consumer_stage,
             upstream_artifacts=work_unit.source_artifacts,
-            artifact_schema_name=work_unit.artifact_schema.name,
+            artifact_schema_name=artifact_schema_name or RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA.name,
         )
 
 
@@ -583,21 +733,146 @@ def validate_residual_field_artifact_manifest(
         raise ValueError("Residual-field artifact manifest schema name does not match its scope.")
 
 
+@dataclass(frozen=True)
+class ResidualFieldShardManifest:
+    """Immutable map-output checkpoint manifest for one residual-field interval/chunk shard."""
+
+    artifact_key: str
+    artifacts: tuple[ArtifactRef, ...]
+    completion_status: CompletionStatus
+    retry: RetryIdempotencySemantics
+    interval_id: int
+    contributing_interval_ids: tuple[int, ...]
+    chunk_id: int
+    parameter_digest: str
+    point_count: int
+    contribution_reciprocal_point_count: int
+    total_reciprocal_point_count: int
+    scratch_root: str | None = None
+    producer_stage: str = "residual_field"
+    consumer_stage: str | None = "residual_field.reducer"
+    upstream_artifacts: tuple[ArtifactRef, ...] = ()
+    artifact_schema_name: str = RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA.name
+    schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
+
+    @classmethod
+    def from_work_unit(
+        cls,
+        work_unit: ResidualFieldWorkUnit,
+        *,
+        artifacts: tuple[ArtifactRef, ...],
+        completion_status: CompletionStatus,
+        point_count: int,
+        contribution_reciprocal_point_count: int,
+        total_reciprocal_point_count: int,
+    ) -> "ResidualFieldShardManifest":
+        validate_residual_field_work_unit(work_unit)
+        if work_unit.interval_id is None:
+            raise ValueError("Shard manifests require interval-scoped residual-field work units.")
+        return cls(
+            artifact_key=work_unit.artifact_key,
+            artifacts=artifacts,
+            completion_status=completion_status,
+            retry=work_unit.retry,
+            interval_id=work_unit.interval_id,
+            contributing_interval_ids=tuple(work_unit.interval_ids or (work_unit.interval_id,)),
+            chunk_id=work_unit.chunk_id,
+            parameter_digest=work_unit.parameter_digest,
+            point_count=int(point_count),
+            contribution_reciprocal_point_count=int(contribution_reciprocal_point_count),
+            total_reciprocal_point_count=int(total_reciprocal_point_count),
+            upstream_artifacts=work_unit.source_artifacts,
+        )
+
+
+def validate_residual_field_shard_manifest(
+    manifest: ResidualFieldShardManifest,
+) -> None:
+    if manifest.producer_stage != "residual_field":
+        raise ValueError("Residual-field shard manifests must be produced by residual_field.")
+    if manifest.schema_version != RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("Unexpected residual-field shard-manifest schema version.")
+    if manifest.interval_id < 0 or manifest.chunk_id < 0:
+        raise ValueError("Residual-field shard manifests require non-negative interval/chunk ids.")
+    if len(set(manifest.contributing_interval_ids)) != len(manifest.contributing_interval_ids):
+        raise ValueError("Residual-field shard manifests require unique contributing interval ids.")
+    if not manifest.contributing_interval_ids:
+        raise ValueError("Residual-field shard manifests require at least one contributing interval id.")
+    if manifest.interval_id != manifest.contributing_interval_ids[0]:
+        raise ValueError("Residual-field shard manifest interval_id must match the first contributing interval id.")
+    if manifest.point_count < 0:
+        raise ValueError("Residual-field shard manifests require non-negative point_count.")
+    if manifest.contribution_reciprocal_point_count < 0:
+        raise ValueError("Residual-field shard manifests require non-negative reciprocal counts.")
+    artifact_keys = [artifact.key for artifact in manifest.artifacts]
+    if len(set(artifact_keys)) != len(artifact_keys):
+        raise ValueError("Residual-field shard manifests must not contain duplicate artifact keys.")
+    if manifest.artifact_schema_name != RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA.name:
+        raise ValueError("Residual-field shard manifest schema name does not match shard scope.")
+
+
+@dataclass(frozen=True)
+class ResidualFieldReducerProgressManifest:
+    artifact: ArtifactRef
+    reducer_key: str
+    chunk_id: int
+    parameter_digest: str
+    completion_status: CompletionStatus
+    incorporated_shard_keys: tuple[str, ...]
+    incorporated_interval_ids: tuple[int, ...]
+    reclaimable_shard_keys: tuple[str, ...]
+    final_artifacts: tuple[ArtifactRef, ...]
+    pending_shard_keys: tuple[str, ...] = ()
+    pending_interval_ids: tuple[int, ...] = ()
+    cleanup_policy: str = "off"
+    schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
+
+
+def validate_residual_field_reducer_progress_manifest(
+    manifest: ResidualFieldReducerProgressManifest,
+) -> None:
+    if manifest.artifact.kind != "residual-reducer-progress-manifest":
+        raise ValueError("Reducer progress manifest must use the reducer-progress artifact kind.")
+    if len(set(manifest.incorporated_shard_keys)) != len(manifest.incorporated_shard_keys):
+        raise ValueError("Reducer progress manifest must not contain duplicate shard keys.")
+    if len(set(manifest.incorporated_interval_ids)) != len(manifest.incorporated_interval_ids):
+        raise ValueError("Reducer progress manifest must not contain duplicate interval ids.")
+    if len(set(manifest.pending_shard_keys)) != len(manifest.pending_shard_keys):
+        raise ValueError("Reducer progress manifest must not contain duplicate pending shard keys.")
+    if len(set(manifest.pending_interval_ids)) != len(manifest.pending_interval_ids):
+        raise ValueError("Reducer progress manifest must not contain duplicate pending interval ids.")
+    if len(set(manifest.reclaimable_shard_keys)) != len(manifest.reclaimable_shard_keys):
+        raise ValueError("Reducer progress manifest must not contain duplicate reclaimable shard keys.")
+    if set(manifest.pending_shard_keys) & set(manifest.reclaimable_shard_keys):
+        raise ValueError("Pending shard keys must not already be reclaimable.")
+    if manifest.cleanup_policy not in {"off", "delete_reclaimable"}:
+        raise ValueError("Reducer progress cleanup_policy must be 'off' or 'delete_reclaimable'.")
+
+
 __all__ = [
     "RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION",
+    "RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA",
     "RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA",
+    "RESIDUAL_FIELD_REDUCER_PROGRESS_SCHEMA",
     "RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS",
     "ResidualFieldArtifactManifest",
     "ResidualFieldPartialResult",
+    "ResidualFieldReducerProgressManifest",
+    "ResidualFieldShardManifest",
     "ResidualFieldWorkUnit",
     "build_residual_field_interval_source_artifacts",
     "build_residual_field_output_artifacts",
+    "build_residual_field_shard_artifacts",
     "build_residual_field_source_artifacts",
+    "make_residual_field_batch_token",
     "make_residual_field_artifact_key",
+    "make_residual_field_reducer_key",
     "make_residual_field_retry_key",
     "merge_residual_field_partial_results",
     "residual_field_partial_result_identity",
     "validate_residual_field_artifact_manifest",
     "validate_residual_field_partial_result",
+    "validate_residual_field_reducer_progress_manifest",
+    "validate_residual_field_shard_manifest",
     "validate_residual_field_work_unit",
 ]

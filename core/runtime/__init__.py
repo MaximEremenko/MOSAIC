@@ -8,7 +8,12 @@ from .dask_helpers import (
 )
 from .logger_config import setup_logging
 from .progress import TIMER, logging_redirect_tqdm, progress_bar, quiet_loggers, timed
-from .worker_hooks import chunk_mutex, handle_worker_gpu_failure, register_cleanup_plugin
+from .worker_hooks import (
+    chunk_mutex,
+    handle_worker_gpu_failure,
+    register_cleanup_plugin,
+    resolve_worker_scratch_root,
+)
 
 __all__ = [
     "DEFAULT_TASK_RETRIES",
@@ -23,6 +28,7 @@ __all__ = [
     "progress_bar",
     "quiet_loggers",
     "register_cleanup_plugin",
+    "resolve_worker_scratch_root",
     "set_log_dir_for_run",
     "shutdown_dask",
     "setup_logging",

@@ -13,6 +13,9 @@ Start here:
   - canonical release-candidate input schema
   - smoke-scale example structure
   - legacy compatibility mapping
+- [hpc_parallel_plan.md](hpc_parallel_plan.md)
+  - safer Map/Reduce architecture for cluster, multi-GPU, pause/resume, and
+    shard-based reduction
 - [examples/README.md](../examples/README.md)
   - supported example files
   - bounded smoke path

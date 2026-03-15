@@ -12,7 +12,7 @@ from core.qspace.intervals.manager import (
 )
 from core.models import PointData, ReciprocalSpaceArtifacts, WorkflowParameters
 from core.storage.database_manager import DatabaseManager
-from core.storage import RIFFTInDataSaver
+from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 
 
 class _ReciprocalSpaceArtifactBundle:
