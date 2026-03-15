@@ -14,6 +14,7 @@ class DecodingRequest:
 @dataclass(frozen=True)
 class DisplacementDecoderSourcePolicy:
     mode: str = "error"
+    assignment: str = "single"
     cache_path: str | None = None
     compute_output_directory: str | None = None
 
@@ -28,9 +29,18 @@ class DisplacementDecoderSourcePolicy:
             or mapping.get("mode")
             or "error"
         ).strip().lower()
+        assignment = str(
+            mapping.get("assignment")
+            or mapping.get("decoder_assignment")
+            or "single"
+        ).strip().lower()
         if mode not in {"error", "cache", "compute"}:
             raise ValueError(
                 "processing.decoder.source must be one of: error, cache, compute."
+            )
+        if assignment not in {"single", "family"}:
+            raise ValueError(
+                "processing.decoder.assignment must be one of: single, family."
             )
         cache_path = mapping.get("cache_path") or mapping.get("path")
         compute_output_directory = (
@@ -48,6 +58,7 @@ class DisplacementDecoderSourcePolicy:
             )
         return cls(
             mode=mode,
+            assignment=assignment,
             cache_path=str(cache_path) if cache_path else None,
             compute_output_directory=(
                 str(compute_output_directory) if compute_output_directory else None
@@ -55,7 +66,7 @@ class DisplacementDecoderSourcePolicy:
         )
 
     def to_mapping(self) -> dict[str, Any]:
-        payload = {"source": self.mode}
+        payload = {"source": self.mode, "assignment": self.assignment}
         if self.cache_path is not None:
             payload["cache_path"] = self.cache_path
         if self.compute_output_directory is not None:

@@ -143,6 +143,7 @@ class FromAveragePointProcessor:
         # Proceed to process parameters
         self.logger.info("Processing parameters for 'from_average' method.")
         points_params = rspace_info.get('points', [])
+        self._validate_decoder_patch_reference_consistency(points_params)
 
         average_coords = self.average_structure.get('average_coords')
         elements = self.average_structure.get('elements')
@@ -258,6 +259,52 @@ class FromAveragePointProcessor:
 
         # Save to HDF5
         self.save_point_data_to_hdf5(self.hdf5_file_path)
+
+    def _validate_decoder_patch_reference_consistency(self, points_params):
+        rspace_info = self.parameters.get("rspace_info", {}) or {}
+        mode = str(rspace_info.get("mode", self.parameters.get("postprocessing_mode", ""))).lower()
+        if mode != "displacement":
+            return
+        decoder_payload = self.parameters.get("decoder")
+        if not isinstance(decoder_payload, dict):
+            decoder_payload = rspace_info.get("decoder", {})
+        assignment = str((decoder_payload or {}).get("assignment", "single")).lower()
+        if assignment != "single":
+            return
+
+        specs_by_reference: dict[int, set[tuple]] = {}
+        for point_info in points_params:
+            reference_number = point_info.get("referenceNumber")
+            dist_from_atom_center = point_info.get("distFromAtomCenter")
+            step_in_angstrom = point_info.get("stepInAngstrom")
+            if reference_number is None or dist_from_atom_center is None or step_in_angstrom is None:
+                continue
+            patch_spec = (
+                len(np.asarray(dist_from_atom_center).reshape(-1)),
+                tuple(float(np.round(value, 12)) for value in np.asarray(dist_from_atom_center, dtype=float).reshape(-1)),
+                tuple(float(np.round(value, 12)) for value in np.asarray(step_in_angstrom, dtype=float).reshape(-1)),
+            )
+            specs_by_reference.setdefault(int(reference_number), set()).add(patch_spec)
+
+        conflicting = {
+            reference_number: specs
+            for reference_number, specs in specs_by_reference.items()
+            if len(specs) > 1
+        }
+        if not conflicting:
+            return
+
+        reference_number, specs = next(iter(conflicting.items()))
+        raise ValueError(
+            "Displacement decoder patch-spec inconsistency: referenceNumber "
+            f"{reference_number} is configured with multiple patch specs in "
+            "processing.points for the current single-global-decoder path. "
+            "This would otherwise be hidden by point deduplication and later "
+            "break decoder feature-space consistency. Use one shared patch spec "
+            "for this referenceNumber now; the proper future extension is a "
+            "fixed decoder family keyed by site class + patch spec, not "
+            f"per-mask retraining. Conflicting configured specs: {sorted(specs)}"
+        )
 
     def _assign_chunk_ids(self, new_point_data: PointData, max_chunk_size: Optional[int] = None):
         """

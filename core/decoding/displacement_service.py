@@ -6,9 +6,12 @@ import os
 import numpy as np
 
 from core.decoding.decoder_service import (
+    _decoder_assignment_mode,
     apply_decoder,
+    apply_decoder_family,
     build_feature_sets,
     ensure_decoder,
+    validate_global_displacement_patch_specs,
 )
 from core.decoding.grid import compute_hkl_max_from_intervals
 from core.decoding.io import write_displacements_csv
@@ -28,6 +31,11 @@ def prepare_displacement_decoder_inputs(
 ):
     output_dir = resolve_output_dir(rifft_saver, chunk_id, output_dir)
     log = logging.getLogger(__name__)
+    if _decoder_assignment_mode(processor) == "single":
+        validate_global_displacement_patch_specs(
+            processor.parameters,
+            point_data_list=point_data_list,
+        )
     data, amplitudes, rifft_space_grid = load_chunk_residual_field_and_grid(
         processor,
         chunk_id=chunk_id,
@@ -65,7 +73,14 @@ def prepare_displacement_decoder_inputs(
     Vd = V[:D_disp, :D_disp]
     Vd_inv = np.linalg.inv(Vd)
 
-    features_all, cids_all, features_train, u_train = build_feature_sets(
+    (
+        features_all,
+        cids_all,
+        decoder_keys_all,
+        features_train,
+        u_train,
+        training_decoder_keys,
+    ) = build_feature_sets(
         processor,
         point_data_list=point_data_list,
         coords_all=coords_all,
@@ -90,8 +105,10 @@ def prepare_displacement_decoder_inputs(
         "data": data,
         "features_all": features_all,
         "cids_all": cids_all,
+        "decoder_keys_all": decoder_keys_all,
         "features_train": features_train,
         "u_train": u_train,
+        "training_decoder_keys": training_decoder_keys,
     }
 
 
@@ -116,12 +133,17 @@ def compute_and_save_displacements(
     data = prepared["data"]
     features_all = prepared["features_all"]
     cids_all = prepared["cids_all"]
+    decoder_keys_all = prepared["decoder_keys_all"]
     ensure_decoder(
         processor,
         features_all=features_all,
+        decoder_keys_all=decoder_keys_all,
         logger=log,
     )
-    U_all = apply_decoder(processor, features_all)
+    if getattr(processor.decoder_source_policy, "assignment", "single") == "family":
+        U_all = apply_decoder_family(processor, features_all, decoder_keys_all)
+    else:
+        U_all = apply_decoder(processor, features_all)
 
     ids = np.array(cids_all, dtype=np.int64)
     U = U_all.astype(np.float64, copy=False)

@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
+import pytest
 
 from core.scattering.context import build_scattering_execution_context
 from core.scattering.stage import ScatteringStage
@@ -25,6 +27,7 @@ from core.models import (
     WorkflowParameters,
 )
 from core.patch_centers.contracts import PointSelectionRequest
+from core.patch_centers.from_average import FromAveragePointProcessor
 from core.storage.database_manager import (
     DatabaseManager,
     create_db_manager_for_thread,
@@ -125,6 +128,81 @@ def test_mask_strategy_service_defaults_to_no_mask_without_definition():
     assert mask.tolist() == [True, True]
 
 
+def test_from_average_processor_rejects_same_reference_number_with_multiple_patch_specs(tmp_path):
+    processor = FromAveragePointProcessor(
+        parameters={
+            "rspace_info": {
+                "method": "from_average",
+                "mode": "displacement",
+                "points": [
+                    {
+                        "elementSymbol": "El1",
+                        "referenceNumber": 1,
+                        "distFromAtomCenter": [0.2],
+                        "stepInAngstrom": [0.05],
+                    },
+                    {
+                        "elementSymbol": "El1",
+                        "referenceNumber": 1,
+                        "distFromAtomCenter": [0.3],
+                        "stepInAngstrom": [0.05],
+                    },
+                ],
+            },
+            "hdf5_file_path": str(tmp_path / "point_data.hdf5"),
+        },
+        average_structure={
+            "metric": {"a": 1.0},
+            "vectors": np.array([[1.0]], dtype=np.float64),
+            "average_coords": pd.DataFrame({"x": [0.0]}),
+            "elements": np.array(["El1"], dtype=object),
+            "refnumbers": np.array([1], dtype=np.int64),
+        },
+        num_chunks=1,
+    )
+
+    with pytest.raises(ValueError, match="referenceNumber 1 is configured with multiple patch specs"):
+        processor.process_parameters()
+
+
+def test_from_average_processor_allows_same_reference_number_mixed_patch_specs_in_family_mode(tmp_path):
+    processor = FromAveragePointProcessor(
+        parameters={
+            "rspace_info": {
+                "method": "from_average",
+                "mode": "displacement",
+                "decoder": {"assignment": "family"},
+                "points": [
+                    {
+                        "elementSymbol": "El1",
+                        "referenceNumber": 1,
+                        "distFromAtomCenter": [0.2],
+                        "stepInAngstrom": [0.05],
+                    },
+                    {
+                        "elementSymbol": "El1",
+                        "referenceNumber": 1,
+                        "distFromAtomCenter": [0.3],
+                        "stepInAngstrom": [0.05],
+                    },
+                ],
+            },
+            "hdf5_file_path": str(tmp_path / "point_data.hdf5"),
+        },
+        average_structure={
+            "metric": {"a": 1.0},
+            "vectors": np.array([[1.0]], dtype=np.float64),
+            "average_coords": pd.DataFrame({"x": [0.0]}),
+            "elements": np.array(["El1"], dtype=object),
+            "refnumbers": np.array([1], dtype=np.int64),
+        },
+        num_chunks=1,
+    )
+
+    processor.process_parameters()
+    assert processor.get_point_data() is not None
+
+
 def test_interval_reconstruction_service_loads_pending_work(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
@@ -167,6 +245,45 @@ def test_scattering_stage_builds_typed_context(tmp_path):
         np.testing.assert_allclose(context.centered_coefficients, np.array([2.0]))
         assert len(context.unsaved_interval_chunks) == 1
         assert len(context.intervals) == 1
+    finally:
+        artifacts.db_manager.close()
+
+
+def test_scattering_context_keeps_coefficient_weights_separate_from_form_factor_family(tmp_path):
+    artifacts = _build_artifacts(tmp_path)
+    try:
+        workflow_parameters = WorkflowParameters(
+            schema_version=1,
+            struct_info={"dimension": 1, "coeff_scheme": "ones"},
+            peak_info={"mask_equation": "h > 0"},
+            rspace_info={"method": "central", "mode": "displacement", "use_coeff": True},
+            runtime_info={"form_factor": {"family": "xray", "calculator": "lobato"}},
+        )
+        structure = StructureData(
+            vectors=np.array([[1.0]]),
+            metric={"a": 1.0},
+            supercell=np.array([4]),
+            original_coords=np.array([[0.1]]),
+            average_coords=np.array([[0.0]]),
+            elements=np.array(["Na"], dtype=object),
+            refnumbers=np.array([1]),
+            cells_origin=np.array([[0.0]]),
+            coeff=np.array([1.0]),
+        )
+        stage = _build_scattering_stage()
+        context = build_scattering_execution_context(
+            workflow_parameters=workflow_parameters,
+            structure=structure,
+            artifacts=artifacts,
+            parameter_loading_service=stage.parameter_loading_service,
+            coefficient_centering_service=stage.coefficient_centering_service,
+            mask_strategy_service=stage.mask_strategy_service,
+            interval_reconstruction_service=stage.interval_reconstruction_service,
+        )
+
+        assert context.form_factor_selection.family == "xray"
+        assert context.form_factor_selection.calculator == "lobato"
+        np.testing.assert_allclose(context.centered_coefficients, np.array([1.0]))
     finally:
         artifacts.db_manager.close()
 

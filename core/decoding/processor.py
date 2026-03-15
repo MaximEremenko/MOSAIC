@@ -36,6 +36,8 @@ class PointDataPostprocessingProcessor:
         self.decoder_source_provenance = None
         self._decoder_M = None
         self._feature_dim = None
+        self._decoder_family = None
+        self._decoder_feature_dims = None
 
     def process_chunk(self, chunk_id, rifft_saver, output_dir):
         point_data_list = self.db_manager.get_point_data_for_chunk(chunk_id)
