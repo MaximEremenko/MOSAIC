@@ -249,6 +249,7 @@ class RSpaceInfo(_MappingView):
     chemical_filtered_ordering: bool | None = None
     coeff_center_by: str | None = None
     use_coeff: bool | None = None
+    decoder: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.num_chunks = int(self.num_chunks)
@@ -280,6 +281,7 @@ class RSpaceInfo(_MappingView):
             chemical_filtered_ordering=mapping.get("chemical_filtered_ordering"),
             coeff_center_by=mapping.get("coeff_center_by"),
             use_coeff=mapping.get("use_coeff"),
+            decoder=dict(mapping.get("decoder")) if isinstance(mapping.get("decoder"), Mapping) else None,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -306,6 +308,8 @@ class RSpaceInfo(_MappingView):
             payload["coeff_center_by"] = self.coeff_center_by
         if self.use_coeff is not None:
             payload["use_coeff"] = self.use_coeff
+        if self.decoder is not None:
+            payload["decoder"] = dict(self.decoder)
         return payload
 
 

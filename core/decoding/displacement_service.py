@@ -18,17 +18,16 @@ from core.residual_field.loader import (
 )
 
 
-def compute_and_save_displacements(
+def prepare_displacement_decoder_inputs(
     processor,
     *,
     chunk_id,
     rifft_saver,
     point_data_list,
     output_dir=None,
-    broadcast_into_rows=False,
 ):
-    log = logging.getLogger(__name__)
     output_dir = resolve_output_dir(rifft_saver, chunk_id, output_dir)
+    log = logging.getLogger(__name__)
     data, amplitudes, rifft_space_grid = load_chunk_residual_field_and_grid(
         processor,
         chunk_id=chunk_id,
@@ -47,7 +46,6 @@ def compute_and_save_displacements(
     ids_all = rifft_space_grid[:, -1].astype(int)
 
     weight_g = float(processor.parameters.get("ls_weight_gamma", 0.35))
-    lam_reg = float(processor.parameters.get("dog_lambda_reg", 1e-3))
     max_train = processor.parameters.get("linear_max_training_samples", None)
     intervals = processor.parameters["reciprocal_space_intervals_all"]
     hkl_max_xyz = compute_hkl_max_from_intervals(intervals)
@@ -66,7 +64,6 @@ def compute_and_save_displacements(
         raise ValueError("Could not determine displacement dimensionality (D_disp).")
     Vd = V[:D_disp, :D_disp]
     Vd_inv = np.linalg.inv(Vd)
-    decoder_cache_path = processor._get_decoder_cache_path(output_dir)
 
     features_all, cids_all, features_train, u_train = build_feature_sets(
         processor,
@@ -88,14 +85,40 @@ def compute_and_save_displacements(
         max_train=max_train,
     )
 
+    return {
+        "output_dir": output_dir,
+        "data": data,
+        "features_all": features_all,
+        "cids_all": cids_all,
+        "features_train": features_train,
+        "u_train": u_train,
+    }
+
+
+def compute_and_save_displacements(
+    processor,
+    *,
+    chunk_id,
+    rifft_saver,
+    point_data_list,
+    output_dir=None,
+    broadcast_into_rows=False,
+):
+    log = logging.getLogger(__name__)
+    prepared = prepare_displacement_decoder_inputs(
+        processor,
+        chunk_id=chunk_id,
+        rifft_saver=rifft_saver,
+        point_data_list=point_data_list,
+        output_dir=output_dir,
+    )
+    output_dir = prepared["output_dir"]
+    data = prepared["data"]
+    features_all = prepared["features_all"]
+    cids_all = prepared["cids_all"]
     ensure_decoder(
         processor,
-        cache_path=decoder_cache_path,
-        chunk_id=chunk_id,
         features_all=features_all,
-        features_train=features_train,
-        u_train=u_train,
-        lam_reg=lam_reg,
         logger=log,
     )
     U_all = apply_decoder(processor, features_all)

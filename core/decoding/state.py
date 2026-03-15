@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from core.decoding.contracts import DisplacementDecoderSourcePolicy
 from core.processing_mode import normalize_processing_mode
 
 
@@ -15,6 +16,7 @@ class PostprocessingProcessorState:
     original_coords: np.ndarray | None
     average_coords: np.ndarray | None
     u_true_all: np.ndarray | None
+    decoder_source_policy: DisplacementDecoderSourcePolicy | None
 
 
 def build_postprocessing_processor_state(
@@ -43,9 +45,22 @@ def build_postprocessing_processor_state(
     normalized.setdefault("q_window_at_db", 100.0)
     normalized.setdefault("edge_guard_frac", 0.10)
 
+    decoder_source_policy = None
+
     original_coords = None
     average_coords = None
     if mode == "displacement":
+        decoder_payload = (
+            normalized.get("decoder")
+            if isinstance(normalized.get("decoder"), dict)
+            else rspace_info.get("decoder")
+            if isinstance(rspace_info.get("decoder"), dict)
+            else {"source": "error"}
+        )
+        decoder_source_policy = DisplacementDecoderSourcePolicy.from_mapping(
+            decoder_payload
+        )
+        normalized["decoder"] = decoder_source_policy.to_mapping()
         if "original_coords" not in normalized:
             raise KeyError("parameters['original_coords'] is required for displacement mode.")
         if "average_coords" not in normalized:
@@ -66,4 +81,5 @@ def build_postprocessing_processor_state(
         original_coords=original_coords,
         average_coords=average_coords,
         u_true_all=u_true_all,
+        decoder_source_policy=decoder_source_policy,
     )

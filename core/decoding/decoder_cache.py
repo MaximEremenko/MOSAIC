@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 
@@ -33,6 +34,10 @@ def build_decoder_cache_path(parameters: dict, output_dir: str) -> str:
     key_json = json.dumps(key_obj, sort_keys=True)
     digest = hashlib.sha1(key_json.encode("utf-8")).hexdigest()[:16]
     return os.path.join(output_dir, f"decoder_M_{digest}.npz")
+
+
+def build_decoder_provenance_path(output_dir: str) -> str:
+    return os.path.join(output_dir, "decoder_source_provenance.json")
 
 
 def load_decoder_cache(cache_path: str, logger):
@@ -73,3 +78,12 @@ def save_decoder_cache(cache_path: str, decoder_M, feature_dim: int, logger) -> 
     except Exception as exc:
         logger.warning("Failed to save decoder M to '%s': %s", cache_path, exc)
 
+
+def save_decoder_provenance(output_dir: str, provenance: dict, logger) -> None:
+    path = Path(build_decoder_provenance_path(output_dir))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8")
+        logger.info("Decoder source provenance saved to '%s'.", path)
+    except Exception as exc:
+        logger.warning("Failed to save decoder provenance to '%s': %s", path, exc)
