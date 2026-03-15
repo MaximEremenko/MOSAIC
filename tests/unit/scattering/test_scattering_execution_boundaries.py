@@ -23,6 +23,7 @@ from core.scattering.planning import (
     build_scattering_interval_lookup,
     build_scattering_precompute_work_units,
 )
+from core.scattering.tasks import run_scattering_interval_chunk_task
 from core.contracts import CompletionStatus
 from core.storage.database_manager import DatabaseManager
 
@@ -219,3 +220,58 @@ def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path)
     data = store.saver.load_data(fn.name)
     assert int(np.asarray(data["ntotal_reciprocal_space_points"]).ravel()[0]) == 11
     assert int(np.asarray(data["ntotal_reciprocal_points"]).ravel()[0]) == 11
+
+
+def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_path):
+    interval_path = tmp_path / "interval_1.npz"
+    np.savez(
+        interval_path,
+        irecip_id=np.array([1], dtype=np.int64),
+        element=np.array(["All"]),
+        q_grid=np.array([[0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "core.scattering.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    calls = {"count": 0}
+    monkeypatch.setattr(
+        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
+        lambda **kwargs: calls.__setitem__("count", calls["count"] + 1) or np.array([[3.0 + 0.0j], [4.0 + 0.0j]]),
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.persist_scattering_interval_chunk_result",
+        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
+    )
+
+    result = run_scattering_interval_chunk_task(
+        ScatteringWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            dimension=1,
+            output_dir=str(tmp_path),
+        ),
+        interval_path,
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        db_path=str(tmp_path / "state.db"),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    assert calls["count"] == 1
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([3.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))

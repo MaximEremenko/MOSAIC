@@ -11,7 +11,9 @@ from core.residual_field.planning import (
     build_residual_field_parameter_digest,
     build_residual_field_work_units,
 )
+from core.residual_field.contracts import ResidualFieldWorkUnit
 from core.residual_field.stage import ResidualFieldStage
+from core.residual_field.tasks import run_residual_field_interval_chunk_task
 from core.storage.database_manager import DatabaseManager
 
 
@@ -194,3 +196,195 @@ def test_residual_field_stage_delegates_to_execution(monkeypatch):
     assert captured["workflow_parameters"].name == "workflow"
     assert captured["structure"].name == "structure"
     assert captured["artifacts"] is artifacts
+
+
+def test_residual_field_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_path):
+    interval_path = tmp_path / "interval_1.npz"
+    np.savez(
+        interval_path,
+        irecip_id=np.array([1], dtype=np.int64),
+        element=np.array(["All"]),
+        q_grid=np.array([[0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    calls = {"count": 0}
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: calls.__setitem__("count", calls["count"] + 1) or np.array([[5.0 + 0.0j], [6.0 + 0.0j]]),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.persist_residual_field_shard_checkpoint",
+        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
+    )
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        interval_path,
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    assert calls["count"] == 1
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([5.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
+
+
+def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(monkeypatch, tmp_path):
+    interval_path_1 = tmp_path / "interval_1.npz"
+    interval_path_2 = tmp_path / "interval_2.npz"
+    for path, interval_id, q_amp in (
+        (interval_path_1, 1, 2.0 + 0.0j),
+        (interval_path_2, 2, 4.0 + 0.0j),
+    ):
+        np.savez(
+            path,
+            irecip_id=np.array([interval_id], dtype=np.int64),
+            element=np.array(["All"]),
+            q_grid=np.array([[0.0]], dtype=np.float64),
+            q_amp=np.array([q_amp]),
+            q_amp_av=np.array([1.0 + 0.0j]),
+        )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+    calls = {"count": 0}
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: calls.__setitem__("count", calls["count"] + 1)
+        or np.array(
+            [
+                [1.0 + 0.0j],
+                [2.0 + 0.0j],
+                [3.0 + 0.0j],
+                [4.0 + 0.0j],
+            ],
+            dtype=np.complex128,
+        ),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.persist_residual_field_shard_checkpoint",
+        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
+    )
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(1, 2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (interval_path_1, interval_path_2),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    assert calls["count"] == 1
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([4.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
+
+
+def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypatch, tmp_path):
+    interval_path_1 = tmp_path / "interval_1.npz"
+    interval_path_2 = tmp_path / "interval_2.npz"
+    np.savez(
+        interval_path_1,
+        irecip_id=np.array([1], dtype=np.int64),
+        element=np.array(["All"]),
+        q_grid=np.array([[0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+    np.savez(
+        interval_path_2,
+        irecip_id=np.array([2], dtype=np.int64),
+        element=np.array(["All"]),
+        q_grid=np.array([[1.0]], dtype=np.float64),
+        q_amp=np.array([4.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+    calls = []
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+
+    def fake_super_batch(**kwargs):
+        calls.append(np.asarray(kwargs["q_coords"]).copy())
+        if np.allclose(kwargs["q_coords"], np.array([[0.0]], dtype=np.float64)):
+            return np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128)
+        return np.array([[3.0 + 0.0j], [4.0 + 0.0j]], dtype=np.complex128)
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        fake_super_batch,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.persist_residual_field_shard_checkpoint",
+        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
+    )
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(1, 2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (interval_path_1, interval_path_2),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    assert len(calls) == 2
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([4.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))

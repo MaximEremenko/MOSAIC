@@ -21,7 +21,7 @@ from core.scattering.kernels import (
     generate_q_space_grid_sync,
 )
 from core.adapters.cunufft_wrapper import (
-    execute_inverse_cunufft,
+    execute_inverse_cunufft_batch_materialize_once,
 )
 from core.contracts import CompletionStatus
 from core.runtime import handle_worker_gpu_failure
@@ -150,18 +150,20 @@ def run_scattering_interval_chunk_task(
             for index in range(atoms.shape[0])
         ]
         rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(chunk_data)
-        amplitudes_delta = execute_inverse_cunufft(
+        inverse_pair = execute_inverse_cunufft_batch_materialize_once(
             q_coords=interval_task.q_grid,
-            c=interval_task.q_amp - interval_task.q_amp_av,
+            weights=np.stack(
+                [
+                    interval_task.q_amp - interval_task.q_amp_av,
+                    interval_task.q_amp_av,
+                ],
+                axis=0,
+            ),
             real_coords=rifft_grid,
             eps=1e-12,
         )
-        amplitudes_average = execute_inverse_cunufft(
-            q_coords=interval_task.q_grid,
-            c=interval_task.q_amp_av,
-            real_coords=rifft_grid,
-            eps=1e-12,
-        )
+        amplitudes_delta = inverse_pair[0]
+        amplitudes_average = inverse_pair[1]
         return persist_scattering_interval_chunk_result(
             work_unit,
             grid_shape_nd=grid_shape_nd,
