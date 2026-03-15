@@ -52,13 +52,11 @@ class _DefaultReciprocalSpaceArtifactBuilder:
         supercell,
     ) -> _ReciprocalSpaceArtifactBundle:
         parameters = workflow_parameters.to_payload()
-        dimension = int(parameters["structInfo"]["dimension"])
+        dimension = workflow_parameters.struct_info.dimension
         saver = self.saver_factory(output_dir, "hdf5")
         point_data_processor = PointDataProcessor(
             data_saver=saver,
-            save_rifft_coordinates=parameters["rspace_info"].get(
-                "save_rifft_coordinates", False
-            ),
+            save_rifft_coordinates=workflow_parameters.rspace_info.save_rifft_coordinates,
         )
         db_manager = self.db_manager_factory(
             str(Path(output_dir) / "point_reciprocal_space_associations.db"),

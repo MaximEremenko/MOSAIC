@@ -24,10 +24,9 @@ class StructureLoadingService:
     def load(
         self, workflow_parameters: WorkflowParameters, working_path: str
     ) -> StructureData:
-        parameters = workflow_parameters.to_payload()
-        struct = parameters["structInfo"]
-        cfg_path = os.path.join(working_path, struct["filename"])
-        cfg_type = determine_configuration_file_type(struct["filename"])
+        struct = workflow_parameters.struct_info
+        cfg_path = os.path.join(working_path, struct.filename)
+        cfg_type = determine_configuration_file_type(struct.filename)
         cfg_proc = self.registry.get_factory(cfg_type).create_processor(
             cfg_path, "calculate"
         )
@@ -44,7 +43,7 @@ class StructureLoadingService:
         cell_ids = cfg_proc.get_cell_ids() if hasattr(cfg_proc, "get_cell_ids") else None
 
         coeff = resolve_structure_coefficients(
-            struct=struct,
+            struct=struct.to_mapping(),
             cfg_proc=cfg_proc,
             working_path=working_path,
             elements=elements,

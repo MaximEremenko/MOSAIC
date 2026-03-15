@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from core.models import FormFactorSelection
 from core.scattering.form_factors.form_factor_factory_producer import (
     FormFactorFactoryProducer,
 )
+from .contracts import FormFactorSelection
 
 
 class FormFactorRegistry:

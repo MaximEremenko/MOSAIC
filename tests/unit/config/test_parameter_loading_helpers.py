@@ -99,9 +99,10 @@ def test_parameter_loading_service_finds_examples_run_file_from_core_workdir(
 
     assert run_settings.run_parameters_path == repo_root / "examples" / "run_parameters.json"
     assert run_settings.input_parameters_path == fixture_dir / "input_parameters.json"
-    assert workflow_parameters.struct_info["filename"] == str(
+    assert workflow_parameters.struct_info.filename == str(
         fixture_dir / "sample_1d.f1d"
     )
+    assert workflow_parameters.rspace_info.method == "full_list"
 
 
 def test_resolve_repo_root_points_to_repository_root():

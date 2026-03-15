@@ -11,7 +11,7 @@ from core.residual_field.planning import (
     build_residual_field_parameter_digest,
     build_residual_field_work_units,
 )
-from core.residual_field.service import ResidualFieldExecutionService
+from core.residual_field.stage import ResidualFieldStage
 from core.storage.database_manager import DatabaseManager
 
 
@@ -146,7 +146,7 @@ def test_residual_field_loader_reconstructs_grid_and_normalizes_values(tmp_path)
     np.testing.assert_allclose(rifft_grid[:, 1], np.array([10, 10]))
 
 
-def test_residual_field_service_delegates_to_execution(monkeypatch):
+def test_residual_field_stage_delegates_to_execution(monkeypatch):
     captured = {}
 
     def fake_execute(*, workflow_parameters, structure, artifacts, client):
@@ -156,15 +156,15 @@ def test_residual_field_service_delegates_to_execution(monkeypatch):
         captured["client"] = client
 
     monkeypatch.setattr(
-        "core.residual_field.service.run_residual_field_stage",
+        "core.residual_field.stage.run_residual_field_stage",
         fake_execute,
     )
 
-    service = ResidualFieldExecutionService()
+    stage = ResidualFieldStage()
     artifacts = SimpleNamespace(db_manager="db", output_dir="/tmp/out")
     params = {"point_data_list": [], "supercell": np.array([4]), "reciprocal_space_intervals_all": []}
 
-    result = service.execute(
+    result = stage.execute(
         workflow_parameters=SimpleNamespace(name="workflow"),
         structure=SimpleNamespace(name="structure"),
         artifacts=artifacts,

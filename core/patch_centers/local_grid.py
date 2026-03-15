@@ -45,12 +45,13 @@ class GridGenerator1D(RIFFTGridGenerator):
         Returns:
             np.ndarray: Generated grid points.
         """
+        center = np.asarray(central_point, dtype=float).reshape(1, 1)
         if dist_from_atom_center == 0:
-            return np.array([[central_point]])  # Only the central point
+            return center, np.array([1])  # Only the central point
 
         step = np.array(self.step_in_frac)
         if step <= 0 or dist_from_atom_center <= step:
-            return np.array([[central_point]])  # Single-point grid
+            return center, np.array([1])  # Single-point grid
 
         # Generate grid points
         epsilon = 1e-12

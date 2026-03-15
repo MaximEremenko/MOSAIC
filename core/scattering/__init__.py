@@ -1,3 +1,11 @@
-from .service import ScatteringExecutionService
+from __future__ import annotations
 
-__all__ = ["ScatteringExecutionService"]
+__all__ = ["ScatteringStage"]
+
+
+def __getattr__(name: str):
+    if name == "ScatteringStage":
+        from .stage import ScatteringStage
+
+        return ScatteringStage
+    raise AttributeError(name)
