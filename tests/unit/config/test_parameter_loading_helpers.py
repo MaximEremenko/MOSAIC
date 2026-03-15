@@ -62,6 +62,36 @@ def test_normalize_input_schema_maps_unified_payload():
     assert normalized["runtime_info"]["form_factor"]["family"] == "neutron"
 
 
+def test_normalize_input_schema_maps_processing_decoder_policy():
+    payload = {
+        "schema_version": 2,
+        "paths": {
+            "config_root": ".",
+            "output_directory": "./out",
+            "structure_file": "sample.f3d",
+        },
+        "structure": {"dimension": 3},
+        "reciprocal_space": {"intervals": [{"limit": [1.0], "subvolume_step": [1.0]}]},
+        "processing": {
+            "mode": "displacement",
+            "method": "from_average",
+            "points": [],
+            "decoder": {
+                "source": "compute",
+                "compute_output_directory": "./decoder_full",
+            },
+        },
+    }
+
+    normalized = normalize_input_schema(payload)
+
+    assert normalized["rspace_info"]["decoder"]["source"] == "compute"
+    assert (
+        normalized["rspace_info"]["decoder"]["compute_output_directory"]
+        == "./decoder_full"
+    )
+
+
 def test_parameter_loading_service_finds_examples_run_file_from_core_workdir(
     tmp_path, monkeypatch
 ):

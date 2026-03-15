@@ -103,6 +103,7 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
     runtime = parameters.get("runtime") or parameters.get("runtime_info") or {}
     coefficients = structure.get("coefficients") if isinstance(structure.get("coefficients"), dict) else {}
     processing_coeff = processing.get("coefficients") if isinstance(processing.get("coefficients"), dict) else {}
+    decoder = processing.get("decoder") if isinstance(processing.get("decoder"), dict) else {}
     cell_limits = structure.get("cell_limits") if isinstance(structure.get("cell_limits"), dict) else {}
     mask = reciprocal_space.get("mask") if isinstance(reciprocal_space.get("mask"), dict) else {}
 
@@ -213,6 +214,33 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
     if use_coeff is not None:
         rspace_info["use_coeff"] = as_bool(use_coeff)
 
+    decoder_source = (
+        first_present(decoder, ("source", "mode"))
+        or first_present(processing, ("decoder_source", "decoderSource"))
+        or "error"
+    )
+    decoder_cache_path = (
+        first_present(decoder, ("cache_path", "path", "cachePath"))
+        or first_present(processing, ("decoder_cache_path", "decoderCachePath"))
+    )
+    decoder_compute_output_directory = (
+        first_present(
+            decoder,
+            ("compute_output_directory", "output_directory", "computeOutputDirectory"),
+        )
+        or first_present(
+            processing,
+            ("decoder_compute_output_directory", "decoderComputeOutputDirectory"),
+        )
+    )
+    rspace_info["decoder"] = {
+        "source": decoder_source,
+    }
+    if decoder_cache_path is not None:
+        rspace_info["decoder"]["cache_path"] = decoder_cache_path
+    if decoder_compute_output_directory is not None:
+        rspace_info["decoder"]["compute_output_directory"] = decoder_compute_output_directory
+
     return {
         "schema_version": parameters.get("schema_version", 2),
         "structInfo": struct_info,
@@ -247,6 +275,13 @@ def normalize_parameter_paths(
         raw = point.get("filename")
         if isinstance(raw, str) and raw.strip():
             point["filename"] = str(resolve_path_from(config_root, raw))
+
+    decoder = parameters.get("rspace_info", {}).get("decoder")
+    if isinstance(decoder, dict):
+        for key in ("cache_path", "compute_output_directory"):
+            raw = decoder.get(key)
+            if isinstance(raw, str) and raw.strip():
+                decoder[key] = str(resolve_path_from(config_root, raw))
 
     parameters["input_parameters_path"] = str(input_parameters_path.resolve())
     parameters["config_root"] = str(config_root.resolve())

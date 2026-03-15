@@ -32,6 +32,8 @@ class PointDataPostprocessingProcessor:
         self.original_coords = state.original_coords
         self.average_coords = state.average_coords
         self.u_true_all = state.u_true_all
+        self.decoder_source_policy = state.decoder_source_policy
+        self.decoder_source_provenance = None
         self._decoder_M = None
         self._feature_dim = None
 
