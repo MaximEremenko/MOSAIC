@@ -11,7 +11,7 @@ from core.scattering.tasks import load_interval_task_payload, scattering_contrib
 from core.residual_field.artifacts import persist_residual_field_shard_checkpoint
 from core.residual_field.contracts import ResidualFieldShardManifest, ResidualFieldWorkUnit
 from core.adapters.cunufft_wrapper import (
-    execute_inverse_cunufft,
+    execute_inverse_cunufft_super_batch,
 )
 from core.runtime import handle_worker_gpu_failure
 
@@ -23,6 +23,11 @@ def _normalize_interval_paths(interval_paths: Path | str | Sequence[Path | str])
     if isinstance(interval_paths, (str, Path)):
         return (Path(interval_paths),)
     return tuple(Path(path) for path in interval_paths)
+
+
+def _q_grid_signature(q_grid: np.ndarray) -> tuple:
+    arr = np.asarray(q_grid)
+    return (tuple(arr.shape), str(arr.dtype), arr.tobytes())
 
 
 def run_residual_field_interval_chunk_task(
@@ -49,36 +54,53 @@ def run_residual_field_interval_chunk_task(
             for index in range(atoms.shape[0])
         ]
         rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(chunk_data)
+        contribution_reciprocal_points = 0
+        interval_tasks = [load_interval_task_payload(interval_path) for interval_path in loaded_interval_paths]
+        grouped_interval_tasks: dict[tuple, list] = {}
+        for interval_task in interval_tasks:
+            grouped_interval_tasks.setdefault(
+                _q_grid_signature(interval_task.q_grid),
+                [],
+            ).append(interval_task)
+            contribution_reciprocal_points += scattering_contribution_point_count(interval_task)
+        if not grouped_interval_tasks:
+            raise ValueError("Residual-field batch task produced no interval contributions.")
         amplitudes_delta = None
         amplitudes_average = None
-        contribution_reciprocal_points = 0
-        for interval_path in loaded_interval_paths:
-            interval_task = load_interval_task_payload(interval_path)
-            delta_contribution = execute_inverse_cunufft(
-                q_coords=interval_task.q_grid,
-                c=interval_task.q_amp - interval_task.q_amp_av,
+        for grouped_tasks in grouped_interval_tasks.values():
+            reference_q_grid = grouped_tasks[0].q_grid
+            stacked_weights = []
+            for interval_task in grouped_tasks:
+                stacked_weights.extend(
+                    [
+                        interval_task.q_amp - interval_task.q_amp_av,
+                        interval_task.q_amp_av,
+                    ]
+                )
+            inverse_outputs = execute_inverse_cunufft_super_batch(
+                q_coords=reference_q_grid,
+                weights=np.stack(stacked_weights, axis=0),
                 real_coords=rifft_grid,
                 eps=1e-12,
             )
-            average_contribution = execute_inverse_cunufft(
-                q_coords=interval_task.q_grid,
-                c=interval_task.q_amp_av,
-                real_coords=rifft_grid,
-                eps=1e-12,
+            grouped_delta = np.asarray(
+                np.sum(inverse_outputs[0::2], axis=0),
+                dtype=np.complex128,
+            )
+            grouped_average = np.asarray(
+                np.sum(inverse_outputs[1::2], axis=0),
+                dtype=np.complex128,
             )
             amplitudes_delta = (
-                delta_contribution
+                grouped_delta
                 if amplitudes_delta is None
-                else amplitudes_delta + delta_contribution
+                else amplitudes_delta + grouped_delta
             )
             amplitudes_average = (
-                average_contribution
+                grouped_average
                 if amplitudes_average is None
-                else amplitudes_average + average_contribution
+                else amplitudes_average + grouped_average
             )
-            contribution_reciprocal_points += scattering_contribution_point_count(interval_task)
-        if amplitudes_delta is None or amplitudes_average is None:
-            raise ValueError("Residual-field batch task produced no interval contributions.")
         return persist_residual_field_shard_checkpoint(
             work_unit,
             grid_shape_nd=grid_shape_nd,
