@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable
 
 import numpy as np
 
-from core.scattering.artifacts import is_interval_artifact_committed
+from core.residual_field.backend import (
+    ScatteringIntervalArtifactPolicy,
+    build_residual_field_reducer_backend,
+    is_same_node_local_client,
+    resolve_residual_field_reducer_backend_kind,
+)
+from core.scattering.artifacts import (
+    is_interval_artifact_committed,
+    persist_precomputed_interval_artifact,
+)
 from core.scattering.contracts import ScatteringWorkUnit
 from core.scattering.kernels import (
+    IntervalTask,
     point_list_to_recarray,
     reciprocal_space_points_counter,
     to_interval_dict,
@@ -30,6 +41,7 @@ from core.runtime import (
     yield_futures_with_results,
 )
 from core.scattering.tasks import (
+    compute_scattering_interval_payload,
     run_scattering_interval_chunk_task,
     run_scattering_interval_task,
 )
@@ -46,6 +58,116 @@ def _chunk_task_key(work_unit: ScatteringWorkUnit) -> str:
     if work_unit.chunk_id is None:
         raise ValueError("Chunk task key requires a chunk-scoped work unit.")
     return f"proc-{work_unit.interval_id}-{work_unit.chunk_id}"
+
+
+def _runtime_info(parameters: Dict[str, Any]) -> dict[str, Any]:
+    runtime_info = parameters.get("runtime_info") or {}
+    return runtime_info if isinstance(runtime_info, dict) else {}
+
+
+def _save_interval_outputs_requested(
+    *,
+    parameters: Dict[str, Any],
+    default: bool,
+) -> bool:
+    runtime_info = _runtime_info(parameters)
+    override = runtime_info.get("save_scattering_interval_artifacts")
+    if override is None:
+        override = runtime_info.get("save_interval_artifacts")
+    if override is None:
+        env = os.getenv("MOSAIC_SAVE_SCATTERING_INTERVAL_ARTIFACTS")
+        if env is not None:
+            override = env == "1"
+    return default if override is None else bool(override)
+
+
+def _resolve_scattering_interval_artifact_policy(
+    *,
+    parameters: Dict[str, Any],
+    client,
+) -> ScatteringIntervalArtifactPolicy:
+    runtime_info = _runtime_info(parameters)
+    backend_kind = resolve_residual_field_reducer_backend_kind(
+        runtime_info=runtime_info,
+        client=client,
+    )
+    backend = build_residual_field_reducer_backend(backend_kind)
+    default_policy = backend.layout.checkpoint_policy.interval_artifacts
+
+    raw_policy = runtime_info.get("scattering_interval_artifact_policy")
+    if raw_policy is None:
+        raw_policy = runtime_info.get("interval_artifact_policy")
+    if raw_policy is None:
+        raw_policy = os.getenv("MOSAIC_SCATTERING_INTERVAL_ARTIFACT_POLICY")
+    if raw_policy is None:
+        requested_policy = (
+            "required_transport"
+            if _save_interval_outputs_requested(
+                parameters=parameters,
+                default=backend.persist_interval_artifacts_by_default(),
+            )
+            else "optional_output"
+        )
+    else:
+        requested_policy = _normalize_scattering_interval_artifact_policy(raw_policy)
+
+    if backend.interval_artifacts_required_for_transport():
+        return "required_transport"
+    if requested_policy == "required_transport":
+        return "required_transport"
+    return default_policy
+
+
+def _normalize_scattering_interval_artifact_policy(
+    value: object,
+) -> ScatteringIntervalArtifactPolicy:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"required", "required_transport", "transport_required"}:
+        return "required_transport"
+    if normalized in {"optional", "optional_output", "inspection_only", "saved_output"}:
+        return "optional_output"
+    raise ValueError(
+        "Scattering interval artifact policy must be 'required_transport' or "
+        "'optional_output'."
+    )
+
+
+def _scatter_shared_precompute_inputs(
+    client,
+    *,
+    B_: np.ndarray,
+    supercell: np.ndarray,
+    original_coords: np.ndarray,
+    cells_origin: np.ndarray,
+    elements_arr: np.ndarray,
+    coeff_val,
+):
+    payloads = {
+        "B_": client.scatter(B_, broadcast=True, hash=False),
+        "supercell": client.scatter(supercell, broadcast=True, hash=False),
+        "original_coords": client.scatter(original_coords, broadcast=True, hash=False),
+        "cells_origin": client.scatter(cells_origin, broadcast=True, hash=False),
+        "elements_arr": client.scatter(elements_arr, broadcast=True, hash=False),
+    }
+    if coeff_val is not None:
+        payloads["coeff_val"] = client.scatter(coeff_val, broadcast=True, hash=False)
+    else:
+        payloads["coeff_val"] = None
+    return payloads
+
+
+def _local_fast_handoff_enabled(
+    *,
+    parameters: Dict[str, Any],
+    client,
+) -> bool:
+    if "runtime_info" not in parameters:
+        return False
+    backend_kind = resolve_residual_field_reducer_backend_kind(
+        runtime_info=_runtime_info(parameters),
+        client=client,
+    )
+    return backend_kind == "local_restartable" and is_same_node_local_client(client)
 
 
 def run_interval_precompute(
@@ -66,46 +188,190 @@ def run_interval_precompute(
     ff_factory,
     db: DatabaseManager,
     client: "Client | None",
+    transient_interval_payloads: dict[int, IntervalTask] | None = None,
 ) -> list[Path]:
+    payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
+    local_fast_handoff = _local_fast_handoff_enabled(parameters=parameters, client=client)
+    interval_artifact_policy = _resolve_scattering_interval_artifact_policy(
+        parameters=parameters,
+        client=client,
+    )
+    persist_interval_artifacts = interval_artifact_policy == "required_transport"
     pending = [
         work_unit
         for work_unit in work_units
-        if not is_interval_artifact_committed(work_unit, db_path=db.db_path)
+        if (
+            int(work_unit.interval_id) not in payload_cache
+            and not (
+                persist_interval_artifacts
+                and is_interval_artifact_committed(work_unit, db_path=db.db_path)
+            )
+        )
     ]
     cached = [
         Path(work_unit.interval_artifact.path)
         for work_unit in work_units
         if work_unit.interval_artifact is not None
         and work_unit.interval_artifact.path is not None
+        and persist_interval_artifacts
         and is_interval_artifact_committed(work_unit, db_path=db.db_path)
+    ]
+    cached_payloads = [
+        int(work_unit.interval_id)
+        for work_unit in work_units
+        if int(work_unit.interval_id) in payload_cache
     ]
 
     if not pending:
         logger.info(
-            "Stage-1 complete: %d written, %d cached, %d skipped",
+            "Stage-1 complete: %d written, %d cached, %d cached-in-memory, %d skipped | transport=%s | interval_policy=%s",
             0,
             len(cached),
+            len(cached_payloads),
             0,
+            "direct-handoff" if local_fast_handoff else "durable-interval-artifacts",
+            interval_artifact_policy,
         )
         return cached
 
     written_files: list[Path] = []
+    produced_payloads = 0
+    if local_fast_handoff and (client is not None) and (not is_sync_client(client)):
+        shared_inputs = _scatter_shared_precompute_inputs(
+            client,
+            B_=B_,
+            supercell=supercell,
+            original_coords=original_coords,
+            cells_origin=cells_origin,
+            elements_arr=elements_arr,
+            coeff_val=parameters.get("coeff"),
+        )
+        futures = [
+            client.submit(
+                compute_scattering_interval_payload,
+                interval_lookup[work_unit.interval_id],
+                B_=shared_inputs["B_"],
+                mask_params=mask_params,
+                MaskStrategy=MaskStrategy,
+                supercell=shared_inputs["supercell"],
+                original_coords=shared_inputs["original_coords"],
+                cells_origin=shared_inputs["cells_origin"],
+                elements_arr=shared_inputs["elements_arr"],
+                charge=charge,
+                use_coeff=("coeff" in parameters),
+                coeff_val=shared_inputs["coeff_val"],
+                unique_elements=list(unique_elements),
+                ff_factory=ff_factory,
+                pure=False,
+                resources={"nufft": 1},
+            )
+            for work_unit in pending
+        ]
+        future_meta = {future: work_unit for future, work_unit in zip(futures, pending)}
+        with logging_redirect_tqdm():
+            with progress_bar(len(futures), desc="Precompute intervals", unit="intervals") as pbar:
+                for future, _ in yield_futures_with_results(futures, client):
+                    work_unit = future_meta[future]
+                    try:
+                        interval_task = future.result()
+                    except Exception:
+                        interval_task = None
+                    if interval_task is not None:
+                        payload_cache[int(work_unit.interval_id)] = interval_task
+                        produced_payloads += 1
+                        if persist_interval_artifacts:
+                            manifest = persist_precomputed_interval_artifact(
+                                work_unit,
+                                interval_task,
+                                db_path=db.db_path,
+                            )
+                            if manifest is not None and manifest.artifacts:
+                                artifact_path = manifest.artifacts[0].path
+                                if artifact_path is not None:
+                                    written_files.append(Path(artifact_path))
+                    pbar.update(1)
+                    pbar.refresh()
+        logger.info(
+            "Stage-1 complete: %d written, %d cached, %d cached-in-memory, %d skipped | transport=%s | interval_policy=%s",
+            len(written_files),
+            len(cached),
+            len(cached_payloads) + produced_payloads,
+            len(pending) - produced_payloads,
+            "direct-handoff",
+            interval_artifact_policy,
+        )
+        return cached + written_files
+
+    if local_fast_handoff:
+        with progress_bar(len(pending), desc="Precompute intervals", unit="intervals") as pbar:
+            for work_unit in pending:
+                interval_task = compute_scattering_interval_payload(
+                    interval_lookup[work_unit.interval_id],
+                    B_=B_,
+                    mask_params=mask_params,
+                    MaskStrategy=MaskStrategy,
+                    supercell=supercell,
+                    original_coords=original_coords,
+                    cells_origin=cells_origin,
+                    elements_arr=elements_arr,
+                    charge=charge,
+                    use_coeff=("coeff" in parameters),
+                    coeff_val=parameters.get("coeff"),
+                    unique_elements=list(unique_elements),
+                    ff_factory=ff_factory,
+                )
+                if interval_task is not None:
+                    payload_cache[int(work_unit.interval_id)] = interval_task
+                    produced_payloads += 1
+                    if persist_interval_artifacts:
+                        manifest = persist_precomputed_interval_artifact(
+                            work_unit,
+                            interval_task,
+                            db_path=db.db_path,
+                        )
+                        if manifest is not None and manifest.artifacts:
+                            artifact_path = manifest.artifacts[0].path
+                            if artifact_path is not None:
+                                written_files.append(Path(artifact_path))
+                pbar.update(1)
+                pbar.refresh()
+
+        logger.info(
+            "Stage-1 complete: %d written, %d cached, %d cached-in-memory, %d skipped | transport=%s | interval_policy=%s",
+            len(written_files),
+            len(cached),
+            len(cached_payloads) + produced_payloads,
+            len(pending) - produced_payloads,
+            "direct-handoff",
+            interval_artifact_policy,
+        )
+        return cached + written_files
+
     if (client is not None) and (not is_sync_client(client)):
+        shared_inputs = _scatter_shared_precompute_inputs(
+            client,
+            B_=B_,
+            supercell=supercell,
+            original_coords=original_coords,
+            cells_origin=cells_origin,
+            elements_arr=elements_arr,
+            coeff_val=parameters.get("coeff"),
+        )
         futures = [
             client.submit(
                 run_scattering_interval_task,
                 work_unit,
                 interval_lookup[work_unit.interval_id],
-                B_=B_,
+                B_=shared_inputs["B_"],
                 mask_params=mask_params,
                 MaskStrategy=MaskStrategy,
-                supercell=supercell,
-                original_coords=original_coords,
-                cells_origin=cells_origin,
-                elements_arr=elements_arr,
+                supercell=shared_inputs["supercell"],
+                original_coords=shared_inputs["original_coords"],
+                cells_origin=shared_inputs["cells_origin"],
+                elements_arr=shared_inputs["elements_arr"],
                 charge=charge,
                 use_coeff=("coeff" in parameters),
-                coeff_val=parameters.get("coeff"),
+                coeff_val=shared_inputs["coeff_val"],
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
                 output_dir=output_dir,
@@ -129,10 +395,13 @@ def run_interval_precompute(
                     pbar.update(1)
                     pbar.refresh()
         logger.info(
-            "Stage-1 complete: %d written, %d cached, %d skipped",
+            "Stage-1 complete: %d written, %d cached, %d cached-in-memory, %d skipped | transport=%s | interval_policy=%s",
             len(written_files),
             len(cached),
+            len(cached_payloads),
             len(pending) - len(written_files),
+            "durable-interval-artifacts",
+            interval_artifact_policy,
         )
         return cached + written_files
 
@@ -164,10 +433,13 @@ def run_interval_precompute(
             pbar.refresh()
 
     logger.info(
-        "Stage-1 complete: %d written, %d cached, %d skipped",
+        "Stage-1 complete: %d written, %d cached, %d cached-in-memory, %d skipped | transport=%s | interval_policy=%s",
         len(written_files),
         len(cached),
+        len(cached_payloads),
         len(pending) - len(written_files),
+        "durable-interval-artifacts",
+        interval_artifact_policy,
     )
     return cached + written_files
 
@@ -386,6 +658,7 @@ def run_scattering_stage(
             ff_factory=FormFactorFactoryProducer,
             db=db_manager,
             client=client,
+            transient_interval_payloads=parameters.get("transient_interval_payloads"),
         )
     logger.info("Completed scattering interval precompute stage")
 

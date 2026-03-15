@@ -208,6 +208,153 @@ def test_execution_serial_precompute_uses_work_units(monkeypatch, tmp_path):
     assert paths == [tmp_path / "precomputed_intervals" / "interval_1.npz"]
 
 
+def test_execution_local_fast_precompute_caches_payload_without_writing_interval_artifact(
+    monkeypatch,
+    tmp_path,
+):
+    work_unit = ScatteringWorkUnit.precompute_interval(
+        interval_id=1,
+        dimension=1,
+        output_dir=str(tmp_path),
+    )
+    payload_cache = {}
+    interval_task = IntervalTask(
+        1,
+        "All",
+        np.array([[0.0]]),
+        np.array([1 + 0j]),
+        np.array([0 + 0j]),
+    )
+
+    monkeypatch.setattr(
+        "core.scattering.execution.is_interval_artifact_committed",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.compute_scattering_interval_payload",
+        lambda *args, **kwargs: interval_task,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.persist_precomputed_interval_artifact",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("local fast path should not persist interval artifacts by default")
+        ),
+    )
+
+    paths = run_interval_precompute(
+        [work_unit],
+        interval_lookup=build_scattering_interval_lookup([{"id": 1, "h_range": (0.0, 1.0)}]),
+        B_=np.eye(1),
+        parameters={"runtime_info": {}, "transient_interval_payloads": payload_cache},
+        unique_elements=[],
+        mask_params={},
+        MaskStrategy=None,
+        supercell=np.array([1]),
+        output_dir=str(tmp_path),
+        original_coords=np.array([[0.0]]),
+        cells_origin=np.array([[0.0]]),
+        elements_arr=np.array(["El"], dtype=object),
+        charge=0.0,
+        ff_factory=SimpleNamespace(),
+        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        client=None,
+        transient_interval_payloads=payload_cache,
+    )
+
+    assert paths == []
+    assert 1 in payload_cache
+    assert payload_cache[1].irecip_id == 1
+    assert not (tmp_path / "precomputed_intervals" / "interval_1.npz").exists()
+
+
+def test_execution_durable_precompute_scatter_shared_inputs_once_and_keeps_required_transport(
+    monkeypatch,
+    tmp_path,
+):
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+    class _ScatterRef:
+        def __init__(self, value):
+            self.value = value
+
+    class _FakeClient:
+        def __init__(self):
+            self.scatter_calls = []
+            self.submit_calls = []
+            self.loop = SimpleNamespace(asyncio_loop=object())
+
+        def scatter(self, value, **kwargs):
+            ref = _ScatterRef(value)
+            self.scatter_calls.append((value, kwargs, ref))
+            return ref
+
+        def submit(self, func, *args, **kwargs):
+            self.submit_calls.append((func, args, kwargs))
+            work_unit = args[0]
+            manifest = ScatteringArtifactManifest.from_work_unit(
+                work_unit,
+                artifacts=(work_unit.interval_artifact,),
+                completion_status=CompletionStatus.COMMITTED,
+                consumer_stage="residual_field",
+            )
+            return _FakeFuture(manifest)
+
+    client = _FakeClient()
+    work_units = build_scattering_precompute_work_units(
+        [{"id": 1, "h_range": (0.0, 1.0)}, {"id": 2, "h_range": (1.0, 2.0)}],
+        dimension=1,
+        output_dir=str(tmp_path),
+    )
+
+    monkeypatch.setattr(
+        "core.scattering.execution.is_interval_artifact_committed",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.yield_futures_with_results",
+        lambda futures, client: ((future, True) for future in futures),
+    )
+
+    paths = run_interval_precompute(
+        work_units,
+        interval_lookup=build_scattering_interval_lookup(
+            [{"id": 1, "h_range": (0.0, 1.0)}, {"id": 2, "h_range": (1.0, 2.0)}]
+        ),
+        B_=np.eye(1),
+        parameters={"runtime_info": {"save_scattering_interval_artifacts": False}},
+        unique_elements=[],
+        mask_params={},
+        MaskStrategy=None,
+        supercell=np.array([1]),
+        output_dir=str(tmp_path),
+        original_coords=np.array([[0.0], [1.0]]),
+        cells_origin=np.array([[0.0], [0.0]]),
+        elements_arr=np.array(["El", "El"], dtype=object),
+        charge=0.0,
+        ff_factory=SimpleNamespace(),
+        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        client=client,
+    )
+
+    assert [path.name for path in paths] == ["interval_1.npz", "interval_2.npz"]
+    assert len(client.scatter_calls) == 5
+    assert len(client.submit_calls) == 2
+    assert all(call[1].get("broadcast") is True for call in client.scatter_calls)
+    assert all(call[1].get("hash") is False for call in client.scatter_calls)
+    assert all(call[0].__name__ == "run_scattering_interval_task" for call in client.submit_calls)
+    first_submit_kwargs = client.submit_calls[0][2]
+    assert isinstance(first_submit_kwargs["B_"], _ScatterRef)
+    assert isinstance(first_submit_kwargs["original_coords"], _ScatterRef)
+
+
 def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path):
     store = ScatteringArtifactStore(str(tmp_path))
     fn = tmp_path / store.saver.generate_filename(
