@@ -2,7 +2,7 @@
 
 import numpy as np
 import logging
-from core.storage import RIFFTInDataSaver
+from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 from core.models import PointData
 from core.patch_centers.local_grid import (
     GridGenerator1D,

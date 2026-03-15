@@ -13,6 +13,7 @@ from core.scattering.accumulation import (
 )
 from core.residual_field.contracts import (
     ResidualFieldPartialResult,
+    ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
     merge_residual_field_partial_results,
     validate_residual_field_partial_result,
@@ -115,6 +116,42 @@ def build_existing_materialized_residual_field_state(
     )
 
 
+def build_materialized_residual_field_state_from_shard(
+    manifest: ResidualFieldShardManifest,
+    *,
+    output_artifacts: tuple[ArtifactRef, ...],
+    point_ids: np.ndarray,
+    grid_shape_nd: np.ndarray,
+    amplitudes_delta: np.ndarray,
+    amplitudes_average: np.ndarray,
+) -> MaterializedResidualFieldState:
+    payload = build_scattering_partial_result(
+        chunk_id=manifest.chunk_id,
+        interval_id=manifest.interval_id,
+        amplitudes_delta=amplitudes_delta,
+        amplitudes_average=amplitudes_average,
+        grid_shape_nd=grid_shape_nd,
+        reciprocal_point_count=manifest.contribution_reciprocal_point_count,
+        point_ids=point_ids,
+    )
+    metadata = ResidualFieldPartialResult(
+        chunk_id=manifest.chunk_id,
+        contributing_interval_ids=manifest.contributing_interval_ids,
+        parameter_digest=manifest.parameter_digest,
+        output_kind="residual-field-chunk",
+        source_artifacts=manifest.upstream_artifacts,
+        output_artifacts=output_artifacts,
+        grid_shape=_grid_shape_tuple(grid_shape_nd),
+        point_ids=tuple(int(point_id) for point_id in payload.point_ids),
+        residual_values=payload.amplitudes_delta.copy(),
+        residual_average_values=payload.amplitudes_average.copy(),
+        reciprocal_point_count=payload.reciprocal_point_count,
+    )
+    return validate_materialized_residual_field_state(
+        MaterializedResidualFieldState(metadata=metadata, payload=payload)
+    )
+
+
 def validate_materialized_residual_field_state(
     state: MaterializedResidualFieldState,
 ) -> MaterializedResidualFieldState:
@@ -160,6 +197,7 @@ __all__ = [
     "MaterializedResidualFieldState",
     "build_existing_materialized_residual_field_state",
     "build_materialized_residual_field_state",
+    "build_materialized_residual_field_state_from_shard",
     "materialize_scattering_payload",
     "merge_materialized_residual_field_states",
     "validate_materialized_residual_field_state",

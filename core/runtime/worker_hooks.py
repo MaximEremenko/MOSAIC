@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
+import tempfile
 from contextlib import AbstractContextManager
+from pathlib import Path
 
 from core.adapters.cunufft_wrapper import free_gpu_memory, set_cpu_only
 
@@ -55,6 +58,53 @@ def _safe_chunk_lock(name: str):
 
 def chunk_mutex(chunk_id: int):
     return _safe_chunk_lock(f"chunk-{chunk_id}")
+
+
+def _worker_scratch_base() -> Path:
+    try:
+        from distributed import get_worker
+
+        worker = get_worker()
+        local_directory = getattr(worker, "local_directory", None)
+        if local_directory:
+            return Path(str(local_directory))
+        worker_dir = getattr(worker, "dir", None)
+        if worker_dir:
+            return Path(str(worker_dir))
+    except Exception:
+        pass
+    return Path(tempfile.gettempdir())
+
+
+def resolve_worker_scratch_root(
+    *,
+    preferred: str | None = None,
+    stage: str,
+) -> str:
+    base = (
+        preferred
+        or os.getenv("MOSAIC_WORKER_SCRATCH_ROOT")
+        or _worker_scratch_base()
+    )
+    base_path = Path(base).expanduser() if isinstance(base, str) else Path(base)
+    try:
+        from distributed import get_worker
+
+        worker = get_worker()
+        worker_token = (
+            getattr(worker, "name", None)
+            or getattr(worker, "address", None)
+            or "worker"
+        )
+        safe_worker_token = (
+            str(worker_token)
+            .replace("://", "_")
+            .replace(":", "_")
+            .replace("/", "_")
+        )
+        return str((base_path / "mosaic" / stage / safe_worker_token).resolve())
+    except Exception:
+        return str((base_path / "mosaic" / stage / "local").resolve())
 
 
 def is_gpu_runtime_error(error: Exception | str) -> bool:
@@ -131,4 +181,5 @@ __all__ = [
     "handle_worker_gpu_failure",
     "is_gpu_runtime_error",
     "register_cleanup_plugin",
+    "resolve_worker_scratch_root",
 ]

@@ -25,7 +25,7 @@ from core.scattering.kernels import IntervalTask
 from core.contracts import ArtifactManifestAssessment, CompletionStatus
 from core.runtime import TIMER
 from core.storage.database_manager import create_db_manager_for_thread
-from core.storage import RIFFTInDataSaver
+from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 
 
 logger = logging.getLogger(__name__)
