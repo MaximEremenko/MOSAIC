@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -19,9 +20,9 @@ from core.runtime import (
     resolve_worker_scratch_root,
     yield_futures_with_results,
 )
-from core.residual_field.artifacts import (
-    delete_reclaimable_residual_field_shards,
-    reduce_residual_field_shards_for_chunk,
+from core.residual_field.backend import (
+    ResidualFieldReducerBackend,
+    resolve_residual_field_reducer_backend,
 )
 from core.residual_field.planning import build_residual_field_work_units
 from core.residual_field.tasks import run_residual_field_interval_chunk_task
@@ -45,6 +46,23 @@ def _interval_paths_for_work_unit(work_unit: ResidualFieldWorkUnit) -> tuple[str
     if not interval_paths:
         raise ValueError("ResidualFieldWorkUnit is missing source interval artifact paths.")
     return interval_paths
+
+
+def _interval_inputs_for_work_unit(
+    work_unit: ResidualFieldWorkUnit,
+    *,
+    transient_interval_payloads: dict[int, object] | None,
+    interval_payload_futures: dict[int, object] | None = None,
+):
+    interval_ids = tuple(int(interval_id) for interval_id in (work_unit.interval_ids or ()))
+    if work_unit.interval_id is not None and not interval_ids:
+        interval_ids = (int(work_unit.interval_id),)
+    if transient_interval_payloads:
+        payload_source = interval_payload_futures or transient_interval_payloads
+        if all(int(interval_id) in payload_source for interval_id in interval_ids):
+            values = tuple(payload_source[int(interval_id)] for interval_id in interval_ids)
+            return values[0] if len(values) == 1 else values
+    return _interval_paths_for_work_unit(work_unit)
 
 
 def _cleanup_residual_shards_enabled(workflow_parameters) -> bool:
@@ -79,23 +97,28 @@ def _finalize_residual_field_chunks(
     output_dir: str,
     db_path: str,
     cleanup_policy: str,
+    reducer_backend: ResidualFieldReducerBackend,
+    scratch_root: str | None,
 ) -> None:
     for chunk_id in sorted(set(int(chunk_id) for chunk_id in chunk_ids)):
-        manifest = reduce_residual_field_shards_for_chunk(
+        manifest = reducer_backend.finalize_chunk(
             chunk_id=int(chunk_id),
             parameter_digest=parameter_digest,
             output_dir=output_dir,
             db_path=db_path,
             manifests=manifests_by_chunk.get(int(chunk_id)),
             cleanup_policy=cleanup_policy,
+            scratch_root=scratch_root,
             quiet_logs=False,
         )
         if cleanup_policy == "delete_reclaimable" and manifest is not None:
-            delete_reclaimable_residual_field_shards(
+            reducer_backend.cleanup_reclaimable_shards(
                 output_dir=output_dir,
                 chunk_id=int(chunk_id),
                 parameter_digest=parameter_digest,
                 db_path=db_path,
+                manifests=manifests_by_chunk.get(int(chunk_id)),
+                scratch_root=scratch_root,
             )
 
 
@@ -107,6 +130,14 @@ def run_residual_field_stage(
     client: "Client | None",
     max_inflight: int = 5_000,
 ) -> None:
+    explicit_scratch_root = workflow_parameters.runtime_info.get(
+        "residual_shard_scratch_root",
+        os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT"),
+    )
+    preliminary_backend = resolve_residual_field_reducer_backend(
+        workflow_parameters=workflow_parameters,
+        client=client,
+    )
     max_intervals_per_shard = int(
         workflow_parameters.runtime_info.get(
             "residual_shard_batch_size",
@@ -114,11 +145,48 @@ def run_residual_field_stage(
         )
     )
     scratch_root = resolve_worker_scratch_root(
-        preferred=workflow_parameters.runtime_info.get(
-            "residual_shard_scratch_root",
-            os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT"),
+        preferred=(
+            explicit_scratch_root
+            if explicit_scratch_root is not None
+            else str(Path(artifacts.output_dir) / ".local_restartable")
+            if preliminary_backend.layout.kind == "local_restartable"
+            else None
         ),
         stage="residual_field",
+    )
+    reducer_backend = preliminary_backend
+    reducer_runtime_state = reducer_backend.describe_runtime_state(
+        output_dir=artifacts.output_dir,
+        scratch_root=scratch_root,
+    )
+    logger.info(
+        "Residual-field reducer backend %s | scratch=%s | durable=%s",
+        reducer_runtime_state.kind,
+        reducer_runtime_state.local_scratch_root or "<none>",
+        reducer_runtime_state.durable_root,
+    )
+    logger.debug(
+        "Residual-field reducer state | ram=%s | scratch=%s | durable=%s | transport=%s | restart=%s",
+        ", ".join(reducer_runtime_state.ram_state),
+        ", ".join(reducer_runtime_state.local_scratch_state),
+        ", ".join(reducer_runtime_state.durable_state),
+        reducer_runtime_state.scattering_interval_transport,
+        reducer_runtime_state.uncommitted_restart_rule,
+    )
+    logger.debug(
+        "Residual-field reducer committed shards | root=%s | storage=%s | compression=%s | direct_handoff=%s",
+        reducer_runtime_state.committed_shard_root,
+        reducer_runtime_state.committed_shard_storage,
+        reducer_runtime_state.shard_compression,
+        reducer_runtime_state.direct_interval_handoff_supported,
+    )
+    logger.debug(
+        "Residual-field checkpoint policy | interval=%s | shards=%s | progress=%s | final=%s | scratch_role=%s",
+        reducer_runtime_state.checkpoint_policy.interval_artifacts,
+        reducer_runtime_state.checkpoint_policy.shard_checkpoints,
+        reducer_runtime_state.checkpoint_policy.reducer_progress_manifest,
+        reducer_runtime_state.checkpoint_policy.final_chunk_artifacts,
+        reducer_runtime_state.checkpoint_policy.worker_local_scratch_role,
     )
     cleanup_policy = _residual_shard_cleanup_policy(workflow_parameters)
     work_units = build_residual_field_work_units(
@@ -142,6 +210,22 @@ def run_residual_field_stage(
         point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
 
     manifests_by_chunk: dict[int, list[ResidualFieldShardManifest]] = {}
+    transient_interval_payloads = getattr(artifacts, "transient_interval_payloads", {}) or {}
+    interval_payload_futures = None
+    if (
+        transient_interval_payloads
+        and reducer_backend.uses_direct_interval_handoff()
+        and client is not None
+        and not is_sync_client(client)
+    ):
+        interval_payload_futures = client.scatter(
+            {
+                int(interval_id): payload
+                for interval_id, payload in transient_interval_payloads.items()
+            },
+            broadcast=False,
+            hash=False,
+        )
 
     if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
@@ -150,11 +234,15 @@ def run_residual_field_stage(
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
                 manifest = run_residual_field_interval_chunk_task(
                     work_unit,
-                    _interval_paths_for_work_unit(work_unit),
+                    _interval_inputs_for_work_unit(
+                        work_unit,
+                        transient_interval_payloads=transient_interval_payloads,
+                    ),
                     atoms,
                     total_reciprocal_points=total_reciprocal_points,
                     output_dir=artifacts.output_dir,
                     scratch_root=scratch_root,
+                    reducer_backend=reducer_backend,
                     quiet_logs=False,
                 )
                 pbar.update(1)
@@ -174,7 +262,11 @@ def run_residual_field_stage(
             output_dir=artifacts.output_dir,
             db_path=artifacts.db_manager.db_path,
             cleanup_policy=cleanup_policy,
+            reducer_backend=reducer_backend,
+            scratch_root=scratch_root,
         )
+        if transient_interval_payloads:
+            transient_interval_payloads.clear()
         logger.info("Residual-field finished (sync).")
         return
 
@@ -214,11 +306,16 @@ def run_residual_field_stage(
         future = client.submit(
             run_residual_field_interval_chunk_task,
             work_unit,
-            _interval_paths_for_work_unit(work_unit),
+            _interval_inputs_for_work_unit(
+                work_unit,
+                transient_interval_payloads=transient_interval_payloads,
+                interval_payload_futures=interval_payload_futures,
+            ),
             chunk_futures[int(work_unit.chunk_id)],
             total_reciprocal_points=total_reciprocal_points,
             output_dir=artifacts.output_dir,
             scratch_root=scratch_root,
+            reducer_backend=reducer_backend,
             quiet_logs=True,
             key=f"residual-{work_unit.artifact_key}",
             pure=False,
@@ -314,7 +411,11 @@ def run_residual_field_stage(
         output_dir=artifacts.output_dir,
         db_path=artifacts.db_manager.db_path,
         cleanup_policy=cleanup_policy,
+        reducer_backend=reducer_backend,
+        scratch_root=scratch_root,
     )
+    if transient_interval_payloads:
+        transient_interval_payloads.clear()
     logger.info("Residual-field finished – %d tasks submitted", submitted)
 
 
