@@ -131,6 +131,7 @@ def build_residual_field_shard_manifest(
     point_count: int,
     contribution_reciprocal_point_count: int,
     total_reciprocal_point_count: int,
+    shard_storage_root: str | None = None,
 ) -> ResidualFieldShardManifest:
     manifest = ResidualFieldShardManifest.from_work_unit(
         work_unit,
@@ -139,6 +140,7 @@ def build_residual_field_shard_manifest(
             chunk_id=work_unit.chunk_id,
             interval_ids=tuple(work_unit.interval_ids or (int(work_unit.interval_id),)),
             parameter_digest=work_unit.parameter_digest,
+            shard_storage_root=shard_storage_root,
         ),
         completion_status=completion_status,
         point_count=point_count,
@@ -607,6 +609,7 @@ def reconcile_residual_field_reducer_progress(
     output_dir: str,
     db_path: str,
     manifests: list[ResidualFieldShardManifest] | None = None,
+    shard_storage_root: str | None = None,
     artifact_store_factory: Callable[[str], ResidualFieldArtifactStore] = ResidualFieldArtifactStore,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> ResidualFieldReducerProgressManifest | None:
@@ -624,6 +627,7 @@ def reconcile_residual_field_reducer_progress(
             output_dir=output_dir,
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
+            shard_storage_root=shard_storage_root,
         ),
     )
     shard_by_key = _shard_manifests_by_key(shard_manifests)
@@ -730,8 +734,9 @@ def discover_residual_field_shard_manifests(
     output_dir: str,
     chunk_id: int,
     parameter_digest: str,
+    shard_storage_root: str | None = None,
 ) -> list[ResidualFieldShardManifest]:
-    shard_dir = Path(output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = Path(shard_storage_root or output_dir) / "residual_shards" / f"chunk_{chunk_id}"
     if not shard_dir.exists():
         return []
     manifests: list[ResidualFieldShardManifest] = []
@@ -837,6 +842,7 @@ def list_reclaimable_residual_field_shards(
     output_dir: str,
     chunk_id: int,
     parameter_digest: str,
+    shard_storage_root: str | None = None,
 ) -> list[ResidualFieldShardManifest]:
     progress = discover_residual_field_reducer_progress_manifest(
         output_dir=output_dir,
@@ -854,6 +860,7 @@ def list_reclaimable_residual_field_shards(
             output_dir=output_dir,
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
+            shard_storage_root=shard_storage_root,
         )
         if manifest.artifact_key in reclaimable
     ]
@@ -866,6 +873,7 @@ def delete_reclaimable_residual_field_shards(
     parameter_digest: str,
     db_path: str,
     manifests: list[ResidualFieldShardManifest] | None = None,
+    shard_storage_root: str | None = None,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> tuple[str, ...]:
     progress = discover_residual_field_reducer_progress_manifest(
@@ -885,6 +893,7 @@ def delete_reclaimable_residual_field_shards(
             output_dir=output_dir,
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
+            shard_storage_root=shard_storage_root,
         ),
     )
     deleted: list[str] = []
@@ -902,7 +911,7 @@ def delete_reclaimable_residual_field_shards(
                 continue
             Path(artifact.path).unlink(missing_ok=True)
         deleted.append(manifest.artifact_key)
-    shard_dir = Path(output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = Path(shard_storage_root or output_dir) / "residual_shards" / f"chunk_{chunk_id}"
     if shard_dir.exists() and not any(shard_dir.iterdir()):
         shard_dir.rmdir()
     return tuple(sorted(deleted))
@@ -919,6 +928,8 @@ def persist_residual_field_shard_checkpoint(
     point_ids: np.ndarray | None = None,
     output_dir: str,
     scratch_root: str | None = None,
+    shard_storage_root: str | None = None,
+    compress: bool = True,
     quiet_logs: bool = False,
 ) -> ResidualFieldShardManifest:
     if work_unit.interval_id is None:
@@ -929,6 +940,7 @@ def persist_residual_field_shard_checkpoint(
         chunk_id=work_unit.chunk_id,
         interval_ids=tuple(work_unit.interval_ids or (work_unit.interval_id,)),
         parameter_digest=work_unit.parameter_digest,
+        shard_storage_root=shard_storage_root,
     )
     manifest = build_residual_field_shard_manifest(
         work_unit,
@@ -937,6 +949,7 @@ def persist_residual_field_shard_checkpoint(
         point_count=int(np.asarray(amplitudes_delta).reshape(-1).shape[0]),
         contribution_reciprocal_point_count=contribution_reciprocal_points,
         total_reciprocal_point_count=total_reciprocal_points,
+        shard_storage_root=shard_storage_root,
     )
     manifest = ResidualFieldShardManifest(
         **{
@@ -981,7 +994,8 @@ def persist_residual_field_shard_checkpoint(
         suffix=".npz",
         delete=False,
     ) as handle:
-        np.savez_compressed(
+        save_fn = np.savez_compressed if compress else np.savez
+        save_fn(
             handle,
             interval_id=np.array([work_unit.interval_id], dtype=np.int64),
             contributing_interval_ids=np.asarray(manifest.contributing_interval_ids, dtype=np.int64),
@@ -1033,6 +1047,7 @@ def reduce_residual_field_shards_for_chunk(
     db_path: str,
     manifests: list[ResidualFieldShardManifest] | None = None,
     cleanup_policy: str | bool | None = None,
+    shard_storage_root: str | None = None,
     artifact_store_factory: Callable[[str], ResidualFieldArtifactStore] = ResidualFieldArtifactStore,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
     quiet_logs: bool = False,
@@ -1043,6 +1058,7 @@ def reduce_residual_field_shards_for_chunk(
             output_dir=output_dir,
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
+            shard_storage_root=shard_storage_root,
         ),
     )
     existing_progress = discover_residual_field_reducer_progress_manifest(
@@ -1062,6 +1078,7 @@ def reduce_residual_field_shards_for_chunk(
             output_dir=output_dir,
             db_path=db_path,
             manifests=shard_manifests,
+            shard_storage_root=shard_storage_root,
             artifact_store_factory=artifact_store_factory,
             db_manager_factory=db_manager_factory,
         )
