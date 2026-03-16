@@ -5,8 +5,6 @@ Created on Tue Oct 29 14:47:06 2024
 @author: Maksim Eremenko
 """
 
-# processors/rmc6f_processor.py
-
 from core.config.contracts.base_interfaces import (
     IConfigurationDataProcessor,
     IConfigurationFileProcessor,

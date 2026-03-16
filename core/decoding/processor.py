@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-processors/point_data_postprocessing_processor.py
-"""
 
 import logging
 
@@ -11,7 +8,6 @@ from core.decoding.decoder_cache import build_decoder_cache_path
 from core.decoding.displacement_service import (
     compute_and_save_displacements,
 )
-from core.residual_field.loader import load_residual_field_and_generate_grid
 from core.decoding.site_intensity_service import (
     compute_and_save_site_intensities,
 )
@@ -65,9 +61,6 @@ class PointDataPostprocessingProcessor:
 
     def _get_decoder_cache_path(self, output_dir: str) -> str:
         return build_decoder_cache_path(self.parameters, output_dir)
-
-    def load_amplitudes_and_generate_grid(self, chunk_id, point_data_list, rifft_saver):
-        return load_residual_field_and_generate_grid(self, chunk_id, point_data_list, rifft_saver)
 
     def compute_and_save_displacements(
         self,

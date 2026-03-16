@@ -5,8 +5,6 @@ Created on Mon Nov  4 15:03:23 2024
 @author: Maksim Eremenko
 """
 
-# processors/parameters_processor.py
-
 from typing import Optional
 
 from core.storage.hdf5_parameter_storage import (

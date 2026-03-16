@@ -4,8 +4,6 @@ Created on Tue Oct 29 14:45:47 2024
 
 @author: Maksim Eremenko
 """
-# processors/rmc6f_average_structure_calculator.py
-
 from core.config.contracts.base_interfaces import (
     IConfigurationDataProcessor,
 )
