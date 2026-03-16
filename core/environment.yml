@@ -4,15 +4,17 @@ channels:
 dependencies:
 - pip
 - pip:
-  - mrcfile==1.5.0
   - finufft==2.2.0
 - dask
-- dill
+- distributed
+- h5py
 - matplotlib
 - numba
 - numpy
 - pandas
+- pyyaml
+- requests
 - scipy
-- h5py
+- sympy
 - tqdm
-name: MOSAIC
+name: mosaic
