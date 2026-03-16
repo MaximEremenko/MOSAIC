@@ -5,8 +5,6 @@ Created on Wed Nov 13 16:56:54 2024
 @author: Maksim Eremenko
 """
 
-# processors/rifft_grid_generator.py
-
 from abc import ABC, abstractmethod
 import numpy as np
 import logging
@@ -49,14 +47,15 @@ class GridGenerator1D(RIFFTGridGenerator):
         if dist_from_atom_center == 0:
             return center, np.array([1])  # Only the central point
 
-        step = np.array(self.step_in_frac)
-        if step <= 0 or dist_from_atom_center <= step:
+        step = float(np.asarray(self.step_in_frac).ravel()[0])
+        dist = float(np.asarray(dist_from_atom_center).ravel()[0])
+        if step <= 0 or dist <= step:
             return center, np.array([1])  # Single-point grid
 
         # Generate grid points
         epsilon = 1e-12
-        start = -dist_from_atom_center
-        stop = dist_from_atom_center + step - epsilon
+        start = -dist
+        stop = dist + step - epsilon
         grid = np.arange(start, stop, step)
         grid_shapeNd = grid.shape
         return (grid + central_point).reshape(-1, 1), grid_shapeNd  # Shape: (N, 1)
@@ -101,24 +100,6 @@ class GridGenerator2D(RIFFTGridGenerator):
         grid_points = np.vstack([mesh_x.flatten(), mesh_y.flatten()]).T + central_point
         return grid_points, grid_shapeNd  # Shape: (N, 2)
 
-# class GridGenerator3D(RIFFTGridGenerator):
-#     def generate_grid_around_point(self, central_point, dist_from_atom_center):
-#         if dist_from_atom_center == 0:
-#             return np.array([central_point])
-
-#         # Ensure self.step_in_frac is an array of shape (3,)
-#         if np.isscalar(self.step_in_frac):
-#             step_sizes = np.array([self.step_in_frac] * 3)
-#         else:
-#             step_sizes = self.step_in_frac
-
-#         num_steps = np.ceil(dist_from_atom_center / step_sizes).astype(int)
-
-#         # Generate grid ranges for each dimension
-#         ranges = [np.arange(-n, n + 1) * s for n, s in zip(num_steps, step_sizes)]
-#         mesh = np.meshgrid(*ranges, indexing='ij')
-#         grid_points = np.vstack([m.flatten() for m in mesh]).T + central_point
-#         return grid_points
 
 class GridGenerator3D(RIFFTGridGenerator):
     def __init__(self, step_in_frac):

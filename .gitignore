@@ -1,22 +1,56 @@
-ChangeLog
+# Python
 __pycache__/
 *.pyc
-tests/
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Runtime artifacts
+*.hdf5
+*.db
+*.npz
+*.xlsx
+dask_logs/
+
+# Example output directories (created by running configs)
+# 1D displacement
+examples/config_1D/displacement/output_displacement/
+examples/config_1D/displacement/output_disp_rest/
+examples/config_1D/displacement/output_disp_all/
+# 1D chemical
+examples/config_1D/chemical_ordering/output_chemical_ordering/
+examples/config_1D/chemical_ordering/output_chem_rest/
+examples/config_1D/chemical_ordering/output_chem_all/
+# 2D displacement
+examples/config_2D/displacement/output_displacement/
+examples/config_2D/displacement/output_displacement_decoder_full/
+examples/config_2D/displacement/output_disp_rest/
+examples/config_2D/displacement/output_disp_rest_decoder_full/
+examples/config_2D/displacement/output_disp_all/
+examples/config_2D/displacement/output_disp_all_decoder_full/
+# 2D chemical
+examples/config_2D/chemical_ordering/output_chemical_ordering/
+examples/config_2D/chemical_ordering/output_chem_rest/
+examples/config_2D/chemical_ordering/output_chem_all/
+# 3D displacement
+examples/config_3D/displacement/output_displacement/
+examples/config_3D/displacement/output_disp_rod/
+examples/config_3D/displacement/output_disp_sphere/
+examples/config_3D/displacement/output_disp_rest/
+examples/config_3D/displacement/output_disp_all/
+# 3D chemical
+examples/config_3D/chemical_ordering/output_chemical_ordering/
+examples/config_3D/chemical_ordering/output_chem_spheres/
+examples/config_3D/chemical_ordering/output_chem_cos/
+examples/config_3D/chemical_ordering/output_chem_combined/
+examples/config_3D/chemical_ordering/output_chem_rest/
+
+# Legacy / scratch
 src/
 tmp_scripts/
-core/**/__pycache__/
-core/**/*.pyc
-core/dependencies.json
-core/dependencies.txt
-core/files/
-core/tests/
-core/dask_logs/
-core/entrypoints/dask_logs/
-core/**/*.hdf5
-core/**/*.db
-core/**/*.npz
-examples/sample_1d_release/
-.codex/
+ChangeLog
+
+# Environment
 .env
 .vscode/
-dask_logs/

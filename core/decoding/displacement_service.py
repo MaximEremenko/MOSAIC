@@ -155,8 +155,8 @@ def compute_and_save_displacements(
         "units": np.array(["angstrom", "angstrom", "angstrom"][: U.shape[1]], dtype=object),
     }
 
-    h5_path = os.path.join(output_dir, f"output_chunk_{chunk_id}_first_moment_displacements.h5")
-    csv_path = os.path.join(output_dir, f"output_chunk_{chunk_id}_first_moment_displacements.csv")
+    h5_path = os.path.join(output_dir, f"chunk_{chunk_id}_site_displacements.h5")
+    csv_path = os.path.join(output_dir, f"chunk_{chunk_id}_site_displacements.csv")
     rifft_saver.save_data(out_table, h5_path)
     write_displacements_csv(csv_path, ids, U)
 
@@ -175,7 +175,7 @@ def compute_and_save_displacements(
         )
         h5_aug = os.path.join(
             output_dir,
-            f"output_chunk_{chunk_id}_amplitudes_with_displacements.h5",
+            f"chunk_{chunk_id}_residual_field_decoded.h5",
         )
         rifft_saver.save_data(d_aug, h5_aug)
 

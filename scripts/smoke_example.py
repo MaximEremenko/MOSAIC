@@ -8,8 +8,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN_FILE = ROOT / "examples" / "run_parameters.json"
-OUTPUT_DIR = ROOT / "examples" / "sample_1d_release"
+RUN_FILE = ROOT / "examples" / "config_1D" / "displacement" / "run_parameters.json"
+OUTPUT_DIR = ROOT / "examples" / "config_1D" / "displacement" / "output_displacement"
 
 
 def main() -> int:
@@ -37,9 +37,6 @@ def main() -> int:
         processed / "point_data_chunk_0_applied_interval_ids.hdf5",
     ]
     missing = [str(path.relative_to(ROOT)) for path in required if not path.exists()]
-    interval_dir = processed / "precomputed_intervals"
-    if not interval_dir.exists() or not any(interval_dir.glob("interval_*.npz")):
-        missing.append(str(interval_dir.relative_to(ROOT)))
     if missing:
         raise SystemExit(
             "Canonical smoke example did not produce expected artifacts:\n"

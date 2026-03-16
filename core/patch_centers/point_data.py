@@ -1,5 +1,3 @@
-# processors/point_data_processor.py
-
 import numpy as np
 import logging
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver

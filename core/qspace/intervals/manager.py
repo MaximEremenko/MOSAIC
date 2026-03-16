@@ -5,9 +5,6 @@ Created on Wed Nov 20 13:43:52 2024
 @author: Maksim Eremenko
 """
 
-# processors/point_data_reciprocal_space_manager.py
-# managers/reciprocal_space_interval_manager.py
-
 import numpy as np
 import h5py
 import os
