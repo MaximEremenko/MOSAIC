@@ -48,8 +48,8 @@ def _lower_worker_log_levels() -> None:
 def load_interval_task_payload(interval_path: Path) -> IntervalTask:
     with np.load(interval_path, mmap_mode="r") as data:
         return IntervalTask(
-            int(data["irecip_id"]),
-            str(data["element"]),
+            int(data["irecip_id"].item()),
+            str(data["element"].item()),
             data["q_grid"],
             data["q_amp"],
             data["q_amp_av"],

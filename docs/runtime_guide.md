@@ -30,6 +30,8 @@ Current example runtime profiles:
 - `examples/config_1D/chemical_ordering`: `synchronous`, `max_workers: 1`
 - `examples/config_2D/displacement`: `local`, `max_workers: 6`, `processes: true`
 - `examples/config_2D/chemical_ordering`: `cuda-local`, `max_workers: 1`
+- `examples/config_3D/displacement`: `local`, `max_workers: 2`, `threads_per_worker: 16`
+- `examples/config_3D/chemical_ordering`: `local`, `max_workers: 2`, `threads_per_worker: 16`
 
 ## Choosing A Starting Point
 
@@ -39,6 +41,8 @@ Use the examples in this order:
 2. `examples/config_1D/chemical_ordering`
 3. `examples/config_2D/displacement`
 4. `examples/config_2D/chemical_ordering`
+5. `examples/config_3D/displacement`
+6. `examples/config_3D/chemical_ordering`
 
 The 1D examples are the smallest and best for installation checks.
 
@@ -99,6 +103,8 @@ Current example outputs:
 - `examples/config_2D/displacement/output_displacement`
 - `examples/config_2D/displacement/output_displacement_decoder_full`
 - `examples/config_2D/chemical_ordering/output_chemical_ordering`
+- `examples/config_3D/displacement/output_displacement`
+- `examples/config_3D/chemical_ordering/output_chemical_ordering`
 
 Most generated artifacts live under `processed_point_data/`. Some modes also
 produce `residual_shards/` for intermediate accumulation data.

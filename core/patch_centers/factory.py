@@ -5,8 +5,6 @@ Created on Tue Nov 12 15:29:44 2024
 @author: Maksim Eremenko
 """
 
-# processors/point_processor_factory.py
-
 from typing import Optional
 
 from core.patch_centers.registry import POINT_PROCESSOR_REGISTRY

@@ -11,7 +11,12 @@ keywords = [
   "Fourier-filtering",
   "non-uniform-fft",
   "materials-science",
+  "site-resolved",
+  "chemical-order",
+  "M-decoder",
+  "residual-field",
 ]
+license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
@@ -20,15 +25,14 @@ authors = [
 dependencies = [
   "dask",
   "distributed",
-  "dill",
   "finufft==2.2.0",
   "h5py",
   "matplotlib",
-  "mrcfile==1.5.0",
   "numba",
   "numpy",
   "pandas",
   "PyYAML",
+  "requests",
   "scipy",
   "sympy",
   "tqdm",

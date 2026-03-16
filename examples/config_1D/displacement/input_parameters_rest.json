@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "paths": {
+    "config_root": ".",
+    "structure_file": "slice_displacement_1d.f1d",
+    "output_directory": "./output_disp_rest"
+  },
+  "structure": {
+    "dimension": 1
+  },
+  "reciprocal_space": {
+    "intervals": [
+      {
+        "limit": [1.0],
+        "subvolume_step": [1.0]
+      }
+    ],
+    "mask": {
+      "equation": "((Mod(h,1.0) - 0.5)**2 > (0.25**2))"
+    }
+  },
+  "processing": {
+    "mode": "displacement",
+    "method": "from_average",
+    "num_chunks": 1,
+    "fresh_start": true,
+    "run_postprocessing": false,
+    "points": [
+      {
+        "selector": {
+          "element": "El1",
+          "reference_number": 1
+        },
+        "window": {
+          "dist_from_atom_center": [0.1],
+          "step_in_angstrom": [0.05]
+        }
+      }
+    ]
+  },
+  "runtime": {
+    "dask": {
+      "backend": "synchronous",
+      "max_workers": 1,
+      "threads_per_worker": 1,
+      "processes": false,
+      "worker_wait_timeout": "30s"
+    },
+    "scattering_weights": {
+      "kind": "ones",
+      "calculator": "default"
+    }
+  }
+}

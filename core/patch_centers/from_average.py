@@ -1,4 +1,3 @@
-# processors/from_average_point_processor.py
 from typing import Optional
 import logging
 import os

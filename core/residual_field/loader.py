@@ -98,14 +98,8 @@ def load_chunk_residual_field_and_grid(processor, *, chunk_id, point_data_list, 
     return data, amplitudes, np.asarray(rifft_space_grid)
 
 
-# Compatibility aliases during the rename wave.
-load_amplitudes_and_generate_grid = load_residual_field_and_generate_grid
-load_chunk_amplitudes_and_grid = load_chunk_residual_field_and_grid
-
 
 __all__ = [
-    "load_amplitudes_and_generate_grid",
-    "load_chunk_amplitudes_and_grid",
     "load_chunk_residual_field_and_grid",
     "load_residual_field_and_generate_grid",
     "resolve_output_dir",

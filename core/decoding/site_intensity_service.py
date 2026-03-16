@@ -106,8 +106,8 @@ def compute_and_save_site_intensities(
     ):
         out_table["refnumber"] = np.asarray(refnumbers_all[ids])
 
-    h5_path = os.path.join(output_dir, f"output_chunk_{chunk_id}_chemical_site_intensities.h5")
-    csv_path = os.path.join(output_dir, f"output_chunk_{chunk_id}_chemical_site_intensities.csv")
+    h5_path = os.path.join(output_dir, f"chunk_{chunk_id}_site_contrast.h5")
+    csv_path = os.path.join(output_dir, f"chunk_{chunk_id}_site_contrast.csv")
     rifft_saver.save_data(out_table, h5_path)
     write_site_intensities_csv(
         csv_path,
