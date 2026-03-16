@@ -30,6 +30,8 @@ def build_base_amplitude_parameters(
         "elements": to_numpy(context.structure.elements),
         "refnumbers": to_numpy(context.structure.refnumbers),
         "rspace_info": context.workflow_parameters.rspace_info.to_mapping(),
+        "runtime_info": context.workflow_parameters.runtime_info.to_mapping(),
+        "transient_interval_payloads": context.artifacts.transient_interval_payloads,
         "vectors": context.structure.vectors,
         "supercell": context.structure.supercell,
         "postprocessing_mode": context.postprocessing_mode,
