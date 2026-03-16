@@ -199,6 +199,25 @@ def _partition_rifft_points(
     )
 
 
+def _byte_budget_with_hysteresis(
+    *,
+    estimated_bytes: int,
+    target_bytes: int,
+    low_factor: float,
+    high_factor: float,
+) -> int:
+    if int(target_bytes) <= 0:
+        raise ValueError("target_bytes must be positive.")
+    low_threshold = float(target_bytes) * float(low_factor)
+    high_threshold = float(target_bytes) * float(high_factor)
+    estimated = float(estimated_bytes)
+    if estimated <= low_threshold:
+        return 1
+    if estimated > high_threshold:
+        return max(1, int(math.ceil(estimated / float(target_bytes))))
+    return 2
+
+
 def build_adaptive_partition_plan(
     point_rows_by_chunk: dict[int, list[dict[str, object]]],
     *,
@@ -207,6 +226,8 @@ def build_adaptive_partition_plan(
     target_partition_bytes_3d: int | None = None,
     max_partitions_per_chunk: int | None = None,
     min_points_per_partition: int = 1,
+    hysteresis_low_factor: float = 0.8,
+    hysteresis_high_factor: float = 1.2,
 ) -> dict[int, ResidualFieldAdaptivePartitionPlan]:
     if effective_nufft_workers <= 0:
         raise ValueError("effective_nufft_workers must be positive.")
@@ -222,6 +243,12 @@ def build_adaptive_partition_plan(
         max_partitions_per_chunk = max(1, int(effective_nufft_workers) * 2)
     if max_partitions_per_chunk <= 0:
         raise ValueError("max_partitions_per_chunk must be positive.")
+    if not (0.0 < float(hysteresis_low_factor) <= 1.0):
+        raise ValueError("hysteresis_low_factor must satisfy 0 < low <= 1.")
+    if float(hysteresis_high_factor) < 1.0:
+        raise ValueError("hysteresis_high_factor must satisfy 1 <= high.")
+    if float(hysteresis_low_factor) > float(hysteresis_high_factor):
+        raise ValueError("hysteresis_low_factor must be <= hysteresis_high_factor.")
 
     plans: dict[int, ResidualFieldAdaptivePartitionPlan] = {}
     chunk_count = max(1, len(point_rows_by_chunk))
@@ -239,18 +266,33 @@ def build_adaptive_partition_plan(
             if chunk_count < int(effective_nufft_workers)
             else 1
         )
-        byte_budget_count = max(1, int(math.ceil(float(estimated_bytes) / float(target_bytes))))
+        byte_budget_count = _byte_budget_with_hysteresis(
+            estimated_bytes=int(estimated_bytes),
+            target_bytes=int(target_bytes),
+            low_factor=float(hysteresis_low_factor),
+            high_factor=float(hysteresis_high_factor),
+        )
         raw_target = max(worker_floor, byte_budget_count)
         max_by_points = max(1, point_count // int(min_points_per_partition))
         target = min(int(max_partitions_per_chunk), int(max_by_points), int(point_count), int(raw_target))
+        byte_budget_hysteresis = (
+            byte_budget_count == 2
+            and float(estimated_bytes) > (float(target_bytes) * float(hysteresis_low_factor))
+            and float(estimated_bytes) <= (float(target_bytes) * float(hysteresis_high_factor))
+        )
+        byte_budget_driven = float(estimated_bytes) > (float(target_bytes) * float(hysteresis_high_factor))
         if target <= 1:
             reason = "whole-chunk"
-        elif byte_budget_count > worker_floor and dimensionality >= 3:
-            reason = "3d-byte-budget"
-        elif byte_budget_count > worker_floor:
-            reason = "byte-budget"
-        elif worker_floor > 1:
+        elif worker_floor > byte_budget_count:
             reason = "worker-capacity-floor"
+        elif dimensionality >= 3 and byte_budget_hysteresis:
+            reason = "3d-byte-budget-hysteresis"
+        elif byte_budget_hysteresis:
+            reason = "byte-budget-hysteresis"
+        elif dimensionality >= 3 and byte_budget_driven:
+            reason = "3d-byte-budget"
+        elif byte_budget_driven:
+            reason = "byte-budget"
         else:
             reason = "partition-cap"
         partition_rifft_points = _partition_rifft_points(
@@ -375,6 +417,7 @@ __all__ = [
     "build_residual_field_parameter_digest",
     "build_adaptive_partition_plan",
     "build_residual_field_work_units",
+    "_byte_budget_with_hysteresis",
     "chunk_ids_for_work_units",
     "estimate_chunk_partition_bytes",
     "estimate_rifft_points_for_point",
