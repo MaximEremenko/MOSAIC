@@ -149,4 +149,5 @@ class ReciprocalSpacePreparationService:
             db_manager=artifact_bundle.db_manager,
             compact_intervals=compact_intervals,
             padded_intervals=padded_intervals,
+            transient_interval_payloads={},
         )
