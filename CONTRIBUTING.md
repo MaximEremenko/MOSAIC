@@ -14,7 +14,7 @@ Conda-first baseline:
 
 ```bash
 conda env create -f core/environment.yml
-conda activate MOSAIC
+conda activate mosaic
 python -m pip install -e .
 ```
 
