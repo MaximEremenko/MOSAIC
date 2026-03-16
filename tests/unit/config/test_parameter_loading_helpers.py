@@ -2,6 +2,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 import core.config.service as configuration_service
 from core.config import ParameterLoadingService
 from core.config.run_files import (
@@ -53,13 +55,53 @@ def test_normalize_input_schema_maps_unified_payload():
         "structure": {"dimension": 2},
         "reciprocal_space": {"intervals": [{"limit": [1.0, 1.0], "subvolume_step": [1.0, 1.0]}]},
         "processing": {"method": "from_average", "num_chunks": 2, "points": []},
-        "runtime": {"form_factor": {"family": "neutron", "calculator": "default"}},
+        "runtime": {"scattering_weights": {"kind": "ones", "calculator": "default"}},
     }
     normalized = normalize_input_schema(payload)
     assert normalized["structInfo"]["dimension"] == 2
     assert normalized["structInfo"]["filename"] == "sample.f2d"
     assert normalized["rspace_info"]["method"] == "from_average"
-    assert normalized["runtime_info"]["form_factor"]["family"] == "neutron"
+    assert normalized["runtime_info"]["scattering_weights"]["kind"] == "ones"
+
+
+def test_normalize_input_schema_rejects_legacy_form_factor_runtime_key():
+    payload = {
+        "schema_version": 2,
+        "paths": {
+            "output_directory": "./out",
+            "structure_file": "sample.f2d",
+        },
+        "structure": {"dimension": 2},
+        "reciprocal_space": {"intervals": [{"limit": [1.0, 1.0], "subvolume_step": [1.0, 1.0]}]},
+        "processing": {"method": "from_average", "num_chunks": 2, "points": []},
+        "runtime": {"form_factor": {"family": "neutron_scattering_length", "calculator": "default"}},
+    }
+
+    with pytest.raises(ValueError, match="Legacy runtime scattering-weight keys are no longer supported"):
+        normalize_input_schema(payload)
+
+
+def test_normalize_input_schema_maps_structure_coefficient_scheme():
+    payload = {
+        "schema_version": 2,
+        "paths": {
+            "output_directory": "./out",
+            "structure_file": "sample.f2d",
+        },
+        "structure": {
+            "dimension": 2,
+            "coefficients": {
+                "scheme": "atomic_number",
+                "file": "./coeff.txt",
+            },
+        },
+        "reciprocal_space": {"intervals": [{"limit": [1.0, 1.0], "subvolume_step": [1.0, 1.0]}]},
+        "processing": {"method": "from_average", "num_chunks": 2, "points": []},
+        "runtime": {"scattering_weights": {"kind": "ones", "calculator": "default"}},
+    }
+    normalized = normalize_input_schema(payload)
+    assert normalized["structInfo"]["coeff_scheme"] == "atomic_number"
+    assert normalized["structInfo"]["coeff_file"] == "./coeff.txt"
 
 
 def test_normalize_input_schema_maps_processing_decoder_policy():

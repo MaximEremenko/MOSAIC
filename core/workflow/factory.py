@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from core.scattering.stage import ScatteringStage
 from core.scattering.coefficients import CoefficientCenteringService
-from core.scattering.form_factors.registry import FormFactorRegistry
+from core.scattering.form_factors.registry import ScatteringWeightRegistry
 from core.patch_centers.service import PointSelectionService
 from core.decoding.decoder_service import DisplacementDecoderSourceService
 from core.decoding.stage import DecodingStage, build_default_decoding_processor
@@ -25,7 +25,7 @@ def build_default_workflow_service() -> WorkflowService:
         coefficient_centering_service=CoefficientCenteringService(),
         mask_strategy_service=MaskStrategyService(),
         interval_reconstruction_service=IntervalReconstructionService(),
-        form_factor_registry=FormFactorRegistry(),
+        scattering_weight_registry=ScatteringWeightRegistry(),
     )
     residual_field_stage = ResidualFieldStage()
     return WorkflowService(

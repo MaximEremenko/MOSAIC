@@ -10,7 +10,7 @@ from core.config.run_files import (
 )
 from core.config.runtime import (
     apply_runtime_settings,
-    resolve_form_factor_settings,
+    resolve_scattering_weight_settings,
     resolve_runtime_settings,
 )
 from core.config.schema import (
@@ -22,7 +22,7 @@ from core.models import (
     RuntimeSettings,
     WorkflowParameters,
 )
-from core.scattering.form_factors.contracts import FormFactorSelection
+from core.scattering.form_factors.contracts import ScatteringWeightSelection
 
 
 def resolve_repo_root() -> Path:
@@ -64,7 +64,7 @@ class ParameterLoadingService:
     def apply_runtime_settings(self, runtime_settings: RuntimeSettings) -> None:
         apply_runtime_settings(runtime_settings)
 
-    def resolve_form_factor_settings(
+    def resolve_scattering_weight_settings(
         self, workflow_parameters: WorkflowParameters
-    ) -> FormFactorSelection:
-        return resolve_form_factor_settings(workflow_parameters)
+    ) -> ScatteringWeightSelection:
+        return resolve_scattering_weight_settings(workflow_parameters)

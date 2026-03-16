@@ -8,7 +8,7 @@ from core.scattering.context import build_scattering_execution_context
 from core.scattering.stage import ScatteringStage
 from core.scattering.coefficients import CoefficientCenteringService
 from core.config import ParameterLoadingService
-from core.scattering.form_factors.registry import FormFactorRegistry
+from core.scattering.form_factors.registry import ScatteringWeightRegistry
 from core.qspace.masking.service import MaskStrategyService
 from core.patch_centers.service import PointSelectionService
 from core.decoding.context import build_decoding_context
@@ -67,7 +67,7 @@ def _build_scattering_stage(*, compute_amplitudes=None):
         coefficient_centering_service=CoefficientCenteringService(),
         mask_strategy_service=MaskStrategyService(),
         interval_reconstruction_service=IntervalReconstructionService(),
-        form_factor_registry=FormFactorRegistry(),
+        scattering_weight_registry=ScatteringWeightRegistry(),
         **kwargs,
     )
 
@@ -240,8 +240,8 @@ def test_scattering_stage_builds_typed_context(tmp_path):
             interval_reconstruction_service=stage.interval_reconstruction_service,
         )
         assert context.dimension == 1
-        assert context.form_factor_selection.family == "neutron"
-        assert context.form_factor_selection.calculator == "default"
+        assert context.scattering_weight_selection.kind == "ones"
+        assert context.scattering_weight_selection.calculator == "default"
         np.testing.assert_allclose(context.centered_coefficients, np.array([2.0]))
         assert len(context.unsaved_interval_chunks) == 1
         assert len(context.intervals) == 1
@@ -249,7 +249,7 @@ def test_scattering_stage_builds_typed_context(tmp_path):
         artifacts.db_manager.close()
 
 
-def test_scattering_context_keeps_coefficient_weights_separate_from_form_factor_family(tmp_path):
+def test_scattering_context_keeps_coefficient_weights_separate_from_scattering_weight_kind(tmp_path):
     artifacts = _build_artifacts(tmp_path)
     try:
         workflow_parameters = WorkflowParameters(
@@ -257,7 +257,7 @@ def test_scattering_context_keeps_coefficient_weights_separate_from_form_factor_
             struct_info={"dimension": 1, "coeff_scheme": "ones"},
             peak_info={"mask_equation": "h > 0"},
             rspace_info={"method": "central", "mode": "displacement", "use_coeff": True},
-            runtime_info={"form_factor": {"family": "xray", "calculator": "lobato"}},
+            runtime_info={"scattering_weights": {"kind": "xray", "calculator": "lobato"}},
         )
         structure = StructureData(
             vectors=np.array([[1.0]]),
@@ -281,8 +281,8 @@ def test_scattering_context_keeps_coefficient_weights_separate_from_form_factor_
             interval_reconstruction_service=stage.interval_reconstruction_service,
         )
 
-        assert context.form_factor_selection.family == "xray"
-        assert context.form_factor_selection.calculator == "lobato"
+        assert context.scattering_weight_selection.kind == "xray"
+        assert context.scattering_weight_selection.calculator == "lobato"
         np.testing.assert_allclose(context.centered_coefficients, np.array([1.0]))
     finally:
         artifacts.db_manager.close()
@@ -651,18 +651,29 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
     assert stale_file.exists() is False
 
 
-def test_parameter_loading_service_returns_form_factor_selection():
-    selection = ParameterLoadingService().resolve_form_factor_settings(
+def test_parameter_loading_service_returns_scattering_weight_selection():
+    selection = ParameterLoadingService().resolve_scattering_weight_settings(
         WorkflowParameters(
             schema_version=1,
             struct_info={},
             peak_info={},
             rspace_info={},
-            runtime_info={"form_factor": {"family": "xray", "calculator": "lobato"}},
+            runtime_info={"scattering_weights": {"kind": "xray", "calculator": "lobato"}},
         )
     )
-    assert selection.family == "xray"
+    assert selection.kind == "xray"
     assert selection.calculator == "lobato"
+
+
+def test_workflow_runtime_info_rejects_legacy_form_factor_runtime_key():
+    with pytest.raises(ValueError, match="Legacy runtime scattering-weight keys are no longer supported"):
+        WorkflowParameters(
+            schema_version=1,
+            struct_info={},
+            peak_info={},
+            rspace_info={},
+            runtime_info={"form_factor": {"family": "neutron_scattering_length", "calculator": "default"}},
+        )
 
 
 def test_workflow_parameters_wrap_section_payloads_into_typed_views():
@@ -671,17 +682,89 @@ def test_workflow_parameters_wrap_section_payloads_into_typed_views():
     assert workflow_parameters.struct_info.dimension == 1
     assert workflow_parameters.peak_info.mask_equation == "h > 0"
     assert workflow_parameters.rspace_info.method == "central"
-    assert workflow_parameters.runtime_info.form_factor.family == "neutron"
+    assert workflow_parameters.runtime_info.scattering_weights.kind == "ones"
 
 
-def test_form_factor_registry_rejects_unknown_family():
-    registry = FormFactorRegistry()
+def test_workflow_runtime_info_emits_only_scattering_weights_mapping():
+    workflow_parameters = WorkflowParameters(
+        schema_version=1,
+        struct_info={},
+        peak_info={},
+        rspace_info={},
+        runtime_info={"scattering_weights": {"kind": "neutron", "calculator": "default"}},
+    )
+
+    assert workflow_parameters.runtime_info.to_mapping() == {
+        "scattering_weights": {
+            "kind": "neutron",
+            "calculator": "default",
+        }
+    }
+
+
+def test_workflow_runtime_info_rejects_legacy_scattering_weight_keys():
+    with pytest.raises(ValueError, match="Legacy scattering-weight keys are no longer supported"):
+        WorkflowParameters(
+            schema_version=1,
+            struct_info={},
+            peak_info={},
+            rspace_info={},
+            runtime_info={"scattering_weights": {"family": "neutron", "calculator": "default"}},
+        )
+
+
+def test_scattering_weight_registry_rejects_unknown_scattering_weight_kind():
+    registry = ScatteringWeightRegistry()
     try:
-        registry.create_calculator(SimpleNamespace(family="unknown", calculator="default"))
+        registry.create_calculator(SimpleNamespace(kind="unknown", calculator="default"))
     except ValueError as exc:
         assert "Unsupported experiment type" in str(exc)
     else:
-        raise AssertionError("Expected ValueError for unknown form factor family")
+        raise AssertionError("Expected ValueError for unknown scattering weight kind")
+
+
+def test_scattering_weight_registry_supports_constant_scattering_weight_kinds():
+    registry = ScatteringWeightRegistry()
+    ones_calc = registry.create_calculator(
+        SimpleNamespace(kind="ones", calculator="default")
+    )
+    atomic_calc = registry.create_calculator(
+        SimpleNamespace(kind="atomic_number", calculator="default")
+    )
+    neutron_calc = registry.create_calculator(
+        SimpleNamespace(kind="neutron", calculator="default")
+    )
+
+    np.testing.assert_allclose(
+        ones_calc.calculate(np.array([[0.0]]), "Na"),
+        np.array([1.0]),
+    )
+    np.testing.assert_allclose(
+        atomic_calc.calculate(np.array([[0.0]]), "Na"),
+        np.array([11.0]),
+    )
+    np.testing.assert_allclose(
+        neutron_calc.calculate(np.array([[0.0]]), "Na"),
+        np.array([0.363]),
+    )
+
+
+def test_scattering_weight_registry_supports_q_dependent_scattering_weight_kinds():
+    registry = ScatteringWeightRegistry()
+    xray_calc = registry.create_calculator(
+        SimpleNamespace(kind="xray", calculator="default")
+    )
+    electron_calc = registry.create_calculator(
+        SimpleNamespace(kind="electron", calculator="default")
+    )
+
+    xray_values = xray_calc.calculate(np.array([[0.0]]), "Na")
+    electron_values = electron_calc.calculate(np.array([[0.0]]), "Na")
+
+    assert xray_values.shape == (1,)
+    assert electron_values.shape == (1,)
+    assert np.isfinite(xray_values).all()
+    assert np.isfinite(electron_values).all()
 
 
 def test_create_db_manager_for_thread_opens_separate_connection(tmp_path):

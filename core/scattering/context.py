@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from core.scattering.coefficients import to_numpy
-from core.scattering.form_factors.contracts import FormFactorSelection
+from core.scattering.form_factors.contracts import ScatteringWeightSelection
 from core.processing_mode import normalize_processing_mode
 from core.models import ReciprocalSpaceArtifacts, StructureData, WorkflowParameters
 
@@ -24,7 +24,7 @@ class ScatteringExecutionContext:
     use_coeff: bool
     centered_coefficients: np.ndarray
     mask_strategy: object
-    form_factor_selection: FormFactorSelection
+    scattering_weight_selection: ScatteringWeightSelection
 
 
 def build_scattering_execution_context(
@@ -70,7 +70,7 @@ def build_scattering_execution_context(
             workflow_parameters.peak_info,
             post_mode=post_mode,
         ),
-        form_factor_selection=parameter_loading_service.resolve_form_factor_settings(
+        scattering_weight_selection=parameter_loading_service.resolve_scattering_weight_settings(
             workflow_parameters
         ),
     )

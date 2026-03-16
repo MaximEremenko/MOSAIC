@@ -7,6 +7,9 @@ Created on Fri Nov 29 13:24:56 2024
 
 # form_factors/form_factor_factory_producer.py
 
+from core.scattering.form_factors.atomic_number_form_factor_factory import (
+    AtomicNumberFormFactorFactory,
+)
 from core.scattering.form_factors.electron_form_factor_factory import (
     ElectronFormFactorFactory,
 )
@@ -14,10 +17,15 @@ from core.scattering.form_factors.form_factor_factory import FormFactorFactory
 from core.scattering.form_factors.neutron_form_factor_factory import (
     NeutronFormFactorFactory,
 )
+from core.scattering.form_factors.ones_form_factor_factory import (
+    OnesFormFactorFactory,
+)
 from core.scattering.form_factors.xray_form_factor_factory import XRayFormFactorFactory
 
 class FormFactorFactoryProducer:
     _factories = {
+        "ones": OnesFormFactorFactory,
+        "atomic_number": AtomicNumberFormFactorFactory,
         "neutron": NeutronFormFactorFactory,
         "xray": XRayFormFactorFactory,
         "electron": ElectronFormFactorFactory,
@@ -33,7 +41,8 @@ class FormFactorFactoryProducer:
         Returns the appropriate factory based on the experiment type.
 
         Args:
-            experiment_type (str): The type of experiment ('neutron', 'xray', 'electron').
+            experiment_type (str): The scattering-weight kind
+                ('ones', 'atomic_number', 'neutron', 'xray', 'electron').
 
         Returns:
             FormFactorFactory: The corresponding factory instance.

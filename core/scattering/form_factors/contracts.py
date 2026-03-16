@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class FormFactorSelection:
-    family: str
+class ScatteringWeightSelection:
+    kind: str
     calculator: str
 
 
-__all__ = ["FormFactorSelection"]
+__all__ = ["ScatteringWeightSelection"]
