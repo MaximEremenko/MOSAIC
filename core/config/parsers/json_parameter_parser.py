@@ -13,6 +13,4 @@ from core.config.contracts.parameter_interfaces import (
 
 class JSONParameterParser(IParameterParser):
     def parse(self, data: dict) -> dict:
-        #TODO:  Validation and transformation logic here if needed
         return data
-    

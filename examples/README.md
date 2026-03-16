@@ -53,11 +53,23 @@ chemical-ordering example is configured for `cuda-local`.
 
 ### `config_3D`
 
-Reference 3D inputs for exploratory work. This folder contains only
-`input_parameters.json` and structure files — there is no `run_parameters.json`.
-To run it, create a `run_parameters.json` pointing to the input file or invoke
-the entry point directly. This folder is not the recommended starting point for
-first runs.
+Research-scale 3D examples with large structure files. These require more
+memory and compute time than the 1D and 2D cases.
+
+Included cases:
+
+- `config_3D/displacement/` (CaTiO3, `.rmc6f`)
+- `config_3D/chemical_ordering/` (LiFeO2, `.rmc6f`)
+
+Run them with:
+
+```bash
+conda run -n mosaic python -m core.main examples/config_3D/displacement/run_parameters.json
+conda run -n mosaic python -m core.main examples/config_3D/chemical_ordering/run_parameters.json
+```
+
+Both 3D examples are configured for `local` Dask execution. This folder is not
+the recommended starting point for first runs.
 
 ## What Each Example Folder Contains
 
@@ -65,7 +77,7 @@ Each runnable example directory contains:
 
 - `run_parameters.json`
 - `input_parameters.json`
-- a structure file such as `.f1d` or `.f2d`
+- a structure file such as `.f1d`, `.f2d`, or `.rmc6f`
 
 ## Outputs
 
@@ -79,6 +91,8 @@ Current output roots in the repo:
 - `examples/config_2D/displacement/output_displacement/`
 - `examples/config_2D/displacement/output_displacement_decoder_full/`
 - `examples/config_2D/chemical_ordering/output_chemical_ordering/`
+- `examples/config_3D/displacement/output_displacement/`
+- `examples/config_3D/chemical_ordering/output_chemical_ordering/`
 
 Most generated artifacts live under `processed_point_data/`.
 

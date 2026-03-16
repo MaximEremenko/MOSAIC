@@ -8,8 +8,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN_FILE = ROOT / "examples" / "run_parameters.json"
-OUTPUT_DIR = ROOT / "examples" / "sample_1d_release"
+RUN_FILE = ROOT / "examples" / "config_1D" / "displacement" / "run_parameters.json"
+OUTPUT_DIR = ROOT / "examples" / "config_1D" / "displacement" / "output_displacement"
 
 
 def main() -> int:

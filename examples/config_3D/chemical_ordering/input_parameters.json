@@ -1,0 +1,94 @@
+{
+  "schema_version": 2,
+  "paths": {
+    "config_root": ".",
+    "structure_file": "LiFeO2.rmc6f",
+    "output_directory": "./output_chemical_ordering",
+    "average_structure_file": "LiFeO2.rmc6f"
+  },
+  "structure": {
+    "dimension": 3,
+    "cell_limits": {
+      "min": [0, 0, 0],
+      "max": [19, 19, 19]
+    }
+  },
+  "reciprocal_space": {
+    "intervals": [
+      {
+        "limit": [10.0, 10.0, 10.0],
+        "subvolume_step": [5.0, 5.0, 5.0]
+      }
+    ],
+    "mask": {
+      "equation": "((Mod(h,1.0) - 0.5)**2 + (Mod(k,1.0) - 0.5)**2 + (Mod(l,1.0) - 0.5)**2 < 0.1576**2)"
+    }
+  },
+  "processing": {
+    "mode": "chemical",
+    "method": "from_average",
+    "num_chunks": 2,
+    "fresh_start": true,
+    "run_postprocessing": true,
+    "points": [
+      {
+        "selector": {
+          "element": "Li",
+          "reference_number": 5
+        },
+        "window": {
+          "dist_from_atom_center": [0.01, 0.01, 0.01],
+          "step_in_angstrom": [0.25, 0.25, 0.25]
+        }
+      },
+      {
+        "selector": {
+          "element": "Li",
+          "reference_number": 6
+        },
+        "window": {
+          "dist_from_atom_center": [0.01, 0.01, 0.01],
+          "step_in_angstrom": [0.25, 0.25, 0.25]
+        }
+      },
+      {
+        "selector": {
+          "element": "Fe",
+          "reference_number": 7
+        },
+        "window": {
+          "dist_from_atom_center": [0.01, 0.01, 0.01],
+          "step_in_angstrom": [0.25, 0.25, 0.25]
+        }
+      },
+      {
+        "selector": {
+          "element": "Fe",
+          "reference_number": 8
+        },
+        "window": {
+          "dist_from_atom_center": [0.01, 0.01, 0.01],
+          "step_in_angstrom": [0.25, 0.25, 0.25]
+        }
+      }
+    ],
+    "chemical_filtered_ordering": true,
+    "coefficients": {
+      "center_by": "global",
+      "use": true
+    }
+  },
+  "runtime": {
+    "dask": {
+      "backend": "local",
+      "max_workers": 2,
+      "threads_per_worker": 16,
+      "processes": false,
+      "worker_wait_timeout": "120s"
+    },
+    "scattering_weights": {
+      "kind": "neutron",
+      "calculator": "default"
+    }
+  }
+}
