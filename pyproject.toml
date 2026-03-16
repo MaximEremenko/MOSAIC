@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic"
+dynamic = ["version"]
+description = "Phase-preserving filtering of diffuse scattering amplitude for site-resolved occupancy and displacement analysis."
+keywords = [
+  "diffuse-scattering",
+  "Fourier-filtering",
+  "non-uniform-fft",
+  "materials-science",
+]
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  {name = "Maksim Eremenko"},
+]
+dependencies = [
+  "dask",
+  "distributed",
+  "dill",
+  "finufft==2.2.0",
+  "h5py",
+  "matplotlib",
+  "mrcfile==1.5.0",
+  "numba",
+  "numpy",
+  "pandas",
+  "PyYAML",
+  "scipy",
+  "sympy",
+  "tqdm",
+]
+
+[project.urls]
+Homepage = "https://github.com/MaximEremenko/MOSAIC"
+Repository = "https://github.com/MaximEremenko/MOSAIC"
+
+[project.scripts]
+mosaic = "core.entrypoints.main:cli"
+
+[tool.setuptools.packages.find]
+include = ["core*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "core.__version__"}

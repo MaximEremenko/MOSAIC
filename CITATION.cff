@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: >-
+  If you use MOSAIC to link selected diffuse-scattering features to
+  site-resolved chemical-order or displacement fields, please cite the
+  software using the metadata in this file.
+title: "MOSAIC"
+version: "0.1.0"
+date-released: 2026-03-14
+license: Apache-2.0
+type: software
+authors:
+  - family-names: "Eremenko"
+    given-names: "Maksim"
+repository-code: "https://github.com/MaximEremenko/MOSAIC"
+url: "https://github.com/MaximEremenko/MOSAIC"
+abstract: >-
+  MOSAIC is a computational framework for linking selected diffuse-scattering
+  features to site-resolved chemical-order and displacement fields in atomistic
+  configurations. It computes the complex scattering amplitude, isolates
+  reciprocal-space features with phase-preserving masks, applies an inverse
+  Fourier transform to recover atom-centered real-space fields, and decodes
+  those fields into site-resolved outputs associated with the chosen diffuse
+  features.
+keywords:
+  - diffuse-scattering
+  - chemical-order
+  - displacement
+  - Fourier-filtering
+  - non-uniform-FFT
+  - scattering
+  - reciprocal-space
+  - residual-field
+  - atomistic-configurations
+  - materials-science
+  - dask
+preferred-citation:
+  type: article
+  title: >-
+    A Filter-Based Approach Linking Diffuse Scattering Features to
+    Site-Resolved Real-Space Fields
+  authors:
+    - family-names: "Eremenko"
+      given-names: "Maksim"
+  year: 2026
