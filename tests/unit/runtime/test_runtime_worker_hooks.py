@@ -4,6 +4,7 @@ import os
 from types import SimpleNamespace
 
 from core.runtime.worker_hooks import (
+    _final_cleanup,
     handle_worker_gpu_failure,
     register_cleanup_plugin,
     resolve_worker_scratch_root,
@@ -48,6 +49,23 @@ def test_handle_worker_gpu_failure_on_non_gpu_error_only_cleans_up(monkeypatch):
 
     assert handled is False
     assert calls == ["freed"]
+
+
+def test_final_cleanup_also_cleans_process_local_reducers(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.free_gpu_memory",
+        lambda: calls.append("gpu"),
+    )
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks._cleanup_process_local_reducers",
+        lambda: calls.append("reducers"),
+    )
+
+    _final_cleanup()
+
+    assert calls[:2] == ["gpu", "reducers"]
 
 
 def test_resolve_worker_scratch_root_uses_preferred_or_env(monkeypatch, tmp_path):

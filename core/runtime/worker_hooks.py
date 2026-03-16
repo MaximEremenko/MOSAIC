@@ -21,8 +21,25 @@ class _NoopLock(AbstractContextManager):
         return False
 
 
+def _cleanup_process_local_reducers() -> None:
+    try:
+        from core.residual_field import backend as residual_backend
+    except Exception:
+        return
+    for name in (
+        "clear_process_local_residual_field_backends",
+        "cleanup_process_local_residual_reducer_state",
+        "clear_process_local_residual_reducer_state",
+    ):
+        cleanup = getattr(residual_backend, name, None)
+        if callable(cleanup):
+            cleanup()
+            return
+
+
 def _final_cleanup() -> None:
     free_gpu_memory()
+    _cleanup_process_local_reducers()
     try:
         from multiprocessing import resource_tracker, shared_memory
 
@@ -159,10 +176,12 @@ def handle_worker_gpu_failure(
 def register_cleanup_plugin(client, *, is_sync_client) -> bool:
     if client is None or is_sync_client(client):
         return False
+    if not hasattr(client, "register_worker_plugin"):
+        return False
     try:
         client.register_worker_plugin(CuPyCleanup(), name="cupy-cleanup")
         return True
-    except ValueError:
+    except (AttributeError, ValueError):
         return False
 
 

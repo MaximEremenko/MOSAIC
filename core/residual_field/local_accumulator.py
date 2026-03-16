@@ -118,6 +118,18 @@ def load_local_accumulator_snapshot(
                 else (int(partition_id) if partition_id is not None else None)
             ),
             "storage_mode": str(data["storage_mode"].tolist()),
+            "checkpoint_write_count": int(
+                np.asarray(data["checkpoint_write_count"]).ravel()[0]
+            ) if "checkpoint_write_count" in data else int(snapshot_seq),
+            "checkpoint_bytes_written_total": int(
+                np.asarray(data["checkpoint_bytes_written_total"]).ravel()[0]
+            ) if "checkpoint_bytes_written_total" in data else 0,
+            "checkpoint_wall_seconds_total": float(
+                np.asarray(data["checkpoint_wall_seconds_total"]).ravel()[0]
+            ) if "checkpoint_wall_seconds_total" in data else 0.0,
+            "checkpoint_cadence_batches": int(
+                np.asarray(data["checkpoint_cadence_batches"]).ravel()[0]
+            ) if "checkpoint_cadence_batches" in data else 0,
         }
 
 
@@ -136,6 +148,11 @@ def write_local_accumulator_snapshot(
     total_reciprocal_points: int,
     incorporated_interval_ids: tuple[int, ...],
     storage_mode: str,
+    checkpoint_write_count: int = 0,
+    checkpoint_bytes_written_total: int = 0,
+    checkpoint_wall_seconds_total: float = 0.0,
+    checkpoint_cadence_batches: int = 0,
+    compress: bool = False,
 ) -> Path:
     snapshot_path = build_local_accumulator_snapshot_path(
         output_dir,
@@ -151,7 +168,8 @@ def write_local_accumulator_snapshot(
         suffix=".tmp",
         delete=False,
     ) as handle:
-        np.savez(
+        save_fn = np.savez_compressed if compress else np.savez
+        save_fn(
             handle,
             point_ids=np.asarray(point_ids, dtype=np.int64),
             grid_shape_nd=np.asarray(grid_shape_nd, dtype=np.int64),
@@ -168,6 +186,10 @@ def write_local_accumulator_snapshot(
                 dtype=np.int64,
             ),
             storage_mode=np.array([str(storage_mode)]),
+            checkpoint_write_count=np.array([int(checkpoint_write_count)], dtype=np.int64),
+            checkpoint_bytes_written_total=np.array([int(checkpoint_bytes_written_total)], dtype=np.int64),
+            checkpoint_wall_seconds_total=np.array([float(checkpoint_wall_seconds_total)], dtype=np.float64),
+            checkpoint_cadence_batches=np.array([int(checkpoint_cadence_batches)], dtype=np.int64),
         )
     Path(handle.name).replace(snapshot_path)
     return snapshot_path
@@ -239,6 +261,10 @@ class LiveLocalAccumulator:
         durable_interval_ids: tuple[int, ...],
         durable_snapshot_seq: int,
         storage_mode: str,
+        checkpoint_write_count: int = 0,
+        checkpoint_bytes_written_total: int = 0,
+        checkpoint_wall_seconds_total: float = 0.0,
+        checkpoint_cadence_batches: int = 0,
         live_dir: Path | None = None,
     ) -> None:
         self.chunk_id = int(chunk_id)
@@ -254,6 +280,10 @@ class LiveLocalAccumulator:
         self.durable_interval_ids = set(int(interval_id) for interval_id in durable_interval_ids)
         self.durable_snapshot_seq = int(durable_snapshot_seq)
         self.accepted_since_snapshot = 0
+        self.checkpoint_write_count = int(checkpoint_write_count)
+        self.checkpoint_bytes_written_total = int(checkpoint_bytes_written_total)
+        self.checkpoint_wall_seconds_total = float(checkpoint_wall_seconds_total)
+        self.checkpoint_cadence_batches = int(checkpoint_cadence_batches)
         self.amplitudes_delta = amplitudes_delta
         self.amplitudes_average = amplitudes_average
 
@@ -265,28 +295,67 @@ class LiveLocalAccumulator:
         scratch_root: str,
         max_ram_bytes: int,
     ) -> "LiveLocalAccumulator":
+        return cls.from_arrays(
+            partial.work_unit,
+            point_ids=partial.point_ids,
+            grid_shape_nd=partial.grid_shape_nd,
+            total_reciprocal_points=partial.total_reciprocal_points,
+            amplitudes_delta=partial.amplitudes_delta,
+            amplitudes_average=partial.amplitudes_average,
+            scratch_root=scratch_root,
+            max_ram_bytes=max_ram_bytes,
+        )
+
+    @classmethod
+    def from_arrays(
+        cls,
+        work_unit: ResidualFieldWorkUnit,
+        *,
+        point_ids: np.ndarray,
+        grid_shape_nd: np.ndarray,
+        total_reciprocal_points: int,
+        amplitudes_delta: np.ndarray,
+        amplitudes_average: np.ndarray,
+        scratch_root: str,
+        max_ram_bytes: int,
+    ) -> "LiveLocalAccumulator":
+        point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        grid_shape_nd_arr = np.asarray(grid_shape_nd, dtype=np.int64)
+        amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
+        amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
+        if amplitudes_delta_arr.shape != amplitudes_average_arr.shape:
+            raise ValueError("Local residual accumulation requires matching delta/average shapes.")
+        if point_ids_arr.shape[0] != amplitudes_delta_arr.shape[0]:
+            raise ValueError("Local residual accumulation requires point_ids to match payload length.")
         storage_mode = (
             "ram"
-            if estimate_local_accumulator_bytes(partial) <= int(max_ram_bytes)
+            if (
+                point_ids_arr.nbytes
+                + grid_shape_nd_arr.nbytes
+                + amplitudes_delta_arr.nbytes
+                + amplitudes_average_arr.nbytes
+            )
+            <= int(max_ram_bytes)
             else "file"
         )
         amplitudes_delta, amplitudes_average, live_dir = _allocate_live_arrays(
-            chunk_id=partial.chunk_id,
-            parameter_digest=partial.parameter_digest,
+            chunk_id=work_unit.chunk_id,
+            parameter_digest=work_unit.parameter_digest,
+            partition_id=work_unit.partition_id,
             scratch_root=scratch_root,
-            template_delta=partial.amplitudes_delta,
-            template_average=partial.amplitudes_average,
+            template_delta=amplitudes_delta_arr,
+            template_average=amplitudes_average_arr,
             storage_mode=storage_mode,
         )
         amplitudes_delta[:] = 0
         amplitudes_average[:] = 0
         return cls(
-            chunk_id=partial.chunk_id,
-            parameter_digest=partial.parameter_digest,
-            partition_id=partial.work_unit.partition_id,
-            point_ids=partial.point_ids,
-            grid_shape_nd=partial.grid_shape_nd,
-            total_reciprocal_points=partial.total_reciprocal_points,
+            chunk_id=work_unit.chunk_id,
+            parameter_digest=work_unit.parameter_digest,
+            partition_id=work_unit.partition_id,
+            point_ids=point_ids_arr,
+            grid_shape_nd=grid_shape_nd_arr,
+            total_reciprocal_points=total_reciprocal_points,
             reciprocal_point_count=0,
             amplitudes_delta=amplitudes_delta,
             amplitudes_average=amplitudes_average,
@@ -294,6 +363,10 @@ class LiveLocalAccumulator:
             durable_interval_ids=(),
             durable_snapshot_seq=0,
             storage_mode=storage_mode,
+            checkpoint_write_count=0,
+            checkpoint_bytes_written_total=0,
+            checkpoint_wall_seconds_total=0.0,
+            checkpoint_cadence_batches=0,
             live_dir=live_dir,
         )
 
@@ -319,6 +392,7 @@ class LiveLocalAccumulator:
         amplitudes_delta, amplitudes_average, live_dir = _allocate_live_arrays(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
+            partition_id=partition_id,
             scratch_root=scratch_root,
             template_delta=np.asarray(snapshot["amplitudes_delta"], dtype=np.complex128),
             template_average=np.asarray(snapshot["amplitudes_average"], dtype=np.complex128),
@@ -341,34 +415,103 @@ class LiveLocalAccumulator:
             durable_interval_ids=incorporated_interval_ids,
             durable_snapshot_seq=int(snapshot_seq),
             storage_mode=storage_mode,
+            checkpoint_write_count=int(snapshot.get("checkpoint_write_count", snapshot_seq)),
+            checkpoint_bytes_written_total=int(snapshot.get("checkpoint_bytes_written_total", 0)),
+            checkpoint_wall_seconds_total=float(snapshot.get("checkpoint_wall_seconds_total", 0.0)),
+            checkpoint_cadence_batches=int(snapshot.get("checkpoint_cadence_batches", 0)),
             live_dir=live_dir,
         )
 
     def should_skip_partial(self, partial: ResidualFieldLocalAccumulatorPartial) -> bool:
         return set(partial.interval_ids).issubset(self.current_interval_ids)
 
+    def should_skip_interval_ids(self, interval_ids: tuple[int, ...]) -> bool:
+        return set(int(interval_id) for interval_id in interval_ids).issubset(
+            self.current_interval_ids
+        )
+
     def accept_partial(self, partial: ResidualFieldLocalAccumulatorPartial) -> None:
-        self._validate_partial(partial)
-        if self.should_skip_partial(partial):
+        self.accept_contribution(
+            partial.work_unit,
+            point_ids=partial.point_ids,
+            grid_shape_nd=partial.grid_shape_nd,
+            total_reciprocal_points=partial.total_reciprocal_points,
+            contribution_reciprocal_points=partial.contribution_reciprocal_points,
+            amplitudes_delta=partial.amplitudes_delta,
+            amplitudes_average=partial.amplitudes_average,
+        )
+
+    def accept_contribution(
+        self,
+        work_unit: ResidualFieldWorkUnit,
+        *,
+        point_ids: np.ndarray,
+        grid_shape_nd: np.ndarray,
+        total_reciprocal_points: int,
+        contribution_reciprocal_points: int,
+        amplitudes_delta: np.ndarray,
+        amplitudes_average: np.ndarray,
+    ) -> None:
+        self._validate_contribution(
+            work_unit,
+            point_ids=point_ids,
+            grid_shape_nd=grid_shape_nd,
+            total_reciprocal_points=total_reciprocal_points,
+            amplitudes_delta=amplitudes_delta,
+            amplitudes_average=amplitudes_average,
+        )
+        interval_ids = (
+            tuple(int(interval_id) for interval_id in work_unit.interval_ids)
+            if work_unit.interval_ids
+            else ((int(work_unit.interval_id),) if work_unit.interval_id is not None else ())
+        )
+        if self.should_skip_interval_ids(interval_ids):
             return
-        self.amplitudes_delta += partial.amplitudes_delta
-        self.amplitudes_average += partial.amplitudes_average
-        self.reciprocal_point_count += int(partial.contribution_reciprocal_points)
-        self.current_interval_ids.update(int(interval_id) for interval_id in partial.interval_ids)
+        self.amplitudes_delta += np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
+        self.amplitudes_average += np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
+        self.reciprocal_point_count += int(contribution_reciprocal_points)
+        self.current_interval_ids.update(interval_ids)
         self.accepted_since_snapshot += 1
 
     def _validate_partial(self, partial: ResidualFieldLocalAccumulatorPartial) -> None:
-        if partial.chunk_id != self.chunk_id:
+        self._validate_contribution(
+            partial.work_unit,
+            point_ids=partial.point_ids,
+            grid_shape_nd=partial.grid_shape_nd,
+            total_reciprocal_points=partial.total_reciprocal_points,
+            amplitudes_delta=partial.amplitudes_delta,
+            amplitudes_average=partial.amplitudes_average,
+        )
+
+    def _validate_contribution(
+        self,
+        work_unit: ResidualFieldWorkUnit,
+        *,
+        point_ids: np.ndarray,
+        grid_shape_nd: np.ndarray,
+        total_reciprocal_points: int,
+        amplitudes_delta: np.ndarray,
+        amplitudes_average: np.ndarray,
+    ) -> None:
+        point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        grid_shape_nd_arr = np.asarray(grid_shape_nd, dtype=np.int64)
+        amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
+        amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
+        if amplitudes_delta_arr.shape != amplitudes_average_arr.shape:
+            raise ValueError("Local residual accumulation requires matching delta/average shapes.")
+        if point_ids_arr.shape[0] != amplitudes_delta_arr.shape[0]:
+            raise ValueError("Local residual accumulation requires point_ids to match payload length.")
+        if int(work_unit.chunk_id) != self.chunk_id:
             raise ValueError("Local accumulator partial chunk_id mismatch.")
-        if partial.parameter_digest != self.parameter_digest:
+        if str(work_unit.parameter_digest) != self.parameter_digest:
             raise ValueError("Local accumulator partial parameter digest mismatch.")
-        if partial.work_unit.partition_id != self.partition_id:
+        if work_unit.partition_id != self.partition_id:
             raise ValueError("Local accumulator partial partition_id mismatch.")
-        if not np.array_equal(self.point_ids, partial.point_ids):
+        if not np.array_equal(self.point_ids, point_ids_arr):
             raise ValueError("Local accumulator partial point_ids mismatch.")
-        if not np.array_equal(self.grid_shape_nd, partial.grid_shape_nd):
+        if not np.array_equal(self.grid_shape_nd, grid_shape_nd_arr):
             raise ValueError("Local accumulator partial grid_shape_nd mismatch.")
-        if partial.total_reciprocal_points != self.total_reciprocal_points:
+        if int(total_reciprocal_points) != self.total_reciprocal_points:
             raise ValueError("Local accumulator total_reciprocal_points mismatch.")
 
     def snapshot_payload(self) -> dict[str, object]:
@@ -382,6 +525,10 @@ class LiveLocalAccumulator:
             "incorporated_interval_ids": tuple(sorted(self.current_interval_ids)),
             "partition_id": self.partition_id,
             "storage_mode": self.storage_mode,
+            "checkpoint_write_count": int(self.checkpoint_write_count),
+            "checkpoint_bytes_written_total": int(self.checkpoint_bytes_written_total),
+            "checkpoint_wall_seconds_total": float(self.checkpoint_wall_seconds_total),
+            "checkpoint_cadence_batches": int(self.checkpoint_cadence_batches),
         }
 
     def durable_progress_interval_ids(self) -> tuple[int, ...]:
@@ -396,6 +543,18 @@ class LiveLocalAccumulator:
         self.durable_snapshot_seq = int(snapshot_seq)
         self.accepted_since_snapshot = 0
         return newly_durable
+
+    def record_checkpoint_metrics(
+        self,
+        *,
+        bytes_written: int,
+        wall_seconds: float,
+        checkpoint_cadence_batches: int,
+    ) -> None:
+        self.checkpoint_write_count += 1
+        self.checkpoint_bytes_written_total += int(bytes_written)
+        self.checkpoint_wall_seconds_total += float(wall_seconds)
+        self.checkpoint_cadence_batches = int(checkpoint_cadence_batches)
 
     def cleanup_live_files(self) -> None:
         if self.live_dir is None:
@@ -413,6 +572,7 @@ def _allocate_live_arrays(
     *,
     chunk_id: int,
     parameter_digest: str,
+    partition_id: int | None,
     scratch_root: str,
     template_delta: np.ndarray,
     template_average: np.ndarray,
@@ -427,7 +587,11 @@ def _allocate_live_arrays(
         Path(scratch_root).expanduser()
         / "residual_accumulators"
         / f"chunk_{chunk_id}"
-        / f"params_{parameter_digest}"
+        / (
+            f"params_{parameter_digest}"
+            if partition_id is None
+            else f"params_{parameter_digest}_partition_{int(partition_id)}"
+        )
     )
     live_dir.mkdir(parents=True, exist_ok=True)
     delta_path = live_dir / "amplitudes_delta.npy"

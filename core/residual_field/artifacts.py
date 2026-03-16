@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import tempfile
 import time
@@ -46,6 +47,10 @@ from core.storage.database_manager import create_db_manager_for_thread
 
 
 logger = logging.getLogger(__name__)
+
+_GENERATION_FILENAME_RE = re.compile(
+    r"^generation_partition_(?P<partition_token>[^_]+)_seq_(?P<generation_seq>\d+)_params_(?P<parameter_digest>.+)$"
+)
 
 
 class _ResidualFieldChunkStatusUpdater:
@@ -150,6 +155,68 @@ def build_residual_field_shard_manifest(
     )
     validate_residual_field_shard_manifest(manifest)
     return manifest
+
+
+def build_residual_field_generation_artifacts(
+    output_dir: str,
+    *,
+    chunk_id: int,
+    partition_id: int | None,
+    generation_seq: int,
+    parameter_digest: str,
+    shard_storage_root: str | None = None,
+) -> tuple[ArtifactRef, ...]:
+    shard_root = Path(shard_storage_root or output_dir)
+    shard_dir = shard_root / "residual_shards" / f"chunk_{chunk_id}"
+    partition_token = "owner" if partition_id is None else str(int(partition_id))
+    base_name = (
+        f"generation_partition_{partition_token}_seq_{int(generation_seq)}"
+        f"_params_{parameter_digest}"
+    )
+    generation_token = f"partition-{partition_token}:seq-{int(generation_seq)}"
+    return (
+        ArtifactRef(
+            stage="residual_field",
+            kind="residual-shard-data",
+            key=make_residual_field_artifact_key(
+                "residual-shard-data",
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            + f":generation-{generation_token}",
+            path=str(shard_dir / f"{base_name}.npz"),
+            schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+        ),
+        ArtifactRef(
+            stage="residual_field",
+            kind="residual-shard-manifest",
+            key=make_residual_field_artifact_key(
+                "residual-shard-manifest",
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            + f":generation-{generation_token}",
+            path=str(shard_dir / f"{base_name}.manifest.json"),
+            schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
+        ),
+    )
+
+
+def parse_residual_field_generation_ref(
+    manifest: ResidualFieldShardManifest,
+) -> tuple[int | None, int] | None:
+    manifest_ref = next(
+        (artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"),
+        None,
+    )
+    if manifest_ref is None or manifest_ref.path is None:
+        return None
+    match = _GENERATION_FILENAME_RE.match(Path(manifest_ref.path).stem.removesuffix(".manifest"))
+    if match is None:
+        return None
+    partition_token = match.group("partition_token")
+    partition_id = None if partition_token == "owner" else int(partition_token)
+    return partition_id, int(match.group("generation_seq"))
 
 
 def _missing_artifact_kinds(
@@ -325,16 +392,52 @@ def load_residual_field_shard_manifest(manifest_path: str | Path) -> ResidualFie
 
 def _write_residual_field_shard_manifest_json(
     manifest: ResidualFieldShardManifest,
+    *,
+    extra_payload: dict[str, object] | None = None,
 ) -> None:
     manifest_ref = next(
         artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"
     )
     if manifest_ref.path is None:
         raise ValueError("Residual-field shard manifest path is required.")
+    payload = _residual_field_shard_manifest_to_payload(manifest)
+    if extra_payload:
+        payload.update(extra_payload)
     _write_json_atomic(
         Path(manifest_ref.path),
-        _residual_field_shard_manifest_to_payload(manifest),
+        payload,
     )
+
+
+def load_residual_field_generation_metadata(
+    manifest: ResidualFieldShardManifest,
+) -> dict[str, object]:
+    manifest_ref = next(
+        artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"
+    )
+    if manifest_ref.path is None or not Path(manifest_ref.path).exists():
+        return {}
+    payload = json.loads(Path(manifest_ref.path).read_text(encoding="utf-8"))
+    generation_ref = parse_residual_field_generation_ref(manifest)
+    partition_id = None
+    generation_seq = None
+    if generation_ref is not None:
+        partition_id, generation_seq = generation_ref
+    return {
+        "partition_id": (
+            int(payload["partition_id"])
+            if payload.get("partition_id") is not None
+            else partition_id
+        ),
+        "generation_seq": (
+            int(payload["generation_seq"])
+            if payload.get("generation_seq") is not None
+            else generation_seq
+        ),
+        "checkpoint_bytes_written": int(payload.get("checkpoint_bytes_written", 0)),
+        "checkpoint_wall_seconds": float(payload.get("checkpoint_wall_seconds", 0.0)),
+        "compression": str(payload.get("compression", "")),
+    }
 
 
 def load_residual_field_reducer_progress_manifest(
@@ -756,12 +859,43 @@ def load_residual_field_shard_payload(
         }
 
 
+def load_residual_field_generation_payload(
+    manifest: ResidualFieldShardManifest,
+) -> dict[str, object]:
+    shard_ref = next(
+        artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-data"
+    )
+    if shard_ref.path is None:
+        raise ValueError("Residual-field generation data path is required.")
+    with np.load(shard_ref.path, allow_pickle=False) as data:
+        return {
+            "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
+            "grid_shape_nd": np.asarray(data["grid_shape_nd"], dtype=np.int64),
+            "amplitudes_delta": np.asarray(data["amplitudes_delta"], dtype=np.complex128),
+            "amplitudes_average": np.asarray(data["amplitudes_average"], dtype=np.complex128),
+            "reciprocal_point_count": int(np.asarray(data["contribution_reciprocal_points"]).ravel()[0]),
+            "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
+            "incorporated_interval_ids": tuple(
+                int(interval_id)
+                for interval_id in np.asarray(data["contributing_interval_ids"], dtype=np.int64).tolist()
+            ),
+            "partition_id": (
+                None
+                if int(np.asarray(data["partition_id"]).ravel()[0]) < 0
+                else int(np.asarray(data["partition_id"]).ravel()[0])
+            ),
+            "generation_seq": int(np.asarray(data["generation_seq"]).ravel()[0]),
+            "storage_mode": "durable_shared_generation",
+        }
+
+
 def discover_residual_field_shard_manifests(
     *,
     output_dir: str,
     chunk_id: int,
     parameter_digest: str,
     shard_storage_root: str | None = None,
+    include_stale_generations: bool = False,
 ) -> list[ResidualFieldShardManifest]:
     shard_dir = Path(shard_storage_root or output_dir) / "residual_shards" / f"chunk_{chunk_id}"
     if not shard_dir.exists():
@@ -769,7 +903,66 @@ def discover_residual_field_shard_manifests(
     manifests: list[ResidualFieldShardManifest] = []
     for path in sorted(shard_dir.glob(f"batch_*_params_{parameter_digest}.manifest.json")):
         manifests.append(load_residual_field_shard_manifest(path))
+    generation_manifests: list[ResidualFieldShardManifest] = []
+    for path in sorted(shard_dir.glob(f"generation_*_params_{parameter_digest}.manifest.json")):
+        generation_manifests.append(load_residual_field_shard_manifest(path))
+    if include_stale_generations:
+        manifests.extend(generation_manifests)
+        return manifests
+    latest_generations: dict[int | None, tuple[int, ResidualFieldShardManifest]] = {}
+    for manifest in generation_manifests:
+        generation_ref = parse_residual_field_generation_ref(manifest)
+        if generation_ref is None:
+            manifests.append(manifest)
+            continue
+        partition_id, generation_seq = generation_ref
+        existing = latest_generations.get(partition_id)
+        if existing is None or generation_seq > existing[0]:
+            latest_generations[partition_id] = (generation_seq, manifest)
+    manifests.extend(
+        manifest
+        for _, manifest in sorted(
+            latest_generations.values(),
+            key=lambda item: (
+                -1 if parse_residual_field_generation_ref(item[1])[0] is None else int(parse_residual_field_generation_ref(item[1])[0]),
+                item[0],
+            ),
+        )
+    )
     return manifests
+
+
+def discover_stale_residual_field_generation_manifests(
+    *,
+    output_dir: str,
+    chunk_id: int,
+    parameter_digest: str,
+    shard_storage_root: str | None = None,
+) -> list[ResidualFieldShardManifest]:
+    all_manifests = discover_residual_field_shard_manifests(
+        output_dir=output_dir,
+        chunk_id=chunk_id,
+        parameter_digest=parameter_digest,
+        shard_storage_root=shard_storage_root,
+        include_stale_generations=True,
+    )
+    latest_generation_keys = {
+        manifest.artifact_key
+        for manifest in discover_residual_field_shard_manifests(
+            output_dir=output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            shard_storage_root=shard_storage_root,
+            include_stale_generations=False,
+        )
+        if parse_residual_field_generation_ref(manifest) is not None
+    }
+    return [
+        manifest
+        for manifest in all_manifests
+        if parse_residual_field_generation_ref(manifest) is not None
+        and manifest.artifact_key not in latest_generation_keys
+    ]
 
 
 def _merge_residual_field_shard_manifests(
@@ -911,7 +1104,6 @@ def delete_reclaimable_residual_field_shards(
     if (
         progress is None
         or progress.completion_status is not CompletionStatus.COMMITTED
-        or progress.cleanup_policy != "delete_reclaimable"
     ):
         return ()
     shard_manifests = _merge_residual_field_shard_manifests(
@@ -921,10 +1113,32 @@ def delete_reclaimable_residual_field_shards(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
             shard_storage_root=shard_storage_root,
+            include_stale_generations=True,
         ),
     )
+    latest_generation_keys = {
+        latest.artifact_key
+        for latest in discover_residual_field_shard_manifests(
+            output_dir=output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            shard_storage_root=shard_storage_root,
+        )
+        if parse_residual_field_generation_ref(latest) is not None
+    }
     deleted: list[str] = []
     for manifest in shard_manifests:
+        generation_ref = parse_residual_field_generation_ref(manifest)
+        if generation_ref is not None:
+            if manifest.artifact_key not in latest_generation_keys:
+                for artifact in manifest.artifacts:
+                    if artifact.path is None:
+                        continue
+                    Path(artifact.path).unlink(missing_ok=True)
+                deleted.append(manifest.artifact_key)
+                continue
+        if progress.cleanup_policy != "delete_reclaimable":
+            continue
         if not is_residual_field_shard_reclaimable(
             manifest,
             output_dir=output_dir,
@@ -1026,15 +1240,31 @@ def persist_residual_field_shard_checkpoint(
         save_fn(
             handle,
             interval_id=np.array([work_unit.interval_id], dtype=np.int64),
-            contributing_interval_ids=np.asarray(manifest.contributing_interval_ids, dtype=np.int64),
+            contributing_interval_ids=np.asarray(
+                manifest.contributing_interval_ids,
+                dtype=np.int64,
+            ),
             chunk_id=np.array([work_unit.chunk_id], dtype=np.int64),
             parameter_digest=np.array([work_unit.parameter_digest]),
-            point_ids=np.asarray(point_ids if point_ids is not None else np.arange(np.asarray(amplitudes_delta).reshape(-1).shape[0], dtype=np.int64)),
+            point_ids=np.asarray(
+                point_ids
+                if point_ids is not None
+                else np.arange(
+                    np.asarray(amplitudes_delta).reshape(-1).shape[0],
+                    dtype=np.int64,
+                )
+            ),
             grid_shape_nd=np.asarray(grid_shape_nd),
             amplitudes_delta=np.asarray(amplitudes_delta),
             amplitudes_average=np.asarray(amplitudes_average),
-            contribution_reciprocal_points=np.array([int(contribution_reciprocal_points)], dtype=np.int64),
-            total_reciprocal_points=np.array([int(total_reciprocal_points)], dtype=np.int64),
+            contribution_reciprocal_points=np.array(
+                [int(contribution_reciprocal_points)],
+                dtype=np.int64,
+            ),
+            total_reciprocal_points=np.array(
+                [int(total_reciprocal_points)],
+                dtype=np.int64,
+            ),
         )
     scratch_path = Path(handle.name)
     if scratch_path.parent == shard_path.parent:
@@ -1076,6 +1306,165 @@ def persist_residual_field_shard_checkpoint(
     return manifest
 
 
+def persist_residual_field_generation_checkpoint(
+    *,
+    chunk_id: int,
+    parameter_digest: str,
+    partition_id: int | None,
+    generation_seq: int,
+    incorporated_interval_ids: tuple[int, ...],
+    grid_shape_nd: np.ndarray,
+    reciprocal_point_count: int,
+    total_reciprocal_points: int,
+    amplitudes_delta: np.ndarray,
+    amplitudes_average: np.ndarray,
+    point_ids: np.ndarray,
+    output_dir: str,
+    scratch_root: str | None = None,
+    shard_storage_root: str | None = None,
+    compress: bool = True,
+    quiet_logs: bool = False,
+) -> ResidualFieldShardManifest:
+    start_time = time.perf_counter()
+    interval_ids = tuple(sorted(set(int(v) for v in incorporated_interval_ids)))
+    if not interval_ids:
+        raise ValueError("Residual-field generation checkpoint requires interval coverage.")
+
+    artifacts = build_residual_field_generation_artifacts(
+        output_dir,
+        chunk_id=chunk_id,
+        partition_id=partition_id,
+        generation_seq=generation_seq,
+        parameter_digest=parameter_digest,
+        shard_storage_root=shard_storage_root,
+    )
+    manifest = ResidualFieldShardManifest(
+        artifact_key=artifacts[0].key,
+        artifacts=artifacts,
+        completion_status=CompletionStatus.COMMITTED,
+        retry=ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=interval_ids,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+        ).retry,
+        interval_id=int(interval_ids[0]),
+        contributing_interval_ids=interval_ids,
+        chunk_id=int(chunk_id),
+        parameter_digest=str(parameter_digest),
+        point_count=int(np.asarray(point_ids, dtype=np.int64).reshape(-1).shape[0]),
+        contribution_reciprocal_point_count=int(reciprocal_point_count),
+        total_reciprocal_point_count=int(total_reciprocal_points),
+        scratch_root=str(Path(scratch_root).expanduser()) if scratch_root else None,
+    )
+    assessment = assess_residual_field_shard_manifest(manifest)
+    if assessment.is_complete:
+        if quiet_logs:
+            logger.debug(
+                "write-generation | chunk %d | partition %s | seq=%d already committed",
+                chunk_id,
+                "owner" if partition_id is None else partition_id,
+                generation_seq,
+            )
+        else:
+            logger.info(
+                "write-generation | chunk %d | partition %s | seq=%d already committed",
+                chunk_id,
+                "owner" if partition_id is None else partition_id,
+                generation_seq,
+            )
+        return manifest
+
+    shard_ref = next(
+        artifact for artifact in artifacts if artifact.kind == "residual-shard-data"
+    )
+    if shard_ref.path is None:
+        raise ValueError("Residual-field generation data path is required.")
+    shard_path = Path(shard_ref.path)
+    shard_path.parent.mkdir(parents=True, exist_ok=True)
+    scratch_dir = (
+        Path(manifest.scratch_root).expanduser()
+        / "residual_shards"
+        / f"chunk_{chunk_id}"
+        if manifest.scratch_root
+        else shard_path.parent
+    )
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=scratch_dir,
+        prefix=f"{shard_path.stem}_",
+        suffix=".npz",
+        delete=False,
+    ) as handle:
+        save_fn = np.savez_compressed if compress else np.savez
+        save_fn(
+            handle,
+            interval_id=np.array([int(interval_ids[0])], dtype=np.int64),
+            contributing_interval_ids=np.asarray(interval_ids, dtype=np.int64),
+            chunk_id=np.array([int(chunk_id)], dtype=np.int64),
+            parameter_digest=np.array([str(parameter_digest)]),
+            point_ids=np.asarray(point_ids, dtype=np.int64),
+            grid_shape_nd=np.asarray(grid_shape_nd, dtype=np.int64),
+            amplitudes_delta=np.asarray(amplitudes_delta, dtype=np.complex128),
+            amplitudes_average=np.asarray(amplitudes_average, dtype=np.complex128),
+            contribution_reciprocal_points=np.array([int(reciprocal_point_count)], dtype=np.int64),
+            total_reciprocal_points=np.array([int(total_reciprocal_points)], dtype=np.int64),
+            partition_id=np.array([-1 if partition_id is None else int(partition_id)], dtype=np.int64),
+            generation_seq=np.array([int(generation_seq)], dtype=np.int64),
+        )
+    scratch_path = Path(handle.name)
+    if scratch_path.parent == shard_path.parent:
+        scratch_path.replace(shard_path)
+    else:
+        with tempfile.NamedTemporaryFile(
+            dir=shard_path.parent,
+            prefix=f"{shard_path.stem}_commit_",
+            suffix=".npz",
+            delete=False,
+        ) as durable_handle:
+            durable_tmp_path = Path(durable_handle.name)
+        shutil.copyfile(scratch_path, durable_tmp_path)
+        durable_tmp_path.replace(shard_path)
+        scratch_path.unlink(missing_ok=True)
+    checkpoint_wall_seconds = time.perf_counter() - start_time
+    checkpoint_bytes_written = sum(
+        int(Path(artifact.path).stat().st_size)
+        for artifact in manifest.artifacts
+        if artifact.path is not None and Path(artifact.path).exists()
+    )
+    _write_residual_field_shard_manifest_json(
+        manifest,
+        extra_payload={
+            "partition_id": (
+                None if partition_id is None else int(partition_id)
+            ),
+            "generation_seq": int(generation_seq),
+            "checkpoint_bytes_written": int(checkpoint_bytes_written),
+            "checkpoint_wall_seconds": float(checkpoint_wall_seconds),
+            "compression": "np.savez_compressed" if compress else "np.savez",
+        },
+    )
+    if quiet_logs:
+        logger.debug(
+            "write-generation | chunk %d | partition %s | seq=%d committed | bytes=%d | duration=%.3fs",
+            chunk_id,
+            "owner" if partition_id is None else partition_id,
+            generation_seq,
+            checkpoint_bytes_written,
+            checkpoint_wall_seconds,
+        )
+    else:
+        logger.info(
+            "write-generation | chunk %d | partition %s | seq=%d committed | bytes=%d | duration=%.3fs",
+            chunk_id,
+            "owner" if partition_id is None else partition_id,
+            generation_seq,
+            checkpoint_bytes_written,
+            checkpoint_wall_seconds,
+        )
+    return manifest
+
+
 def summarize_residual_field_shards(
     manifests: list[ResidualFieldShardManifest],
 ) -> dict[str, int]:
@@ -1093,6 +1482,32 @@ def summarize_residual_field_shards(
         "committed_shard_count": int(len(manifests)),
         "committed_shard_bytes": int(shard_bytes),
         "committed_point_count": int(point_count),
+    }
+
+
+def summarize_residual_field_generation_metrics(
+    manifests: list[ResidualFieldShardManifest],
+) -> dict[str, float | int]:
+    total_checkpoint_bytes = 0
+    total_checkpoint_writes = 0
+    total_checkpoint_wall_seconds = 0.0
+    max_generation_seq = 0
+    for manifest in manifests:
+        if parse_residual_field_generation_ref(manifest) is None:
+            continue
+        metadata = load_residual_field_generation_metadata(manifest)
+        total_checkpoint_writes += 1
+        total_checkpoint_bytes += int(metadata.get("checkpoint_bytes_written", 0))
+        total_checkpoint_wall_seconds += float(metadata.get("checkpoint_wall_seconds", 0.0))
+        max_generation_seq = max(
+            max_generation_seq,
+            int(metadata.get("generation_seq") or 0),
+        )
+    return {
+        "total_checkpoint_bytes_written": int(total_checkpoint_bytes),
+        "total_checkpoint_writes": int(total_checkpoint_writes),
+        "total_checkpoint_wall_seconds": float(total_checkpoint_wall_seconds),
+        "max_generation_seq": int(max_generation_seq),
     }
 
 
@@ -1185,6 +1600,7 @@ def reduce_residual_field_shards_for_chunk(
     if not committed_shards:
         return None
     shard_summary = summarize_residual_field_shards(committed_shards)
+    generation_summary = summarize_residual_field_generation_metrics(committed_shards)
 
     with chunk_mutex(chunk_id):
         store = artifact_store_factory(output_dir)
@@ -1351,22 +1767,28 @@ def reduce_residual_field_shards_for_chunk(
     write_residual_field_reducer_progress_manifest(progress_manifest)
     if quiet_logs:
         logger.debug(
-            "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | duration=%.3fs",
+            "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | checkpoint_writes=%d | checkpoint_bytes=%d | checkpoint_wall=%.3fs | duration=%.3fs",
             chunk_id,
             len(reduced_shard_keys),
             shard_summary["committed_shard_count"],
             shard_summary["committed_shard_bytes"],
             shard_summary["committed_point_count"],
+            generation_summary["total_checkpoint_writes"],
+            generation_summary["total_checkpoint_bytes_written"],
+            generation_summary["total_checkpoint_wall_seconds"],
             time.perf_counter() - start_time,
         )
     else:
         logger.info(
-            "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | duration=%.3fs",
+            "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | checkpoint_writes=%d | checkpoint_bytes=%d | checkpoint_wall=%.3fs | duration=%.3fs",
             chunk_id,
             len(reduced_shard_keys),
             shard_summary["committed_shard_count"],
             shard_summary["committed_shard_bytes"],
             shard_summary["committed_point_count"],
+            generation_summary["total_checkpoint_writes"],
+            generation_summary["total_checkpoint_bytes_written"],
+            generation_summary["total_checkpoint_wall_seconds"],
             time.perf_counter() - start_time,
         )
     return manifest
@@ -1508,6 +1930,7 @@ __all__ = [
     "assess_residual_field_manifest",
     "assess_residual_field_shard_manifest",
     "build_residual_field_chunk_manifest",
+    "build_residual_field_generation_artifacts",
     "build_residual_field_output_artifact_refs",
     "build_residual_field_reducer_progress_artifact",
     "build_residual_field_shard_manifest",
@@ -1515,18 +1938,24 @@ __all__ = [
     "delete_reclaimable_residual_field_shards",
     "discover_residual_field_reducer_progress_manifest",
     "discover_residual_field_shard_manifests",
+    "discover_stale_residual_field_generation_manifests",
     "is_residual_field_manifest_complete",
     "is_residual_field_shard_reclaimable",
     "list_reclaimable_residual_field_shards",
     "load_existing_residual_field_partial_result",
     "load_existing_materialized_state",
+    "load_residual_field_generation_metadata",
+    "load_residual_field_generation_payload",
     "load_residual_field_reducer_progress_manifest",
     "load_residual_field_shard_manifest",
     "load_residual_field_shard_payload",
+    "parse_residual_field_generation_ref",
+    "persist_residual_field_generation_checkpoint",
     "persist_residual_field_shard_checkpoint",
     "persist_residual_field_chunk_result",
     "persist_residual_field_interval_chunk_result",
     "reconcile_residual_field_reducer_progress",
     "reduce_residual_field_shards_for_chunk",
+    "summarize_residual_field_generation_metrics",
     "write_residual_field_reducer_progress_manifest",
 ]

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Sequence
 
@@ -9,7 +8,6 @@ import numpy as np
 
 from core.residual_field.backend import (
     ResidualFieldReducerBackend,
-    ResidualFieldLocalAccumulatorPartial,
     build_residual_field_reducer_backend,
     get_process_local_residual_field_backend,
 )
@@ -68,9 +66,9 @@ def run_residual_field_interval_chunk_task(
     scratch_root: str | None = None,
     reducer_backend: ResidualFieldReducerBackend | None = None,
     total_expected_partials: int | None = None,
-    worker_owned_local_reducer: bool = False,
+    owner_local_reducer: bool = False,
     quiet_logs: bool = False,
-) -> ResidualFieldShardManifest | ResidualFieldLocalAccumulatorPartial | ResidualFieldAccumulatorStatus | None:
+) -> ResidualFieldShardManifest | ResidualFieldAccumulatorStatus | None:
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
     try:
         show_progress = _task_progress_enabled(quiet_logs)
@@ -93,14 +91,22 @@ def run_residual_field_interval_chunk_task(
             }
             for index in range(partition_atoms.shape[0])
         ]
-        if resolved_backend.uses_local_chunk_accumulator() and worker_owned_local_reducer:
+        if owner_local_reducer:
             if scratch_root is None or db_path is None or total_expected_partials is None:
                 raise ValueError(
-                    "Worker-owned local reduction requires scratch_root, db_path, and total_expected_partials."
+                    "Owner-local reducer tasks require scratch_root, db_path, and total_expected_partials."
+                )
+            if not callable(getattr(resolved_backend, "accept_local_contribution", None)):
+                raise ValueError(
+                    "Residual-field owner-local reduction requires accept_local_contribution support."
                 )
             worker_backend = get_process_local_residual_field_backend(
                 resolved_backend
             )
+            if not callable(getattr(worker_backend, "accept_local_contribution", None)):
+                raise ValueError(
+                    "Residual-field owner-local reduction requires process-local accept_local_contribution support."
+                )
             already_durable = getattr(
                 worker_backend,
                 "local_intervals_already_durable",
@@ -190,41 +196,8 @@ def run_residual_field_interval_chunk_task(
                 else amplitudes_average + grouped_average
             )
         point_ids = np.arange(amplitudes_delta.shape[0], dtype=np.int64)
-        if resolved_backend.uses_local_chunk_accumulator():
-            if worker_owned_local_reducer:
-                partial = worker_backend.build_local_partial(
-                    work_unit,
-                    grid_shape_nd=grid_shape_nd,
-                    total_reciprocal_points=total_reciprocal_points,
-                    contribution_reciprocal_points=contribution_reciprocal_points,
-                    amplitudes_delta=amplitudes_delta,
-                    amplitudes_average=amplitudes_average,
-                    point_ids=point_ids,
-                )
-                worker_backend.accept_partial(
-                    partial,
-                    output_dir=output_dir,
-                    scratch_root=scratch_root,
-                    db_path=db_path,
-                    total_expected_partials=total_expected_partials,
-                    cleanup_policy="off",
-                )
-                return ResidualFieldAccumulatorStatus(
-                    artifact_key=work_unit.artifact_key,
-                    chunk_id=work_unit.chunk_id,
-                    parameter_digest=work_unit.parameter_digest,
-                    interval_ids=work_unit.interval_ids,
-                    partition_id=work_unit.partition_id,
-                    contribution_reciprocal_point_count=contribution_reciprocal_points,
-                    total_reciprocal_points=total_reciprocal_points,
-                )
-            if show_progress:
-                logger.info(
-                    "Residual batch ready for local accumulator | chunk=%d | intervals=%s",
-                    int(work_unit.chunk_id),
-                    ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a",
-                )
-            return resolved_backend.build_local_partial(
+        if owner_local_reducer:
+            worker_backend.accept_local_contribution(
                 work_unit,
                 grid_shape_nd=grid_shape_nd,
                 total_reciprocal_points=total_reciprocal_points,
@@ -232,6 +205,20 @@ def run_residual_field_interval_chunk_task(
                 amplitudes_delta=amplitudes_delta,
                 amplitudes_average=amplitudes_average,
                 point_ids=point_ids,
+                output_dir=output_dir,
+                scratch_root=scratch_root,
+                db_path=db_path,
+                total_expected_partials=total_expected_partials,
+                cleanup_policy="off",
+            )
+            return ResidualFieldAccumulatorStatus(
+                artifact_key=work_unit.artifact_key,
+                chunk_id=work_unit.chunk_id,
+                parameter_digest=work_unit.parameter_digest,
+                interval_ids=work_unit.interval_ids,
+                partition_id=work_unit.partition_id,
+                contribution_reciprocal_point_count=contribution_reciprocal_points,
+                total_reciprocal_points=total_reciprocal_points,
             )
         if show_progress:
             logger.info(
