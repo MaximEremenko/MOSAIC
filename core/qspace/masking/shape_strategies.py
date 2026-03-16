@@ -16,13 +16,32 @@ from core.qspace.masking.shape_cpu import (
 )
 
 
+def _resolve_coord_bounds(
+    data_points: np.ndarray,
+    mask_context: Dict[str, Any] | None,
+    *,
+    dims: int,
+    pad: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    context = mask_context or {}
+    coord_min = context.get("interval_coord_min")
+    coord_max = context.get("interval_coord_max")
+    if coord_min is None or coord_max is None:
+        coord_min = np.min(data_points, axis=0)
+        coord_max = np.max(data_points, axis=0)
+    coord_min = np.asarray(coord_min, dtype=np.float64).reshape(-1)[:dims]
+    coord_max = np.asarray(coord_max, dtype=np.float64).reshape(-1)[:dims]
+    return coord_min - pad, coord_max + pad
+
+
 class SphereShapeStrategy:
+    blockwise_safe = True
+
     def __init__(self, spetial_points_param: Dict[str, Any]):
         self.spetial_points_param = spetial_points_param
 
-    def generate_mask(self, data: np.ndarray) -> np.ndarray:
-        coord_min = np.min(data, axis=0)
-        coord_max = np.max(data, axis=0)
+    def generate_mask(self, data: np.ndarray, mask_context: Dict[str, Any] | None = None) -> np.ndarray:
+        coord_min, coord_max = _resolve_coord_bounds(data, mask_context, dims=3, pad=0.0)
 
         special_points = self.spetial_points_param["specialPoints"]
         M = len(special_points)
@@ -36,6 +55,8 @@ class SphereShapeStrategy:
 
 
 class EllipsoidShapeStrategy:
+    blockwise_safe = True
+
     def __init__(self, spetial_points: np.ndarray, axes: np.ndarray, theta: float, phi: float):
         self.axes = axes
         self.rotation_matrix = self._create_rotation_matrix(theta, phi)
@@ -70,12 +91,13 @@ class EllipsoidShapeStrategy:
 
 
 class CircleShapeStrategy:
+    blockwise_safe = True
+
     def __init__(self, special_points_param: Dict[str, Any]):
         self.special_points_param = special_points_param
 
-    def generate_mask(self, data_points: np.ndarray) -> np.ndarray:
-        coord_min = np.min(data_points, axis=0) - 1
-        coord_max = np.max(data_points, axis=0) + 1
+    def generate_mask(self, data_points: np.ndarray, mask_context: Dict[str, Any] | None = None) -> np.ndarray:
+        coord_min, coord_max = _resolve_coord_bounds(data_points, mask_context, dims=2, pad=1.0)
 
         special_points = self.special_points_param["specialPoints"]
         num_circles = len(special_points)
@@ -90,12 +112,20 @@ class CircleShapeStrategy:
 
 
 class IntervalShapeStrategy:
+    blockwise_safe = True
+
     def __init__(self, special_points_param: Dict[str, Any]):
         self.special_points_param = special_points_param
 
-    def generate_mask(self, data_points: np.ndarray) -> np.ndarray:
-        coord_min = np.min(data_points) - 1
-        coord_max = np.max(data_points) + 1
+    def generate_mask(self, data_points: np.ndarray, mask_context: Dict[str, Any] | None = None) -> np.ndarray:
+        coord_min_vec, coord_max_vec = _resolve_coord_bounds(
+            data_points,
+            mask_context,
+            dims=1,
+            pad=1.0,
+        )
+        coord_min = float(coord_min_vec[0])
+        coord_max = float(coord_max_vec[0])
 
         special_points = self.special_points_param["specialPoints"]
         num_intervals = len(special_points)
