@@ -32,7 +32,7 @@ class StructureInfo(_MappingView):
     filename: str = ""
     config_root: str | None = None
     filename_av: str | None = None
-    coeff_source: str | None = None
+    coeff_scheme: str | None = None
     coeff_file: str | None = None
     cells_limits_min: tuple[Any, ...] | None = None
     cells_limits_max: tuple[Any, ...] | None = None
@@ -51,7 +51,11 @@ class StructureInfo(_MappingView):
             filename=str(mapping.get("filename", "")),
             config_root=mapping.get("config_root"),
             filename_av=mapping.get("filename_av"),
-            coeff_source=mapping.get("coeff_source"),
+            coeff_scheme=mapping.get("coeff_scheme")
+            if mapping.get("coeff_scheme") is not None
+            else mapping.get("coeff_source")
+            if mapping.get("coeff_source") is not None
+            else mapping.get("coefficient_scheme"),
             coeff_file=mapping.get("coeff_file"),
             cells_limits_min=mapping.get("cells_limits_min"),
             cells_limits_max=mapping.get("cells_limits_max"),
@@ -67,8 +71,8 @@ class StructureInfo(_MappingView):
             payload["config_root"] = self.config_root
         if self.filename_av is not None:
             payload["filename_av"] = self.filename_av
-        if self.coeff_source is not None:
-            payload["coeff_source"] = self.coeff_source
+        if self.coeff_scheme is not None:
+            payload["coeff_scheme"] = self.coeff_scheme
         if self.coeff_file is not None:
             payload["coeff_file"] = self.coeff_file
         if self.cells_limits_min is not None:
@@ -314,58 +318,97 @@ class RSpaceInfo(_MappingView):
 
 
 @dataclass
-class FormFactorConfig(_MappingView):
-    family: str = "neutron"
+class ScatteringWeightConfig(_MappingView):
+    kind: str = "ones"
     calculator: str = "default"
 
+    @staticmethod
+    def _normalize_kind(value: Any) -> str:
+        normalized = str(value or "ones").strip().lower()
+        if normalized in {
+            "unity",
+            "atomicnumber",
+            "z",
+            "neutron_scattering_length",
+            "neutron_scattering_lengths",
+        }:
+            raise ValueError(
+                "Legacy scattering_weights.kind values are no longer supported. "
+                "Use one of: ones, atomic_number, neutron, xray, electron."
+            )
+        return normalized
+
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any] | None) -> "FormFactorConfig":
+    def from_mapping(cls, payload: Mapping[str, Any] | None) -> "ScatteringWeightConfig":
         mapping = dict(payload or {})
+        legacy_keys = {
+            "family",
+            "source",
+            "factory",
+            "type",
+            "method",
+            "name",
+            "form_factor_family",
+            "form_factor_calculator",
+        }
+        present_legacy_keys = sorted(key for key in legacy_keys if key in mapping)
+        if present_legacy_keys:
+            raise ValueError(
+                "Legacy scattering-weight keys are no longer supported: "
+                f"{', '.join(present_legacy_keys)}. "
+                "Use runtime.scattering_weights.kind and runtime.scattering_weights.calculator."
+            )
+        unsupported_keys = sorted(
+            key for key in mapping if key not in {"kind", "calculator"}
+        )
+        if unsupported_keys:
+            raise ValueError(
+                "Unsupported scattering-weight keys: "
+                f"{', '.join(unsupported_keys)}. "
+                "Use runtime.scattering_weights.kind and runtime.scattering_weights.calculator."
+            )
         return cls(
-            family=str(
-                mapping.get("family")
-                or mapping.get("factory")
-                or mapping.get("type")
-                or mapping.get("form_factor_family")
-                or "neutron"
-            ).strip().lower(),
-            calculator=str(
-                mapping.get("calculator")
-                or mapping.get("method")
-                or mapping.get("name")
-                or mapping.get("form_factor_calculator")
-                or "default"
-            ).strip(),
+            kind=cls._normalize_kind(mapping.get("kind") or "ones"),
+            calculator=str(mapping.get("calculator") or "default").strip(),
         )
 
     def to_mapping(self) -> dict[str, Any]:
         return {
-            "family": self.family,
+            "kind": self.kind,
             "calculator": self.calculator,
         }
 
 
 @dataclass
 class WorkflowRuntimeInfo(_MappingView):
-    form_factor: FormFactorConfig = field(default_factory=FormFactorConfig)
+    scattering_weights: ScatteringWeightConfig = field(default_factory=ScatteringWeightConfig)
     extra: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any] | None) -> "WorkflowRuntimeInfo":
         mapping = dict(payload or {})
-        form_factor = FormFactorConfig.from_mapping(
-            mapping.get("form_factor") or mapping.get("formFactor")
+        present_legacy_keys = sorted(
+            key for key in ("scatteringWeights", "form_factor", "formFactor") if key in mapping
+        )
+        if present_legacy_keys:
+            raise ValueError(
+                "Legacy runtime scattering-weight keys are no longer supported: "
+                f"{', '.join(present_legacy_keys)}. "
+                "Use runtime.scattering_weights."
+            )
+        scattering_weights = ScatteringWeightConfig.from_mapping(
+            mapping.get("scattering_weights")
         )
         extra = {
             key: value
             for key, value in mapping.items()
-            if key not in {"form_factor", "formFactor"}
+            if key != "scattering_weights"
         }
-        return cls(form_factor=form_factor, extra=extra)
+        return cls(scattering_weights=scattering_weights, extra=extra)
 
     def to_mapping(self) -> dict[str, Any]:
         payload = dict(self.extra)
-        payload["form_factor"] = self.form_factor.to_mapping()
+        payload["scattering_weights"] = self.scattering_weights.to_mapping()
         return payload
 
 
@@ -563,6 +606,7 @@ class ReciprocalSpaceArtifacts:
     db_manager: object
     compact_intervals: list[dict[str, Any]]
     padded_intervals: list[dict[str, Any]]
+    transient_interval_payloads: dict[int, Any] = field(default_factory=dict)
 
     def close(self) -> None:
         close = getattr(self.db_manager, "close", None)
@@ -571,7 +615,7 @@ class ReciprocalSpaceArtifacts:
 
 
 __all__ = [
-    "FormFactorConfig",
+    "ScatteringWeightConfig",
     "PeakInfo",
     "PointData",
     "RSpaceInfo",

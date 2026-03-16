@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from core.models import ScatteringWeightConfig
 from core.config.values import (
     as_bool,
     first_present,
@@ -80,6 +81,26 @@ def expand_processing_points(points: list[dict[str, Any]]) -> list[dict[str, Any
     return expanded
 
 
+def normalize_runtime_section(runtime: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(runtime or {})
+    present_legacy_keys = sorted(
+        key for key in ("scatteringWeights", "form_factor", "formFactor") if key in normalized
+    )
+    if present_legacy_keys:
+        raise ValueError(
+            "Legacy runtime scattering-weight keys are no longer supported: "
+            f"{', '.join(present_legacy_keys)}. "
+            "Use runtime.scattering_weights."
+        )
+    selection_payload = normalized.get("scattering_weights")
+    if selection_payload is None:
+        return normalized
+
+    selection = ScatteringWeightConfig.from_mapping(selection_payload)
+    normalized["scattering_weights"] = selection.to_mapping()
+    return normalized
+
+
 def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("Input parameters must be a JSON object.")
@@ -101,6 +122,8 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
     reciprocal_space = parameters.get("reciprocal_space") or {}
     processing = parameters.get("processing") or {}
     runtime = parameters.get("runtime") or parameters.get("runtime_info") or {}
+    if isinstance(runtime, dict):
+        runtime = normalize_runtime_section(runtime)
     coefficients = structure.get("coefficients") if isinstance(structure.get("coefficients"), dict) else {}
     processing_coeff = processing.get("coefficients") if isinstance(processing.get("coefficients"), dict) else {}
     decoder = processing.get("decoder") if isinstance(processing.get("decoder"), dict) else {}
@@ -122,9 +145,12 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
     if average_structure_file is not None:
         struct_info["filename_av"] = average_structure_file
 
-    coeff_source = first_present(coefficients, ("source", "coeff_source", "coeffSource"))
-    if coeff_source is not None:
-        struct_info["coeff_source"] = coeff_source
+    coeff_scheme = first_present(
+        coefficients,
+        ("scheme", "coeff_scheme", "coeffScheme", "source", "coeff_source", "coeffSource"),
+    )
+    if coeff_scheme is not None:
+        struct_info["coeff_scheme"] = coeff_scheme
     coeff_file = first_present(coefficients, ("file", "path", "filename", "coeff_file", "coeff_path"))
     if coeff_file is not None:
         struct_info["coeff_file"] = coeff_file

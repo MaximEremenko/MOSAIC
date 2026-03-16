@@ -4,7 +4,7 @@ import os
 
 from core.config.values import as_bool, first_present
 from core.models import RuntimeSettings, WorkflowParameters
-from core.scattering.form_factors.contracts import FormFactorSelection
+from core.scattering.form_factors.contracts import ScatteringWeightSelection
 
 
 def apply_runtime_settings(runtime_settings: RuntimeSettings) -> None:
@@ -15,12 +15,12 @@ def apply_runtime_settings(runtime_settings: RuntimeSettings) -> None:
     os.environ["DASK_PROCESSES"] = "1" if runtime_settings.processes else "0"
 
 
-def resolve_form_factor_settings(
+def resolve_scattering_weight_settings(
     workflow_parameters: WorkflowParameters,
-) -> FormFactorSelection:
-    return FormFactorSelection(
-        family=workflow_parameters.runtime_info.form_factor.family,
-        calculator=workflow_parameters.runtime_info.form_factor.calculator,
+) -> ScatteringWeightSelection:
+    return ScatteringWeightSelection(
+        kind=workflow_parameters.runtime_info.scattering_weights.kind,
+        calculator=workflow_parameters.runtime_info.scattering_weights.calculator,
     )
 
 

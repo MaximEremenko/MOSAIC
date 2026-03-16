@@ -9,7 +9,7 @@ from core.scattering.payloads import (
     build_base_amplitude_parameters,
 )
 from core.config import ParameterLoadingService
-from core.scattering.form_factors.registry import FormFactorRegistry
+from core.scattering.form_factors.registry import ScatteringWeightRegistry
 from core.qspace.masking.service import MaskStrategyService
 from core.qspace.intervals.interval_reconstruction import (
     IntervalReconstructionService,
@@ -31,14 +31,15 @@ class ScatteringStage:
         coefficient_centering_service: CoefficientCenteringService,
         mask_strategy_service: MaskStrategyService,
         interval_reconstruction_service: IntervalReconstructionService,
-        form_factor_registry: FormFactorRegistry,
+        scattering_weight_registry: ScatteringWeightRegistry | None = None,
         compute_amplitudes=_compute_amplitudes,
     ) -> None:
+        registry = scattering_weight_registry or ScatteringWeightRegistry()
         self.parameter_loading_service = parameter_loading_service
         self.coefficient_centering_service = coefficient_centering_service
         self.mask_strategy_service = mask_strategy_service
         self.interval_reconstruction_service = interval_reconstruction_service
-        self.form_factor_registry = form_factor_registry
+        self.scattering_weight_registry = registry
         self.compute_amplitudes = compute_amplitudes
 
     def execute(
@@ -61,12 +62,12 @@ class ScatteringStage:
             return {}
         base_params = build_base_amplitude_parameters(context)
         amplitude_parameters = build_amplitude_adapter_payload(context, base_params)
-        ff_calculator_impl = self.form_factor_registry.create_calculator(
-            context.form_factor_selection
+        scattering_calculator_impl = self.scattering_weight_registry.create_calculator(
+            context.scattering_weight_selection
         )
         self.compute_amplitudes(
             parameters=amplitude_parameters,
-            FormFactorFactoryProducer=ff_calculator_impl,
+            FormFactorFactoryProducer=scattering_calculator_impl,
             MaskStrategy=context.mask_strategy,
             MaskStrategyParameters=context.workflow_parameters.peak_info.to_mapping(),
             db_manager=context.artifacts.db_manager,
