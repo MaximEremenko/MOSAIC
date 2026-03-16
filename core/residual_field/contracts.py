@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -231,8 +231,10 @@ def build_residual_field_shard_artifacts(
     chunk_id: int,
     interval_ids: tuple[int, ...],
     parameter_digest: str,
+    shard_storage_root: str | None = None,
 ) -> tuple[ArtifactRef, ...]:
-    shard_dir = Path(output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    shard_root = Path(shard_storage_root or output_dir)
+    shard_dir = shard_root / "residual_shards" / f"chunk_{chunk_id}"
     batch_token = make_residual_field_batch_token(interval_ids)
     base_name = f"batch_{batch_token}_params_{parameter_digest}"
     return (
@@ -278,6 +280,9 @@ class ResidualFieldWorkUnit:
     window_spec: str | None
     artifact_key: str
     retry: RetryIdempotencySemantics
+    partition_id: int | None = None
+    point_start: int | None = None
+    point_stop: int | None = None
     schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -413,6 +418,64 @@ class ResidualFieldWorkUnit:
     @property
     def artifact_schema(self) -> ArtifactSchemaSpec:
         return RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA
+
+    def with_partition(
+        self,
+        *,
+        partition_id: int,
+        point_start: int,
+        point_stop: int,
+    ) -> "ResidualFieldWorkUnit":
+        token = f"partition-{int(partition_id)}:points-{int(point_start)}-{int(point_stop)}"
+        return replace(
+            self,
+            artifact_key=f"{self.artifact_key}:{token}",
+            retry=RetryIdempotencySemantics(
+                failure_unit=self.retry.failure_unit,
+                retry_unit=self.retry.retry_unit,
+                idempotency_key=f"{self.retry.idempotency_key}:{token}",
+                replay_disposition=self.retry.replay_disposition,
+                crash_recovery_rule=self.retry.crash_recovery_rule,
+            ),
+            partition_id=int(partition_id),
+            point_start=int(point_start),
+            point_stop=int(point_stop),
+        )
+
+
+@dataclass(frozen=True)
+class ResidualFieldAccumulatorStatus:
+    """
+    Small task-return contract for worker-owned local reduction.
+    """
+
+    artifact_key: str
+    chunk_id: int
+    parameter_digest: str
+    interval_ids: tuple[int, ...]
+    contribution_reciprocal_point_count: int
+    total_reciprocal_points: int
+    partition_id: int | None = None
+    reducer_mode: str = "local_owner"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "interval_ids",
+            tuple(sorted(int(interval_id) for interval_id in self.interval_ids)),
+        )
+        object.__setattr__(
+            self,
+            "contribution_reciprocal_point_count",
+            int(self.contribution_reciprocal_point_count),
+        )
+        object.__setattr__(
+            self,
+            "total_reciprocal_points",
+            int(self.total_reciprocal_points),
+        )
+        if self.partition_id is not None:
+            object.__setattr__(self, "partition_id", int(self.partition_id))
 
 
 @dataclass(frozen=True)
@@ -559,6 +622,20 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
         raise ValueError("Residual-field work units must not contain duplicate source artifact keys.")
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
         raise ValueError("Residual-field Phase 6 assumes NO_OP replay semantics.")
+    if work_unit.partition_id is None:
+        if work_unit.point_start is not None or work_unit.point_stop is not None:
+            raise ValueError(
+                "Unpartitioned residual-field work units must not define point_start/point_stop."
+            )
+    else:
+        if work_unit.point_start is None or work_unit.point_stop is None:
+            raise ValueError(
+                "Partitioned residual-field work units must define point_start and point_stop."
+            )
+        if int(work_unit.partition_id) < 0:
+            raise ValueError("partition_id must be non-negative.")
+        if int(work_unit.point_start) < 0 or int(work_unit.point_stop) <= int(work_unit.point_start):
+            raise ValueError("Partition point range must satisfy 0 <= point_start < point_stop.")
 
 
 def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -> None:
@@ -822,6 +899,7 @@ class ResidualFieldReducerProgressManifest:
     incorporated_interval_ids: tuple[int, ...]
     reclaimable_shard_keys: tuple[str, ...]
     final_artifacts: tuple[ArtifactRef, ...]
+    durable_truth_unit: str = "committed_shard_checkpoint"
     pending_shard_keys: tuple[str, ...] = ()
     pending_interval_ids: tuple[int, ...] = ()
     cleanup_policy: str = "off"
@@ -833,6 +911,14 @@ def validate_residual_field_reducer_progress_manifest(
 ) -> None:
     if manifest.artifact.kind != "residual-reducer-progress-manifest":
         raise ValueError("Reducer progress manifest must use the reducer-progress artifact kind.")
+    if manifest.durable_truth_unit not in {
+        "committed_local_snapshot_generation",
+        "committed_shard_checkpoint",
+    }:
+        raise ValueError(
+            "Reducer progress manifest durable_truth_unit must be "
+            "'committed_local_snapshot_generation' or 'committed_shard_checkpoint'."
+        )
     if len(set(manifest.incorporated_shard_keys)) != len(manifest.incorporated_shard_keys):
         raise ValueError("Reducer progress manifest must not contain duplicate shard keys.")
     if len(set(manifest.incorporated_interval_ids)) != len(manifest.incorporated_interval_ids):
@@ -855,6 +941,7 @@ __all__ = [
     "RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA",
     "RESIDUAL_FIELD_REDUCER_PROGRESS_SCHEMA",
     "RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS",
+    "ResidualFieldAccumulatorStatus",
     "ResidualFieldArtifactManifest",
     "ResidualFieldPartialResult",
     "ResidualFieldReducerProgressManifest",

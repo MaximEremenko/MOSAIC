@@ -4,6 +4,7 @@ import json
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -233,6 +234,7 @@ def _residual_field_reducer_progress_manifest_to_payload(
         "chunk_id": manifest.chunk_id,
         "parameter_digest": manifest.parameter_digest,
         "completion_status": manifest.completion_status.value,
+        "durable_truth_unit": manifest.durable_truth_unit,
         "incorporated_shard_keys": list(manifest.incorporated_shard_keys),
         "incorporated_interval_ids": list(manifest.incorporated_interval_ids),
         "pending_shard_keys": list(manifest.pending_shard_keys),
@@ -353,6 +355,9 @@ def load_residual_field_reducer_progress_manifest(
         chunk_id=int(payload["chunk_id"]),
         parameter_digest=str(payload["parameter_digest"]),
         completion_status=CompletionStatus(str(payload["completion_status"])),
+        durable_truth_unit=str(
+            payload.get("durable_truth_unit", "committed_shard_checkpoint")
+        ),
         incorporated_shard_keys=tuple(str(key) for key in payload["incorporated_shard_keys"]),
         incorporated_interval_ids=tuple(int(interval_id) for interval_id in payload["incorporated_interval_ids"]),
         pending_shard_keys=tuple(str(key) for key in payload.get("pending_shard_keys", [])),
@@ -387,6 +392,7 @@ def _build_residual_field_reducer_progress_manifest(
     chunk_id: int,
     parameter_digest: str,
     completion_status: CompletionStatus,
+    durable_truth_unit: str = "committed_shard_checkpoint",
     incorporated_shard_keys: tuple[str, ...],
     incorporated_interval_ids: tuple[int, ...],
     reclaimable_shard_keys: tuple[str, ...],
@@ -408,6 +414,7 @@ def _build_residual_field_reducer_progress_manifest(
         chunk_id=chunk_id,
         parameter_digest=parameter_digest,
         completion_status=completion_status,
+        durable_truth_unit=str(durable_truth_unit),
         incorporated_shard_keys=tuple(sorted(set(str(key) for key in incorporated_shard_keys))),
         incorporated_interval_ids=tuple(
             sorted(set(int(interval_id) for interval_id in incorporated_interval_ids))
@@ -639,6 +646,25 @@ def reconcile_residual_field_reducer_progress(
         for key in target_shard_keys
         if key in shard_by_key and assess_residual_field_shard_manifest(shard_by_key[key]).is_complete
     ]
+    missing_target_shard_keys = tuple(
+        sorted(set(target_shard_keys) - {manifest.artifact_key for manifest in target_shards})
+    )
+    if missing_target_shard_keys:
+        blocked_progress = _build_residual_field_reducer_progress_manifest(
+            output_dir=output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            completion_status=CompletionStatus.MATERIALIZED,
+            durable_truth_unit=progress.durable_truth_unit,
+            incorporated_shard_keys=progress.incorporated_shard_keys,
+            incorporated_interval_ids=progress.incorporated_interval_ids,
+            reclaimable_shard_keys=progress.reclaimable_shard_keys,
+            final_artifacts=progress.final_artifacts,
+            pending_shard_keys=missing_target_shard_keys,
+            pending_interval_ids=progress.pending_interval_ids,
+            cleanup_policy=progress.cleanup_policy,
+        )
+        return write_residual_field_reducer_progress_manifest(blocked_progress)
     if not target_shards:
         return progress
 
@@ -699,6 +725,7 @@ def reconcile_residual_field_reducer_progress(
             if final_assessment.is_complete
             else CompletionStatus.MATERIALIZED
         ),
+        durable_truth_unit="committed_shard_checkpoint",
         incorporated_shard_keys=target_shard_keys,
         incorporated_interval_ids=target_interval_ids,
         reclaimable_shard_keys=(
@@ -932,6 +959,7 @@ def persist_residual_field_shard_checkpoint(
     compress: bool = True,
     quiet_logs: bool = False,
 ) -> ResidualFieldShardManifest:
+    start_time = time.perf_counter()
     if work_unit.interval_id is None:
         raise ValueError("Residual-field shard checkpoint requires interval_id.")
 
@@ -1023,20 +1051,65 @@ def persist_residual_field_shard_checkpoint(
         durable_tmp_path.replace(shard_path)
         scratch_path.unlink(missing_ok=True)
     _write_residual_field_shard_manifest_json(manifest)
+    shard_bytes = sum(
+        int(Path(artifact.path).stat().st_size)
+        for artifact in manifest.artifacts
+        if artifact.path is not None and Path(artifact.path).exists()
+    )
 
     if quiet_logs:
         logger.debug(
-            "write-shard | chunk %d | batch %s committed",
+            "write-shard | chunk %d | batch %s committed | bytes=%d | duration=%.3fs",
             work_unit.chunk_id,
             ",".join(str(interval_id) for interval_id in manifest.contributing_interval_ids),
+            shard_bytes,
+            time.perf_counter() - start_time,
         )
     else:
         logger.info(
-            "write-shard | chunk %d | batch %s committed",
+            "write-shard | chunk %d | batch %s committed | bytes=%d | duration=%.3fs",
             work_unit.chunk_id,
             ",".join(str(interval_id) for interval_id in manifest.contributing_interval_ids),
+            shard_bytes,
+            time.perf_counter() - start_time,
         )
     return manifest
+
+
+def summarize_residual_field_shards(
+    manifests: list[ResidualFieldShardManifest],
+) -> dict[str, int]:
+    shard_bytes = 0
+    point_count = 0
+    for manifest in manifests:
+        point_count += int(manifest.point_count)
+        for artifact in manifest.artifacts:
+            if artifact.kind != "residual-shard-data" or artifact.path is None:
+                continue
+            path = Path(artifact.path)
+            if path.exists():
+                shard_bytes += int(path.stat().st_size)
+    return {
+        "committed_shard_count": int(len(manifests)),
+        "committed_shard_bytes": int(shard_bytes),
+        "committed_point_count": int(point_count),
+    }
+
+
+def summarize_residual_field_output_artifacts(
+    artifacts: tuple[ArtifactRef, ...],
+) -> dict[str, int]:
+    total_bytes = 0
+    for artifact in artifacts:
+        if artifact.path is None:
+            continue
+        path = Path(artifact.path)
+        if path.exists():
+            total_bytes += int(path.stat().st_size)
+    return {
+        "final_artifact_count": int(len(artifacts)),
+        "final_artifact_bytes": int(total_bytes),
+    }
 
 
 def reduce_residual_field_shards_for_chunk(
@@ -1052,6 +1125,7 @@ def reduce_residual_field_shards_for_chunk(
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
     quiet_logs: bool = False,
 ) -> ResidualFieldArtifactManifest | None:
+    start_time = time.perf_counter()
     shard_manifests = _merge_residual_field_shard_manifests(
         manifests,
         discover_residual_field_shard_manifests(
@@ -1087,8 +1161,30 @@ def reduce_residual_field_shards_for_chunk(
         for manifest in shard_manifests
         if assess_residual_field_shard_manifest(manifest).is_complete
     ]
+    if existing_progress is not None and existing_progress.pending_shard_keys:
+        committed_shard_keys = {
+            manifest.artifact_key for manifest in committed_shards
+        }
+        missing_pending = tuple(
+            sorted(set(existing_progress.pending_shard_keys) - committed_shard_keys)
+        )
+        if missing_pending:
+            if quiet_logs:
+                logger.debug(
+                    "reduce-shards | chunk %d blocked by missing durable shard coverage %s",
+                    chunk_id,
+                    missing_pending,
+                )
+            else:
+                logger.warning(
+                    "reduce-shards | chunk %d blocked by missing durable shard coverage %s",
+                    chunk_id,
+                    missing_pending,
+                )
+            return None
     if not committed_shards:
         return None
+    shard_summary = summarize_residual_field_shards(committed_shards)
 
     with chunk_mutex(chunk_id):
         store = artifact_store_factory(output_dir)
@@ -1157,6 +1253,7 @@ def reduce_residual_field_shards_for_chunk(
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
                 completion_status=CompletionStatus.MATERIALIZED,
+                durable_truth_unit="committed_shard_checkpoint",
                 incorporated_shard_keys=tuple(sorted(set(existing_progress.incorporated_shard_keys))) if existing_progress is not None else (),
                 incorporated_interval_ids=tuple(
                     sorted(set(existing_progress.incorporated_interval_ids))
@@ -1235,6 +1332,7 @@ def reduce_residual_field_shards_for_chunk(
             if manifest_assessment.is_complete
             else CompletionStatus.MATERIALIZED
         ),
+        durable_truth_unit="committed_shard_checkpoint",
         incorporated_shard_keys=tuple(sorted(incorporated_shard_keys)),
         incorporated_interval_ids=tuple(
             sorted(
@@ -1253,15 +1351,23 @@ def reduce_residual_field_shards_for_chunk(
     write_residual_field_reducer_progress_manifest(progress_manifest)
     if quiet_logs:
         logger.debug(
-            "reduce-shards | chunk %d | reduced %d shard(s)",
+            "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | duration=%.3fs",
             chunk_id,
             len(reduced_shard_keys),
+            shard_summary["committed_shard_count"],
+            shard_summary["committed_shard_bytes"],
+            shard_summary["committed_point_count"],
+            time.perf_counter() - start_time,
         )
     else:
         logger.info(
-            "reduce-shards | chunk %d | reduced %d shard(s)",
+            "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | duration=%.3fs",
             chunk_id,
             len(reduced_shard_keys),
+            shard_summary["committed_shard_count"],
+            shard_summary["committed_shard_bytes"],
+            shard_summary["committed_point_count"],
+            time.perf_counter() - start_time,
         )
     return manifest
 
