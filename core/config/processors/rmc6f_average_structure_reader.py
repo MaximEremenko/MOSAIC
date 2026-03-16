@@ -5,8 +5,6 @@ Created on Tue Oct 29 14:46:24 2024
 @author: Maksim Eremenko
 """
 
-# processors/rmc6f_average_structure_reader.py
-
 from core.config.contracts.base_interfaces import (
     IConfigurationDataProcessor,
 )
