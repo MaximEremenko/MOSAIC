@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import os
 
-from numba import set_num_threads
+from numba import config as numba_config, set_num_threads
 
 from core.decoding.decoder_cache import build_decoder_cache_path
 from core.decoding.displacement_service import (
@@ -14,7 +15,7 @@ from core.decoding.site_intensity_service import (
 from core.decoding.state import build_postprocessing_processor_state
 from core.decoding.window import filter_from_window as filter_from_window_impl
 
-set_num_threads(32)
+set_num_threads(min(int(os.getenv("MOSAIC_NUMBA_THREADS", 32)), numba_config.NUMBA_NUM_THREADS))
 logger = logging.getLogger(__name__)
 
 
