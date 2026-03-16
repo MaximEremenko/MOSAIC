@@ -1,60 +1,96 @@
 # Examples
 
-This directory contains one supported release-candidate example and a larger set
-of research, historical, and exploratory material.
+This folder contains the current shipped example surface.
 
-## Supported Release-Candidate Example
+## Start Here
 
-- [run_parameters.json](run_parameters.json)
-- [input_parameters.json](input_parameters.json)
-- [sample_1d.f1d](sample_1d.f1d)
-- [central_points.txt](central_points.txt)
+If you want the smallest runnable case, start with:
 
-Run it from the repository root:
+- `examples/config_1D/displacement/`
+
+Then move to:
+
+- `examples/config_1D/chemical_ordering/`
+- `examples/config_2D/displacement/`
+- `examples/config_2D/chemical_ordering/`
+
+## Example Families
+
+### `config_1D`
+
+Small CPU-friendly examples for first runs and smoke validation.
+
+Included cases:
+
+- `config_1D/displacement/`
+- `config_1D/chemical_ordering/`
+
+Run them with:
 
 ```bash
-MOSAIC_NUFFT_CPU_ONLY=1 python -m core.main examples/run_parameters.json
+conda run -n mosaic python -m core.main examples/config_1D/displacement/run_parameters.json
+conda run -n mosaic python -m core.main examples/config_1D/chemical_ordering/run_parameters.json
 ```
 
-Release smoke helper:
+### `config_2D`
+
+Larger examples with richer masks and larger outputs.
+
+Included cases:
+
+- `config_2D/displacement/`
+- `config_2D/chemical_ordering/`
+
+Run them with:
 
 ```bash
-python scripts/smoke_example.py
+conda run -n mosaic python -m core.main examples/config_2D/displacement/run_parameters.json
+conda run -n mosaic python -m core.main examples/config_2D/chemical_ordering/run_parameters.json
 ```
 
-This helper is the CI-facing smoke path. It recreates the canonical output
-tree and checks for the expected artifact set under a fixed timeout.
+The 2D displacement example is configured for `local` Dask execution. The 2D
+chemical-ordering example is configured for `cuda-local`.
 
-Expected output location:
+### `config_3D`
 
-- `examples/sample_1d_release/processed_point_data/`
+Reference 3D inputs for exploratory work. This folder contains only
+`input_parameters.json` and structure files — there is no `run_parameters.json`.
+To run it, create a `run_parameters.json` pointing to the input file or invoke
+the entry point directly. This folder is not the recommended starting point for
+first runs.
 
-Canonical smoke-scale runtime assumptions:
+## What Each Example Folder Contains
 
-- CPU-only baseline
-- local backend
-- one worker
-- one thread per worker
-- one chunk
-- `run_postprocessing: false`
+Each runnable example directory contains:
 
-## Canonical Schema
+- `run_parameters.json`
+- `input_parameters.json`
+- a structure file such as `.f1d` or `.f2d`
 
-The supported example uses the unified release schema documented in
-[docs/input_schema.md](../docs/input_schema.md).
+## Outputs
 
-## Research and Historical Material
+Outputs are written to the `paths.output_directory` configured in each
+`input_parameters.json`.
 
-The rest of `examples/` is not part of the supported release-candidate surface.
-That includes, for example:
+Current output roots in the repo:
 
-- `config_2D/` and `config_3D/`
-- legacy `main*.py` drivers
-- cluster helper scripts such as `run_slurm.sh`, `run_sge.sh`, and
-  `run_local_gpu.sh`
-- `.opju` plotting/project files
-- exploratory SymPy and plotting helpers
-- large `.rmc6f` research inputs
+- `examples/config_1D/displacement/output_displacement/`
+- `examples/config_1D/chemical_ordering/output_chemical_ordering/`
+- `examples/config_2D/displacement/output_displacement/`
+- `examples/config_2D/displacement/output_displacement_decoder_full/`
+- `examples/config_2D/chemical_ordering/output_chemical_ordering/`
 
-Those files remain useful reference material, but they are not validated by the
-canonical smoke path and should not be treated as release-grade examples.
+Most generated artifacts live under `processed_point_data/`.
+
+## Smoke Check
+
+For the canonical bounded smoke path:
+
+```bash
+MOSAIC_NUFFT_CPU_ONLY=1 conda run -n mosaic python scripts/smoke_example.py
+```
+
+## Related Docs
+
+- [../docs/input_schema.md](../docs/input_schema.md)
+- [../docs/runtime_guide.md](../docs/runtime_guide.md)
