@@ -52,6 +52,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+_LOCAL_DIRECT_HANDOFF_MAX_INTERVALS_DEFAULT = 64
+_LOCAL_DIRECT_HANDOFF_MAX_BYTES_DEFAULT = 256 << 20
 
 
 def _chunk_task_key(work_unit: ScatteringWorkUnit) -> str:
@@ -156,6 +158,25 @@ def _scatter_shared_precompute_inputs(
     return payloads
 
 
+def _store_transient_interval_payload(
+    payload_cache: dict[int, object],
+    *,
+    interval_id: int,
+    interval_task: IntervalTask,
+    client,
+) -> None:
+    if client is not None and not is_sync_client(client):
+        payload_cache.update(
+            client.scatter(
+                {int(interval_id): interval_task},
+                broadcast=False,
+                hash=False,
+            )
+        )
+        return
+    payload_cache[int(interval_id)] = interval_task
+
+
 def _local_fast_handoff_enabled(
     *,
     parameters: Dict[str, Any],
@@ -168,6 +189,61 @@ def _local_fast_handoff_enabled(
         client=client,
     )
     return backend_kind == "local_restartable" and is_same_node_local_client(client)
+
+
+def _estimate_interval_payload_bytes_upper_bound(interval: dict, supercell: np.ndarray) -> int:
+    q_points = reciprocal_space_points_counter(to_interval_dict(interval), supercell)
+    dim = int(np.asarray(supercell).size)
+    return int(q_points) * int((dim * 8) + 16 + 16)
+
+
+def _local_direct_handoff_limits(parameters: Dict[str, Any]) -> tuple[int, int]:
+    runtime_info = _runtime_info(parameters)
+    max_intervals = int(
+        runtime_info.get(
+            "local_direct_handoff_max_intervals",
+            _LOCAL_DIRECT_HANDOFF_MAX_INTERVALS_DEFAULT,
+        )
+    )
+    max_bytes = int(
+        runtime_info.get(
+            "local_direct_handoff_max_bytes",
+            _LOCAL_DIRECT_HANDOFF_MAX_BYTES_DEFAULT,
+        )
+    )
+    return max_intervals, max_bytes
+
+
+def _local_direct_handoff_is_safe(
+    *,
+    pending: list[ScatteringWorkUnit],
+    interval_lookup: dict[int, dict],
+    supercell: np.ndarray,
+    parameters: Dict[str, Any],
+) -> bool:
+    max_intervals, max_bytes = _local_direct_handoff_limits(parameters)
+    if len(pending) > max_intervals:
+        logger.info(
+            "Disabling local direct-handoff: %d intervals exceed safe in-memory limit %d.",
+            len(pending),
+            max_intervals,
+        )
+        return False
+    estimated_bytes = sum(
+        _estimate_interval_payload_bytes_upper_bound(
+            interval_lookup[work_unit.interval_id],
+            supercell,
+        )
+        for work_unit in pending
+    )
+    if estimated_bytes > max_bytes:
+        logger.info(
+            "Disabling local direct-handoff: estimated interval payload volume %.1f MiB exceeds safe limit %.1f MiB.",
+            estimated_bytes / float(1 << 20),
+            max_bytes / float(1 << 20),
+        )
+        return False
+    return True
 
 
 def run_interval_precompute(
@@ -221,6 +297,15 @@ def run_interval_precompute(
         for work_unit in work_units
         if int(work_unit.interval_id) in payload_cache
     ]
+    if local_fast_handoff and not _local_direct_handoff_is_safe(
+        pending=pending,
+        interval_lookup=interval_lookup,
+        supercell=supercell,
+        parameters=parameters,
+    ):
+        local_fast_handoff = False
+        interval_artifact_policy = "required_transport"
+        persist_interval_artifacts = True
 
     if not pending:
         logger.info(
@@ -277,7 +362,12 @@ def run_interval_precompute(
                     except Exception:
                         interval_task = None
                     if interval_task is not None:
-                        payload_cache[int(work_unit.interval_id)] = interval_task
+                        _store_transient_interval_payload(
+                            payload_cache,
+                            interval_id=int(work_unit.interval_id),
+                            interval_task=interval_task,
+                            client=client,
+                        )
                         produced_payloads += 1
                         if persist_interval_artifacts:
                             manifest = persist_precomputed_interval_artifact(
@@ -321,7 +411,12 @@ def run_interval_precompute(
                     ff_factory=ff_factory,
                 )
                 if interval_task is not None:
-                    payload_cache[int(work_unit.interval_id)] = interval_task
+                    _store_transient_interval_payload(
+                        payload_cache,
+                        interval_id=int(work_unit.interval_id),
+                        interval_task=interval_task,
+                        client=client,
+                    )
                     produced_payloads += 1
                     if persist_interval_artifacts:
                         manifest = persist_precomputed_interval_artifact(

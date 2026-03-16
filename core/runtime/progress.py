@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import time
 from contextlib import contextmanager
@@ -40,6 +41,8 @@ tqdm = _tqdm
 logging_redirect_tqdm = _logging_redirect_tqdm
 
 TIMER = time.perf_counter
+_FORCE_PROGRESS_OVERRIDE: bool | None = None
+_TASK_PROGRESS_OVERRIDE: bool | None = None
 
 
 @contextmanager
@@ -65,7 +68,38 @@ def quiet_loggers(*names: str):
             log.setLevel(level)
 
 
+def configure_progress(
+    *,
+    force_progress: bool | None = None,
+    task_progress: bool | None = None,
+) -> None:
+    global _FORCE_PROGRESS_OVERRIDE, _TASK_PROGRESS_OVERRIDE
+    _FORCE_PROGRESS_OVERRIDE = force_progress
+    _TASK_PROGRESS_OVERRIDE = task_progress
+
+
+def force_progress_enabled() -> bool:
+    if _FORCE_PROGRESS_OVERRIDE is not None:
+        return bool(_FORCE_PROGRESS_OVERRIDE)
+    return os.getenv("MOSAIC_FORCE_PROGRESS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def task_progress_enabled(default: bool = False) -> bool:
+    if _TASK_PROGRESS_OVERRIDE is not None:
+        return bool(_TASK_PROGRESS_OVERRIDE)
+    value = os.getenv("MOSAIC_TASK_PROGRESS", "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
 def progress_bar(total: int, *, desc: str, unit: str):
+    force_progress = force_progress_enabled()
     return tqdm(
         total=total,
         desc=desc,
@@ -75,14 +109,17 @@ def progress_bar(total: int, *, desc: str, unit: str):
         miniters=1,
         mininterval=0.1,
         leave=True,
-        disable=(total <= 0 or not sys.stderr.isatty()),
+        disable=(total <= 0 or (not force_progress and not sys.stderr.isatty())),
     )
 
 __all__ = [
     "TIMER",
+    "configure_progress",
+    "force_progress_enabled",
     "logging_redirect_tqdm",
     "progress_bar",
     "quiet_loggers",
+    "task_progress_enabled",
     "timed",
     "tqdm",
 ]

@@ -267,6 +267,306 @@ def test_execution_local_fast_precompute_caches_payload_without_writing_interval
     assert not (tmp_path / "precomputed_intervals" / "interval_1.npz").exists()
 
 
+def test_execution_async_local_fast_precompute_caches_scattered_payload_once(
+    monkeypatch,
+    tmp_path,
+):
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+    class _ScatterRef:
+        def __init__(self, value):
+            self.value = value
+
+    class _FakeClient:
+        def __init__(self):
+            self.scatter_calls = []
+            self.submit_calls = []
+            self.loop = SimpleNamespace(asyncio_loop=object())
+
+        def scatter(self, value, **kwargs):
+            self.scatter_calls.append((value, kwargs))
+            if isinstance(value, dict):
+                return {key: _ScatterRef(item) for key, item in value.items()}
+            return _ScatterRef(value)
+
+        def submit(self, func, *args, **kwargs):
+            self.submit_calls.append((func, args, kwargs))
+            return _FakeFuture(
+                IntervalTask(
+                    1,
+                    "All",
+                    np.array([[0.0]]),
+                    np.array([1 + 0j]),
+                    np.array([0 + 0j]),
+                )
+            )
+
+    client = _FakeClient()
+    payload_cache = {}
+    work_unit = ScatteringWorkUnit.precompute_interval(
+        interval_id=1,
+        dimension=1,
+        output_dir=str(tmp_path),
+    )
+
+    monkeypatch.setenv("DASK_BACKEND", "local")
+    monkeypatch.setattr(
+        "core.scattering.execution.is_interval_artifact_committed",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.yield_futures_with_results",
+        lambda futures, client: ((future, True) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.persist_precomputed_interval_artifact",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("async local fast path should not persist interval artifacts by default")
+        ),
+    )
+
+    paths = run_interval_precompute(
+        [work_unit],
+        interval_lookup=build_scattering_interval_lookup([{"id": 1, "h_range": (0.0, 1.0)}]),
+        B_=np.eye(1),
+        parameters={"runtime_info": {}, "transient_interval_payloads": payload_cache},
+        unique_elements=[],
+        mask_params={},
+        MaskStrategy=None,
+        supercell=np.array([1]),
+        output_dir=str(tmp_path),
+        original_coords=np.array([[0.0]]),
+        cells_origin=np.array([[0.0]]),
+        elements_arr=np.array(["El"], dtype=object),
+        charge=0.0,
+        ff_factory=SimpleNamespace(),
+        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        client=client,
+        transient_interval_payloads=payload_cache,
+    )
+
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+    assert paths == []
+    assert len(client.submit_calls) == 1
+    assert len(client.scatter_calls) == 6
+    assert isinstance(payload_cache[1], _ScatterRef)
+    assert isinstance(payload_cache[1].value, IntervalTask)
+    scattered_mapping, scatter_kwargs = client.scatter_calls[-1]
+    assert isinstance(scattered_mapping, dict)
+    assert list(scattered_mapping.keys()) == [1]
+    assert isinstance(scattered_mapping[1], IntervalTask)
+    assert scatter_kwargs["broadcast"] is False
+    assert scatter_kwargs["hash"] is False
+
+
+def test_execution_async_local_fast_precompute_falls_back_to_required_transport_when_interval_count_is_too_large(
+    monkeypatch,
+    tmp_path,
+):
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+    class _ScatterRef:
+        def __init__(self, value):
+            self.value = value
+
+    class _FakeClient:
+        def __init__(self):
+            self.scatter_calls = []
+            self.submit_calls = []
+            self.loop = SimpleNamespace(asyncio_loop=object())
+
+        def scatter(self, value, **kwargs):
+            ref = _ScatterRef(value)
+            self.scatter_calls.append((value, kwargs, ref))
+            return ref
+
+        def submit(self, func, *args, **kwargs):
+            self.submit_calls.append((func, args, kwargs))
+            work_unit = args[0]
+            manifest = ScatteringArtifactManifest.from_work_unit(
+                work_unit,
+                artifacts=(work_unit.interval_artifact,),
+                completion_status=CompletionStatus.COMMITTED,
+                consumer_stage="residual_field",
+            )
+            return _FakeFuture(manifest)
+
+    client = _FakeClient()
+    payload_cache = {}
+    work_units = build_scattering_precompute_work_units(
+        [{"id": 1, "h_range": (0.0, 1.0)}, {"id": 2, "h_range": (1.0, 2.0)}],
+        dimension=1,
+        output_dir=str(tmp_path),
+    )
+
+    monkeypatch.setenv("DASK_BACKEND", "local")
+    monkeypatch.setattr(
+        "core.scattering.execution.is_interval_artifact_committed",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.yield_futures_with_results",
+        lambda futures, client: ((future, True) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.compute_scattering_interval_payload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe local direct-handoff should fall back before payload caching")
+        ),
+    )
+
+    paths = run_interval_precompute(
+        work_units,
+        interval_lookup=build_scattering_interval_lookup(
+            [{"id": 1, "h_range": (0.0, 1.0)}, {"id": 2, "h_range": (1.0, 2.0)}]
+        ),
+        B_=np.eye(1),
+        parameters={
+            "runtime_info": {"local_direct_handoff_max_intervals": 1},
+            "transient_interval_payloads": payload_cache,
+        },
+        unique_elements=[],
+        mask_params={},
+        MaskStrategy=None,
+        supercell=np.array([1]),
+        output_dir=str(tmp_path),
+        original_coords=np.array([[0.0], [1.0]]),
+        cells_origin=np.array([[0.0], [0.0]]),
+        elements_arr=np.array(["El", "El"], dtype=object),
+        charge=0.0,
+        ff_factory=SimpleNamespace(),
+        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        client=client,
+        transient_interval_payloads=payload_cache,
+    )
+
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+    assert [path.name for path in paths] == ["interval_1.npz", "interval_2.npz"]
+    assert payload_cache == {}
+    assert len(client.scatter_calls) == 5
+    assert all(call[1].get("broadcast") is True for call in client.scatter_calls)
+    assert all(call[1].get("hash") is False for call in client.scatter_calls)
+    assert all(call[0].__name__ == "run_scattering_interval_task" for call in client.submit_calls)
+
+
+def test_execution_async_local_fast_precompute_falls_back_to_required_transport_when_payload_bytes_are_too_large(
+    monkeypatch,
+    tmp_path,
+):
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+    class _ScatterRef:
+        def __init__(self, value):
+            self.value = value
+
+    class _FakeClient:
+        def __init__(self):
+            self.scatter_calls = []
+            self.submit_calls = []
+            self.loop = SimpleNamespace(asyncio_loop=object())
+
+        def scatter(self, value, **kwargs):
+            ref = _ScatterRef(value)
+            self.scatter_calls.append((value, kwargs, ref))
+            return ref
+
+        def submit(self, func, *args, **kwargs):
+            self.submit_calls.append((func, args, kwargs))
+            work_unit = args[0]
+            manifest = ScatteringArtifactManifest.from_work_unit(
+                work_unit,
+                artifacts=(work_unit.interval_artifact,),
+                completion_status=CompletionStatus.COMMITTED,
+                consumer_stage="residual_field",
+            )
+            return _FakeFuture(manifest)
+
+    client = _FakeClient()
+    payload_cache = {}
+    work_unit = ScatteringWorkUnit.precompute_interval(
+        interval_id=1,
+        dimension=1,
+        output_dir=str(tmp_path),
+    )
+
+    monkeypatch.setenv("DASK_BACKEND", "local")
+    monkeypatch.setattr(
+        "core.scattering.execution.is_interval_artifact_committed",
+        lambda *args, **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.yield_futures_with_results",
+        lambda futures, client: ((future, True) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1_000_000,
+    )
+    monkeypatch.setattr(
+        "core.scattering.execution.compute_scattering_interval_payload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe local direct-handoff should fall back before payload caching")
+        ),
+    )
+
+    paths = run_interval_precompute(
+        [work_unit],
+        interval_lookup=build_scattering_interval_lookup([{"id": 1, "h_range": (0.0, 1.0)}]),
+        B_=np.eye(1),
+        parameters={
+            "runtime_info": {"local_direct_handoff_max_bytes": 1},
+            "transient_interval_payloads": payload_cache,
+        },
+        unique_elements=[],
+        mask_params={},
+        MaskStrategy=None,
+        supercell=np.array([1]),
+        output_dir=str(tmp_path),
+        original_coords=np.array([[0.0]]),
+        cells_origin=np.array([[0.0]]),
+        elements_arr=np.array(["El"], dtype=object),
+        charge=0.0,
+        ff_factory=SimpleNamespace(),
+        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        client=client,
+        transient_interval_payloads=payload_cache,
+    )
+
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+    assert [path.name for path in paths] == ["interval_1.npz"]
+    assert payload_cache == {}
+    assert len(client.scatter_calls) == 5
+    assert all(call[1].get("broadcast") is True for call in client.scatter_calls)
+    assert all(call[0].__name__ == "run_scattering_interval_task" for call in client.submit_calls)
+
+
 def test_execution_durable_precompute_scatter_shared_inputs_once_and_keeps_required_transport(
     monkeypatch,
     tmp_path,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,10 +19,14 @@ from core.runtime import (
     logging_redirect_tqdm,
     progress_bar,
     resolve_worker_scratch_root,
+    task_progress_enabled,
     yield_futures_with_results,
 )
 from core.residual_field.backend import (
     ResidualFieldReducerBackend,
+    ResidualFieldLocalAccumulatorPartial,
+    build_residual_field_reducer_backend,
+    is_same_node_local_client,
     resolve_residual_field_reducer_backend,
 )
 from core.residual_field.planning import build_residual_field_work_units
@@ -35,6 +40,121 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_RESIDUAL_INTERVALS_PER_SHARD = 4
+
+
+def _format_progress_bar(count: int, total: int, *, width: int = 20) -> str:
+    total = max(int(total), 1)
+    count = max(0, min(int(count), total))
+    filled = int(round((count / float(total)) * width))
+    return f"[{'#' * filled}{'.' * (width - filled)}]"
+
+
+def _work_unit_interval_label(work_unit: ResidualFieldWorkUnit) -> str:
+    interval_ids = work_unit.interval_ids or (
+        (work_unit.interval_id,) if work_unit.interval_id is not None else ()
+    )
+    return ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a"
+
+
+def _log_async_residual_progress(
+    *,
+    enabled: bool,
+    event: str,
+    work_unit: ResidualFieldWorkUnit,
+    completed: int,
+    total: int,
+    submitted: int,
+    running: int,
+    detail: str | None = None,
+) -> None:
+    if not enabled:
+        return
+    current = int(submitted if event == "queue" else completed)
+    progress_bar_text = _format_progress_bar(current, total)
+    percent = (100.0 * current / float(max(int(total), 1)))
+    suffix = f" | {detail}" if detail else ""
+    logger.info(
+        "Residual-field %s %s %d/%d (%.0f%%) | running=%d | chunk=%d | intervals=%s%s",
+        event,
+        progress_bar_text,
+        current,
+        int(total),
+        percent,
+        int(running),
+        int(work_unit.chunk_id),
+        _work_unit_interval_label(work_unit),
+        suffix,
+    )
+
+
+def _should_log_async_progress(
+    *,
+    phase: str,
+    count: int,
+    total: int,
+    force: bool = False,
+) -> bool:
+    if force or total <= 0:
+        return True
+    if count <= 1 or count >= total:
+        return True
+    target_updates = 4 if phase == "queue" else 8
+    stride = max(1, int(math.ceil(total / float(target_updates))))
+    return count % stride == 0
+
+
+def _cap_async_max_inflight(
+    *,
+    client,
+    requested: int,
+) -> int:
+    requested = max(1, int(requested))
+    if client is None or is_sync_client(client):
+        return requested
+    if not is_same_node_local_client(client):
+        return requested
+    try:
+        scheduler_info = client.scheduler_info()
+        workers = scheduler_info.get("workers", {})
+    except Exception:
+        workers = {}
+    if not workers:
+        return min(requested, 1)
+    nufft_slots = sum(
+        int(worker.get("resources", {}).get("nufft", 0))
+        for worker in workers.values()
+    )
+    capacity = max(1, int(nufft_slots) if int(nufft_slots) > 0 else len(workers))
+    capped = min(requested, capacity)
+    if capped < requested:
+        logger.info(
+            "Residual-field local inflight cap | requested=%d | effective=%d | workers=%d | nufft_slots=%d",
+            requested,
+            capped,
+            len(workers),
+            int(nufft_slots),
+        )
+    return capped
+
+
+def _build_task_reducer_backend(
+    reducer_backend: ResidualFieldReducerBackend,
+) -> ResidualFieldReducerBackend:
+    return build_residual_field_reducer_backend(
+        reducer_backend.layout.kind,
+        shard_storage_root_override=getattr(
+            reducer_backend,
+            "shard_storage_root_override",
+            None,
+        ),
+        local_accumulator_max_ram_bytes=int(
+            getattr(
+                reducer_backend,
+                "local_accumulator_max_ram_bytes",
+                256 * 1024 * 1024,
+            )
+        ),
+    )
 
 
 def _interval_paths_for_work_unit(work_unit: ResidualFieldWorkUnit) -> tuple[str, ...]:
@@ -52,13 +172,12 @@ def _interval_inputs_for_work_unit(
     work_unit: ResidualFieldWorkUnit,
     *,
     transient_interval_payloads: dict[int, object] | None,
-    interval_payload_futures: dict[int, object] | None = None,
 ):
     interval_ids = tuple(int(interval_id) for interval_id in (work_unit.interval_ids or ()))
     if work_unit.interval_id is not None and not interval_ids:
         interval_ids = (int(work_unit.interval_id),)
     if transient_interval_payloads:
-        payload_source = interval_payload_futures or transient_interval_payloads
+        payload_source = transient_interval_payloads
         if all(int(interval_id) in payload_source for interval_id in interval_ids):
             values = tuple(payload_source[int(interval_id)] for interval_id in interval_ids)
             return values[0] if len(values) == 1 else values
@@ -155,6 +274,7 @@ def run_residual_field_stage(
         stage="residual_field",
     )
     reducer_backend = preliminary_backend
+    task_reducer_backend = _build_task_reducer_backend(reducer_backend)
     reducer_runtime_state = reducer_backend.describe_runtime_state(
         output_dir=artifacts.output_dir,
         scratch_root=scratch_root,
@@ -210,23 +330,12 @@ def run_residual_field_stage(
         point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
 
     manifests_by_chunk: dict[int, list[ResidualFieldShardManifest]] = {}
+    total_partials_by_chunk = {
+        int(chunk_id): sum(1 for work_unit in work_units if int(work_unit.chunk_id) == int(chunk_id))
+        for chunk_id in chunk_ids
+    }
     transient_interval_payloads = getattr(artifacts, "transient_interval_payloads", {}) or {}
-    interval_payload_futures = None
-    if (
-        transient_interval_payloads
-        and reducer_backend.uses_direct_interval_handoff()
-        and client is not None
-        and not is_sync_client(client)
-    ):
-        interval_payload_futures = client.scatter(
-            {
-                int(interval_id): payload
-                for interval_id, payload in transient_interval_payloads.items()
-            },
-            broadcast=False,
-            hash=False,
-        )
-
+    stage_task_logs = task_progress_enabled(False)
     if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
         with progress_bar(total_tasks, desc="Residual field (chunks × shard-batches)", unit="batches") as pbar:
@@ -242,7 +351,7 @@ def run_residual_field_stage(
                     total_reciprocal_points=total_reciprocal_points,
                     output_dir=artifacts.output_dir,
                     scratch_root=scratch_root,
-                    reducer_backend=reducer_backend,
+                    reducer_backend=task_reducer_backend,
                     quiet_logs=False,
                 )
                 pbar.update(1)
@@ -252,6 +361,15 @@ def run_residual_field_stage(
                         "GAVE UP after retries | residual batch %s | chunk %d (sync)",
                         ",".join(str(interval_id) for interval_id in work_unit.interval_ids),
                         work_unit.chunk_id,
+                    )
+                elif isinstance(manifest, ResidualFieldLocalAccumulatorPartial):
+                    reducer_backend.accept_partial(
+                        manifest,
+                        output_dir=artifacts.output_dir,
+                        scratch_root=scratch_root,
+                        db_path=artifacts.db_manager.db_path,
+                        total_expected_partials=total_partials_by_chunk[int(work_unit.chunk_id)],
+                        cleanup_policy=cleanup_policy,
                     )
                 else:
                     manifests_by_chunk.setdefault(int(work_unit.chunk_id), []).append(manifest)
@@ -272,6 +390,10 @@ def run_residual_field_stage(
 
     fail_streak, fail_threshold = 0, 3
     gpu_tripped = False
+    max_inflight = _cap_async_max_inflight(
+        client=client,
+        requested=max_inflight,
+    )
 
     def _trip_to_cpu_only() -> None:
         nonlocal gpu_tripped, max_inflight
@@ -300,6 +422,17 @@ def run_residual_field_stage(
     flying: set = set()
     future_meta: dict = {}
     submitted = 0
+    completed = 0
+
+    if stage_task_logs:
+        logger.info(
+            "Residual-field start | batches=%d | chunks=%d | batch_size=%d | max_inflight=%d | cleanup=%s",
+            int(total_tasks),
+            int(len(chunk_ids)),
+            int(max_intervals_per_shard),
+            int(max_inflight),
+            cleanup_policy,
+        )
 
     def _submit(work_unit: ResidualFieldWorkUnit) -> None:
         nonlocal submitted
@@ -309,13 +442,12 @@ def run_residual_field_stage(
             _interval_inputs_for_work_unit(
                 work_unit,
                 transient_interval_payloads=transient_interval_payloads,
-                interval_payload_futures=interval_payload_futures,
             ),
             chunk_futures[int(work_unit.chunk_id)],
             total_reciprocal_points=total_reciprocal_points,
             output_dir=artifacts.output_dir,
             scratch_root=scratch_root,
-            reducer_backend=reducer_backend,
+            reducer_backend=task_reducer_backend,
             quiet_logs=True,
             key=f"residual-{work_unit.artifact_key}",
             pure=False,
@@ -325,9 +457,50 @@ def run_residual_field_stage(
         flying.add(future)
         future_meta[future] = work_unit
         submitted += 1
+        if _should_log_async_progress(
+            phase="queue",
+            count=submitted,
+            total=total_tasks,
+        ):
+            _log_async_residual_progress(
+                enabled=stage_task_logs,
+                event="queue",
+                work_unit=work_unit,
+                completed=completed,
+                total=total_tasks,
+                submitted=submitted,
+                running=len(flying),
+            )
+
+    def _incorporate_completed_result(
+        future,
+        completed_work_unit: ResidualFieldWorkUnit | None,
+    ) -> None:
+        if completed_work_unit is None:
+            return
+        try:
+            payload = future.result()
+            if isinstance(payload, ResidualFieldLocalAccumulatorPartial):
+                reducer_backend.accept_partial(
+                    payload,
+                    output_dir=artifacts.output_dir,
+                    scratch_root=scratch_root,
+                    db_path=artifacts.db_manager.db_path,
+                    total_expected_partials=total_partials_by_chunk[
+                        int(completed_work_unit.chunk_id)
+                    ],
+                    cleanup_policy=cleanup_policy,
+                )
+            else:
+                manifests_by_chunk.setdefault(
+                    int(completed_work_unit.chunk_id),
+                    [],
+                ).append(payload)
+        except Exception:
+            pass
 
     def _harvest_finished_nonblocking(bump) -> None:
-        nonlocal fail_streak
+        nonlocal completed, fail_streak
         done_now = [future for future in list(flying) if future.done()]
         for future in done_now:
             try:
@@ -337,6 +510,24 @@ def run_residual_field_stage(
             flying.discard(future)
             work_unit = future_meta.pop(future, None)
             bump()
+            completed += 1
+            if work_unit is not None:
+                if _should_log_async_progress(
+                    phase="progress",
+                    count=completed,
+                    total=total_tasks,
+                    force=not ok,
+                ):
+                    _log_async_residual_progress(
+                        enabled=stage_task_logs,
+                        event="progress",
+                        work_unit=work_unit,
+                        completed=completed,
+                        total=total_tasks,
+                        submitted=submitted,
+                        running=len(flying),
+                        detail=("failed" if not ok else "result-ready"),
+                    )
             if not ok and work_unit is not None:
                 fail_streak += 1
                 if fail_streak >= fail_threshold:
@@ -347,6 +538,7 @@ def run_residual_field_stage(
                     _submit(work_unit)
             else:
                 fail_streak = 0
+                _incorporate_completed_result(future, work_unit)
 
     with logging_redirect_tqdm():
         with progress_bar(total_tasks, desc="Residual field (chunks × shard-batches)", unit="batches") as pbar:
@@ -364,6 +556,24 @@ def run_residual_field_stage(
                         flying.discard(future)
                         completed_work_unit = future_meta.pop(future, None)
                         bump()
+                        completed += 1
+                        if completed_work_unit is not None:
+                            if _should_log_async_progress(
+                                phase="progress",
+                                count=completed,
+                                total=total_tasks,
+                                force=not ok,
+                            ):
+                                _log_async_residual_progress(
+                                    enabled=stage_task_logs,
+                                    event="progress",
+                                    work_unit=completed_work_unit,
+                                    completed=completed,
+                                    total=total_tasks,
+                                    submitted=submitted,
+                                    running=len(flying),
+                                    detail=("failed" if not ok else "result-ready"),
+                                )
                         if not ok and completed_work_unit is not None:
                             fail_streak += 1
                             if fail_streak >= fail_threshold:
@@ -377,18 +587,31 @@ def run_residual_field_stage(
                                 _submit(completed_work_unit)
                         else:
                             fail_streak = 0
-                            if result and completed_work_unit is not None:
-                                try:
-                                    manifests_by_chunk.setdefault(
-                                        int(completed_work_unit.chunk_id),
-                                        [],
-                                    ).append(future.result())
-                                except Exception:
-                                    pass
+                            if result:
+                                _incorporate_completed_result(future, completed_work_unit)
 
             for future, result in yield_futures_with_results(list(flying), client):
+                flying.discard(future)
                 completed_work_unit = future_meta.pop(future, None)
                 bump()
+                completed += 1
+                if completed_work_unit is not None:
+                    if _should_log_async_progress(
+                        phase="progress",
+                        count=completed,
+                        total=total_tasks,
+                        force=not bool(result),
+                    ):
+                        _log_async_residual_progress(
+                            enabled=stage_task_logs,
+                            event="progress",
+                            work_unit=completed_work_unit,
+                            completed=completed,
+                            total=total_tasks,
+                            submitted=submitted,
+                            running=len(flying),
+                            detail=("failed" if not bool(result) else "result-ready"),
+                        )
                 if not bool(result) and completed_work_unit is not None:
                     logger.error(
                         "GAVE UP after retries | residual batch %s | chunk %d",
@@ -396,13 +619,7 @@ def run_residual_field_stage(
                         completed_work_unit.chunk_id,
                     )
                 elif completed_work_unit is not None:
-                    try:
-                        manifests_by_chunk.setdefault(
-                            int(completed_work_unit.chunk_id),
-                            [],
-                        ).append(future.result())
-                    except Exception:
-                        pass
+                    _incorporate_completed_result(future, completed_work_unit)
 
     _finalize_residual_field_chunks(
         chunk_ids=chunk_ids,

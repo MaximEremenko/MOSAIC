@@ -15,6 +15,7 @@ from core.config import ParameterLoadingService
 from core import __version__
 from core.workflow import build_default_workflow_service
 from core.runtime import (
+    configure_progress,
     get_client,
     set_log_dir_for_run,
     setup_logging,
@@ -28,6 +29,27 @@ def main(run_file: str = "run_parameters.json") -> None:
     parameter_loading_service.apply_runtime_settings(run_settings.runtime)
     run_dir = Path(workflow_parameters.struct_info.working_directory).resolve()
     set_log_dir_for_run(run_dir)
+
+    runtime_info = workflow_parameters.runtime_info.to_mapping()
+    progress_cfg = runtime_info.get("progress") or {}
+    if not isinstance(progress_cfg, dict):
+        progress_cfg = {}
+    force_progress = progress_cfg.get(
+        "force",
+        runtime_info.get("force_progress"),
+    )
+    task_progress = progress_cfg.get(
+        "task_logs",
+        runtime_info.get("task_progress"),
+    )
+    configure_progress(
+        force_progress=(
+            None if force_progress is None else bool(force_progress)
+        ),
+        task_progress=(
+            None if task_progress is None else bool(task_progress)
+        ),
+    )
 
     setup_logging()
     log = logging.getLogger("app")
@@ -43,6 +65,19 @@ def main(run_file: str = "run_parameters.json") -> None:
 
     client = get_client()
     if client is not None:
+        if force_progress is not None or task_progress is not None:
+            try:
+                client.run(
+                    configure_progress,
+                    force_progress=(
+                        None if force_progress is None else bool(force_progress)
+                    ),
+                    task_progress=(
+                        None if task_progress is None else bool(task_progress)
+                    ),
+                )
+            except Exception:
+                pass
         client.wait_for_workers(
             run_settings.runtime.max_workers,
             timeout=run_settings.runtime.wait_timeout,
