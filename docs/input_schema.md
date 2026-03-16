@@ -1,183 +1,181 @@
-# Canonical Input Schema
+# Input Schema
 
-This document defines the canonical release-candidate input schema for MOSAIC.
-It matches the `schema_version: 2` format used in
-[examples/input_parameters.json](/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/input_parameters.json).
+MOSAIC runs use two JSON files:
 
-The code still accepts older compatibility payloads such as `structInfo`,
-`peakInfo`, `rspace_info`, and `runtime_info`, but those should be treated as
-legacy forms. Public-facing examples and new workflows should use the unified
-schema below.
+1. `run_parameters.json`
+2. `input_parameters.json`
 
-## Top-Level Keys
+The shipped examples all follow that pattern.
+
+## `run_parameters.json`
+
+This is the small entry file passed to the CLI. In the examples it contains:
+
+```json
+{
+  "input_parameters_path": "./input_parameters.json"
+}
+```
+
+Run an example from the repository root with:
+
+```bash
+conda run -n mosaic python -m core.main examples/config_1D/displacement/run_parameters.json
+```
+
+If MOSAIC is installed as a CLI, the equivalent command is:
+
+```bash
+conda run -n mosaic mosaic examples/config_1D/displacement/run_parameters.json
+```
+
+## `input_parameters.json`
+
+The current public schema uses these top-level sections:
+
+- `schema_version`
+- `paths`
+- `structure`
+- `reciprocal_space`
+- `processing`
+- `runtime`
+
+## Section Summary
 
 ### `schema_version`
 
 - Integer schema marker.
-- Release-candidate examples use `2`.
+- All shipped examples use `2`.
 
 ### `paths`
 
-Defines file-system inputs and outputs.
+Controls where inputs are read from and where outputs are written.
 
-Supported keys:
+Common keys in the shipped examples:
 
 - `config_root`
-  - Base directory for resolving relative structure, coefficient, and point
-    selector files.
 - `structure_file`
-  - Structure/configuration file to load.
 - `output_directory`
-  - Working directory for generated release outputs.
+
+Optional key used by some workflows:
+
 - `average_structure_file`
-  - Optional average-structure file where the selected processing mode requires
-    it.
 
 ### `structure`
 
-Defines structure-specific inputs.
+Describes the structure input.
 
-Supported keys:
+Common keys:
 
 - `dimension`
-  - `1`, `2`, or `3`.
 - `coefficients`
-  - Optional coefficient source information.
 - `cell_limits`
-  - Optional `min` / `max` bounds when a cropped cell window is required.
+
+Notes:
+
+- The examples use `dimension: 1` or `dimension: 2`.
+- `structure.coefficients` is optional.
+- `structure.coefficients` provides per-site chemical labels or grouping used
+  during coefficient-based postprocessing. The loader accepts either `scheme`
+  or `source` inside `structure.coefficients`. The shipped examples use both
+  forms.
 
 ### `reciprocal_space`
 
-Defines the reciprocal-space regions and masks to evaluate.
+Defines what MOSAIC samples in reciprocal space.
 
-Supported keys:
+Common keys:
 
 - `intervals`
-  - List of reciprocal-space subsets to sample.
-  - In the canonical example each interval uses:
-    - `limit`
-    - `subvolume_step`
 - `mask`
-  - Reciprocal-space selection logic.
-  - Common keys include:
-    - `equation`
-    - `special_points`
-    - `shell_radii`
 
-Conceptually, these windows correspond to the manuscript’s
-phase-preserving mask `W_F(Q)` applied to selected diffuse-scattering features.
+Common `mask` entries:
+
+- `equation`: a symbolic expression evaluated per Q-point (used by 1D and 2D
+  examples). In the manuscript this is called a *window* W_F(Q).
+- `special_points`: list of named reciprocal-space points with symmetry and
+  shape parameters (used by the 3D example)
+- `shell_radii`: radial bounds (`r1`, `r2`) for shell-based masking around
+  special points (used with `special_points` in the 3D example)
 
 ### `processing`
 
-Defines how MOSAIC converts reciprocal-space selections into site-resolved
-outputs.
+Controls the scientific workflow and postprocessing surface.
 
-Supported keys:
+Common keys:
 
 - `mode`
-  - Scientific interpretation mode.
-  - Common values in the current codebase:
-    - `displacement`
-    - chemical/average-position style workflows through the same compatibility
-      layer
 - `method`
-  - Patch-center / point-selection method.
-  - Example: `central`
 - `num_chunks`
-  - Number of chunk groups for stage accumulation.
 - `fresh_start`
-  - Whether to remove prior generated output for the run.
 - `run_postprocessing`
-  - Whether the decoder/output stage should run after residual-field creation.
 - `points`
-  - Point-selection entries, each with:
-    - `selector`
-      - e.g. `file`
-    - `window`
-      - `dist_from_atom_center`
-      - `step_in_angstrom`
+
+The shipped examples use:
+
+- `mode: "displacement"`
+- `mode: "chemical"`
+- `method: "from_average"`
+
+Optional keys present in some examples:
+
+- `decoder`: configures the `M`-decoder pipeline for displacement mode. The
+  `M`-decoder is a trained linear operator that maps local residual-field
+  patches to site-resolved displacement vectors. The 2D displacement example
+  includes this section and writes an additional decoder output directory.
+- `chemical_filtered_ordering`: boolean. When `true`, enables filtered
+  chemical-ordering output (scalar occupancy contrast per site). Used by the
+  chemical-ordering examples.
+- `coefficients`: controls how structure coefficients are applied during
+  postprocessing. Keys include `use` (boolean) and `center_by` (centering
+  strategy, e.g. `"global"`).
 
 ### `runtime`
 
-Defines runtime and form-factor settings.
+Controls execution settings.
 
-Supported keys:
+Common keys:
 
 - `dask`
-  - Runtime backend configuration.
-  - Common keys:
-    - `backend`
-    - `max_workers`
-    - `threads_per_worker`
-    - `processes`
-    - `worker_wait_timeout`
-- `form_factor`
-  - Scattering-factor family and calculator choice.
-  - Common keys:
-    - `family`
-    - `calculator`
+- `scattering_weights`
+- `progress`
 
-## Canonical Smoke Example
+Common `runtime.dask` keys:
 
-The release-candidate smoke path uses the following minimal pattern:
+- `backend`
+- `max_workers`
+- `threads_per_worker`
+- `processes`
+- `worker_wait_timeout`
 
-```json
-{
-  "schema_version": 2,
-  "paths": {
-    "config_root": ".",
-    "structure_file": "sample_1d.f1d",
-    "output_directory": "./sample_1d_release"
-  },
-  "structure": {
-    "dimension": 1
-  },
-  "reciprocal_space": {
-    "intervals": [
-      {
-        "limit": [1.0],
-        "subvolume_step": [1.0]
-      }
-    ],
-    "mask": {
-      "equation": "h**2>=-1"
-    }
-  },
-  "processing": {
-    "mode": "displacement",
-    "method": "central",
-    "num_chunks": 1,
-    "fresh_start": true,
-    "run_postprocessing": false
-  },
-  "runtime": {
-    "dask": {
-      "backend": "local",
-      "max_workers": 1,
-      "threads_per_worker": 1,
-      "processes": false,
-      "worker_wait_timeout": "30s"
-    },
-    "form_factor": {
-      "family": "neutron",
-      "calculator": "default"
-    }
-  }
-}
-```
+`runtime.scattering_weights` selects the type of scattering factor used in the
+amplitude calculation. This is distinct from `structure.coefficients`, which
+provides per-site chemical labels for coefficient-based postprocessing.
 
-See [examples/input_parameters.json](/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/input_parameters.json)
-for the exact supported smoke-scale example.
+Supported `kind` values for `runtime.scattering_weights`:
 
-## Legacy Compatibility Mapping
+- `ones`: unit weights (default)
+- `atomic_number`: Z-based weights
+- `neutron`: neutron scattering lengths
+- `xray`: X-ray form factors
+- `electron`: electron scattering factors
 
-The loader in [core/config/schema.py](/mnt/c/Projects/MOSAICPaper/MOSAIC/core/config/schema.py)
-still maps older payloads into the canonical internal structure. In particular:
+## Example References
 
-- `structInfo` maps to `paths + structure`
-- `peakInfo` maps to `reciprocal_space`
-- `rspace_info` maps to `processing`
-- `runtime_info` maps to `runtime`
+Use the shipped examples as the concrete schema reference:
 
-That compatibility exists for historical inputs, but new release-facing
-examples should stay on the unified schema.
+- [../examples/config_1D/displacement/input_parameters.json](../examples/config_1D/displacement/input_parameters.json)
+- [../examples/config_1D/chemical_ordering/input_parameters.json](../examples/config_1D/chemical_ordering/input_parameters.json)
+- [../examples/config_2D/displacement/input_parameters.json](../examples/config_2D/displacement/input_parameters.json)
+- [../examples/config_2D/chemical_ordering/input_parameters.json](../examples/config_2D/chemical_ordering/input_parameters.json)
+
+## Compatibility Note
+
+The loader still accepts older compatibility forms such as:
+
+- `structInfo`
+- `peakInfo`
+- `rspace_info`
+- `runtime_info`
+
+New configs should use the unified schema shown above.

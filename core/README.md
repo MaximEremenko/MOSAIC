@@ -3,10 +3,12 @@
 `core/` is the installable scientific-stage Python package used by MOSAIC.
 
 Use the repository-level [README.md](../README.md) for installation, the
-canonical run command, method overview, and release-facing guidance.
+canonical run command, method overview, and manuscript-facing project
+overview.
 
-Use [docs/input_schema.md](../docs/input_schema.md) for the canonical
-release-candidate input schema.
+For documentation, start with [docs/README.md](../docs/README.md). That index
+links to the maintained input-schema, runtime, troubleshooting, and example
+guides.
 
 Primary package surface:
 
