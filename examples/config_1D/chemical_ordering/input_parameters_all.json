@@ -2,11 +2,14 @@
   "schema_version": 2,
   "paths": {
     "config_root": ".",
-    "structure_file": "sample_1d.f1d",
-    "output_directory": "./sample_1d_release"
+    "structure_file": "slice_chemical_ordering_1d.f1d",
+    "output_directory": "./output_chem_all"
   },
   "structure": {
-    "dimension": 1
+    "dimension": 1,
+    "coefficients": {
+      "source": "config"
+    }
   },
   "reciprocal_space": {
     "intervals": [
@@ -16,38 +19,40 @@
       }
     ],
     "mask": {
-      "equation": "h**2>=-1"
+      "equation": "((Mod(h,1.0) - 0.5)**2 >= 0)"
     }
   },
   "processing": {
-    "mode": "displacement",
-    "method": "central",
+    "mode": "chemical",
+    "method": "from_average",
     "num_chunks": 1,
     "fresh_start": true,
-    "run_postprocessing": false,
+    "run_postprocessing": true,
     "points": [
       {
         "selector": {
-          "file": "central_points.txt"
+          "element": "El1",
+          "reference_number": 1
         },
         "window": {
-          "dist_from_atom_center": [0.1],
+          "dist_from_atom_center": [0.01],
           "step_in_angstrom": [0.05]
         }
       }
-    ]
+    ],
+    "chemical_filtered_ordering": true,
+    "coefficients": {
+      "center_by": "global",
+      "use": true
+    }
   },
   "runtime": {
     "dask": {
-      "backend": "local",
+      "backend": "synchronous",
       "max_workers": 1,
       "threads_per_worker": 1,
       "processes": false,
       "worker_wait_timeout": "30s"
-    },
-    "form_factor": {
-      "family": "neutron",
-      "calculator": "default"
     }
   }
 }

@@ -114,7 +114,8 @@ Runnable example packages currently include:
 | `examples/config_1D/chemical_ordering/` | 1D | Chemical ordering |
 | `examples/config_2D/displacement/` | 2D | Displacement |
 | `examples/config_2D/chemical_ordering/` | 2D | Chemical ordering |
-| `examples/config_3D/` | 3D | Reference inputs only |
+| `examples/config_3D/displacement/` | 3D | Displacement |
+| `examples/config_3D/chemical_ordering/` | 3D | Chemical ordering |
 
 See [examples/README.md](examples/README.md) for the current example surface
 and the distinction between runnable examples and larger research material.
