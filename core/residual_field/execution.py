@@ -132,7 +132,7 @@ def _residual_partition_runtime_policy(
     *,
     default_target_bytes: int,
     effective_nufft_workers: int,
-) -> dict[str, int]:
+) -> dict[str, int | float]:
     runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
 
     def _get_int(name: str, default: int) -> int:
@@ -143,6 +143,15 @@ def _residual_partition_runtime_policy(
             env_name = f"MOSAIC_{name.upper()}"
             value = os.getenv(env_name)
         return int(value) if value is not None else int(default)
+
+    def _get_float(name: str, default: float) -> float:
+        value = None
+        if hasattr(runtime_info, "get"):
+            value = runtime_info.get(name)
+        if value is None:
+            env_name = f"MOSAIC_{name.upper()}"
+            value = os.getenv(env_name)
+        return float(value) if value is not None else float(default)
 
     return {
         "target_partition_bytes": max(1, _get_int("residual_partition_target_bytes", int(default_target_bytes))),
@@ -163,6 +172,14 @@ def _residual_partition_runtime_policy(
         "min_points_per_partition": max(
             1,
             _get_int("residual_min_points_per_partition", 1),
+        ),
+        "hysteresis_low_factor": _get_float(
+            "residual_partition_hysteresis_low",
+            0.8,
+        ),
+        "hysteresis_high_factor": _get_float(
+            "residual_partition_hysteresis_high",
+            1.2,
         ),
     }
 
@@ -616,7 +633,10 @@ def _inspect_owner_local_reducer_targets_or_raise(
     for future, result in yield_futures_with_results(inspect_futures, client):
         if future is None:
             continue
-        inspected_target_states[target_keys_by_future[future]] = result
+        try:
+            inspected_target_states[target_keys_by_future[future]] = future.result()
+        except Exception:
+            inspected_target_states[target_keys_by_future[future]] = None
     return inspected_target_states
 
 
@@ -1009,6 +1029,8 @@ def run_residual_field_stage(
             target_partition_bytes_3d=int(partition_policy["target_partition_bytes_3d"]),
             max_partitions_per_chunk=int(partition_policy["max_partitions_per_chunk"]),
             min_points_per_partition=int(partition_policy["min_points_per_partition"]),
+            hysteresis_low_factor=float(partition_policy["hysteresis_low_factor"]),
+            hysteresis_high_factor=float(partition_policy["hysteresis_high_factor"]),
         )
         target_partitions_by_chunk = {
             int(chunk_id): int(plan.target_partitions)
@@ -1028,6 +1050,18 @@ def run_residual_field_stage(
         }
         for chunk_id, plan in partition_plans.items():
             if plan.target_partitions > 1:
+                low_threshold_bytes = int(
+                    round(
+                        float(plan.target_partition_bytes)
+                        * float(partition_policy["hysteresis_low_factor"])
+                    )
+                )
+                high_threshold_bytes = int(
+                    round(
+                        float(plan.target_partition_bytes)
+                        * float(partition_policy["hysteresis_high_factor"])
+                    )
+                )
                 partition_rifft_points = tuple(
                     int(value)
                     for value in getattr(plan, "partition_rifft_points", ())
@@ -1041,13 +1075,15 @@ def run_residual_field_stage(
                         target_partitions=int(plan.target_partitions),
                     )
                 logger.info(
-                    "Residual-field partition plan | chunk=%d | dim=%d | points=%d | rifft_points=%d | est_bytes=%d | target_bytes=%d | partitions=%d | partition_rifft_points=%s | imbalance=%.3f | reason=%s",
+                    "Residual-field partition plan | chunk=%d | dim=%d | points=%d | rifft_points=%d | est_bytes=%d | target_bytes=%d | hysteresis_band=%d-%d | partitions=%d | partition_rifft_points=%s | imbalance=%.3f | reason=%s",
                     int(chunk_id),
                     int(plan.dimensionality),
                     int(plan.point_count),
                     int(plan.estimated_rifft_points),
                     int(plan.estimated_bytes),
                     int(plan.target_partition_bytes),
+                    int(low_threshold_bytes),
+                    int(high_threshold_bytes),
                     int(plan.target_partitions),
                     partition_rifft_points,
                     float(planned_imbalance_ratio),

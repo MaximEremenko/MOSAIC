@@ -27,6 +27,7 @@ from core.residual_field.execution import (
     _cap_async_max_inflight,
     _distributed_owner_affinity_enabled,
     _distributed_owner_local_reducer_supported,
+    _residual_partition_runtime_policy,
     run_residual_field_stage,
 )
 from core.residual_field.contracts import (
@@ -288,6 +289,24 @@ class _FakeDistributedOwnerLocalBackend(_FakeLocalReducerBackend):
         return target_state
 
 
+def _point_rows_2d(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "coordinates": np.array([float(index), float(index)]),
+        }
+        for index in range(count)
+    ]
+
+
+def _point_rows_3d(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "coordinates": np.array([float(index), float(index), float(index)]),
+        }
+        for index in range(count)
+    ]
+
+
 def test_residual_field_planning_builds_interval_chunk_work_units(tmp_path):
     parameters = {
         "postprocessing_mode": "displacement",
@@ -417,6 +436,107 @@ def test_adaptive_partition_plan_splits_when_estimated_bytes_exceed_budget():
     assert plan.partition_imbalance_ratio == pytest.approx(1.0)
 
 
+def test_adaptive_partition_plan_stays_whole_chunk_below_hysteresis_low_threshold():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_2d(2)},
+        effective_nufft_workers=1,
+        target_partition_bytes=160,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.estimated_bytes == 112
+    assert plan.target_partitions == 1
+    assert plan.reason == "whole-chunk"
+
+
+def test_adaptive_partition_plan_uses_hysteresis_in_dead_zone():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_2d(2)},
+        effective_nufft_workers=1,
+        target_partition_bytes=112,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.estimated_bytes == 112
+    assert plan.target_partitions == 2
+    assert plan.reason == "byte-budget-hysteresis"
+
+
+def test_adaptive_partition_plan_uses_normal_byte_budget_above_hysteresis_high_threshold():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_2d(2)},
+        effective_nufft_workers=1,
+        target_partition_bytes=74,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.estimated_bytes == 112
+    assert plan.target_partitions == 2
+    assert plan.reason == "byte-budget"
+
+
+def test_adaptive_partition_plan_scales_normally_well_above_target_bytes():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_2d(3)},
+        effective_nufft_workers=1,
+        target_partition_bytes=56,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.estimated_bytes == 168
+    assert plan.target_partitions == 3
+    assert plan.reason == "byte-budget"
+
+
+def test_adaptive_partition_plan_preserves_worker_floor_dominance_over_hysteresis():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_2d(4)},
+        effective_nufft_workers=4,
+        target_partition_bytes=500,
+        max_partitions_per_chunk=8,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.estimated_bytes == 224
+    assert plan.target_partitions == 4
+    assert plan.reason == "worker-capacity-floor"
+
+
+def test_adaptive_partition_plan_can_disable_hysteresis():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_2d(2)},
+        effective_nufft_workers=1,
+        target_partition_bytes=111,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+        hysteresis_low_factor=1.0,
+        hysteresis_high_factor=1.0,
+    )[3]
+
+    assert plan.estimated_bytes == 112
+    assert plan.target_partitions == 2
+    assert plan.reason == "byte-budget"
+
+
+def test_adaptive_partition_plan_uses_3d_hysteresis_reason_in_dead_zone():
+    plan = build_adaptive_partition_plan(
+        {3: _point_rows_3d(2)},
+        effective_nufft_workers=1,
+        target_partition_bytes=512,
+        target_partition_bytes_3d=128,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.estimated_bytes == 128
+    assert plan.target_partitions == 2
+    assert plan.reason == "3d-byte-budget-hysteresis"
+
+
 def test_adaptive_partition_plan_tracks_weighted_partition_balance():
     point_rows_by_chunk = {
         3: [
@@ -505,6 +625,189 @@ def test_adaptive_partition_plan_biases_3d_cutover():
     assert plan_3d.target_partition_bytes < plan_2d.target_partition_bytes
     assert plan_3d.target_partitions >= plan_2d.target_partitions
     assert plan_3d.reason in {"3d-byte-budget", "worker-capacity-floor", "partition-cap"}
+
+
+def _make_uniform_2d_point_rows(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "coordinates": np.array([float(index), float(index)], dtype=np.float64),
+            "dist_from_atom_center": np.array([2.0, 2.0], dtype=np.float64),
+            "step_in_frac": np.array([0.5, 0.5], dtype=np.float64),
+        }
+        for index in range(count)
+    ]
+
+
+def _make_uniform_3d_point_rows(count: int) -> list[dict[str, object]]:
+    return [
+        {
+            "coordinates": np.array([float(index), float(index), float(index)], dtype=np.float64),
+            "dist_from_atom_center": np.array([2.0, 2.0, 2.0], dtype=np.float64),
+            "step_in_frac": np.array([0.5, 0.5, 0.5], dtype=np.float64),
+        }
+        for index in range(count)
+    ]
+
+
+def test_adaptive_partition_plan_stays_whole_chunk_below_hysteresis_low_threshold():
+    point_rows_by_chunk = {3: _make_uniform_2d_point_rows(2)}
+    baseline = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=1_000_000,
+    )[3]
+    target_bytes = int(np.ceil(float(baseline.estimated_bytes) / 0.7))
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=target_bytes,
+    )[3]
+
+    assert plan.target_partitions == 1
+    assert plan.reason == "whole-chunk"
+
+
+def test_adaptive_partition_plan_enters_hysteresis_dead_zone_for_2d_cutover():
+    point_rows_by_chunk = {3: _make_uniform_2d_point_rows(2)}
+    baseline = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=1_000_000,
+    )[3]
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=baseline.estimated_bytes,
+    )[3]
+
+    assert plan.target_partitions == 2
+    assert plan.reason == "byte-budget-hysteresis"
+
+
+def test_adaptive_partition_plan_uses_normal_byte_budget_above_hysteresis_high_threshold():
+    point_rows_by_chunk = {3: _make_uniform_2d_point_rows(2)}
+    baseline = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=1_000_000,
+    )[3]
+    target_bytes = int(np.ceil(float(baseline.estimated_bytes) / 1.5))
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=target_bytes,
+    )[3]
+
+    assert plan.target_partitions == 2
+    assert plan.reason == "byte-budget"
+
+
+def test_adaptive_partition_plan_keeps_ceil_behavior_well_above_hysteresis_high_threshold():
+    point_rows_by_chunk = {3: _make_uniform_2d_point_rows(4)}
+    baseline = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=1_000_000,
+    )[3]
+    target_bytes = int(np.ceil(float(baseline.estimated_bytes) / 3.0))
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=target_bytes,
+        max_partitions_per_chunk=4,
+    )[3]
+
+    assert plan.target_partitions == 3
+    assert plan.reason == "byte-budget"
+
+
+def test_adaptive_partition_plan_worker_floor_still_dominates_hysteresis():
+    point_rows_by_chunk = {3: _make_uniform_2d_point_rows(4)}
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=4,
+        target_partition_bytes=1_000_000,
+        max_partitions_per_chunk=4,
+    )[3]
+
+    assert plan.target_partitions == 4
+    assert plan.reason == "worker-capacity-floor"
+
+
+def test_adaptive_partition_plan_can_disable_hysteresis():
+    point_rows_by_chunk = {3: _make_uniform_2d_point_rows(2)}
+    baseline = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=1_000_000,
+    )[3]
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=baseline.estimated_bytes,
+        hysteresis_low_factor=1.0,
+        hysteresis_high_factor=1.0,
+    )[3]
+
+    assert plan.target_partitions == 1
+    assert plan.reason == "whole-chunk"
+
+
+def test_adaptive_partition_plan_enters_hysteresis_dead_zone_for_3d_cutover():
+    point_rows_by_chunk = {3: _make_uniform_3d_point_rows(2)}
+    baseline = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=1_000_000,
+        target_partition_bytes_3d=1_000_000,
+    )[3]
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=1,
+        target_partition_bytes=10_000_000,
+        target_partition_bytes_3d=baseline.estimated_bytes,
+    )[3]
+
+    assert plan.target_partitions == 2
+    assert plan.reason == "3d-byte-budget-hysteresis"
+
+
+def test_residual_partition_runtime_policy_includes_hysteresis_overrides(monkeypatch):
+    policy = _residual_partition_runtime_policy(
+        SimpleNamespace(
+            runtime_info={
+                "residual_partition_hysteresis_low": 0.9,
+                "residual_partition_hysteresis_high": 1.1,
+            }
+        ),
+        default_target_bytes=256,
+        effective_nufft_workers=4,
+    )
+
+    assert policy["hysteresis_low_factor"] == pytest.approx(0.9)
+    assert policy["hysteresis_high_factor"] == pytest.approx(1.1)
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_PARTITION_HYSTERESIS_LOW", "0.85")
+    monkeypatch.setenv("MOSAIC_RESIDUAL_PARTITION_HYSTERESIS_HIGH", "1.25")
+    try:
+        env_policy = _residual_partition_runtime_policy(
+            SimpleNamespace(runtime_info={}),
+            default_target_bytes=256,
+            effective_nufft_workers=4,
+        )
+    finally:
+        monkeypatch.delenv("MOSAIC_RESIDUAL_PARTITION_HYSTERESIS_LOW", raising=False)
+        monkeypatch.delenv("MOSAIC_RESIDUAL_PARTITION_HYSTERESIS_HIGH", raising=False)
+
+    assert env_policy["hysteresis_low_factor"] == pytest.approx(0.85)
+    assert env_policy["hysteresis_high_factor"] == pytest.approx(1.25)
 
 
 def test_residual_field_artifacts_preserve_current_saved_and_applied_semantics(tmp_path):
@@ -1572,6 +1875,196 @@ def test_residual_field_async_local_stage_uses_owner_affinity_per_unique_reducer
         ["worker-b"],
     ]
     assert [kwargs["allow_other_workers"] for kwargs in task_submits] == [False, False, False]
+
+
+def test_residual_partition_runtime_policy_reads_hysteresis_from_runtime_info_and_env(
+    monkeypatch,
+):
+    runtime_policy = _residual_partition_runtime_policy(
+        SimpleNamespace(
+            runtime_info={
+                "residual_partition_hysteresis_low": "0.7",
+                "residual_partition_hysteresis_high": "1.3",
+            }
+        ),
+        default_target_bytes=256,
+        effective_nufft_workers=4,
+    )
+
+    assert runtime_policy["hysteresis_low_factor"] == pytest.approx(0.7)
+    assert runtime_policy["hysteresis_high_factor"] == pytest.approx(1.3)
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_PARTITION_HYSTERESIS_LOW", "0.6")
+    monkeypatch.setenv("MOSAIC_RESIDUAL_PARTITION_HYSTERESIS_HIGH", "1.4")
+    env_policy = _residual_partition_runtime_policy(
+        SimpleNamespace(runtime_info={}),
+        default_target_bytes=256,
+        effective_nufft_workers=4,
+    )
+
+    assert env_policy["hysteresis_low_factor"] == pytest.approx(0.6)
+    assert env_policy["hysteresis_high_factor"] == pytest.approx(1.4)
+
+
+def test_residual_field_async_stage_passes_hysteresis_policy_into_partition_planner_and_logs_band(
+    monkeypatch,
+    tmp_path,
+    caplog,
+):
+    work_unit = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=1,
+        chunk_id=3,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    )
+
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {"workers": {"worker-a": {"resources": {"nufft": 1}}}}
+
+        def scatter(self, data, **kwargs):
+            return data
+
+        def submit(self, func, *args, **kwargs):
+            if kwargs.get("key", "").startswith("residual-"):
+                planned_work_unit = args[0]
+                return _FakeFuture(
+                    ResidualFieldAccumulatorStatus(
+                        artifact_key=planned_work_unit.artifact_key,
+                        chunk_id=planned_work_unit.chunk_id,
+                        parameter_digest=planned_work_unit.parameter_digest,
+                        interval_ids=planned_work_unit.interval_ids,
+                        partition_id=planned_work_unit.partition_id,
+                        contribution_reciprocal_point_count=1,
+                        total_reciprocal_points=1,
+                    )
+                )
+            call_kwargs = dict(kwargs)
+            for reserved_key in (
+                "key",
+                "pure",
+                "workers",
+                "allow_other_workers",
+                "resources",
+                "retries",
+            ):
+                call_kwargs.pop(reserved_key, None)
+            return _FakeFuture(func(*args, **call_kwargs))
+
+    planner_kwargs: dict[str, object] = {}
+    fake_backend = _FakeLocalReducerBackend()
+
+    def _capture_partition_plan(*args, **kwargs):
+        planner_kwargs.update(kwargs)
+        return {
+            3: SimpleNamespace(
+                target_partitions=2,
+                dimensionality=2,
+                point_count=2,
+                estimated_rifft_points=2,
+                estimated_bytes=112,
+                target_partition_bytes=100,
+                reason="byte-budget-hysteresis",
+                rifft_points_per_atom=(1, 1),
+                partition_rifft_points=(1, 1),
+                partition_imbalance_ratio=1.0,
+            )
+        }
+
+    monkeypatch.setenv("DASK_BACKEND", "local")
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_residual_field_reducer_backend",
+        lambda *args, **kwargs: fake_backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_residual_field_work_units",
+        lambda *args, **kwargs: [work_unit],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.point_list_to_recarray",
+        lambda *args, **kwargs: np.array(
+            [
+                ([0.0, 0.0], 3),
+                ([1.0, 1.0], 3),
+            ],
+            dtype=[("coordinates", object), ("chunk_id", np.int64)],
+        ).view(np.recarray),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_adaptive_partition_plan",
+        _capture_partition_plan,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.yield_futures_with_results",
+        lambda futures, client: ((future, future.result()) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._validate_local_durable_coverage_or_raise",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.finalize_process_local_residual_chunk",
+        lambda *args, **kwargs: {"chunk_id": kwargs["chunk_id"]},
+    )
+
+    artifacts = SimpleNamespace(
+        db_manager=SimpleNamespace(
+            get_unsaved_interval_chunks=lambda: [(1, 3)],
+            get_point_data_for_chunk=lambda chunk_id: [
+                {"chunk_id": 3, "coordinates": np.array([0.0, 0.0])},
+                {"chunk_id": 3, "coordinates": np.array([1.0, 1.0])},
+            ],
+            db_path=str(tmp_path / "state.db"),
+        ),
+        padded_intervals=[{"h_range": (0.0, 0.0)}],
+        output_dir=str(tmp_path),
+        transient_interval_payloads={},
+    )
+
+    caplog.set_level(logging.INFO, logger="core.residual_field.execution")
+    try:
+        run_residual_field_stage(
+            workflow_parameters=SimpleNamespace(
+                runtime_info={
+                    "residual_partition_hysteresis_low": 0.7,
+                    "residual_partition_hysteresis_high": 1.3,
+                }
+            ),
+            structure=SimpleNamespace(supercell=np.array([1])),
+            artifacts=artifacts,
+            client=_FakeClient(),
+        )
+    finally:
+        monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+    assert planner_kwargs["hysteresis_low_factor"] == pytest.approx(0.7)
+    assert planner_kwargs["hysteresis_high_factor"] == pytest.approx(1.3)
+    assert any(
+        "Residual-field partition plan | chunk=3" in message
+        and "hysteresis_band=70-130" in message
+        and "reason=byte-budget-hysteresis" in message
+        for message in caplog.messages
+    )
 
 
 def test_residual_field_async_distributed_stage_flushes_validates_and_logs_metrics(
