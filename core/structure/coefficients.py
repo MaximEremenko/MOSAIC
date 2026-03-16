@@ -145,7 +145,7 @@ def resolve_structure_coefficients(
     )
     n_atoms = int(len(elements))
     if coeff_scheme == "ones":
-        return 10*np.ones((n_atoms,), dtype=float)
+        return np.ones((n_atoms,), dtype=float)
     if coeff_scheme == "atomic_number":
         return _build_atomic_number_coefficients(elements)
     if coeff_scheme == "neutron":
