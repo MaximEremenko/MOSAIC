@@ -7,7 +7,16 @@ from .dask_helpers import (
     yield_futures_with_results,
 )
 from .logger_config import setup_logging
-from .progress import TIMER, logging_redirect_tqdm, progress_bar, quiet_loggers, timed
+from .progress import (
+    TIMER,
+    configure_progress,
+    force_progress_enabled,
+    logging_redirect_tqdm,
+    progress_bar,
+    quiet_loggers,
+    task_progress_enabled,
+    timed,
+)
 from .worker_hooks import (
     chunk_mutex,
     handle_worker_gpu_failure,
@@ -19,8 +28,10 @@ __all__ = [
     "DEFAULT_TASK_RETRIES",
     "TIMER",
     "chunk_mutex",
+    "configure_progress",
     "default_log_dir",
     "ensure_dask_client",
+    "force_progress_enabled",
     "get_client",
     "handle_worker_gpu_failure",
     "is_sync_client",
@@ -32,6 +43,7 @@ __all__ = [
     "set_log_dir_for_run",
     "shutdown_dask",
     "setup_logging",
+    "task_progress_enabled",
     "timed",
     "yield_futures_with_results",
 ]
