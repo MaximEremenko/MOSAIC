@@ -15,15 +15,20 @@ from core.residual_field.artifacts import (
 )
 from core.residual_field.loader import load_chunk_residual_field_and_grid
 from core.residual_field.planning import (
+    build_adaptive_partition_plan,
     build_residual_field_parameter_digest,
     build_residual_field_work_units,
+    partition_residual_field_work_units,
 )
 from core.residual_field.execution import (
     _build_task_reducer_backend,
     _cap_async_max_inflight,
     run_residual_field_stage,
 )
-from core.residual_field.contracts import ResidualFieldWorkUnit
+from core.residual_field.contracts import (
+    ResidualFieldAccumulatorStatus,
+    ResidualFieldWorkUnit,
+)
 from core.residual_field.stage import ResidualFieldStage
 from core.residual_field.tasks import run_residual_field_interval_chunk_task
 from core.scattering.kernels import IntervalTask
@@ -72,6 +77,10 @@ class _FakeLocalReducerBackend:
             committed_shard_root=output_dir,
             committed_shard_storage="n/a",
             shard_compression="n/a",
+            durable_truth_unit="committed_local_snapshot_generation",
+            live_state_storage_role="owner-local-live-accumulator",
+            durable_checkpoint_storage_role="durable-local-snapshot-generation",
+            final_artifact_storage_role="durable-final-chunk-artifact",
             direct_interval_handoff_supported=True,
             checkpoint_policy=SimpleNamespace(
                 interval_artifacts="optional_output",
@@ -155,6 +164,110 @@ def test_residual_field_planning_batches_intervals_per_chunk(tmp_path):
     assert [unit.interval_ids for unit in work_units] == [(1, 2), (3,)]
     assert work_units[0].retry.idempotency_key.endswith("batch-1-2-n2")
     assert work_units[1].retry.idempotency_key.endswith("interval-3")
+
+
+def test_residual_field_planning_can_partition_work_units_for_local_owner(tmp_path):
+    parameters = {
+        "postprocessing_mode": "displacement",
+        "supercell": np.array([4]),
+        "rspace_info": {"mode": "displacement"},
+    }
+    work_units = build_residual_field_work_units(
+        [(1, 3), (2, 3)],
+        parameters=parameters,
+        output_dir=str(tmp_path),
+    )
+
+    partitioned = partition_residual_field_work_units(
+        work_units,
+        point_counts_by_chunk={3: 4},
+        target_partitions_by_chunk={3: 2},
+    )
+
+    assert [(unit.partition_id, unit.point_start, unit.point_stop) for unit in partitioned] == [
+        (0, 0, 2),
+        (1, 2, 4),
+        (0, 0, 2),
+        (1, 2, 4),
+    ]
+    assert all("partition-" in unit.artifact_key for unit in partitioned)
+
+
+def test_adaptive_partition_plan_splits_when_estimated_bytes_exceed_budget():
+    point_rows_by_chunk = {
+        3: [
+            {
+                "coordinates": np.array([0.0, 0.0]),
+                "dist_from_atom_center": np.array([2.0, 2.0]),
+                "step_in_frac": np.array([0.5, 0.5]),
+            },
+            {
+                "coordinates": np.array([1.0, 1.0]),
+                "dist_from_atom_center": np.array([2.0, 2.0]),
+                "step_in_frac": np.array([0.5, 0.5]),
+            },
+        ]
+    }
+
+    plan = build_adaptive_partition_plan(
+        point_rows_by_chunk,
+        effective_nufft_workers=4,
+        target_partition_bytes=100,
+        max_partitions_per_chunk=4,
+        min_points_per_partition=1,
+    )[3]
+
+    assert plan.target_partitions > 1
+    assert plan.reason in {"byte-budget", "worker-capacity-floor"}
+
+
+def test_adaptive_partition_plan_biases_3d_cutover():
+    point_rows_2d = {
+        3: [
+            {
+                "coordinates": np.array([0.0, 0.0]),
+                "dist_from_atom_center": np.array([2.0, 2.0]),
+                "step_in_frac": np.array([0.5, 0.5]),
+            },
+            {
+                "coordinates": np.array([1.0, 1.0]),
+                "dist_from_atom_center": np.array([2.0, 2.0]),
+                "step_in_frac": np.array([0.5, 0.5]),
+            },
+        ]
+    }
+    point_rows_3d = {
+        3: [
+            {
+                "coordinates": np.array([0.0, 0.0, 0.0]),
+                "dist_from_atom_center": np.array([2.0, 2.0, 2.0]),
+                "step_in_frac": np.array([0.5, 0.5, 0.5]),
+            },
+            {
+                "coordinates": np.array([1.0, 1.0, 1.0]),
+                "dist_from_atom_center": np.array([2.0, 2.0, 2.0]),
+                "step_in_frac": np.array([0.5, 0.5, 0.5]),
+            },
+        ]
+    }
+
+    plan_2d = build_adaptive_partition_plan(
+        point_rows_2d,
+        effective_nufft_workers=2,
+        target_partition_bytes=10_000,
+        target_partition_bytes_3d=2_000,
+    )[3]
+    plan_3d = build_adaptive_partition_plan(
+        point_rows_3d,
+        effective_nufft_workers=2,
+        target_partition_bytes=10_000,
+        target_partition_bytes_3d=2_000,
+    )[3]
+
+    assert plan_3d.estimated_bytes > plan_2d.estimated_bytes
+    assert plan_3d.target_partition_bytes < plan_2d.target_partition_bytes
+    assert plan_3d.target_partitions >= plan_2d.target_partitions
+    assert plan_3d.reason in {"3d-byte-budget", "worker-capacity-floor", "partition-cap"}
 
 
 def test_residual_field_artifacts_preserve_current_saved_and_applied_semantics(tmp_path):
@@ -344,6 +457,11 @@ def test_residual_field_reducer_backend_resolution_is_mode_aware(monkeypatch):
         durable_state.checkpoint_policy.worker_local_scratch_role
         == "temporary_staging_only"
     )
+    assert local_state.durable_truth_unit == "committed_local_snapshot_generation"
+    assert durable_state.durable_truth_unit == "committed_shard_checkpoint"
+    assert durable_state.live_state_storage_role == "owner-local-scratch-staging"
+    assert durable_state.durable_checkpoint_storage_role == "durable-shared-shard-checkpoint"
+    assert durable_state.final_artifact_storage_role == "durable-final-chunk-artifact"
 
     monkeypatch.setenv("DASK_BACKEND", "local")
     local_async_backend = resolve_residual_field_reducer_backend(
@@ -439,6 +557,113 @@ def test_residual_field_async_local_handoff_reuses_scattered_interval_payloads(m
         monkeypatch.delenv("DASK_BACKEND", raising=False)
 
     assert scatter_calls == []
+
+
+def test_residual_field_async_stage_uses_owner_affinity_for_distributed_backend_when_enabled(
+    monkeypatch,
+    tmp_path,
+):
+    work_unit = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=1,
+        chunk_id=3,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    )
+
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+    submits = []
+
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {
+                "workers": {
+                    "worker-a": {"resources": {"nufft": 1}},
+                    "worker-b": {"resources": {"nufft": 1}},
+                }
+            }
+
+        def scatter(self, data, **kwargs):
+            return data
+
+        def submit(self, func, *args, **kwargs):
+            submits.append(kwargs)
+            return _FakeFuture("manifest")
+
+    durable_backend = build_residual_field_reducer_backend("durable_shared_restartable")
+
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_residual_field_reducer_backend",
+        lambda *args, **kwargs: durable_backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_residual_field_work_units",
+        lambda *args, **kwargs: [work_unit],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.point_list_to_recarray",
+        lambda *args, **kwargs: np.array(
+            [([0.0], [0.1], [0.05], 3)],
+            dtype=[
+                ("coordinates", object),
+                ("dist_from_atom_center", object),
+                ("step_in_frac", object),
+                ("chunk_id", np.int64),
+            ],
+        ).view(np.recarray),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.yield_futures_with_results",
+        lambda futures, client: ((future, True) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._finalize_residual_field_chunks",
+        lambda **kwargs: None,
+    )
+
+    artifacts = SimpleNamespace(
+        db_manager=SimpleNamespace(
+            get_unsaved_interval_chunks=lambda: [(1, 3)],
+            get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
+            db_path=str(tmp_path / "state.db"),
+        ),
+        padded_intervals=[{"h_range": (0.0, 0.0)}],
+        output_dir=str(tmp_path),
+        transient_interval_payloads={},
+    )
+    workflow_parameters = SimpleNamespace(
+        runtime_info={"residual_distributed_owner_affinity": True}
+    )
+    structure = SimpleNamespace(supercell=np.array([1]))
+
+    run_residual_field_stage(
+        workflow_parameters=workflow_parameters,
+        structure=structure,
+        artifacts=artifacts,
+        client=_FakeClient(),
+    )
+
+    task_submit = next(kwargs for kwargs in submits if kwargs.get("key", "").startswith("residual-"))
+    assert task_submit["workers"] == ["worker-a"]
+    assert task_submit["allow_other_workers"] is False
 
 
 def test_residual_field_async_local_max_inflight_is_capped_to_worker_capacity(monkeypatch):
@@ -586,6 +811,94 @@ def test_residual_field_async_stage_logs_main_process_progress_when_enabled(
     assert any("Residual-field queue" in message for message in caplog.messages)
     assert any("Residual-field progress" in message for message in caplog.messages)
     assert len(fake_backend.accepted) == 1
+
+
+def test_residual_field_sync_stage_uses_worker_owned_local_reducer_boundary(
+    monkeypatch,
+    tmp_path,
+):
+    work_unit = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=1,
+        chunk_id=3,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    )
+    fake_backend = _FakeLocalReducerBackend()
+    rec = np.array(
+        [([0.0], [0.1], [0.05], 3)],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+            ("chunk_id", np.int64),
+        ],
+    ).view(np.recarray)
+    finalized = []
+
+    def _forbid_accept_partial(*args, **kwargs):
+        raise AssertionError("driver-side accept_partial should not run in worker-owned mode")
+
+    fake_backend.accept_partial = _forbid_accept_partial
+
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_residual_field_reducer_backend",
+        lambda *args, **kwargs: fake_backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_residual_field_work_units",
+        lambda *args, **kwargs: [work_unit],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.point_list_to_recarray",
+        lambda *args, **kwargs: rec,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.run_residual_field_interval_chunk_task",
+        lambda *args, **kwargs: ResidualFieldAccumulatorStatus(
+            artifact_key=work_unit.artifact_key,
+            chunk_id=3,
+            parameter_digest="abc123",
+            interval_ids=(1,),
+            contribution_reciprocal_point_count=1,
+            total_reciprocal_points=1,
+        ),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.finalize_process_local_residual_chunk",
+        lambda *args, **kwargs: finalized.append(kwargs["chunk_id"]) or None,
+    )
+
+    artifacts = SimpleNamespace(
+        db_manager=SimpleNamespace(
+            get_unsaved_interval_chunks=lambda: [(1, 3)],
+            get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
+            db_path=str(tmp_path / "state.db"),
+        ),
+        padded_intervals=[{"h_range": (0.0, 0.0)}],
+        output_dir=str(tmp_path),
+        transient_interval_payloads={},
+    )
+    workflow_parameters = SimpleNamespace(
+        runtime_info={"residual_local_owner_reducer": True}
+    )
+    structure = SimpleNamespace(supercell=np.array([1]))
+
+    run_residual_field_stage(
+        workflow_parameters=workflow_parameters,
+        structure=structure,
+        artifacts=artifacts,
+        client=None,
+    )
+
+    assert finalized == [3]
 
 
 def test_residual_field_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_path):
@@ -739,6 +1052,165 @@ def test_residual_field_interval_chunk_task_returns_local_partial_for_local_back
     np.testing.assert_allclose(result.amplitudes_delta, np.array([9.0 + 0.0j]))
     np.testing.assert_allclose(result.amplitudes_average, np.array([10.0 + 0.0j]))
     assert not (tmp_path / "residual_shards").exists()
+
+
+def test_residual_field_interval_chunk_task_returns_small_status_for_worker_owned_local_reducer(
+    monkeypatch,
+    tmp_path,
+):
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    local_backend = resolve_residual_field_reducer_backend(
+        workflow_parameters=SimpleNamespace(runtime_info={}),
+        client=None,
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: np.array([[9.0 + 0.0j], [10.0 + 0.0j]]),
+    )
+
+    class _WorkerLocalBackend:
+        def build_local_partial(self, work_unit, **kwargs):
+            captured["partial"] = ResidualFieldLocalAccumulatorPartial(
+                work_unit=work_unit,
+                **kwargs,
+            )
+            return captured["partial"]
+
+        def accept_partial(self, partial, **kwargs):
+            captured["accepted"] = partial
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.get_process_local_residual_field_backend",
+        lambda template_backend: _WorkerLocalBackend(),
+    )
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        IntervalTask(
+            1,
+            "All",
+            np.array([[0.0]], dtype=np.float64),
+            np.array([2.0 + 0.0j]),
+            np.array([1.0 + 0.0j]),
+        ),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        db_path=str(tmp_path / "state.db"),
+        scratch_root=str(tmp_path / "scratch"),
+        reducer_backend=local_backend,
+        total_expected_partials=4,
+        worker_owned_local_reducer=True,
+        quiet_logs=True,
+    )
+
+    assert isinstance(result, ResidualFieldAccumulatorStatus)
+    np.testing.assert_allclose(
+        captured["accepted"].amplitudes_delta,
+        np.array([9.0 + 0.0j]),
+    )
+    np.testing.assert_allclose(
+        captured["accepted"].amplitudes_average,
+        np.array([10.0 + 0.0j]),
+    )
+
+
+def test_residual_field_interval_chunk_task_slices_partition_atoms_for_worker_owned_local_reducer(
+    monkeypatch,
+    tmp_path,
+):
+    atoms = np.array(
+        [
+            ([0.0], [0.1], [0.05]),
+            ([1.0], [0.2], [0.05]),
+        ],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    local_backend = resolve_residual_field_reducer_backend(
+        workflow_parameters=SimpleNamespace(runtime_info={}),
+        client=None,
+    )
+    captured = {}
+
+    def _capture_grid(chunk_data):
+        captured["chunk_data_len"] = len(chunk_data)
+        return np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        _capture_grid,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: np.array([[9.0 + 0.0j], [10.0 + 0.0j]]),
+    )
+
+    class _WorkerLocalBackend:
+        def local_intervals_already_durable(self, work_unit, *, output_dir):
+            return False
+
+        def build_local_partial(self, work_unit, **kwargs):
+            return ResidualFieldLocalAccumulatorPartial(work_unit=work_unit, **kwargs)
+
+        def accept_partial(self, partial, **kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.get_process_local_residual_field_backend",
+        lambda template_backend: _WorkerLocalBackend(),
+    )
+
+    work_unit = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=1,
+        chunk_id=3,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    ).with_partition(partition_id=1, point_start=1, point_stop=2)
+
+    result = run_residual_field_interval_chunk_task(
+        work_unit,
+        IntervalTask(
+            1,
+            "All",
+            np.array([[0.0]], dtype=np.float64),
+            np.array([2.0 + 0.0j]),
+            np.array([1.0 + 0.0j]),
+        ),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        db_path=str(tmp_path / "state.db"),
+        scratch_root=str(tmp_path / "scratch"),
+        reducer_backend=local_backend,
+        total_expected_partials=4,
+        worker_owned_local_reducer=True,
+        quiet_logs=True,
+    )
+
+    assert isinstance(result, ResidualFieldAccumulatorStatus)
+    assert captured["chunk_data_len"] == 1
 
 
 def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(monkeypatch, tmp_path):

@@ -11,11 +11,16 @@ from core.residual_field.backend import (
     ResidualFieldReducerBackend,
     ResidualFieldLocalAccumulatorPartial,
     build_residual_field_reducer_backend,
+    get_process_local_residual_field_backend,
 )
 from core.scattering.kernels import build_rifft_grid_for_chunk
 from core.scattering.kernels import IntervalTask
 from core.scattering.tasks import load_interval_task_payload, scattering_contribution_point_count
-from core.residual_field.contracts import ResidualFieldShardManifest, ResidualFieldWorkUnit
+from core.residual_field.contracts import (
+    ResidualFieldAccumulatorStatus,
+    ResidualFieldShardManifest,
+    ResidualFieldWorkUnit,
+)
 from core.adapters.cunufft_wrapper import (
     execute_inverse_cunufft_super_batch,
 )
@@ -59,10 +64,13 @@ def run_residual_field_interval_chunk_task(
     *,
     total_reciprocal_points: int,
     output_dir: str,
+    db_path: str | None = None,
     scratch_root: str | None = None,
     reducer_backend: ResidualFieldReducerBackend | None = None,
+    total_expected_partials: int | None = None,
+    worker_owned_local_reducer: bool = False,
     quiet_logs: bool = False,
-) -> ResidualFieldShardManifest | ResidualFieldLocalAccumulatorPartial | None:
+) -> ResidualFieldShardManifest | ResidualFieldLocalAccumulatorPartial | ResidualFieldAccumulatorStatus | None:
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
     try:
         show_progress = _task_progress_enabled(quiet_logs)
@@ -72,14 +80,45 @@ def run_residual_field_interval_chunk_task(
         loaded_interval_inputs = _normalize_interval_inputs(interval_paths)
         if not loaded_interval_inputs:
             raise ValueError("Residual-field batch task requires at least one interval artifact path.")
+        partition_atoms = atoms
+        if work_unit.point_start is not None or work_unit.point_stop is not None:
+            start = int(work_unit.point_start or 0)
+            stop = int(work_unit.point_stop or len(atoms))
+            partition_atoms = atoms[start:stop]
         chunk_data = [
             {
-                "coordinates": atoms["coordinates"][index],
-                "dist_from_atom_center": atoms["dist_from_atom_center"][index],
-                "step_in_frac": atoms["step_in_frac"][index],
+                "coordinates": partition_atoms["coordinates"][index],
+                "dist_from_atom_center": partition_atoms["dist_from_atom_center"][index],
+                "step_in_frac": partition_atoms["step_in_frac"][index],
             }
-            for index in range(atoms.shape[0])
+            for index in range(partition_atoms.shape[0])
         ]
+        if resolved_backend.uses_local_chunk_accumulator() and worker_owned_local_reducer:
+            if scratch_root is None or db_path is None or total_expected_partials is None:
+                raise ValueError(
+                    "Worker-owned local reduction requires scratch_root, db_path, and total_expected_partials."
+                )
+            worker_backend = get_process_local_residual_field_backend(
+                resolved_backend
+            )
+            already_durable = getattr(
+                worker_backend,
+                "local_intervals_already_durable",
+                lambda *_args, **_kwargs: False,
+            )
+            if already_durable(
+                work_unit,
+                output_dir=output_dir,
+            ):
+                return ResidualFieldAccumulatorStatus(
+                    artifact_key=work_unit.artifact_key,
+                    chunk_id=work_unit.chunk_id,
+                    parameter_digest=work_unit.parameter_digest,
+                    interval_ids=work_unit.interval_ids,
+                    partition_id=work_unit.partition_id,
+                    contribution_reciprocal_point_count=0,
+                    total_reciprocal_points=total_reciprocal_points,
+                )
         rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(chunk_data)
         if show_progress:
             logger.info(
@@ -152,6 +191,33 @@ def run_residual_field_interval_chunk_task(
             )
         point_ids = np.arange(amplitudes_delta.shape[0], dtype=np.int64)
         if resolved_backend.uses_local_chunk_accumulator():
+            if worker_owned_local_reducer:
+                partial = worker_backend.build_local_partial(
+                    work_unit,
+                    grid_shape_nd=grid_shape_nd,
+                    total_reciprocal_points=total_reciprocal_points,
+                    contribution_reciprocal_points=contribution_reciprocal_points,
+                    amplitudes_delta=amplitudes_delta,
+                    amplitudes_average=amplitudes_average,
+                    point_ids=point_ids,
+                )
+                worker_backend.accept_partial(
+                    partial,
+                    output_dir=output_dir,
+                    scratch_root=scratch_root,
+                    db_path=db_path,
+                    total_expected_partials=total_expected_partials,
+                    cleanup_policy="off",
+                )
+                return ResidualFieldAccumulatorStatus(
+                    artifact_key=work_unit.artifact_key,
+                    chunk_id=work_unit.chunk_id,
+                    parameter_digest=work_unit.parameter_digest,
+                    interval_ids=work_unit.interval_ids,
+                    partition_id=work_unit.partition_id,
+                    contribution_reciprocal_point_count=contribution_reciprocal_points,
+                    total_reciprocal_points=total_reciprocal_points,
+                )
             if show_progress:
                 logger.info(
                     "Residual batch ready for local accumulator | chunk=%d | intervals=%s",

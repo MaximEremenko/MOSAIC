@@ -4,6 +4,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -23,15 +24,28 @@ from core.runtime import (
     yield_futures_with_results,
 )
 from core.residual_field.backend import (
+    finalize_process_local_residual_chunk,
     ResidualFieldReducerBackend,
     ResidualFieldLocalAccumulatorPartial,
     build_residual_field_reducer_backend,
     is_same_node_local_client,
     resolve_residual_field_reducer_backend,
 )
-from core.residual_field.planning import build_residual_field_work_units
+from core.residual_field.contracts import (
+    ResidualFieldAccumulatorStatus,
+    ResidualFieldShardManifest,
+    ResidualFieldWorkUnit,
+)
+from core.residual_field.artifacts import (
+    summarize_residual_field_output_artifacts,
+    summarize_residual_field_shards,
+)
+from core.residual_field.planning import (
+    build_adaptive_partition_plan,
+    build_residual_field_work_units,
+    partition_residual_field_work_units,
+)
 from core.residual_field.tasks import run_residual_field_interval_chunk_task
-from core.residual_field.contracts import ResidualFieldShardManifest, ResidualFieldWorkUnit
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -40,6 +54,74 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_RESIDUAL_INTERVALS_PER_SHARD = 4
+
+
+def _worker_owned_local_reducer_enabled(workflow_parameters) -> bool:
+    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
+    override = None
+    if hasattr(runtime_info, "get"):
+        override = runtime_info.get("residual_local_owner_reducer")
+    if override is None:
+        override = os.getenv("MOSAIC_RESIDUAL_LOCAL_OWNER_REDUCER")
+    if override is None:
+        return False
+    if isinstance(override, str):
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(override)
+
+
+def _distributed_owner_affinity_enabled(workflow_parameters) -> bool:
+    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
+    override = None
+    if hasattr(runtime_info, "get"):
+        override = runtime_info.get("residual_distributed_owner_affinity")
+    if override is None:
+        override = os.getenv("MOSAIC_RESIDUAL_DISTRIBUTED_OWNER_AFFINITY")
+    if override is None:
+        return False
+    if isinstance(override, str):
+        return override.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(override)
+
+
+def _residual_partition_runtime_policy(
+    workflow_parameters,
+    *,
+    default_target_bytes: int,
+    effective_nufft_workers: int,
+) -> dict[str, int]:
+    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
+
+    def _get_int(name: str, default: int) -> int:
+        value = None
+        if hasattr(runtime_info, "get"):
+            value = runtime_info.get(name)
+        if value is None:
+            env_name = f"MOSAIC_{name.upper()}"
+            value = os.getenv(env_name)
+        return int(value) if value is not None else int(default)
+
+    return {
+        "target_partition_bytes": max(1, _get_int("residual_partition_target_bytes", int(default_target_bytes))),
+        "target_partition_bytes_3d": max(
+            1,
+            _get_int(
+                "residual_partition_target_bytes_3d",
+                max(1, int(default_target_bytes) // 2),
+            ),
+        ),
+        "max_partitions_per_chunk": max(
+            1,
+            _get_int(
+                "residual_max_partitions_per_chunk",
+                max(1, int(effective_nufft_workers) * 2),
+            ),
+        ),
+        "min_points_per_partition": max(
+            1,
+            _get_int("residual_min_points_per_partition", 1),
+        ),
+    }
 
 
 def _format_progress_bar(count: int, total: int, *, width: int = 20) -> str:
@@ -184,6 +266,12 @@ def _interval_inputs_for_work_unit(
     return _interval_paths_for_work_unit(work_unit)
 
 
+def _reducer_target_key(work_unit: ResidualFieldWorkUnit) -> tuple[int, int | None]:
+    return int(work_unit.chunk_id), (
+        int(work_unit.partition_id) if work_unit.partition_id is not None else None
+    )
+
+
 def _cleanup_residual_shards_enabled(workflow_parameters) -> bool:
     return _residual_shard_cleanup_policy(workflow_parameters) == "delete_reclaimable"
 
@@ -213,6 +301,7 @@ def _finalize_residual_field_chunks(
     chunk_ids: list[int],
     parameter_digest: str,
     manifests_by_chunk: dict[int, list[ResidualFieldShardManifest]],
+    expected_interval_ids_by_chunk: dict[int, tuple[int, ...]],
     output_dir: str,
     db_path: str,
     cleanup_policy: str,
@@ -220,16 +309,60 @@ def _finalize_residual_field_chunks(
     scratch_root: str | None,
 ) -> None:
     for chunk_id in sorted(set(int(chunk_id) for chunk_id in chunk_ids)):
+        shard_manifests = manifests_by_chunk.get(int(chunk_id))
+        if not reducer_backend.uses_local_chunk_accumulator():
+            reconciled_progress = reducer_backend.reconcile_progress(
+                chunk_id=int(chunk_id),
+                parameter_digest=parameter_digest,
+                output_dir=output_dir,
+                db_path=db_path,
+                manifests=shard_manifests,
+                scratch_root=scratch_root,
+            )
+            expected_interval_ids = set(
+                int(interval_id)
+                for interval_id in expected_interval_ids_by_chunk.get(int(chunk_id), ())
+            )
+            if reconciled_progress is not None:
+                durable_interval_ids = set(
+                    int(interval_id)
+                    for interval_id in reconciled_progress.incorporated_interval_ids
+                )
+                missing_interval_ids = tuple(sorted(expected_interval_ids - durable_interval_ids))
+                if missing_interval_ids:
+                    raise RuntimeError(
+                        "Residual-field distributed finalize missing durable coverage for "
+                        f"chunk {int(chunk_id)}: {missing_interval_ids}"
+                    )
+                logger.info(
+                    "Residual-field reconcile | chunk=%d | truth=%s | committed_shards=%d | pending_shards=%d | pending_intervals=%d",
+                    int(chunk_id),
+                    reconciled_progress.durable_truth_unit,
+                    int(len(reconciled_progress.incorporated_shard_keys)),
+                    int(len(reconciled_progress.pending_shard_keys)),
+                    int(len(reconciled_progress.pending_interval_ids)),
+                )
+        shard_summary = summarize_residual_field_shards(shard_manifests or [])
+        finalize_start = time.perf_counter()
         manifest = reducer_backend.finalize_chunk(
             chunk_id=int(chunk_id),
             parameter_digest=parameter_digest,
             output_dir=output_dir,
             db_path=db_path,
-            manifests=manifests_by_chunk.get(int(chunk_id)),
+            manifests=shard_manifests,
             cleanup_policy=cleanup_policy,
             scratch_root=scratch_root,
             quiet_logs=False,
         )
+        if manifest is not None:
+            output_summary = summarize_residual_field_output_artifacts(manifest.artifacts)
+            logger.info(
+                "Residual-field finalize | chunk=%d | shard_bytes=%d | final_bytes=%d | duration=%.3fs",
+                int(chunk_id),
+                int(shard_summary["committed_shard_bytes"]),
+                int(output_summary["final_artifact_bytes"]),
+                time.perf_counter() - finalize_start,
+            )
         if cleanup_policy == "delete_reclaimable" and manifest is not None:
             reducer_backend.cleanup_reclaimable_shards(
                 output_dir=output_dir,
@@ -275,6 +408,10 @@ def run_residual_field_stage(
     )
     reducer_backend = preliminary_backend
     task_reducer_backend = _build_task_reducer_backend(reducer_backend)
+    worker_owned_local_reducer = (
+        reducer_backend.layout.kind == "local_restartable"
+        and _worker_owned_local_reducer_enabled(workflow_parameters)
+    )
     reducer_runtime_state = reducer_backend.describe_runtime_state(
         output_dir=artifacts.output_dir,
         scratch_root=scratch_root,
@@ -301,6 +438,13 @@ def run_residual_field_stage(
         reducer_runtime_state.direct_interval_handoff_supported,
     )
     logger.debug(
+        "Residual-field storage roles | truth=%s | live=%s | checkpoint=%s | final=%s",
+        reducer_runtime_state.durable_truth_unit,
+        reducer_runtime_state.live_state_storage_role,
+        reducer_runtime_state.durable_checkpoint_storage_role,
+        reducer_runtime_state.final_artifact_storage_role,
+    )
+    logger.debug(
         "Residual-field checkpoint policy | interval=%s | shards=%s | progress=%s | final=%s | scratch_role=%s",
         reducer_runtime_state.checkpoint_policy.interval_artifacts,
         reducer_runtime_state.checkpoint_policy.shard_checkpoints,
@@ -315,6 +459,73 @@ def run_residual_field_stage(
         output_dir=artifacts.output_dir,
         max_intervals_per_shard=max_intervals_per_shard,
     )
+    chunk_ids = sorted({work_unit.chunk_id for work_unit in work_units})
+    point_data_list: list[dict] = []
+    for chunk_id in chunk_ids:
+        point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
+
+    if (
+        worker_owned_local_reducer
+        and client is not None
+        and not is_sync_client(client)
+        and work_units
+    ):
+        point_rows_by_chunk = {
+            int(chunk_id): [
+                point_data
+                for point_data in point_data_list
+                if int(point_data["chunk_id"]) == int(chunk_id)
+            ]
+            for chunk_id in chunk_ids
+        }
+        local_partition_capacity = _cap_async_max_inflight(
+            client=client,
+            requested=max_inflight,
+        )
+        partition_policy = _residual_partition_runtime_policy(
+            workflow_parameters,
+            default_target_bytes=getattr(
+                task_reducer_backend,
+                "local_accumulator_max_ram_bytes",
+                256 * 1024 * 1024,
+            ),
+            effective_nufft_workers=int(local_partition_capacity),
+        )
+        partition_plans = build_adaptive_partition_plan(
+            point_rows_by_chunk,
+            effective_nufft_workers=int(local_partition_capacity),
+            target_partition_bytes=int(partition_policy["target_partition_bytes"]),
+            target_partition_bytes_3d=int(partition_policy["target_partition_bytes_3d"]),
+            max_partitions_per_chunk=int(partition_policy["max_partitions_per_chunk"]),
+            min_points_per_partition=int(partition_policy["min_points_per_partition"]),
+        )
+        target_partitions_by_chunk = {
+            int(chunk_id): int(plan.target_partitions)
+            for chunk_id, plan in partition_plans.items()
+        }
+        for chunk_id, plan in partition_plans.items():
+            if plan.target_partitions > 1:
+                logger.info(
+                    "Residual-field partition plan | chunk=%d | dim=%d | points=%d | rifft_points=%d | est_bytes=%d | target_bytes=%d | partitions=%d | reason=%s",
+                    int(chunk_id),
+                    int(plan.dimensionality),
+                    int(plan.point_count),
+                    int(plan.estimated_rifft_points),
+                    int(plan.estimated_bytes),
+                    int(plan.target_partition_bytes),
+                    int(plan.target_partitions),
+                    plan.reason,
+                )
+        if any(int(value) > 1 for value in target_partitions_by_chunk.values()):
+            work_units = partition_residual_field_work_units(
+                work_units,
+                point_counts_by_chunk={
+                    int(chunk_id): len(point_rows)
+                    for chunk_id, point_rows in point_rows_by_chunk.items()
+                },
+                target_partitions_by_chunk=target_partitions_by_chunk,
+            )
+
     total_tasks = len(work_units)
     if total_tasks == 0:
         logger.info("Residual-field skipped – no unsaved (interval, chunk) pairs.")
@@ -324,15 +535,28 @@ def run_residual_field_stage(
         reciprocal_space_points_counter(to_interval_dict(interval), structure.supercell)
         for interval in artifacts.padded_intervals
     )
-    chunk_ids = sorted({work_unit.chunk_id for work_unit in work_units})
-    point_data_list: list[dict] = []
-    for chunk_id in chunk_ids:
-        point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
 
     manifests_by_chunk: dict[int, list[ResidualFieldShardManifest]] = {}
-    total_partials_by_chunk = {
-        int(chunk_id): sum(1 for work_unit in work_units if int(work_unit.chunk_id) == int(chunk_id))
+    expected_interval_ids_by_chunk = {
+        int(chunk_id): tuple(
+            sorted(
+                {
+                    int(interval_id)
+                    for work_unit in work_units
+                    if int(work_unit.chunk_id) == int(chunk_id)
+                    for interval_id in work_unit.interval_ids
+                }
+            )
+        )
         for chunk_id in chunk_ids
+    }
+    total_partials_by_target = {
+        _reducer_target_key(work_unit): sum(
+            1
+            for candidate in work_units
+            if _reducer_target_key(candidate) == _reducer_target_key(work_unit)
+        )
+        for work_unit in work_units
     }
     transient_interval_payloads = getattr(artifacts, "transient_interval_payloads", {}) or {}
     stage_task_logs = task_progress_enabled(False)
@@ -350,8 +574,11 @@ def run_residual_field_stage(
                     atoms,
                     total_reciprocal_points=total_reciprocal_points,
                     output_dir=artifacts.output_dir,
+                    db_path=artifacts.db_manager.db_path,
                     scratch_root=scratch_root,
                     reducer_backend=task_reducer_backend,
+                    total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
+                    worker_owned_local_reducer=worker_owned_local_reducer,
                     quiet_logs=False,
                 )
                 pbar.update(1)
@@ -368,21 +595,37 @@ def run_residual_field_stage(
                         output_dir=artifacts.output_dir,
                         scratch_root=scratch_root,
                         db_path=artifacts.db_manager.db_path,
-                        total_expected_partials=total_partials_by_chunk[int(work_unit.chunk_id)],
+                        total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
                         cleanup_policy=cleanup_policy,
                     )
+                elif isinstance(manifest, ResidualFieldAccumulatorStatus):
+                    continue
                 else:
                     manifests_by_chunk.setdefault(int(work_unit.chunk_id), []).append(manifest)
-        _finalize_residual_field_chunks(
-            chunk_ids=chunk_ids,
-            parameter_digest=work_units[0].parameter_digest,
-            manifests_by_chunk=manifests_by_chunk,
-            output_dir=artifacts.output_dir,
-            db_path=artifacts.db_manager.db_path,
-            cleanup_policy=cleanup_policy,
-            reducer_backend=reducer_backend,
-            scratch_root=scratch_root,
-        )
+        if worker_owned_local_reducer:
+            for chunk_id in chunk_ids:
+                finalize_process_local_residual_chunk(
+                    task_reducer_backend,
+                    chunk_id=int(chunk_id),
+                    parameter_digest=work_units[0].parameter_digest,
+                    output_dir=artifacts.output_dir,
+                    db_path=artifacts.db_manager.db_path,
+                    cleanup_policy=cleanup_policy,
+                    scratch_root=scratch_root,
+                    quiet_logs=False,
+                )
+        else:
+            _finalize_residual_field_chunks(
+                chunk_ids=chunk_ids,
+                parameter_digest=work_units[0].parameter_digest,
+                manifests_by_chunk=manifests_by_chunk,
+                expected_interval_ids_by_chunk=expected_interval_ids_by_chunk,
+                output_dir=artifacts.output_dir,
+                db_path=artifacts.db_manager.db_path,
+                cleanup_policy=cleanup_policy,
+                reducer_backend=reducer_backend,
+                scratch_root=scratch_root,
+            )
         if transient_interval_payloads:
             transient_interval_payloads.clear()
         logger.info("Residual-field finished (sync).")
@@ -415,6 +658,47 @@ def run_residual_field_stage(
         chunk_id: client.scatter(rec[rec.chunk_id == chunk_id], broadcast=False, hash=False)
         for chunk_id in chunk_ids
     }
+    try:
+        worker_addresses = sorted((client.scheduler_info().get("workers") or {}).keys())
+    except Exception:
+        worker_addresses = []
+    distributed_owner_affinity = (
+        reducer_backend.layout.kind == "durable_shared_restartable"
+        and _distributed_owner_affinity_enabled(workflow_parameters)
+    )
+    distributed_owner_finalize = (
+        reducer_backend.layout.kind == "durable_shared_restartable"
+        and distributed_owner_affinity
+        and bool(worker_addresses)
+    )
+    target_owners = (
+        {
+            _reducer_target_key(work_unit): worker_addresses[index % len(worker_addresses)]
+            for index, work_unit in enumerate(work_units)
+        }
+        if (worker_owned_local_reducer or distributed_owner_affinity) and worker_addresses
+        else {}
+    )
+    chunk_finalizers = (
+        {
+            int(chunk_id): (
+                target_owners[
+                    _reducer_target_key(
+                        next(
+                            work_unit
+                            for work_unit in work_units
+                            if int(work_unit.chunk_id) == int(chunk_id)
+                        )
+                    )
+                ]
+                if worker_owned_local_reducer
+                else worker_addresses[position % len(worker_addresses)]
+            )
+            for position, chunk_id in enumerate(chunk_ids)
+        }
+        if (worker_owned_local_reducer or distributed_owner_finalize) and worker_addresses
+        else {}
+    )
     retries_left = {
         (str(work_unit.artifact_key), int(work_unit.chunk_id)): DEFAULT_TASK_RETRIES
         for work_unit in work_units
@@ -436,6 +720,28 @@ def run_residual_field_stage(
 
     def _submit(work_unit: ResidualFieldWorkUnit) -> None:
         nonlocal submitted
+        submit_kwargs = dict(
+            total_reciprocal_points=total_reciprocal_points,
+            output_dir=artifacts.output_dir,
+            db_path=artifacts.db_manager.db_path,
+            scratch_root=scratch_root,
+            reducer_backend=task_reducer_backend,
+            total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
+            worker_owned_local_reducer=worker_owned_local_reducer,
+            quiet_logs=True,
+            key=f"residual-{work_unit.artifact_key}",
+            pure=False,
+            resources={"nufft": 1},
+            retries=DEFAULT_TASK_RETRIES,
+        )
+        target_key = _reducer_target_key(work_unit)
+        if target_key in target_owners:
+            owner_address = target_owners[target_key]
+            if owner_address not in worker_addresses and worker_addresses:
+                owner_address = worker_addresses[0]
+                target_owners[target_key] = owner_address
+            submit_kwargs["workers"] = [owner_address]
+            submit_kwargs["allow_other_workers"] = False
         future = client.submit(
             run_residual_field_interval_chunk_task,
             work_unit,
@@ -444,15 +750,7 @@ def run_residual_field_stage(
                 transient_interval_payloads=transient_interval_payloads,
             ),
             chunk_futures[int(work_unit.chunk_id)],
-            total_reciprocal_points=total_reciprocal_points,
-            output_dir=artifacts.output_dir,
-            scratch_root=scratch_root,
-            reducer_backend=task_reducer_backend,
-            quiet_logs=True,
-            key=f"residual-{work_unit.artifact_key}",
-            pure=False,
-            resources={"nufft": 1},
-            retries=DEFAULT_TASK_RETRIES,
+            **submit_kwargs,
         )
         flying.add(future)
         future_meta[future] = work_unit
@@ -486,11 +784,13 @@ def run_residual_field_stage(
                     output_dir=artifacts.output_dir,
                     scratch_root=scratch_root,
                     db_path=artifacts.db_manager.db_path,
-                    total_expected_partials=total_partials_by_chunk[
-                        int(completed_work_unit.chunk_id)
+                    total_expected_partials=total_partials_by_target[
+                        _reducer_target_key(completed_work_unit)
                     ],
                     cleanup_policy=cleanup_policy,
                 )
+            elif isinstance(payload, ResidualFieldAccumulatorStatus):
+                return
             else:
                 manifests_by_chunk.setdefault(
                     int(completed_work_unit.chunk_id),
@@ -621,16 +921,81 @@ def run_residual_field_stage(
                 elif completed_work_unit is not None:
                     _incorporate_completed_result(future, completed_work_unit)
 
-    _finalize_residual_field_chunks(
-        chunk_ids=chunk_ids,
-        parameter_digest=work_units[0].parameter_digest,
-        manifests_by_chunk=manifests_by_chunk,
-        output_dir=artifacts.output_dir,
-        db_path=artifacts.db_manager.db_path,
-        cleanup_policy=cleanup_policy,
-        reducer_backend=reducer_backend,
-        scratch_root=scratch_root,
-    )
+    if worker_owned_local_reducer and worker_addresses:
+        finalize_futures = []
+        for chunk_id in chunk_ids:
+            finalize_futures.append(
+                client.submit(
+                    finalize_process_local_residual_chunk,
+                    task_reducer_backend,
+                    chunk_id=int(chunk_id),
+                    parameter_digest=work_units[0].parameter_digest,
+                    output_dir=artifacts.output_dir,
+                    db_path=artifacts.db_manager.db_path,
+                    cleanup_policy=cleanup_policy,
+                    scratch_root=scratch_root,
+                    quiet_logs=False,
+                    pure=False,
+                    workers=[chunk_finalizers[int(chunk_id)]],
+                    allow_other_workers=False,
+                )
+            )
+        for future, result in yield_futures_with_results(finalize_futures, client):
+            if not bool(result):
+                raise RuntimeError("Worker-owned local residual finalization failed.")
+    elif distributed_owner_finalize:
+        reconcile_futures = []
+        for chunk_id in chunk_ids:
+            reconcile_futures.append(
+                client.submit(
+                    task_reducer_backend.reconcile_progress,
+                    chunk_id=int(chunk_id),
+                    parameter_digest=work_units[0].parameter_digest,
+                    output_dir=artifacts.output_dir,
+                    db_path=artifacts.db_manager.db_path,
+                    manifests=manifests_by_chunk.get(int(chunk_id)),
+                    scratch_root=scratch_root,
+                    pure=False,
+                    workers=[chunk_finalizers[int(chunk_id)]],
+                    allow_other_workers=False,
+                )
+            )
+        for future, result in yield_futures_with_results(reconcile_futures, client):
+            if future is None:
+                continue
+        finalize_futures = []
+        for chunk_id in chunk_ids:
+            finalize_futures.append(
+                client.submit(
+                    task_reducer_backend.finalize_chunk,
+                    chunk_id=int(chunk_id),
+                    parameter_digest=work_units[0].parameter_digest,
+                    output_dir=artifacts.output_dir,
+                    db_path=artifacts.db_manager.db_path,
+                    manifests=manifests_by_chunk.get(int(chunk_id)),
+                    cleanup_policy=cleanup_policy,
+                    scratch_root=scratch_root,
+                    quiet_logs=False,
+                    pure=False,
+                    workers=[chunk_finalizers[int(chunk_id)]],
+                    allow_other_workers=False,
+                )
+            )
+        for future, result in yield_futures_with_results(finalize_futures, client):
+            if not bool(result):
+                raise RuntimeError("Distributed residual finalization failed.")
+    else:
+        _finalize_residual_field_chunks(
+            chunk_ids=chunk_ids,
+            parameter_digest=work_units[0].parameter_digest,
+            manifests_by_chunk=manifests_by_chunk,
+            expected_interval_ids_by_chunk=expected_interval_ids_by_chunk,
+            output_dir=artifacts.output_dir,
+            db_path=artifacts.db_manager.db_path,
+            cleanup_policy=cleanup_policy,
+            reducer_backend=reducer_backend,
+            scratch_root=scratch_root,
+        )
     if transient_interval_payloads:
         transient_interval_payloads.clear()
     logger.info("Residual-field finished – %d tasks submitted", submitted)
