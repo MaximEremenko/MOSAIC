@@ -1141,7 +1141,7 @@ def run_residual_field_stage(
         for work_unit in work_units
     }
     transient_interval_payloads = getattr(artifacts, "transient_interval_payloads", {}) or {}
-    stage_task_logs = task_progress_enabled(False)
+    stage_task_logs = task_progress_enabled(True)
     if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
         with progress_bar(total_tasks, desc="Residual field (chunks × shard-batches)", unit="batches") as pbar:
@@ -1305,7 +1305,7 @@ def run_residual_field_stage(
             reducer_backend=task_reducer_backend,
             total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
             owner_local_reducer=owner_local_reducer,
-            quiet_logs=True,
+            quiet_logs=False,
             key=f"residual-{work_unit.artifact_key}",
             pure=False,
             resources={"nufft": 1},
