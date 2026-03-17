@@ -694,6 +694,32 @@ class ManifestDrivenResidualFieldReducerBackend:
             scratch_root=scratch_root,
             partition_id=work_unit.partition_id,
         )
+        if accumulator is not None:
+            current_start = getattr(work_unit, "point_start", None)
+            current_stop = getattr(work_unit, "point_stop", None)
+            layout_changed = (
+                (accumulator.point_start is not None or accumulator.point_stop is not None)
+                and (accumulator.point_start != current_start or accumulator.point_stop != current_stop)
+            ) or (
+                accumulator.point_start is None
+                and accumulator.point_stop is None
+                and not np.array_equal(
+                    accumulator.point_ids,
+                    np.asarray(point_ids, dtype=np.int64).reshape(-1),
+                )
+            )
+            if layout_changed:
+                logger.warning(
+                    "Partition layout changed for chunk=%d partition=%s: "
+                    "checkpoint atoms=[%s:%s], current atoms=[%s:%s] "
+                    "(checkpoint had %d intervals). Discarding checkpoint.",
+                    int(work_unit.chunk_id),
+                    work_unit.partition_id,
+                    accumulator.point_start, accumulator.point_stop,
+                    current_start, current_stop,
+                    len(accumulator.current_interval_ids),
+                )
+                accumulator = None
         if accumulator is None:
             accumulator = LiveLocalAccumulator.from_arrays(
                 work_unit,
@@ -723,6 +749,13 @@ class ManifestDrivenResidualFieldReducerBackend:
         if snapshot_state is None:
             return False
         _, snapshot = snapshot_state
+        snap_start = snapshot.get("point_start")
+        snap_stop = snapshot.get("point_stop")
+        current_start = getattr(work_unit, "point_start", None)
+        current_stop = getattr(work_unit, "point_stop", None)
+        if snap_start is not None or snap_stop is not None:
+            if snap_start != current_start or snap_stop != current_stop:
+                return False
         durable_intervals = set(
             int(interval_id) for interval_id in snapshot["incorporated_interval_ids"]
         )
@@ -894,6 +927,8 @@ class ManifestDrivenResidualFieldReducerBackend:
                     accumulator.checkpoint_wall_seconds_total
                 ),
                 checkpoint_cadence_batches=int(accumulator.checkpoint_cadence_batches),
+                point_start=accumulator.point_start,
+                point_stop=accumulator.point_stop,
             )
             accumulator.record_checkpoint_metrics(
                 bytes_written=int(local_snapshot_path.stat().st_size),
