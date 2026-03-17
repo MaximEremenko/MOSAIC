@@ -19,6 +19,7 @@ import logging
 from core.qspace.intervals import (
     ReciprocalSpaceIntervalGenerator,
 )
+from core.runtime.log_utils import short_path
 
 class ReciprocalSpaceIntervalManager:
     def __init__(self, hdf5_file_path: str, parameters: dict, supercell):
@@ -119,7 +120,7 @@ class ReciprocalSpaceIntervalManager:
                 for idx, interval in enumerate(self.reciprocal_space_intervals):
                     interval_str = self._interval_to_str(interval)
                     reciprocal_space_intervals_grp.attrs[str(idx)] = interval_str
-            self.logger.info(f"reciprocal_space intervals saved to {self.hdf5_file_path}")
+            self.logger.info("reciprocal_space intervals saved to %s", short_path(self.hdf5_file_path))
         except Exception as e:
             self.logger.error(f"Failed to save reciprocal_space data to HDF5: {e}")
 
@@ -128,7 +129,7 @@ class ReciprocalSpaceIntervalManager:
         Loads reciprocal_space intervals from an HDF5 file.
         """
         if not os.path.exists(self.hdf5_file_path):
-            self.logger.error(f"HDF5 file {self.hdf5_file_path} does not exist.")
+            self.logger.error("HDF5 file %s does not exist.", short_path(self.hdf5_file_path))
             return False
         try:
             with h5py.File(self.hdf5_file_path, 'r') as h5file:
@@ -139,7 +140,7 @@ class ReciprocalSpaceIntervalManager:
                     interval_str = reciprocal_space_intervals_grp.attrs[idx]
                     interval = eval(interval_str)
                     self.reciprocal_space_intervals.append(interval)
-            self.logger.info(f"reciprocal_space intervals loaded from {self.hdf5_file_path}")
+            self.logger.info("reciprocal_space intervals loaded from %s", short_path(self.hdf5_file_path))
             return True
         except Exception as e:
             self.logger.error(f"Failed to load reciprocal_space data from HDF5: {e}")

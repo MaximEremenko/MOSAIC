@@ -29,6 +29,9 @@ examples/config_2D/displacement/output_disp_rest/
 examples/config_2D/displacement/output_disp_rest_decoder_full/
 examples/config_2D/displacement/output_disp_all/
 examples/config_2D/displacement/output_disp_all_decoder_full/
+# 2D demo notebook artifacts
+examples/config_2D/displacement/output_demo_*/
+examples/config_2D/displacement/*_demo_*.json
 # 2D chemical
 examples/config_2D/chemical_ordering/output_chemical_ordering/
 examples/config_2D/chemical_ordering/output_chem_rest/
@@ -50,6 +53,9 @@ examples/config_3D/chemical_ordering/output_chem_rest/
 src/
 tmp_scripts/
 ChangeLog
+
+# Jupyter
+.ipynb_checkpoints/
 
 # Environment
 .env

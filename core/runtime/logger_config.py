@@ -37,7 +37,7 @@ def setup_logging(default_path='logging.conf', default_level=logging.INFO, env_k
         if path.exists():
             # Load logging configuration from the file
             logging.config.fileConfig(path, disable_existing_loggers=False)
-            logging.getLogger(__name__).info("Logging configuration loaded from %s", path)
+            logging.getLogger(__name__).info("Logging configuration loaded from %s", path.name)
         else:
             handlers = [logging.StreamHandler(sys.stdout)]
             if log_file:
