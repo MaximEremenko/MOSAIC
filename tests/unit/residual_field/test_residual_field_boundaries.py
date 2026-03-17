@@ -2546,7 +2546,7 @@ def test_residual_field_async_stage_logs_main_process_progress_when_enabled(
 
     assert any("Residual-field start" in message for message in caplog.messages)
     assert any("Residual-field queue" in message for message in caplog.messages)
-    assert any("Residual-field progress" in message for message in caplog.messages)
+    assert any("Residual-field finished" in message for message in caplog.messages)
     assert fake_backend.accepted == []
 
 
