@@ -28,7 +28,7 @@
     "mode": "displacement",
     "method": "from_average",
     "num_chunks": 4,
-    "fresh_start": true,
+    "fresh_start": false,
     "run_postprocessing": true,
     "points": [
       {
@@ -66,9 +66,9 @@
   "runtime": {
     "dask": {
       "backend": "local",
-      "max_workers": 2,
-      "threads_per_worker": 16,
-      "processes": false,
+      "max_workers": 4,
+      "threads_per_worker": 8,
+      "processes": true,
       "worker_wait_timeout": "120s"
     },
     "scattering_weights": {
