@@ -162,12 +162,9 @@ def _residual_partition_runtime_policy(
                 max(1, int(default_target_bytes) // 2),
             ),
         ),
-        "max_partitions_per_chunk": max(
-            1,
-            _get_int(
-                "residual_max_partitions_per_chunk",
-                max(1, int(effective_nufft_workers) * 2),
-            ),
+        "max_partitions_per_chunk": _get_int(
+            "residual_max_partitions_per_chunk",
+            0,  # 0 = auto: let byte budget drive partition count
         ),
         "min_points_per_partition": max(
             1,
@@ -308,6 +305,27 @@ def _work_unit_interval_label(work_unit: ResidualFieldWorkUnit) -> str:
     return ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a"
 
 
+def _format_elapsed_eta(elapsed_seconds: float, completed: int, total: int) -> str:
+    """Format elapsed time and estimated remaining time."""
+    def _fmt(seconds: float) -> str:
+        seconds = max(0.0, seconds)
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        minutes = seconds / 60.0
+        if minutes < 60:
+            return f"{minutes:.1f}m"
+        hours = minutes / 60.0
+        return f"{hours:.1f}h"
+
+    parts = [f"elapsed={_fmt(elapsed_seconds)}"]
+    if completed > 0 and completed < total:
+        rate = completed / max(elapsed_seconds, 0.001)
+        remaining = (total - completed) / rate
+        parts.append(f"eta={_fmt(remaining)}")
+        parts.append(f"rate={rate:.1f}/s")
+    return " | ".join(parts)
+
+
 def _log_async_residual_progress(
     *,
     enabled: bool,
@@ -318,6 +336,7 @@ def _log_async_residual_progress(
     submitted: int,
     running: int,
     detail: str | None = None,
+    start_time: float | None = None,
 ) -> None:
     if not enabled:
         return
@@ -325,8 +344,11 @@ def _log_async_residual_progress(
     progress_bar_text = _format_progress_bar(current, total)
     percent = (100.0 * current / float(max(int(total), 1)))
     suffix = f" | {detail}" if detail else ""
+    timing = ""
+    if start_time is not None and event == "progress":
+        timing = f" | {_format_elapsed_eta(time.monotonic() - start_time, completed, total)}"
     logger.info(
-        "Residual-field %s %s %d/%d (%.0f%%) | running=%d | chunk=%d | intervals=%s%s",
+        "Residual-field %s %s %d/%d (%.0f%%) | running=%d | chunk=%d | intervals=%s%s%s",
         event,
         progress_bar_text,
         current,
@@ -335,6 +357,7 @@ def _log_async_residual_progress(
         int(running),
         int(work_unit.chunk_id),
         _work_unit_interval_label(work_unit),
+        timing,
         suffix,
     )
 
@@ -350,7 +373,7 @@ def _should_log_async_progress(
         return True
     if count <= 1 or count >= total:
         return True
-    target_updates = 4 if phase == "queue" else 8
+    target_updates = 4 if phase == "queue" else 20
     stride = max(1, int(math.ceil(total / float(target_updates))))
     return count % stride == 0
 
@@ -1144,7 +1167,7 @@ def run_residual_field_stage(
     stage_task_logs = task_progress_enabled(True)
     if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
-        with progress_bar(total_tasks, desc="Residual field (chunks × shard-batches)", unit="batches") as pbar:
+        with progress_bar(total_tasks, desc="Residual-field", unit="batch", force=True) as pbar:
             for work_unit in work_units:
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
                 manifest = run_residual_field_interval_chunk_task(
@@ -1285,6 +1308,8 @@ def run_residual_field_stage(
     submitted = 0
     completed = 0
 
+    _residual_start_time = time.monotonic()
+
     if stage_task_logs:
         logger.info(
             "Residual-field start | batches=%d | chunks=%d | batch_size=%d | max_inflight=%d | cleanup=%s",
@@ -1362,7 +1387,7 @@ def run_residual_field_stage(
             manifests_by_chunk=manifests_by_chunk,
         )
 
-    def _harvest_finished_nonblocking(bump) -> None:
+    def _harvest_finished_nonblocking(bump, pbar=None) -> None:
         nonlocal completed, fail_streak
         done_now = [future for future in list(flying) if future.done()]
         for future in done_now:
@@ -1374,22 +1399,13 @@ def run_residual_field_stage(
             work_unit = future_meta.pop(future, None)
             bump()
             completed += 1
-            if work_unit is not None:
-                if _should_log_async_progress(
-                    phase="progress",
-                    count=completed,
-                    total=total_tasks,
-                    force=not ok,
-                ):
-                    _log_async_residual_progress(
-                        enabled=stage_task_logs,
-                        event="progress",
-                        work_unit=work_unit,
-                        completed=completed,
-                        total=total_tasks,
-                        submitted=submitted,
-                        running=len(flying),
-                        detail=("failed" if not ok else "result-ready"),
+            if work_unit is not None and pbar is not None:
+                _update_pbar_postfix(pbar, work_unit, ok=ok)
+                if not ok:
+                    logger.warning(
+                        "Residual-field batch FAILED | chunk=%d | intervals=%s",
+                        work_unit.chunk_id,
+                        _work_unit_interval_label(work_unit),
                     )
             if not ok and work_unit is not None:
                 fail_streak += 1
@@ -1403,8 +1419,16 @@ def run_residual_field_stage(
                 fail_streak = 0
                 _incorporate_completed_result(future, work_unit)
 
+    def _update_pbar_postfix(pbar, work_unit, ok=True):
+        elapsed = time.monotonic() - _residual_start_time
+        timing = _format_elapsed_eta(elapsed, completed, total_tasks)
+        status = "" if ok else " | FAILED"
+        pbar.set_postfix_str(
+            f"chunk={work_unit.chunk_id} | running={len(flying)} | {timing}{status}"
+        )
+
     with logging_redirect_tqdm():
-        with progress_bar(total_tasks, desc="Residual field (chunks × shard-batches)", unit="batches") as pbar:
+        with progress_bar(total_tasks, desc="Residual-field", unit="batch", force=True) as pbar:
 
             def bump() -> None:
                 pbar.update(1)
@@ -1412,7 +1436,7 @@ def run_residual_field_stage(
 
             for work_unit in work_units:
                 _submit(work_unit)
-                _harvest_finished_nonblocking(bump)
+                _harvest_finished_nonblocking(bump, pbar=pbar)
                 while len(flying) >= max_inflight:
                     for future, result in yield_futures_with_results(list(flying), client):
                         ok = bool(result)
@@ -1421,21 +1445,12 @@ def run_residual_field_stage(
                         bump()
                         completed += 1
                         if completed_work_unit is not None:
-                            if _should_log_async_progress(
-                                phase="progress",
-                                count=completed,
-                                total=total_tasks,
-                                force=not ok,
-                            ):
-                                _log_async_residual_progress(
-                                    enabled=stage_task_logs,
-                                    event="progress",
-                                    work_unit=completed_work_unit,
-                                    completed=completed,
-                                    total=total_tasks,
-                                    submitted=submitted,
-                                    running=len(flying),
-                                    detail=("failed" if not ok else "result-ready"),
+                            _update_pbar_postfix(pbar, completed_work_unit, ok=ok)
+                            if not ok:
+                                logger.warning(
+                                    "Residual-field batch FAILED | chunk=%d | intervals=%s",
+                                    completed_work_unit.chunk_id,
+                                    _work_unit_interval_label(completed_work_unit),
                                 )
                         if not ok and completed_work_unit is not None:
                             fail_streak += 1
@@ -1459,21 +1474,12 @@ def run_residual_field_stage(
                 bump()
                 completed += 1
                 if completed_work_unit is not None:
-                    if _should_log_async_progress(
-                        phase="progress",
-                        count=completed,
-                        total=total_tasks,
-                        force=not bool(result),
-                    ):
-                        _log_async_residual_progress(
-                            enabled=stage_task_logs,
-                            event="progress",
-                            work_unit=completed_work_unit,
-                            completed=completed,
-                            total=total_tasks,
-                            submitted=submitted,
-                            running=len(flying),
-                            detail=("failed" if not bool(result) else "result-ready"),
+                    _update_pbar_postfix(pbar, completed_work_unit, ok=bool(result))
+                    if not bool(result):
+                        logger.warning(
+                            "Residual-field batch FAILED | chunk=%d | intervals=%s",
+                            completed_work_unit.chunk_id,
+                            _work_unit_interval_label(completed_work_unit),
                         )
                 if not bool(result) and completed_work_unit is not None:
                     logger.error(
