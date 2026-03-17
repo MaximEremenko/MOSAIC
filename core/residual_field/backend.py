@@ -1189,23 +1189,28 @@ class ManifestDrivenResidualFieldReducerBackend:
                         snapshot_seq=snapshot_seq,
                     )
                 )
-        checkpoint_metrics = (
-            self._generation_metrics_for_target(
+        if self.uses_shared_durable_generations():
+            checkpoint_metrics = self._generation_metrics_for_target(
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
                 output_dir=output_dir,
                 partition_id=partition_id,
             )
-            if self.uses_shared_durable_generations()
-            else {
-                "total_checkpoint_bytes_written": 0,
+        else:
+            snapshot_bytes = 0
+            if snapshot_path is not None:
+                try:
+                    snapshot_bytes = int(Path(snapshot_path).stat().st_size)
+                except OSError:
+                    pass
+            checkpoint_metrics = {
+                "total_checkpoint_bytes_written": snapshot_bytes,
                 "total_checkpoint_writes": int(snapshot_seq),
                 "total_checkpoint_wall_seconds": 0.0,
                 "latest_generation_seq": int(snapshot_seq),
-                "latest_checkpoint_bytes_written": 0,
+                "latest_checkpoint_bytes_written": snapshot_bytes,
                 "latest_checkpoint_wall_seconds": 0.0,
             }
-        )
         return {
             "chunk_id": int(chunk_id),
             "parameter_digest": str(parameter_digest),
@@ -1404,25 +1409,27 @@ class ManifestDrivenResidualFieldReducerBackend:
             ]
             if not generation_manifests:
                 return None
-            snapshots = [
-                load_residual_field_generation_payload(manifest)
-                for manifest in generation_manifests
-            ]
-            partitioned = any(snapshot.get("partition_id") is not None for snapshot in snapshots)
+            first_snapshot = load_residual_field_generation_payload(generation_manifests[0])
+            partitioned = first_snapshot.get("partition_id") is not None
             if partitioned:
                 point_ids_blocks: list[np.ndarray] = []
                 delta_blocks: list[np.ndarray] = []
                 average_blocks: list[np.ndarray] = []
                 grid_shape_blocks: list[np.ndarray] = []
                 applied_set: set[int] = set()
-                total_reciprocal_points = int(snapshots[0]["total_reciprocal_points"])
+                total_reciprocal_points = int(first_snapshot["total_reciprocal_points"])
                 reciprocal_point_count = 0
-                for snapshot in sorted(
-                    snapshots,
-                    key=lambda item: (
-                        -1 if item["partition_id"] is None else int(item["partition_id"])
+                del first_snapshot
+                sorted_manifests = sorted(
+                    generation_manifests,
+                    key=lambda m: (
+                        -1
+                        if parse_residual_field_generation_ref(m) is None
+                        else parse_residual_field_generation_ref(m)[0] or -1
                     ),
-                ):
+                )
+                for manifest in sorted_manifests:
+                    snapshot = load_residual_field_generation_payload(manifest)
                     point_ids_blocks.append(
                         np.asarray(snapshot["point_ids"], dtype=np.int64)
                     )
@@ -1440,6 +1447,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                         int(interval_id)
                         for interval_id in snapshot["incorporated_interval_ids"]
                     )
+                    del snapshot
                 snapshot_payload = {
                     "point_ids": (
                         np.concatenate(point_ids_blocks)
@@ -1465,8 +1473,9 @@ class ManifestDrivenResidualFieldReducerBackend:
                     "total_reciprocal_points": int(total_reciprocal_points),
                     "incorporated_interval_ids": tuple(sorted(applied_set)),
                 }
+                del point_ids_blocks, delta_blocks, average_blocks, grid_shape_blocks
             else:
-                snapshot_payload = snapshots[0]
+                snapshot_payload = first_snapshot
                 applied_set = set(
                     int(interval_id)
                     for interval_id in snapshot_payload["incorporated_interval_ids"]
