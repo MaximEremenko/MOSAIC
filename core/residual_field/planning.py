@@ -240,9 +240,9 @@ def build_adaptive_partition_plan(
     if target_partition_bytes_3d <= 0:
         raise ValueError("target_partition_bytes_3d must be positive.")
     if max_partitions_per_chunk is None:
-        max_partitions_per_chunk = max(1, int(effective_nufft_workers) * 2)
-    if max_partitions_per_chunk <= 0:
-        raise ValueError("max_partitions_per_chunk must be positive.")
+        max_partitions_per_chunk = 0  # sentinel: compute per-chunk from byte budget
+    if max_partitions_per_chunk < 0:
+        raise ValueError("max_partitions_per_chunk must be non-negative (0 = auto).")
     if not (0.0 < float(hysteresis_low_factor) <= 1.0):
         raise ValueError("hysteresis_low_factor must satisfy 0 < low <= 1.")
     if float(hysteresis_high_factor) < 1.0:
@@ -274,7 +274,12 @@ def build_adaptive_partition_plan(
         )
         raw_target = max(worker_floor, byte_budget_count)
         max_by_points = max(1, point_count // int(min_points_per_partition))
-        target = min(int(max_partitions_per_chunk), int(max_by_points), int(point_count), int(raw_target))
+        effective_cap = (
+            max(int(effective_nufft_workers) * 2, raw_target)
+            if max_partitions_per_chunk == 0
+            else int(max_partitions_per_chunk)
+        )
+        target = min(int(effective_cap), int(max_by_points), int(point_count), int(raw_target))
         byte_budget_hysteresis = (
             byte_budget_count == 2
             and float(estimated_bytes) > (float(target_bytes) * float(hysteresis_low_factor))
