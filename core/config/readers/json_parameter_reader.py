@@ -14,6 +14,8 @@ from core.config.contracts.parameter_interfaces import (
 )
 import logging
 
+from core.runtime.log_utils import short_path
+
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ class JSONParameterReader(IParameterReader):
                 data = json.load(file)
             return data
         except Exception:
-            logger.exception("Failed to read JSON file: %s", self.json_file_path)
+            logger.exception("Failed to read JSON file: %s", short_path(self.json_file_path))
             raise
             
             

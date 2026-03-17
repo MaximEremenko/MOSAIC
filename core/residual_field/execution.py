@@ -21,6 +21,7 @@ from core.runtime import (
     progress_bar,
     register_cleanup_plugin,
     resolve_worker_scratch_root,
+    short_path,
     task_progress_enabled,
     yield_futures_with_results,
 )
@@ -957,8 +958,8 @@ def run_residual_field_stage(
     logger.info(
         "Residual-field reducer backend %s | scratch=%s | durable=%s",
         reducer_runtime_state.kind,
-        reducer_runtime_state.local_scratch_root or "<none>",
-        reducer_runtime_state.durable_root,
+        short_path(reducer_runtime_state.local_scratch_root),
+        short_path(reducer_runtime_state.durable_root),
     )
     logger.debug(
         "Residual-field reducer state | ram=%s | scratch=%s | durable=%s | transport=%s | restart=%s",

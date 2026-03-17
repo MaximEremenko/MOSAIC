@@ -19,6 +19,7 @@ from core.runtime import (
     get_client,
     set_log_dir_for_run,
     setup_logging,
+    short_path,
     shutdown_dask,
 )
 
@@ -53,8 +54,8 @@ def main(run_file: str = "run_parameters.json") -> None:
 
     setup_logging()
     log = logging.getLogger("app")
-    log.info("Using input parameters: %s", run_settings.input_parameters_path)
-    log.info("Resolved configuration root: %s", run_settings.config_root)
+    log.info("Using input parameters: %s", short_path(run_settings.input_parameters_path))
+    log.info("Resolved configuration root: %s", short_path(run_settings.config_root))
     log.info(
         "Runtime settings: backend=%s max_workers=%d threads_per_worker=%d processes=%s",
         run_settings.runtime.backend,

@@ -2,6 +2,7 @@ import numpy as np
 import logging
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 from core.models import PointData
+from core.runtime.log_utils import short_path
 from core.patch_centers.local_grid import (
     GridGenerator1D,
     GridGenerator2D,
@@ -301,6 +302,6 @@ class PointDataProcessor:
                 if 'grid_amplitude_initialized' in h5file:
                     del h5file['grid_amplitude_initialized']
                 h5file.create_dataset('grid_amplitude_initialized', data=self.point_data.grid_amplitude_initialized.astype(int))
-            self.logger.info(f"Updated grid_amplitude_initialized saved to {hdf5_file_path}")
+            self.logger.info("Updated grid_amplitude_initialized saved to %s", short_path(hdf5_file_path))
         except Exception as e:
             self.logger.error(f"Failed to save updated grid_amplitude_initialized: {e}")
