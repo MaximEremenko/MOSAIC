@@ -171,30 +171,28 @@ def run_residual_field_interval_chunk_task(
                         interval_task.q_amp_av,
                     ]
                 )
+            stacked_arr = np.stack(stacked_weights, axis=0)
+            del stacked_weights
             inverse_outputs = execute_inverse_cunufft_super_batch(
                 q_coords=reference_q_grid,
-                weights=np.stack(stacked_weights, axis=0),
+                weights=stacked_arr,
                 real_coords=rifft_grid,
                 eps=1e-12,
             )
-            grouped_delta = np.asarray(
-                np.sum(inverse_outputs[0::2], axis=0),
-                dtype=np.complex128,
-            )
-            grouped_average = np.asarray(
-                np.sum(inverse_outputs[1::2], axis=0),
-                dtype=np.complex128,
-            )
-            amplitudes_delta = (
-                grouped_delta
-                if amplitudes_delta is None
-                else amplitudes_delta + grouped_delta
-            )
-            amplitudes_average = (
-                grouped_average
-                if amplitudes_average is None
-                else amplitudes_average + grouped_average
-            )
+            del stacked_arr
+            grouped_delta = np.sum(inverse_outputs[0::2], axis=0, dtype=np.complex128)
+            grouped_average = np.sum(inverse_outputs[1::2], axis=0, dtype=np.complex128)
+            del inverse_outputs
+            if amplitudes_delta is None:
+                amplitudes_delta = grouped_delta
+            else:
+                amplitudes_delta += grouped_delta
+                del grouped_delta
+            if amplitudes_average is None:
+                amplitudes_average = grouped_average
+            else:
+                amplitudes_average += grouped_average
+                del grouped_average
         point_ids = np.arange(amplitudes_delta.shape[0], dtype=np.int64)
         if owner_local_reducer:
             worker_backend.accept_local_contribution(
