@@ -130,6 +130,16 @@ def load_local_accumulator_snapshot(
             "checkpoint_cadence_batches": int(
                 np.asarray(data["checkpoint_cadence_batches"]).ravel()[0]
             ) if "checkpoint_cadence_batches" in data else 0,
+            "point_start": (
+                int(np.asarray(data["point_start"]).ravel()[0])
+                if "point_start" in data and int(np.asarray(data["point_start"]).ravel()[0]) >= 0
+                else None
+            ),
+            "point_stop": (
+                int(np.asarray(data["point_stop"]).ravel()[0])
+                if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
+                else None
+            ),
         }
 
 
@@ -152,6 +162,8 @@ def write_local_accumulator_snapshot(
     checkpoint_bytes_written_total: int = 0,
     checkpoint_wall_seconds_total: float = 0.0,
     checkpoint_cadence_batches: int = 0,
+    point_start: int | None = None,
+    point_stop: int | None = None,
     compress: bool = False,
 ) -> Path:
     snapshot_path = build_local_accumulator_snapshot_path(
@@ -190,6 +202,8 @@ def write_local_accumulator_snapshot(
             checkpoint_bytes_written_total=np.array([int(checkpoint_bytes_written_total)], dtype=np.int64),
             checkpoint_wall_seconds_total=np.array([float(checkpoint_wall_seconds_total)], dtype=np.float64),
             checkpoint_cadence_batches=np.array([int(checkpoint_cadence_batches)], dtype=np.int64),
+            point_start=np.array([-1 if point_start is None else int(point_start)], dtype=np.int64),
+            point_stop=np.array([-1 if point_stop is None else int(point_stop)], dtype=np.int64),
         )
     Path(handle.name).replace(snapshot_path)
     return snapshot_path
@@ -266,11 +280,15 @@ class LiveLocalAccumulator:
         checkpoint_wall_seconds_total: float = 0.0,
         checkpoint_cadence_batches: int = 0,
         live_dir: Path | None = None,
+        point_start: int | None = None,
+        point_stop: int | None = None,
     ) -> None:
         self.chunk_id = int(chunk_id)
         self.parameter_digest = str(parameter_digest)
         self.partition_id = int(partition_id) if partition_id is not None else None
         self.point_ids = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        self.point_start = int(point_start) if point_start is not None else None
+        self.point_stop = int(point_stop) if point_stop is not None else None
         self.grid_shape_nd = np.asarray(grid_shape_nd, dtype=np.int64)
         self.total_reciprocal_points = int(total_reciprocal_points)
         self.reciprocal_point_count = int(reciprocal_point_count)
@@ -368,6 +386,8 @@ class LiveLocalAccumulator:
             checkpoint_wall_seconds_total=0.0,
             checkpoint_cadence_batches=0,
             live_dir=live_dir,
+            point_start=getattr(work_unit, "point_start", None),
+            point_stop=getattr(work_unit, "point_stop", None),
         )
 
     @classmethod
@@ -420,6 +440,8 @@ class LiveLocalAccumulator:
             checkpoint_wall_seconds_total=float(snapshot.get("checkpoint_wall_seconds_total", 0.0)),
             checkpoint_cadence_batches=int(snapshot.get("checkpoint_cadence_batches", 0)),
             live_dir=live_dir,
+            point_start=int(snapshot["point_start"]) if snapshot.get("point_start") is not None else None,
+            point_stop=int(snapshot["point_stop"]) if snapshot.get("point_stop") is not None else None,
         )
 
     def should_skip_partial(self, partial: ResidualFieldLocalAccumulatorPartial) -> bool:
@@ -529,6 +551,8 @@ class LiveLocalAccumulator:
             "checkpoint_bytes_written_total": int(self.checkpoint_bytes_written_total),
             "checkpoint_wall_seconds_total": float(self.checkpoint_wall_seconds_total),
             "checkpoint_cadence_batches": int(self.checkpoint_cadence_batches),
+            "point_start": self.point_start,
+            "point_stop": self.point_stop,
         }
 
     def durable_progress_interval_ids(self) -> tuple[int, ...]:

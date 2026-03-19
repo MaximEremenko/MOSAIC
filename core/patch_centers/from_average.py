@@ -5,6 +5,7 @@ import h5py
 import numpy as np
 from core.structure import angstrom_to_fractional
 from core.models import PointData
+from core.runtime.log_utils import short_path
 
 
 class FromAveragePointProcessor:
@@ -114,17 +115,17 @@ class FromAveragePointProcessor:
         if fresh_start and os.path.exists(self.hdf5_file_path):
             try:
                 os.remove(self.hdf5_file_path)
-                self.logger.info("Removed existing HDF5 for fresh_start: %s", self.hdf5_file_path)
+                self.logger.info("Removed existing HDF5 for fresh_start: %s", short_path(self.hdf5_file_path))
             except Exception as e:
-                self.logger.warning("Failed to remove %s for fresh_start: %s", self.hdf5_file_path, e)
+                self.logger.warning("Failed to remove %s for fresh_start: %s", short_path(self.hdf5_file_path), e)
 
         # Check if HDF5 file exists and handle accordingly
         if os.path.exists(self.hdf5_file_path) and not fresh_start:
-            self.logger.info(f"HDF5 file found: {self.hdf5_file_path}. Attempting to load existing data for appending.")
+            self.logger.info("HDF5 file found: %s. Attempting to load existing data for appending.", short_path(self.hdf5_file_path))
             if self.load_point_data_from_hdf5(self.hdf5_file_path):
-                self.logger.info(f"Existing point data loaded from {self.hdf5_file_path}. New points will be appended.")
+                self.logger.info("Existing point data loaded from %s. New points will be appended.", short_path(self.hdf5_file_path))
             else:
-                self.logger.warning(f"Failed to load existing point data from {self.hdf5_file_path}. Proceeding to create new data.")
+                self.logger.warning("Failed to load existing point data from %s. Proceeding to create new data.", short_path(self.hdf5_file_path))
                 fresh_start = True  # Fallback to fresh start if loading fails
 
         if fresh_start or self.point_data is None:
@@ -436,7 +437,7 @@ class FromAveragePointProcessor:
                     ds.resize(arr.shape[0], axis=0)
                     ds[n_old:] = arr[n_old:]
 
-        self.logger.info("Point data appended/updated in %s", hdf5_file_path)
+        self.logger.info("Point data appended/updated in %s", short_path(hdf5_file_path))
 
     def load_point_data_from_hdf5(self, hdf5_file_path: str) -> bool:
         try:

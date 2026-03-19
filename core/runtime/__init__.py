@@ -6,6 +6,7 @@ from .dask_helpers import (
     shutdown_dask,
     yield_futures_with_results,
 )
+from .log_utils import short_path
 from .logger_config import setup_logging
 from .progress import (
     TIMER,
@@ -41,6 +42,7 @@ __all__ = [
     "register_cleanup_plugin",
     "resolve_worker_scratch_root",
     "set_log_dir_for_run",
+    "short_path",
     "shutdown_dask",
     "setup_logging",
     "task_progress_enabled",

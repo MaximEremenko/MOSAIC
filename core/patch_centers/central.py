@@ -4,6 +4,7 @@ import numpy as np
 import h5py
 from core.structure import angstrom_to_fractional
 from core.models import PointData
+from core.runtime.log_utils import short_path
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class CentralPointProcessor:
         # Load existing PointData if available
         if os.path.exists(self.hdf5_file_path):
             if self.load_point_data_from_hdf5(self.hdf5_file_path):
-                logger.info(f"Loaded point data from {self.hdf5_file_path}")
+                logger.info("Loaded point data from %s", short_path(self.hdf5_file_path))
                 return
     
         # Generate PointData from parameters
@@ -49,12 +50,12 @@ class CentralPointProcessor:
                 continue
     
             if not os.path.exists(file_name):
-                logger.error(f"Central points file not found: {file_name}")
+                logger.error("Central points file not found: %s", short_path(file_name))
                 continue
     
             central_points = self._read_central_points(file_name)
             if central_points.size == 0:
-                logger.warning(f"No central points loaded from {file_name}")
+                logger.warning("No central points loaded from %s", short_path(file_name))
                 continue
     
             try:
@@ -80,7 +81,7 @@ class CentralPointProcessor:
             )
             self._assign_chunk_ids()
             self.save_point_data_to_hdf5(self.hdf5_file_path)
-            logger.info(f"Point data generated and saved to {self.hdf5_file_path}")
+            logger.info("Point data generated and saved to %s", short_path(self.hdf5_file_path))
         else:
             logger.error("No point data generated.")
 
@@ -94,7 +95,7 @@ class CentralPointProcessor:
     
             return coords
         except Exception as e:
-            logger.error(f"Failed to read central points from {filename}: {e}")
+            logger.error("Failed to read central points from %s: %s", short_path(filename), e)
             return np.empty((0, self.vectors.shape[0]))
 
     def _assign_chunk_ids(self):
@@ -121,9 +122,9 @@ class CentralPointProcessor:
                 h5file.create_dataset('central_point_ids', data=self.point_data.central_point_ids)
                 h5file.create_dataset('chunk_ids', data=self.point_data.chunk_ids)
                 h5file.create_dataset('grid_amplitude_initialized', data=self.point_data.grid_amplitude_initialized.astype(int))
-            logger.info(f"Point data saved to {hdf5_file_path}")
+            logger.info("Point data saved to %s", short_path(hdf5_file_path))
         except Exception as e:
-            logger.error(f"Failed to save point data to HDF5 file: {e}")
+            logger.error("Failed to save point data to HDF5 file: %s", e)
 
     def load_point_data_from_hdf5(self, hdf5_file_path: str) -> bool:
         """
