@@ -6,6 +6,7 @@ import numpy as np
 
 from core.structure import angstrom_to_fractional
 from core.models import PointData
+from core.runtime.log_utils import short_path
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class FullListPointProcessor:
     def process_parameters(self):
         if os.path.exists(self.hdf5_file_path):
             if self.load_point_data_from_hdf5(self.hdf5_file_path):
-                logger.info("Loaded point data from %s", self.hdf5_file_path)
+                logger.info("Loaded point data from %s", short_path(self.hdf5_file_path))
                 return
 
         logger.info("Processing parameters for 'full_list' method.")
@@ -40,12 +41,12 @@ class FullListPointProcessor:
                 continue
 
             if not os.path.exists(file_name):
-                logger.error("Points file not found: %s", file_name)
+                logger.error("Points file not found: %s", short_path(file_name))
                 continue
 
             points = self._read_points_file(file_name)
             if points.size == 0:
-                logger.warning("No points loaded from %s", file_name)
+                logger.warning("No points loaded from %s", short_path(file_name))
                 continue
 
             if self.vectors is None:
@@ -86,10 +87,10 @@ class FullListPointProcessor:
             points = np.loadtxt(file_name)
             if points.ndim == 1:
                 points = np.expand_dims(points, axis=0)
-            logger.info("Loaded %d points from %s.", points.shape[0], file_name)
+            logger.info("Loaded %d points from %s.", points.shape[0], short_path(file_name))
             return points
         except Exception as exc:
-            logger.error("Failed to read points from file %s: %s", file_name, exc)
+            logger.error("Failed to read points from file %s: %s", short_path(file_name), exc)
             return np.array([])
 
     def _build_chunk_ids(self, num_points: int) -> np.ndarray:
@@ -123,7 +124,7 @@ class FullListPointProcessor:
                     "grid_amplitude_initialized",
                     data=self.point_data.grid_amplitude_initialized.astype(int),
                 )
-            logger.info("Point data saved to HDF5 file: %s", hdf5_file_path)
+            logger.info("Point data saved to HDF5 file: %s", short_path(hdf5_file_path))
         except Exception as exc:
             logger.error("Failed to save point data to HDF5 file: %s", exc)
 

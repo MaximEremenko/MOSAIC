@@ -29,6 +29,9 @@ except ModuleNotFoundError:
         def close(self) -> None:
             return None
 
+        def set_postfix_str(self, s: str = "", refresh: bool = True) -> None:
+            return None
+
     def _tqdm(*args, **kwargs) -> _NoopTqdm:
         return _NoopTqdm()
 
@@ -98,8 +101,8 @@ def task_progress_enabled(default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def progress_bar(total: int, *, desc: str, unit: str):
-    force_progress = force_progress_enabled()
+def progress_bar(total: int, *, desc: str, unit: str, force: bool = False):
+    force_progress = force or force_progress_enabled()
     return tqdm(
         total=total,
         desc=desc,

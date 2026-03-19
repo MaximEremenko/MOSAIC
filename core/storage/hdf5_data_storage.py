@@ -17,6 +17,8 @@ import pandas as pd
 import numpy as np
 import logging
 
+from core.runtime.log_utils import short_path
+
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +80,9 @@ class HDF5ConfigDataSaver(IConfigDataSaver):
                 logger.debug("Creating 'coeff' dataset")
                 hdf5_file.create_dataset('coeff', data=data['coeff'])
                 
-            logger.info("Configuration data saved to %s", self.hdf5_file_path)
+            logger.info("Configuration data saved to %s", short_path(self.hdf5_file_path))
         except Exception:
-            logger.exception("Failed to save data to HDF5 file: %s", self.hdf5_file_path)
+            logger.exception("Failed to save data to HDF5 file: %s", short_path(self.hdf5_file_path))
             raise
 
 
@@ -146,7 +148,7 @@ class HDF5ConfigDataLoader(IConfigDataLoader):
                 
                 coeff = hdf5_file['coeff'][:]
                 logger.debug("Loaded 'coeff'")
-            logger.info("Configuration data loaded from %s", self.hdf5_file_path)
+            logger.info("Configuration data loaded from %s", short_path(self.hdf5_file_path))
             return {
                 'original_coords': original_coords,
                 'average_coords': average_coords,
@@ -159,6 +161,6 @@ class HDF5ConfigDataLoader(IConfigDataLoader):
                 'coeff': coeff
             }
         except Exception:
-            logger.exception("Failed to load data from HDF5 file: %s", self.hdf5_file_path)
+            logger.exception("Failed to load data from HDF5 file: %s", short_path(self.hdf5_file_path))
             raise
 

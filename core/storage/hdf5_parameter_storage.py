@@ -14,6 +14,7 @@ from core.config.contracts.base_interfaces import (
     IConfigDataLoader,
     IConfigDataSaver,
 )
+from core.runtime.log_utils import short_path
 
 
 logger = logging.getLogger(__name__)
@@ -31,9 +32,9 @@ class HDF5ParameterSaver(IConfigDataSaver):
                 dt = h5py.string_dtype(encoding='utf-8')
                 # Create a dataset named 'parameters' to store the JSON string
                 hdf5_file.create_dataset('parameters', data=json_str, dtype=dt)
-            logger.info("Parameters saved to %s", self.hdf5_file_path)
+            logger.info("Parameters saved to %s", short_path(self.hdf5_file_path))
         except Exception:
-            logger.exception("Failed to save parameters to HDF5 file: %s", self.hdf5_file_path)
+            logger.exception("Failed to save parameters to HDF5 file: %s", short_path(self.hdf5_file_path))
             raise
 
 class HDF5ParameterLoader(IConfigDataLoader):
@@ -53,8 +54,8 @@ class HDF5ParameterLoader(IConfigDataLoader):
                     json_str = json_str.decode('utf-8')
                 # Deserialize the JSON string back to a dictionary
                 data = json.loads(json_str)
-            logger.info("Parameters loaded from %s", self.hdf5_file_path)
+            logger.info("Parameters loaded from %s", short_path(self.hdf5_file_path))
             return data
         except Exception:
-            logger.exception("Failed to read parameters from HDF5 file: %s", self.hdf5_file_path)
+            logger.exception("Failed to read parameters from HDF5 file: %s", short_path(self.hdf5_file_path))
             raise

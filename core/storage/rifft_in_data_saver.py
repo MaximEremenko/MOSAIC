@@ -5,6 +5,8 @@ import h5py
 import numpy as np
 import logging
 
+from core.runtime.log_utils import short_path
+
 class RIFFTInDataSaver:
     """
     Saves data to HDF5 files and generates file paths.
@@ -122,7 +124,7 @@ class RIFFTInDataSaver:
         file_path = os.path.join(self.output_dir, filename)
     
         if not os.path.exists(file_path):
-            self.logger.info(f"File not found: {file_path}")
+            self.logger.info("File not found: %s", short_path(file_path))
             raise FileNotFoundError(f"File not found: {file_path}")
     
         if self.file_extension == 'hdf5':
