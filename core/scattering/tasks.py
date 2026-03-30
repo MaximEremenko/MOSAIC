@@ -8,6 +8,7 @@ import numpy as np
 from core.scattering.artifacts import (
     build_scattering_interval_manifest,
     is_interval_artifact_committed,
+    mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
     persist_scattering_interval_chunk_result,
 )
@@ -156,6 +157,12 @@ def run_scattering_interval_task(
         ff_factory=ff_factory,
     )
     if interval_task is None:
+        # Mask eliminated all Q-points in this interval.  Mark it as
+        # precomputed so that downstream stages (Stage-2 and
+        # residual-field) do not attempt to load a non-existent .npz.
+        mark_empty_interval_precomputed(
+            work_unit.interval_id, db_path=db_path
+        )
         return None
     return persist_precomputed_interval_artifact(work_unit, interval_task, db_path=db_path)
 

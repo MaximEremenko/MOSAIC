@@ -15,6 +15,7 @@ from core.residual_field.backend import (
 )
 from core.scattering.artifacts import (
     is_interval_artifact_committed,
+    mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
 )
 from core.scattering.contracts import ScatteringWorkUnit
@@ -379,6 +380,10 @@ def run_interval_precompute(
                                 artifact_path = manifest.artifacts[0].path
                                 if artifact_path is not None:
                                     written_files.append(Path(artifact_path))
+                    else:
+                        mark_empty_interval_precomputed(
+                            work_unit.interval_id, db_path=db.db_path,
+                        )
                     pbar.update(1)
                     pbar.refresh()
         logger.info(
@@ -428,6 +433,10 @@ def run_interval_precompute(
                             artifact_path = manifest.artifacts[0].path
                             if artifact_path is not None:
                                 written_files.append(Path(artifact_path))
+                else:
+                    mark_empty_interval_precomputed(
+                        work_unit.interval_id, db_path=db.db_path,
+                    )
                 pbar.update(1)
                 pbar.refresh()
 

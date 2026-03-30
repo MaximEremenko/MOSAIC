@@ -225,6 +225,36 @@ class ScatteringArtifactStore:
         )
 
 
+def mark_empty_interval_precomputed(
+    interval_id: int,
+    *,
+    db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+) -> None:
+    """Mark an interval whose mask produced an empty Q-grid as complete.
+
+    When a reciprocal-space mask eliminates all Q-points in a subvolume,
+    no ``.npz`` artifact is written.  This function marks the interval as
+    precomputed **and** marks every ``(interval, chunk)`` pair as saved so
+    that downstream stages (Stage-2 chunk accumulation and residual-field)
+    do not attempt to load the non-existent artifact file.
+    """
+    _IntervalPrecomputeStateUpdater(
+        db_path, db_manager_factory=db_manager_factory
+    ).mark_precomputed(interval_id)
+    db = db_manager_factory(db_path)
+    try:
+        unsaved = db.get_unsaved_interval_chunks()
+        for iv_id, chunk_id in unsaved:
+            if int(iv_id) == int(interval_id):
+                db.update_interval_chunk_status(int(iv_id), int(chunk_id), saved=True)
+    finally:
+        db.close()
+    logger.debug(
+        "Empty-mask interval %d marked precomputed + all chunks saved.", interval_id
+    )
+
+
 def build_scattering_interval_manifest(
     work_unit: ScatteringWorkUnit,
     *,
@@ -583,6 +613,7 @@ __all__ = [
     "is_interval_artifact_committed",
     "is_scattering_manifest_complete",
     "load_existing_scattering_partial_result",
+    "mark_empty_interval_precomputed",
     "persist_precomputed_interval_artifact",
     "persist_scattering_interval_chunk_result",
 ]
