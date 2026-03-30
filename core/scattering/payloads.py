@@ -49,6 +49,6 @@ def build_amplitude_adapter_payload(
         )
     if context.chemical_filtered:
         amplitude_parameters["original_coords"] = to_numpy(
-            context.structure.cells_origin
+            context.structure.average_coords
         )
     return amplitude_parameters
