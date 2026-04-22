@@ -33,8 +33,8 @@ def main() -> int:
         processed / "point_reciprocal_space_data.hdf5",
         processed / "point_data_chunk_0_amplitudes.hdf5",
         processed / "point_data_chunk_0_amplitudes_av.hdf5",
-        processed / "point_data_chunk_0_shapeNd.hdf5",
-        processed / "point_data_chunk_0_applied_interval_ids.hdf5",
+        processed / "residual_chunk_0_shapeNd.hdf5",
+        processed / "residual_chunk_0_applied_interval_ids.hdf5",
     ]
     missing = [str(path.relative_to(ROOT)) for path in required if not path.exists()]
     if missing:
