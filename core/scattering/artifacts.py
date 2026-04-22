@@ -100,26 +100,72 @@ class ScatteringArtifactStore:
     def _artifact_filename(self, artifact_path: str) -> str:
         return Path(artifact_path).name
 
+    def build_chunk_artifact_refs(self, chunk_id: int):
+        return build_chunk_artifact_refs(self.output_dir, chunk_id)
+
+    def build_legacy_chunk_artifact_refs(self, chunk_id: int):
+        return ()
+
+    def chunk_amplitudes_kind(self) -> str:
+        return "chunk-amplitudes"
+
+    def chunk_amplitudes_average_kind(self) -> str:
+        return "chunk-amplitudes-average"
+
+    def chunk_grid_shape_kind(self) -> str:
+        return "chunk-grid-shape"
+
+    def chunk_reciprocal_point_count_kind(self) -> str:
+        return "chunk-reciprocal-point-count"
+
+    def chunk_total_reciprocal_point_count_kind(self) -> str:
+        return "chunk-total-reciprocal-point-count"
+
+    def chunk_applied_interval_ids_kind(self) -> str:
+        return "chunk-applied-interval-ids"
+
+    def _ref_by_kind(self, chunk_id: int, *, legacy: bool = False) -> dict[str, object]:
+        refs = (
+            self.build_legacy_chunk_artifact_refs(chunk_id)
+            if legacy
+            else self.build_chunk_artifact_refs(chunk_id)
+        )
+        return {ref.kind: ref for ref in refs}
+
+    def _filename_for_kind(self, chunk_id: int, kind: str, *, legacy: bool = False) -> str:
+        ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
+        return self._artifact_filename(ref_by_kind[kind].path)
+
     def ensure_grid_shape(self, chunk_id: int, grid_shape_nd: np.ndarray) -> None:
-        fn_shape = self._filename(chunk_id, "_shapeNd")
+        fn_shape = self._filename_for_kind(chunk_id, self.chunk_grid_shape_kind())
         try:
             self.saver.load_data(fn_shape)
         except FileNotFoundError:
             self.saver.save_data({"shapeNd": np.asarray(grid_shape_nd)}, fn_shape)
 
     def load_grid_shape(self, chunk_id: int) -> np.ndarray | None:
-        fn_shape = self._filename(chunk_id, "_shapeNd")
-        try:
-            return np.asarray(self.saver.load_data(fn_shape)["shapeNd"])
-        except FileNotFoundError:
-            return None
+        for legacy in (False, True):
+            ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
+            if not ref_by_kind:
+                continue
+            fn_shape = self._artifact_filename(
+                ref_by_kind[self.chunk_grid_shape_kind()].path
+            )
+            try:
+                return np.asarray(self.saver.load_data(fn_shape)["shapeNd"])
+            except FileNotFoundError:
+                continue
+        return None
 
     def ensure_total_reciprocal_points(
         self,
         chunk_id: int,
         total_reciprocal_points: int,
     ) -> None:
-        fn_tot = self._filename(chunk_id, "_amplitudes_ntotal_reciprocal_space_points")
+        fn_tot = self._filename_for_kind(
+            chunk_id,
+            self.chunk_total_reciprocal_point_count_kind(),
+        )
         val = int(total_reciprocal_points)
 
         def _write_total_points() -> None:
@@ -160,15 +206,25 @@ class ScatteringArtifactStore:
             _write_total_points()
 
     def load_applied_interval_ids(self, chunk_id: int) -> set[int]:
-        fn_applied = self._filename(chunk_id, "_applied_interval_ids")
-        try:
-            applied_arr = self.saver.load_data(fn_applied)["ids"]
-        except FileNotFoundError:
-            return set()
-        return set(int(item) for item in np.asarray(applied_arr).ravel().tolist())
+        for legacy in (False, True):
+            ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
+            if not ref_by_kind:
+                continue
+            fn_applied = self._artifact_filename(
+                ref_by_kind[self.chunk_applied_interval_ids_kind()].path
+            )
+            try:
+                applied_arr = self.saver.load_data(fn_applied)["ids"]
+            except FileNotFoundError:
+                continue
+            return set(int(item) for item in np.asarray(applied_arr).ravel().tolist())
+        return set()
 
     def save_applied_interval_ids(self, chunk_id: int, applied_set: set[int]) -> None:
-        fn_applied = self._filename(chunk_id, "_applied_interval_ids")
+        fn_applied = self._filename_for_kind(
+            chunk_id,
+            self.chunk_applied_interval_ids_kind(),
+        )
         self.saver.save_data(
             {"ids": np.array(sorted(applied_set), dtype=np.int64)},
             fn_applied,
@@ -178,28 +234,39 @@ class ScatteringArtifactStore:
         self,
         chunk_id: int,
     ) -> tuple[np.ndarray | None, np.ndarray | None, int, np.ndarray | None]:
-        refs = build_chunk_artifact_refs(self.output_dir, chunk_id)
-        ref_by_kind = {ref.kind: ref for ref in refs}
-        try:
-            current = self.saver.load_data(
-                self._artifact_filename(ref_by_kind["chunk-amplitudes"].path)
-            )["amplitudes"]
-            current_av = self.saver.load_data(
-                self._artifact_filename(ref_by_kind["chunk-amplitudes-average"].path)
-            )["amplitudes_av"]
-            nrec = self.saver.load_data(
-                self._artifact_filename(ref_by_kind["chunk-reciprocal-point-count"].path)
-            )["nreciprocal_space_points"]
-            shape_nd = self.saver.load_data(
-                self._artifact_filename(ref_by_kind["chunk-grid-shape"].path)
-            )["shapeNd"]
-        except FileNotFoundError:
-            return None, None, 0, None
-        try:
-            reciprocal_point_count = int(np.asarray(nrec).ravel()[0])
-        except Exception:
-            reciprocal_point_count = 0
-        return current, current_av, reciprocal_point_count, np.asarray(shape_nd)
+        for legacy in (False, True):
+            ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
+            if not ref_by_kind:
+                continue
+            try:
+                current = self.saver.load_data(
+                    self._artifact_filename(
+                        ref_by_kind[self.chunk_amplitudes_kind()].path
+                    )
+                )["amplitudes"]
+                current_av = self.saver.load_data(
+                    self._artifact_filename(
+                        ref_by_kind[self.chunk_amplitudes_average_kind()].path
+                    )
+                )["amplitudes_av"]
+                nrec = self.saver.load_data(
+                    self._artifact_filename(
+                        ref_by_kind[self.chunk_reciprocal_point_count_kind()].path
+                    )
+                )["nreciprocal_space_points"]
+                shape_nd = self.saver.load_data(
+                    self._artifact_filename(
+                        ref_by_kind[self.chunk_grid_shape_kind()].path
+                    )
+                )["shapeNd"]
+            except FileNotFoundError:
+                continue
+            try:
+                reciprocal_point_count = int(np.asarray(nrec).ravel()[0])
+            except Exception:
+                reciprocal_point_count = 0
+            return current, current_av, reciprocal_point_count, np.asarray(shape_nd)
+        return None, None, 0, None
 
     def save_chunk_payloads(
         self,
@@ -209,19 +276,22 @@ class ScatteringArtifactStore:
         amplitudes_average_payload: np.ndarray,
         reciprocal_point_count: int,
     ) -> None:
-        refs = build_chunk_artifact_refs(self.output_dir, chunk_id)
-        ref_by_kind = {ref.kind: ref for ref in refs}
+        ref_by_kind = self._ref_by_kind(chunk_id)
         self.saver.save_data(
             {"amplitudes": amplitudes_payload},
-            self._artifact_filename(ref_by_kind["chunk-amplitudes"].path),
+            self._artifact_filename(ref_by_kind[self.chunk_amplitudes_kind()].path),
         )
         self.saver.save_data(
             {"amplitudes_av": amplitudes_average_payload},
-            self._artifact_filename(ref_by_kind["chunk-amplitudes-average"].path),
+            self._artifact_filename(
+                ref_by_kind[self.chunk_amplitudes_average_kind()].path
+            ),
         )
         self.saver.save_data(
             {"nreciprocal_space_points": np.array([int(reciprocal_point_count)], dtype=np.int64)},
-            self._artifact_filename(ref_by_kind["chunk-reciprocal-point-count"].path),
+            self._artifact_filename(
+                ref_by_kind[self.chunk_reciprocal_point_count_kind()].path
+            ),
         )
 
 
