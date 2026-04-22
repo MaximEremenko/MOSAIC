@@ -1,0 +1,58 @@
+MOSAIC
+Copyright 2024-2026 Maksim Eremenko
+
+This repository contains the MOSAIC software project, a computational
+framework for linking selected diffuse-scattering features to site-resolved
+chemical-order and displacement fields in atomistic configurations.
+
+Source repository:
+https://github.com/MaximEremenko/MOSAIC
+
+Licensed under the Apache License, Version 2.0.
+See the accompanying LICENSE file for the full license text.
+
+This NOTICE file is provided for attribution purposes only and does not modify
+the terms of the Apache License, Version 2.0.
+
+----------------------------------------------------------------
+Notice regarding support from UT-Battelle, LLC / Oak Ridge National
+Laboratory / U.S. Department of Energy
+----------------------------------------------------------------
+
+This work was performed under subcontract CW44332 from UT-Battelle, LLC,
+c/o Oak Ridge National Laboratory, a subcontract under Contract
+DE-AC05-00OR22725 from the U.S. Department of Energy.
+
+This work was prepared as an account of work sponsored by an agency of
+the United States Government. Neither the United States Government, nor
+the U.S. Department of Energy, nor UT-Battelle, LLC, nor Oak Ridge
+National Laboratory, nor any of their employees, makes any warranty,
+expressed or implied, or assumes any legal liability or responsibility
+for the accuracy, completeness, or usefulness of any information,
+apparatus, product, or process disclosed, or represents that its use
+would not infringe privately owned rights.
+
+Reference herein to any specific commercial product, process, or service
+by trade name, trademark, manufacturer, or otherwise does not
+necessarily constitute or imply its endorsement, recommendation, or
+favoring by the United States Government, the U.S. Department of Energy,
+UT-Battelle, LLC, or Oak Ridge National Laboratory.
+
+The statements, findings, conclusions, and recommendations expressed
+herein are those of the author(s) and do not necessarily reflect the
+views of the United States Government, the U.S. Department of Energy,
+UT-Battelle, LLC, or Oak Ridge National Laboratory.
+
+----------------------------------------------------------------
+Notice regarding support from the National Institute of Standards and
+Technology / U.S. Department of Commerce
+----------------------------------------------------------------
+
+This work was performed under financial assistance award 70NANB24H134
+from the National Institute of Standards and Technology, U.S.
+Department of Commerce.
+
+The statements, findings, conclusions, and recommendations are those of
+the author(s) and do not necessarily reflect the views of the National
+Institute of Standards and Technology or the U.S. Department of
+Commerce.
