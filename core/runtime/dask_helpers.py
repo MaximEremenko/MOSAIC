@@ -304,12 +304,17 @@ def is_sync_client(client) -> bool:
 
 def yield_futures_with_results(futs, client: Client | None):
     loop = getattr(client, "loop", None)
-    for future, result in as_completed(futs, with_results=True, loop=loop):
-        ok = False
-        try:
-            ok = bool(result)
-        except Exception:
-            ok = False
+    for future, result in as_completed(
+        futs,
+        with_results=True,
+        raise_errors=False,
+        loop=loop,
+    ):
+        status = getattr(future, "status", None)
+        if status is None:
+            ok = result is not None
+        else:
+            ok = status == "finished" and result is not None
         yield future, ok
 
 
