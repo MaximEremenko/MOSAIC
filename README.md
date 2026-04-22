@@ -200,4 +200,4 @@ See [CITATION.cff](CITATION.cff) for machine-readable metadata.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
