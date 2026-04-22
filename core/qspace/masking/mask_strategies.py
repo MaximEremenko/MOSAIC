@@ -398,7 +398,10 @@ class EqBasedStrategy:
 
     def _cpu_mask(self, h_vals: np.ndarray, k_vals: np.ndarray, l_vals: np.ndarray) -> np.ndarray:
         func = self._ensure_cpu_callable()
-        return np.asarray(func(h_vals, k_vals, l_vals), dtype=bool).reshape(-1)
+        raw = np.asarray(func(h_vals, k_vals, l_vals), dtype=bool).reshape(-1)
+        if raw.size == 1 and h_vals.size != 1:
+            return np.broadcast_to(raw, h_vals.shape).copy()
+        return raw
 
     def _backend_decision(self, point_count: int, dim: int) -> tuple[dict, object | None]:
         backend_override = _env_str("MOSAIC_MASK_EQUATION_BACKEND", "auto")
@@ -505,6 +508,8 @@ class EqBasedStrategy:
                 d_l = cp_mod.asarray(l_vals)
                 d_mask = func(d_h, d_k, d_l)
                 mask = np.asarray(cp_mod.asnumpy(d_mask), dtype=bool).reshape(-1)
+                if mask.size == 1 and h_vals.size != 1:
+                    mask = np.broadcast_to(mask, h_vals.shape).copy()
                 self._validate_gpu_result(
                     gpu_mask=mask,
                     h_vals=h_vals,
