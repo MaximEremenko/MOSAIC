@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
+
+from core.residual_field.contracts import (
+    build_legacy_residual_field_output_artifacts,
+    build_residual_field_output_artifacts,
+)
 
 
 def load_scalar_from_store(rifft_saver, filename, key_candidates):
@@ -18,10 +26,40 @@ def load_scalar_from_store(rifft_saver, filename, key_candidates):
     return None
 
 
+def resolve_residual_chunk_artifact_filename(output_dir: str, chunk_id: int, kind: str) -> str:
+    primary_refs = {
+        artifact.kind: artifact
+        for artifact in build_residual_field_output_artifacts(output_dir, chunk_id)
+    }
+    primary = Path(primary_refs[kind].path).name
+    if (Path(output_dir) / primary).exists():
+        return primary
+
+    legacy_refs = {
+        artifact.kind: artifact
+        for artifact in build_legacy_residual_field_output_artifacts(output_dir, chunk_id)
+    }
+    legacy = Path(legacy_refs[kind].path).name
+    if (Path(output_dir) / legacy).exists():
+        return legacy
+    return primary
+
+
+def _resolve_store_output_dir(rifft_saver, chunk_id: int) -> str:
+    out_by_saver = getattr(rifft_saver, "output_dir", None)
+    if out_by_saver is not None:
+        return str(out_by_saver)
+    return os.path.dirname(
+        os.path.abspath(rifft_saver.generate_filename(chunk_id, suffix="_amplitudes"))
+    )
+
+
 def normalize_residual_values_ntotal(values, *, rifft_saver, chunk_id, logger=None):
-    filename = rifft_saver.generate_filename(
+    output_dir = _resolve_store_output_dir(rifft_saver, chunk_id)
+    filename = resolve_residual_chunk_artifact_filename(
+        output_dir,
         chunk_id,
-        suffix="_amplitudes_ntotal_reciprocal_space_points",
+        "chunk-total-reciprocal-point-count",
     )
     ntot = load_scalar_from_store(
         rifft_saver,
@@ -47,4 +85,8 @@ def normalize_residual_values_ntotal(values, *, rifft_saver, chunk_id, logger=No
     return values
 
 
-__all__ = ["load_scalar_from_store", "normalize_residual_values_ntotal"]
+__all__ = [
+    "load_scalar_from_store",
+    "normalize_residual_values_ntotal",
+    "resolve_residual_chunk_artifact_filename",
+]

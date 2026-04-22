@@ -17,6 +17,7 @@ from core.residual_field.contracts import (
     ResidualFieldArtifactManifest,
     ResidualFieldPartialResult,
     ResidualFieldWorkUnit,
+    build_residual_field_output_artifacts,
     merge_residual_field_partial_results,
     residual_field_partial_result_identity,
     validate_residual_field_work_unit,
@@ -131,6 +132,9 @@ def test_residual_field_work_unit_and_manifest_keep_seam_neutral(tmp_path):
     assert work_unit.retry.idempotency_key == "residual-field:chunk:4:abc123"
     assert interval_work_unit.retry.idempotency_key == "residual-field:chunk:4:abc123:interval-2"
     assert all(artifact.stage == "scattering" for artifact in interval_work_unit.source_artifacts)
+    assert build_residual_field_output_artifacts(str(tmp_path), 4)[0].path.endswith(
+        "residual_chunk_4_amplitudes.hdf5"
+    )
 
     manifest = ResidualFieldArtifactManifest.from_work_unit(
         interval_work_unit,

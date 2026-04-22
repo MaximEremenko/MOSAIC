@@ -27,6 +27,7 @@ from core.residual_field.contracts import (
     ResidualFieldReducerProgressManifest,
     ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
+    build_legacy_residual_field_output_artifacts,
     build_residual_field_output_artifacts,
     build_residual_field_shard_artifacts,
     make_residual_field_artifact_key,
@@ -82,7 +83,19 @@ class _ResidualFieldChunkStatusUpdater:
 
 
 class ResidualFieldArtifactStore(ScatteringArtifactStore):
-    """Current residual-field extraction reuses the existing chunk artifact layout."""
+    """Residual-field chunk artifacts use their own namespace with legacy fallback."""
+
+    def build_chunk_artifact_refs(self, chunk_id: int):
+        return build_residual_field_output_artifacts(self.output_dir, chunk_id)
+
+    def build_legacy_chunk_artifact_refs(self, chunk_id: int):
+        return build_legacy_residual_field_output_artifacts(self.output_dir, chunk_id)
+
+    def chunk_amplitudes_kind(self) -> str:
+        return "chunk-residual-values"
+
+    def chunk_amplitudes_average_kind(self) -> str:
+        return "chunk-residual-average-values"
 
 
 def build_residual_field_output_artifact_refs(

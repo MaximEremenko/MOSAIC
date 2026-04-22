@@ -5,7 +5,10 @@ import os
 
 import numpy as np
 
-from core.residual_field.io import normalize_residual_values_ntotal
+from core.residual_field.io import (
+    normalize_residual_values_ntotal,
+    resolve_residual_chunk_artifact_filename,
+)
 
 
 def resolve_output_dir(rifft_saver, chunk_id, output_dir=None):
@@ -22,7 +25,12 @@ def resolve_output_dir(rifft_saver, chunk_id, output_dir=None):
 
 
 def load_residual_field_and_generate_grid(processor, chunk_id, point_data_list, rifft_saver):
-    filename = rifft_saver.generate_filename(chunk_id, suffix="_amplitudes")
+    output_dir = resolve_output_dir(rifft_saver, chunk_id)
+    filename = resolve_residual_chunk_artifact_filename(
+        output_dir,
+        chunk_id,
+        "chunk-residual-values",
+    )
     try:
         data = rifft_saver.load_data(filename)
         amplitudes = data.get("amplitudes", None)
@@ -65,7 +73,12 @@ def load_residual_field_and_generate_grid(processor, chunk_id, point_data_list, 
 
 
 def load_chunk_residual_field_and_grid(processor, *, chunk_id, point_data_list, rifft_saver, logger):
-    fn_amp = rifft_saver.generate_filename(chunk_id, suffix="_amplitudes")
+    output_dir = resolve_output_dir(rifft_saver, chunk_id)
+    fn_amp = resolve_residual_chunk_artifact_filename(
+        output_dir,
+        chunk_id,
+        "chunk-residual-values",
+    )
     try:
         data = rifft_saver.load_data(fn_amp)
         amplitudes = data.get("amplitudes", None)

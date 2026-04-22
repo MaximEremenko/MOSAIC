@@ -167,8 +167,14 @@ def build_residual_field_interval_source_artifacts(
 def build_residual_field_output_artifacts(
     output_dir: str,
     chunk_id: int,
+    *,
+    legacy_layout: bool = False,
 ) -> tuple[ArtifactRef, ...]:
-    chunk_prefix = Path(output_dir) / f"point_data_chunk_{chunk_id}"
+    chunk_prefix = Path(output_dir) / (
+        f"point_data_chunk_{chunk_id}"
+        if legacy_layout
+        else f"residual_chunk_{chunk_id}"
+    )
     return (
         ArtifactRef(
             stage="residual_field",
@@ -222,6 +228,17 @@ def build_residual_field_output_artifacts(
             ),
             schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
         ),
+    )
+
+
+def build_legacy_residual_field_output_artifacts(
+    output_dir: str,
+    chunk_id: int,
+) -> tuple[ArtifactRef, ...]:
+    return build_residual_field_output_artifacts(
+        output_dir,
+        chunk_id,
+        legacy_layout=True,
     )
 
 
@@ -947,6 +964,7 @@ __all__ = [
     "ResidualFieldReducerProgressManifest",
     "ResidualFieldShardManifest",
     "ResidualFieldWorkUnit",
+    "build_legacy_residual_field_output_artifacts",
     "build_residual_field_interval_source_artifacts",
     "build_residual_field_output_artifacts",
     "build_residual_field_shard_artifacts",
