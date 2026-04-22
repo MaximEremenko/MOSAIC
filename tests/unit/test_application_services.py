@@ -651,6 +651,82 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
     assert stale_file.exists() is False
 
 
+def test_workflow_service_recovers_local_residual_state_before_scattering(
+    tmp_path,
+    monkeypatch,
+):
+    recovered = []
+
+    class FakeStructureService:
+        def load(self, workflow_parameters, working_path):
+            return SimpleNamespace(supercell=np.array([4]))
+
+    class FakePointSelectionService:
+        def select(self, request):
+            return SimpleNamespace(chunk_ids=np.array([0]))
+
+    class FakeArtifacts:
+        def __init__(self):
+            self.output_dir = str(tmp_path / "processed_point_data")
+            self.db_manager = SimpleNamespace(
+                db_path=str(tmp_path / "state.db"),
+                get_pending_chunk_ids=lambda: [3],
+            )
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    artifacts = FakeArtifacts()
+
+    class FakeReciprocalService:
+        def prepare(self, workflow_parameters, point_data, supercell, output_dir):
+            return artifacts
+
+    workflow_service = WorkflowService(
+        structure_loading_service=FakeStructureService(),
+        point_selection_service=FakePointSelectionService(),
+        reciprocal_space_service=FakeReciprocalService(),
+        scattering_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        residual_field_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        decoding_stage=SimpleNamespace(execute=lambda **kwargs: None),
+    )
+    workflow_parameters = _build_workflow_parameters()
+    workflow_parameters.struct_info.working_directory = str(tmp_path / "workdir")
+
+    class FakeBackend:
+        layout = SimpleNamespace(kind="local_restartable")
+
+        def load_progress_manifest(self, **kwargs):
+            return {"chunk_id": kwargs["chunk_id"]}
+
+        def finalize_chunk(self, **kwargs):
+            recovered.append(kwargs["chunk_id"])
+            return {"chunk_id": kwargs["chunk_id"]}
+
+    monkeypatch.setattr(
+        "core.workflow.service.resolve_residual_field_reducer_backend",
+        lambda **kwargs: FakeBackend(),
+    )
+    monkeypatch.setattr(
+        "core.workflow.service.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / ".local_restartable"),
+    )
+    monkeypatch.setattr(
+        "core.workflow.service.build_residual_field_parameter_digest",
+        lambda workflow_parameters: "stable-digest",
+    )
+
+    workflow_service.run(
+        run_settings=SimpleNamespace(working_path=tmp_path),
+        workflow_parameters=workflow_parameters,
+        client=None,
+    )
+
+    assert recovered == [3]
+    assert artifacts.closed is True
+
+
 def test_parameter_loading_service_returns_scattering_weight_selection():
     selection = ParameterLoadingService().resolve_scattering_weight_settings(
         WorkflowParameters(
