@@ -343,6 +343,61 @@ def test_residual_field_planning_batches_intervals_per_chunk(tmp_path):
     assert work_units[1].retry.idempotency_key.endswith("interval-3")
 
 
+def test_residual_field_parameter_digest_ignores_decoder_and_resume_flags():
+    base = {
+        "schema_version": 2,
+        "struct_info": {
+            "dimension": 3,
+            "filename": "Catio3.rmc6f",
+            "filename_av": "Catio3_average.rmc6f",
+            "cells_limits_min": [0, 0, 0],
+            "cells_limits_max": [15, 15, 15],
+        },
+        "peak_info": {
+            "reciprocal_space_limits": [
+                {"limit": [32.0, 32.0, 32.0], "subvolume_step": [5.0, 5.0, 5.0]}
+            ],
+            "mask_equation": "h > 0",
+        },
+        "rspace_info": {
+            "mode": "displacement",
+            "method": "from_average",
+            "num_chunks": 4,
+            "fresh_start": False,
+            "run_postprocessing": True,
+            "points": [
+                {
+                    "elementSymbol": "O",
+                    "referenceNumber": 2,
+                    "distFromAtomCenter": [0.5, 0.5, 0.5],
+                    "stepInAngstrom": [0.05, 0.05, 0.05],
+                }
+            ],
+            "decoder": {
+                "source": "compute",
+                "compute_output_directory": "./output_disp_hkl32_decoder",
+            },
+        },
+        "postprocessing_mode": "displacement",
+        "supercell": np.array([16, 16, 16]),
+    }
+    modified = {
+        **base,
+        "rspace_info": {
+            **base["rspace_info"],
+            "fresh_start": True,
+            "run_postprocessing": False,
+            "filter_type": "Chebyshev",
+            "decoder": {
+                "source": "cache",
+                "cache_path": "./decoder_M.npz",
+            },
+        },
+    }
+
+    assert build_residual_field_parameter_digest(base) == build_residual_field_parameter_digest(modified)
+
+
 def test_residual_field_planning_can_partition_work_units_for_local_owner(tmp_path):
     parameters = {
         "postprocessing_mode": "displacement",

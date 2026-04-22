@@ -40,11 +40,86 @@ def _parameter_value(parameters: object, key: str, default=None):
     return getattr(parameters, key, default)
 
 
+def _stable_point_payload(point: object) -> dict[str, object]:
+    return {
+        "filename": _parameter_value(point, "filename"),
+        "element_symbol": (
+            _parameter_value(point, "element_symbol")
+            if _parameter_value(point, "element_symbol") is not None
+            else _parameter_value(point, "elementSymbol")
+        ),
+        "reference_number": (
+            _parameter_value(point, "reference_number")
+            if _parameter_value(point, "reference_number") is not None
+            else _parameter_value(point, "referenceNumber")
+        ),
+        "dist_from_atom_center": (
+            _to_jsonable(_parameter_value(point, "dist_from_atom_center"))
+            if _parameter_value(point, "dist_from_atom_center") is not None
+            else _to_jsonable(_parameter_value(point, "distFromAtomCenter"))
+        ),
+        "step_in_angstrom": (
+            _to_jsonable(_parameter_value(point, "step_in_angstrom"))
+            if _parameter_value(point, "step_in_angstrom") is not None
+            else _to_jsonable(_parameter_value(point, "stepInAngstrom"))
+        ),
+    }
+
+
 def build_residual_field_parameter_digest(parameters: object) -> str:
+    rspace_info = _parameter_value(parameters, "rspace_info", {}) or {}
+    struct_info = _parameter_value(parameters, "struct_info", {}) or {}
+    peak_info = _parameter_value(parameters, "peak_info", {}) or {}
     payload = {
-        "postprocessing_mode": _parameter_value(parameters, "postprocessing_mode"),
+        "digest_schema_version": 2,
+        "postprocessing_mode": (
+            _parameter_value(parameters, "postprocessing_mode")
+            if _parameter_value(parameters, "postprocessing_mode") is not None
+            else _parameter_value(rspace_info, "mode")
+        ),
         "supercell": _to_jsonable(_parameter_value(parameters, "supercell")),
-        "rspace_info": _to_jsonable(_parameter_value(parameters, "rspace_info", {})),
+        "structure": {
+            "dimension": _parameter_value(struct_info, "dimension"),
+            "filename": _parameter_value(struct_info, "filename"),
+            "filename_av": _parameter_value(struct_info, "filename_av"),
+            "cells_limits_min": _to_jsonable(
+                _parameter_value(struct_info, "cells_limits_min")
+            ),
+            "cells_limits_max": _to_jsonable(
+                _parameter_value(struct_info, "cells_limits_max")
+            ),
+        },
+        "peak_info": {
+            "reciprocal_space_limits": _to_jsonable(
+                _parameter_value(peak_info, "reciprocal_space_limits", ())
+            ),
+            "mask_equation": _parameter_value(peak_info, "mask_equation"),
+            "special_points": _to_jsonable(
+                _parameter_value(peak_info, "special_points", ())
+            ),
+            "r1": _parameter_value(peak_info, "r1"),
+            "r2": _parameter_value(peak_info, "r2"),
+        },
+        "residual_inputs": {
+            "method": _parameter_value(rspace_info, "method"),
+            "mode": _parameter_value(rspace_info, "mode"),
+            "num_chunks": _parameter_value(rspace_info, "num_chunks"),
+            "cells_limits_min": _to_jsonable(
+                _parameter_value(rspace_info, "cells_limits_min")
+            ),
+            "cells_limits_max": _to_jsonable(
+                _parameter_value(rspace_info, "cells_limits_max")
+            ),
+            "points": tuple(
+                _stable_point_payload(point)
+                for point in (_parameter_value(rspace_info, "points", ()) or ())
+            ),
+            "chemical_filtered_ordering": _parameter_value(
+                rspace_info, "chemical_filtered_ordering"
+            ),
+            "coeff_center_by": _parameter_value(rspace_info, "coeff_center_by"),
+            "use_coeff": _parameter_value(rspace_info, "use_coeff"),
+        },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:12]
