@@ -117,7 +117,7 @@ def build_residual_field_source_artifacts(
                 stage="scattering",
                 kind="interval-precompute",
                 key=f"scattering:interval-precompute:interval-{interval_id}",
-                path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+                path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.hdf5"),
                 schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
             )
         )
@@ -158,7 +158,7 @@ def build_residual_field_interval_source_artifacts(
             stage="scattering",
             kind="interval-precompute",
             key=f"scattering:interval-precompute:interval-{interval_id}",
-            path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+            path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.hdf5"),
             schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
         ),
     )
@@ -264,7 +264,7 @@ def build_residual_field_shard_artifacts(
                 parameter_digest=parameter_digest,
             )
             + f":batch-{batch_token}",
-            path=str(shard_dir / f"{base_name}.npz"),
+            path=str(shard_dir / f"{base_name}.hdf5"),
             schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
         ),
         ArtifactRef(

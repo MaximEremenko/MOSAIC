@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import mmap
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +9,50 @@ from pathlib import Path
 import numpy as np
 
 from core.residual_field.contracts import ResidualFieldWorkUnit
+
+_LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT = 64 * 1024 * 1024
+
+
+def _flush_and_drop_array_pages(array) -> None:
+    try:
+        flush = getattr(array, "flush", None)
+        if callable(flush):
+            flush()
+        mmap_obj = getattr(array, "_mmap", None)
+        if mmap_obj is None:
+            return
+        mmap_flush = getattr(mmap_obj, "flush", None)
+        if callable(mmap_flush):
+            mmap_flush()
+        madvise = getattr(mmap_obj, "madvise", None)
+        if callable(madvise) and hasattr(mmap, "MADV_DONTNEED"):
+            madvise(mmap.MADV_DONTNEED)
+    except Exception:
+        pass
+
+
+def _local_accumulation_block_len() -> int:
+    raw = os.getenv("MOSAIC_LOCAL_ACCUMULATION_BLOCK_BYTES")
+    try:
+        block_bytes = int(raw) if raw is not None else _LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT
+    except ValueError:
+        block_bytes = _LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT
+    return max(1, int(block_bytes) // np.dtype(np.complex128).itemsize)
+
+
+def _chunked_add_complex(target, source) -> None:
+    source_arr = np.asarray(source, dtype=np.complex128).reshape(-1)
+    target_arr = np.asarray(target, dtype=np.complex128).reshape(-1)
+    if target_arr.shape != source_arr.shape:
+        raise ValueError("Local residual accumulation requires matching target/source shapes.")
+    use_blocks = isinstance(target, np.memmap) or isinstance(source_arr, np.memmap)
+    if not use_blocks:
+        target_arr += source_arr
+        return
+    block_len = _local_accumulation_block_len()
+    for start in range(0, int(source_arr.shape[0]), block_len):
+        stop = min(int(source_arr.shape[0]), start + block_len)
+        target_arr[start:stop] += source_arr[start:stop]
 
 
 @dataclass(frozen=True)
@@ -107,6 +153,61 @@ def load_local_accumulator_snapshot(
             "grid_shape_nd": np.asarray(data["grid_shape_nd"], dtype=np.int64),
             "amplitudes_delta": np.asarray(data["amplitudes_delta"], dtype=np.complex128),
             "amplitudes_average": np.asarray(data["amplitudes_average"], dtype=np.complex128),
+            "reciprocal_point_count": int(np.asarray(data["reciprocal_point_count"]).ravel()[0]),
+            "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
+            "incorporated_interval_ids": tuple(
+                int(interval_id) for interval_id in np.asarray(data["incorporated_interval_ids"], dtype=np.int64).tolist()
+            ),
+            "partition_id": (
+                int(np.asarray(data["partition_id"]).ravel()[0])
+                if "partition_id" in data
+                else (int(partition_id) if partition_id is not None else None)
+            ),
+            "storage_mode": str(data["storage_mode"].tolist()),
+            "checkpoint_write_count": int(
+                np.asarray(data["checkpoint_write_count"]).ravel()[0]
+            ) if "checkpoint_write_count" in data else int(snapshot_seq),
+            "checkpoint_bytes_written_total": int(
+                np.asarray(data["checkpoint_bytes_written_total"]).ravel()[0]
+            ) if "checkpoint_bytes_written_total" in data else 0,
+            "checkpoint_wall_seconds_total": float(
+                np.asarray(data["checkpoint_wall_seconds_total"]).ravel()[0]
+            ) if "checkpoint_wall_seconds_total" in data else 0.0,
+            "checkpoint_cadence_batches": int(
+                np.asarray(data["checkpoint_cadence_batches"]).ravel()[0]
+            ) if "checkpoint_cadence_batches" in data else 0,
+            "point_start": (
+                int(np.asarray(data["point_start"]).ravel()[0])
+                if "point_start" in data and int(np.asarray(data["point_start"]).ravel()[0]) >= 0
+                else None
+            ),
+            "point_stop": (
+                int(np.asarray(data["point_stop"]).ravel()[0])
+                if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
+                else None
+            ),
+        }
+
+
+def load_local_accumulator_snapshot_metadata(
+    output_dir: str,
+    *,
+    chunk_id: int,
+    parameter_digest: str,
+    partition_id: int | None = None,
+    snapshot_seq: int,
+) -> dict[str, object] | None:
+    snapshot_path = build_local_accumulator_snapshot_path(
+        output_dir,
+        chunk_id=chunk_id,
+        parameter_digest=parameter_digest,
+        partition_id=partition_id,
+        snapshot_seq=snapshot_seq,
+    )
+    if not snapshot_path.exists():
+        return None
+    with np.load(snapshot_path, allow_pickle=False) as data:
+        return {
             "reciprocal_point_count": int(np.asarray(data["reciprocal_point_count"]).ravel()[0]),
             "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
             "incorporated_interval_ids": tuple(
@@ -364,9 +465,8 @@ class LiveLocalAccumulator:
             template_delta=amplitudes_delta_arr,
             template_average=amplitudes_average_arr,
             storage_mode=storage_mode,
+            copy_templates=False,
         )
-        amplitudes_delta[:] = 0
-        amplitudes_average[:] = 0
         return cls(
             chunk_id=work_unit.chunk_id,
             parameter_digest=work_unit.parameter_digest,
@@ -489,8 +589,8 @@ class LiveLocalAccumulator:
         )
         if self.should_skip_interval_ids(interval_ids):
             return
-        self.amplitudes_delta += np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
-        self.amplitudes_average += np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
+        _chunked_add_complex(self.amplitudes_delta, amplitudes_delta)
+        _chunked_add_complex(self.amplitudes_average, amplitudes_average)
         self.reciprocal_point_count += int(contribution_reciprocal_points)
         self.current_interval_ids.update(interval_ids)
         self.accepted_since_snapshot += 1
@@ -538,10 +638,10 @@ class LiveLocalAccumulator:
 
     def snapshot_payload(self) -> dict[str, object]:
         return {
-            "point_ids": self.point_ids.copy(),
-            "grid_shape_nd": self.grid_shape_nd.copy(),
-            "amplitudes_delta": np.asarray(self.amplitudes_delta, dtype=np.complex128).copy(),
-            "amplitudes_average": np.asarray(self.amplitudes_average, dtype=np.complex128).copy(),
+            "point_ids": self.point_ids,
+            "grid_shape_nd": self.grid_shape_nd,
+            "amplitudes_delta": np.asarray(self.amplitudes_delta, dtype=np.complex128),
+            "amplitudes_average": np.asarray(self.amplitudes_average, dtype=np.complex128),
             "reciprocal_point_count": int(self.reciprocal_point_count),
             "total_reciprocal_points": int(self.total_reciprocal_points),
             "incorporated_interval_ids": tuple(sorted(self.current_interval_ids)),
@@ -580,14 +680,37 @@ class LiveLocalAccumulator:
         self.checkpoint_wall_seconds_total += float(wall_seconds)
         self.checkpoint_cadence_batches = int(checkpoint_cadence_batches)
 
-    def cleanup_live_files(self) -> None:
-        if self.live_dir is None:
+    def trim_live_memory(self) -> None:
+        if self.storage_mode != "file":
             return
-        for path in self.live_dir.glob("*.npy"):
+        _flush_and_drop_array_pages(self.amplitudes_delta)
+        _flush_and_drop_array_pages(self.amplitudes_average)
+
+    def cleanup_live_files(self) -> None:
+        for array_name in ("amplitudes_delta", "amplitudes_average"):
+            array = getattr(self, array_name, None)
+            _flush_and_drop_array_pages(array)
+            mmap_obj = getattr(array, "_mmap", None)
+            close = getattr(mmap_obj, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            setattr(self, array_name, None)
+
+        self.point_ids = np.array([], dtype=np.int64)
+        self.grid_shape_nd = np.array([], dtype=np.int64)
+
+        live_dir = self.live_dir
+        self.live_dir = None
+        if live_dir is None:
+            return
+        for path in live_dir.glob("*.npy"):
             path.unlink(missing_ok=True)
-        if self.live_dir.exists() and not any(self.live_dir.iterdir()):
-            self.live_dir.rmdir()
-        parent = self.live_dir.parent
+        if live_dir.exists() and not any(live_dir.iterdir()):
+            live_dir.rmdir()
+        parent = live_dir.parent
         if parent.exists() and not any(parent.iterdir()):
             parent.rmdir()
 
@@ -601,11 +724,14 @@ def _allocate_live_arrays(
     template_delta: np.ndarray,
     template_average: np.ndarray,
     storage_mode: str,
+    copy_templates: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, Path | None]:
     delta = np.asarray(template_delta, dtype=np.complex128).reshape(-1)
     average = np.asarray(template_average, dtype=np.complex128).reshape(-1)
     if storage_mode == "ram":
-        return delta.copy(), average.copy(), None
+        if copy_templates:
+            return delta.copy(), average.copy(), None
+        return np.zeros_like(delta), np.zeros_like(average), None
 
     live_dir = (
         Path(scratch_root).expanduser()
@@ -632,8 +758,12 @@ def _allocate_live_arrays(
         dtype=np.complex128,
         shape=average.shape,
     )
-    delta_mm[:] = delta
-    average_mm[:] = average
+    if copy_templates:
+        delta_mm[:] = delta
+        average_mm[:] = average
+    else:
+        delta_mm[:] = 0
+        average_mm[:] = 0
     return delta_mm, average_mm, live_dir
 
 
@@ -643,5 +773,6 @@ __all__ = [
     "build_local_accumulator_snapshot_path",
     "estimate_local_accumulator_bytes",
     "load_local_accumulator_snapshot",
+    "load_local_accumulator_snapshot_metadata",
     "write_local_accumulator_snapshot",
 ]

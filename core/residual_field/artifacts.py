@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable
 
+import h5py
 import numpy as np
 
 from core.scattering.artifacts import ScatteringArtifactStore
@@ -16,7 +19,6 @@ from core.residual_field.accumulation import (
     build_existing_materialized_residual_field_state,
     build_materialized_residual_field_state,
     build_materialized_residual_field_state_from_shard,
-    materialize_scattering_payload,
     merge_materialized_residual_field_states,
 )
 from core.residual_field.contracts import (
@@ -52,6 +54,28 @@ logger = logging.getLogger(__name__)
 _GENERATION_FILENAME_RE = re.compile(
     r"^generation_partition_(?P<partition_token>[^_]+)_seq_(?P<generation_seq>\d+)_params_(?P<parameter_digest>.+)$"
 )
+
+
+def _fsync_path(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_parent(path: Path) -> None:
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 class _ResidualFieldChunkStatusUpdater:
@@ -96,6 +120,79 @@ class ResidualFieldArtifactStore(ScatteringArtifactStore):
 
     def chunk_amplitudes_average_kind(self) -> str:
         return "chunk-residual-average-values"
+
+    def save_chunk_payload_components(
+        self,
+        chunk_id: int,
+        *,
+        point_ids: np.ndarray,
+        amplitudes_delta: np.ndarray,
+        amplitudes_average: np.ndarray,
+        reciprocal_point_count: int,
+    ) -> None:
+        ref_by_kind = self._ref_by_kind(chunk_id)
+        self._save_two_column_complex_payload(
+            self._artifact_filename(ref_by_kind[self.chunk_amplitudes_kind()].path),
+            "amplitudes",
+            point_ids=point_ids,
+            values=amplitudes_delta,
+        )
+        self._save_two_column_complex_payload(
+            self._artifact_filename(
+                ref_by_kind[self.chunk_amplitudes_average_kind()].path
+            ),
+            "amplitudes_av",
+            point_ids=point_ids,
+            values=amplitudes_average,
+        )
+        self.saver.save_data(
+            {"nreciprocal_space_points": np.array([int(reciprocal_point_count)], dtype=np.int64)},
+            self._artifact_filename(
+                ref_by_kind[self.chunk_reciprocal_point_count_kind()].path
+            ),
+        )
+
+    def _save_two_column_complex_payload(
+        self,
+        filename: str,
+        dataset_name: str,
+        *,
+        point_ids: np.ndarray,
+        values: np.ndarray,
+    ) -> None:
+        point_ids_arr = np.asarray(point_ids)
+        values_arr = np.asarray(values).reshape(-1)
+        if point_ids_arr.shape[0] != values_arr.shape[0]:
+            raise ValueError(
+                f"{dataset_name} point ids and values must have matching length."
+            )
+        file_path = Path(self.output_dir) / filename
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = file_path.with_name(
+            f".{file_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        row_count = int(values_arr.shape[0])
+        row_bytes = np.dtype(np.complex128).itemsize * 2
+        block_rows = max(1, (64 * 1024 * 1024) // row_bytes)
+        chunk_rows = max(1, min(row_count or 1, (4 * 1024 * 1024) // row_bytes))
+        try:
+            with h5py.File(tmp_path, "w") as h5file:
+                dataset = h5file.create_dataset(
+                    dataset_name,
+                    shape=(row_count, 2),
+                    maxshape=(None, 2),
+                    dtype=np.complex128,
+                    chunks=(chunk_rows, 2),
+                )
+                for start in range(0, row_count, block_rows):
+                    stop = min(row_count, start + block_rows)
+                    block = np.empty((stop - start, 2), dtype=np.complex128)
+                    block[:, 0] = point_ids_arr[start:stop]
+                    block[:, 1] = values_arr[start:stop]
+                    dataset[start:stop] = block
+            tmp_path.replace(file_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 
 def build_residual_field_output_artifact_refs(
@@ -197,7 +294,7 @@ def build_residual_field_generation_artifacts(
                 parameter_digest=parameter_digest,
             )
             + f":generation-{generation_token}",
-            path=str(shard_dir / f"{base_name}.npz"),
+            path=str(shard_dir / f"{base_name}.hdf5"),
             schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
         ),
         ArtifactRef(
@@ -246,7 +343,19 @@ def _missing_artifact_kinds(
 def _missing_artifact_paths(artifacts: tuple[ArtifactRef, ...]) -> tuple[str, ...]:
     missing: list[str] = []
     for artifact in artifacts:
-        if artifact.path is None or not Path(artifact.path).exists():
+        if artifact.path is None:
+            missing.append(artifact.key)
+            continue
+        path = Path(artifact.path)
+        if path.exists():
+            continue
+        if (
+            path.suffix == ".hdf5"
+            and artifact.kind in {"residual-shard-data", "interval-precompute"}
+            and path.with_suffix(".npz").exists()
+        ):
+            continue
+        else:
             missing.append(artifact.key)
     return tuple(sorted(missing))
 
@@ -356,7 +465,66 @@ def _write_json_atomic(target_path: Path, payload: dict[str, object]) -> None:
         encoding="utf-8",
     ) as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
     Path(handle.name).replace(target_path)
+    _fsync_parent(target_path)
+
+
+def _write_hdf5_payload_atomic(
+    target_path: Path,
+    payload: dict[str, np.ndarray],
+    *,
+    attrs: dict[str, object] | None = None,
+) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=target_path.parent,
+        prefix=f"{target_path.stem}_",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+    try:
+        with h5py.File(temp_path, "w") as h5file:
+            for name, value in payload.items():
+                data = np.asarray(value)
+                if data.dtype.kind in {"U", "O"}:
+                    dtype = h5py.string_dtype("utf-8")
+                    h5file.create_dataset(name, data=data.astype(dtype), dtype=dtype)
+                else:
+                    h5file.create_dataset(name, data=data)
+            if attrs:
+                for name, value in attrs.items():
+                    h5file.attrs[name] = value
+            h5file.flush()
+        _fsync_path(temp_path)
+        with h5py.File(temp_path, "r") as h5file:
+            for name, value in payload.items():
+                if name not in h5file:
+                    raise OSError(f"HDF5 payload validation failed: missing {name!r}")
+                if h5file[name].shape != np.asarray(value).shape:
+                    raise OSError(
+                        f"HDF5 payload validation failed for {name!r}: "
+                        f"{h5file[name].shape} != {np.asarray(value).shape}"
+                    )
+        temp_path.replace(target_path)
+        _fsync_parent(target_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _load_array_payload(path: str | Path) -> dict[str, np.ndarray]:
+    payload_path = Path(path)
+    if not payload_path.exists() and payload_path.suffix == ".hdf5":
+        legacy_path = payload_path.with_suffix(".npz")
+        if legacy_path.exists():
+            payload_path = legacy_path
+    if payload_path.suffix in {".h5", ".hdf5"}:
+        with h5py.File(payload_path, "r") as h5file:
+            return {name: np.asarray(h5file[name]) for name in h5file.keys()}
+    with np.load(payload_path, allow_pickle=False) as data:
+        return {name: np.asarray(data[name]) for name in data.files}
 
 
 def load_residual_field_shard_manifest(manifest_path: str | Path) -> ResidualFieldShardManifest:
@@ -646,6 +814,69 @@ def is_residual_field_manifest_complete(
     ).is_complete
 
 
+def is_residual_field_replacement_complete(
+    *,
+    chunk_id: int,
+    parameter_digest: str,
+    expected_interval_ids: tuple[int, ...],
+    output_dir: str,
+    db_path: str,
+    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+) -> bool:
+    expected_set = set(int(interval_id) for interval_id in expected_interval_ids)
+    if not expected_set:
+        return True
+    progress = discover_residual_field_reducer_progress_manifest(
+        output_dir=output_dir,
+        chunk_id=int(chunk_id),
+        parameter_digest=parameter_digest,
+    )
+    if progress is None or progress.completion_status is not CompletionStatus.COMMITTED:
+        return False
+    if set(int(interval_id) for interval_id in progress.incorporated_interval_ids) != expected_set:
+        return False
+    store = ResidualFieldArtifactStore(output_dir)
+    applied_set = set(int(interval_id) for interval_id in store.load_applied_interval_ids(chunk_id))
+    if applied_set != expected_set:
+        return False
+    current, current_av, reciprocal_point_count, grid_shape_nd = store.load_chunk_payloads(chunk_id)
+    if current is None or current_av is None or grid_shape_nd is None:
+        return False
+    current_arr = np.asarray(current)
+    current_av_arr = np.asarray(current_av)
+    if current_arr.shape != current_av_arr.shape:
+        return False
+    if current_arr.size == 0 or int(reciprocal_point_count) < 0:
+        return False
+    status_updater = _ResidualFieldChunkStatusUpdater(
+        db_path,
+        db_manager_factory=db_manager_factory,
+    )
+    missing_db_rows = [
+        int(interval_id)
+        for interval_id in expected_set
+        if not status_updater.is_saved(int(interval_id), int(chunk_id))
+    ]
+    for interval_id in missing_db_rows:
+        status_updater.mark_saved(int(interval_id), int(chunk_id))
+    representative = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=max(expected_set),
+        chunk_id=int(chunk_id),
+        parameter_digest=parameter_digest,
+        output_dir=output_dir,
+    )
+    manifest = build_residual_field_chunk_manifest(
+        representative,
+        output_dir=output_dir,
+        completion_status=CompletionStatus.COMMITTED,
+    )
+    return assess_residual_field_manifest(
+        manifest,
+        db_path=db_path,
+        db_manager_factory=db_manager_factory,
+    ).is_complete
+
+
 def can_resume_residual_field_work_unit(
     work_unit: ResidualFieldWorkUnit,
     *,
@@ -703,24 +934,47 @@ def _write_residual_field_chunk_state(
     total_reciprocal_points: int | None,
     applied_set: set[int],
 ) -> None:
-    store.ensure_grid_shape(chunk_id, np.asarray(merged_state.payload.grid_shape_nd))
+    _write_residual_field_chunk_payload_components(
+        store=store,
+        chunk_id=chunk_id,
+        point_ids=merged_state.payload.point_ids,
+        grid_shape_nd=merged_state.payload.grid_shape_nd,
+        amplitudes_delta=merged_state.payload.amplitudes_delta,
+        amplitudes_average=merged_state.payload.amplitudes_average,
+        reciprocal_point_count=merged_state.payload.reciprocal_point_count,
+        total_reciprocal_points=total_reciprocal_points,
+        applied_set=applied_set,
+    )
+
+
+def _write_residual_field_chunk_payload_components(
+    *,
+    store: ResidualFieldArtifactStore,
+    chunk_id: int,
+    point_ids: np.ndarray,
+    grid_shape_nd: np.ndarray,
+    amplitudes_delta: np.ndarray,
+    amplitudes_average: np.ndarray,
+    reciprocal_point_count: int,
+    total_reciprocal_points: int | None,
+    applied_set: set[int],
+) -> None:
+    store.ensure_grid_shape(chunk_id, np.asarray(grid_shape_nd))
     if total_reciprocal_points is not None:
         store.ensure_total_reciprocal_points(chunk_id, total_reciprocal_points)
-    amplitudes_payload = materialize_scattering_payload(
-        None,
-        merged_state.payload.point_ids,
-        merged_state.payload.amplitudes_delta,
-    )
-    amplitudes_average_payload = materialize_scattering_payload(
-        None,
-        merged_state.payload.point_ids,
-        merged_state.payload.amplitudes_average,
-    )
-    store.save_chunk_payloads(
+    point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+    amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
+    amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
+    if point_ids_arr.shape[0] != amplitudes_delta_arr.shape[0]:
+        raise ValueError("Residual-field point_ids must match amplitudes_delta length.")
+    if amplitudes_delta_arr.shape != amplitudes_average_arr.shape:
+        raise ValueError("Residual-field delta and average payloads must match.")
+    store.save_chunk_payload_components(
         chunk_id,
-        amplitudes_payload=amplitudes_payload,
-        amplitudes_average_payload=amplitudes_average_payload,
-        reciprocal_point_count=merged_state.payload.reciprocal_point_count,
+        point_ids=point_ids_arr,
+        amplitudes_delta=amplitudes_delta_arr,
+        amplitudes_average=amplitudes_average_arr,
+        reciprocal_point_count=reciprocal_point_count,
     )
     store.save_applied_interval_ids(chunk_id, applied_set)
 
@@ -795,7 +1049,7 @@ def reconcile_residual_field_reducer_progress(
     if merged_state is None:
         return progress
 
-    with chunk_mutex(chunk_id):
+    with chunk_mutex(chunk_id, lock_root=output_dir):
         store = artifact_store_factory(output_dir)
         _write_residual_field_chunk_state(
             store=store,
@@ -804,13 +1058,6 @@ def reconcile_residual_field_reducer_progress(
             total_reciprocal_points=total_reciprocal_points,
             applied_set=set(int(interval_id) for interval_id in target_interval_ids),
         )
-
-    status_updater = _ResidualFieldChunkStatusUpdater(
-        db_path,
-        db_manager_factory=db_manager_factory,
-    )
-    for interval_id in target_interval_ids:
-        status_updater.mark_saved(int(interval_id), int(chunk_id))
 
     representative_interval_id = (
         max(int(interval_id) for interval_id in target_interval_ids)
@@ -827,10 +1074,9 @@ def reconcile_residual_field_reducer_progress(
         output_dir=output_dir,
         completion_status=CompletionStatus.COMMITTED,
     )
-    final_assessment = assess_residual_field_manifest(
-        final_manifest,
-        db_path=db_path,
-        db_manager_factory=db_manager_factory,
+    final_artifacts_present = (
+        not _missing_artifact_kinds(final_manifest)
+        and not _missing_artifact_paths(final_manifest.artifacts)
     )
     reconciled_progress = _build_residual_field_reducer_progress_manifest(
         output_dir=output_dir,
@@ -838,21 +1084,29 @@ def reconcile_residual_field_reducer_progress(
         parameter_digest=parameter_digest,
         completion_status=(
             CompletionStatus.COMMITTED
-            if final_assessment.is_complete
+            if final_artifacts_present
             else CompletionStatus.MATERIALIZED
         ),
         durable_truth_unit="committed_shard_checkpoint",
         incorporated_shard_keys=target_shard_keys,
         incorporated_interval_ids=target_interval_ids,
         reclaimable_shard_keys=(
-            target_shard_keys if final_assessment.is_complete else ()
+            target_shard_keys if final_artifacts_present else ()
         ),
         final_artifacts=final_manifest.artifacts,
         pending_shard_keys=(),
         pending_interval_ids=(),
         cleanup_policy=progress.cleanup_policy,
     )
-    return write_residual_field_reducer_progress_manifest(reconciled_progress)
+    written_progress = write_residual_field_reducer_progress_manifest(reconciled_progress)
+    if written_progress.completion_status is CompletionStatus.COMMITTED:
+        status_updater = _ResidualFieldChunkStatusUpdater(
+            db_path,
+            db_manager_factory=db_manager_factory,
+        )
+        for interval_id in target_interval_ids:
+            status_updater.mark_saved(int(interval_id), int(chunk_id))
+    return written_progress
 
 
 def load_residual_field_shard_payload(
@@ -863,13 +1117,13 @@ def load_residual_field_shard_payload(
     )
     if shard_ref.path is None:
         raise ValueError("Residual-field shard data path is required.")
-    with np.load(shard_ref.path, allow_pickle=False) as data:
-        return {
-            "point_ids": np.asarray(data["point_ids"]),
-            "grid_shape_nd": np.asarray(data["grid_shape_nd"]),
-            "amplitudes_delta": np.asarray(data["amplitudes_delta"]),
-            "amplitudes_average": np.asarray(data["amplitudes_average"]),
-        }
+    data = _load_array_payload(shard_ref.path)
+    return {
+        "point_ids": np.asarray(data["point_ids"]),
+        "grid_shape_nd": np.asarray(data["grid_shape_nd"]),
+        "amplitudes_delta": np.asarray(data["amplitudes_delta"]),
+        "amplitudes_average": np.asarray(data["amplitudes_average"]),
+    }
 
 
 def load_residual_field_generation_payload(
@@ -880,26 +1134,36 @@ def load_residual_field_generation_payload(
     )
     if shard_ref.path is None:
         raise ValueError("Residual-field generation data path is required.")
-    with np.load(shard_ref.path, allow_pickle=False) as data:
-        return {
-            "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
-            "grid_shape_nd": np.asarray(data["grid_shape_nd"], dtype=np.int64),
-            "amplitudes_delta": np.asarray(data["amplitudes_delta"], dtype=np.complex128),
-            "amplitudes_average": np.asarray(data["amplitudes_average"], dtype=np.complex128),
-            "reciprocal_point_count": int(np.asarray(data["contribution_reciprocal_points"]).ravel()[0]),
-            "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
-            "incorporated_interval_ids": tuple(
-                int(interval_id)
-                for interval_id in np.asarray(data["contributing_interval_ids"], dtype=np.int64).tolist()
-            ),
-            "partition_id": (
-                None
-                if int(np.asarray(data["partition_id"]).ravel()[0]) < 0
-                else int(np.asarray(data["partition_id"]).ravel()[0])
-            ),
-            "generation_seq": int(np.asarray(data["generation_seq"]).ravel()[0]),
-            "storage_mode": "durable_shared_generation",
-        }
+    data = _load_array_payload(shard_ref.path)
+    return {
+        "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
+        "grid_shape_nd": np.asarray(data["grid_shape_nd"], dtype=np.int64),
+        "amplitudes_delta": np.asarray(data["amplitudes_delta"], dtype=np.complex128),
+        "amplitudes_average": np.asarray(data["amplitudes_average"], dtype=np.complex128),
+        "reciprocal_point_count": int(np.asarray(data["contribution_reciprocal_points"]).ravel()[0]),
+        "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
+        "incorporated_interval_ids": tuple(
+            int(interval_id)
+            for interval_id in np.asarray(data["contributing_interval_ids"], dtype=np.int64).tolist()
+        ),
+        "partition_id": (
+            None
+            if int(np.asarray(data["partition_id"]).ravel()[0]) < 0
+            else int(np.asarray(data["partition_id"]).ravel()[0])
+        ),
+        "generation_seq": int(np.asarray(data["generation_seq"]).ravel()[0]),
+        "point_start": (
+            int(np.asarray(data["point_start"]).ravel()[0])
+            if "point_start" in data and int(np.asarray(data["point_start"]).ravel()[0]) >= 0
+            else None
+        ),
+        "point_stop": (
+            int(np.asarray(data["point_stop"]).ravel()[0])
+            if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
+            else None
+        ),
+        "storage_mode": "durable_shared_generation",
+    }
 
 
 def discover_residual_field_shard_manifests(
@@ -1183,7 +1447,7 @@ def persist_residual_field_shard_checkpoint(
     output_dir: str,
     scratch_root: str | None = None,
     shard_storage_root: str | None = None,
-    compress: bool = True,
+    compress: bool = False,
     quiet_logs: bool = False,
 ) -> ResidualFieldShardManifest:
     start_time = time.perf_counter()
@@ -1243,44 +1507,57 @@ def persist_residual_field_shard_checkpoint(
         else shard_path.parent
     )
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=scratch_dir,
-        prefix=f"{shard_path.stem}_",
-        suffix=".npz",
-        delete=False,
-    ) as handle:
-        save_fn = np.savez_compressed if compress else np.savez
-        save_fn(
-            handle,
-            interval_id=np.array([work_unit.interval_id], dtype=np.int64),
-            contributing_interval_ids=np.asarray(
-                manifest.contributing_interval_ids,
+    payload = {
+        "interval_id": np.array([work_unit.interval_id], dtype=np.int64),
+        "contributing_interval_ids": np.asarray(
+            manifest.contributing_interval_ids,
+            dtype=np.int64,
+        ),
+        "chunk_id": np.array([work_unit.chunk_id], dtype=np.int64),
+        "parameter_digest": np.array([work_unit.parameter_digest]),
+        "point_ids": np.asarray(
+            point_ids
+            if point_ids is not None
+            else np.arange(
+                np.asarray(amplitudes_delta).reshape(-1).shape[0],
                 dtype=np.int64,
-            ),
-            chunk_id=np.array([work_unit.chunk_id], dtype=np.int64),
-            parameter_digest=np.array([work_unit.parameter_digest]),
-            point_ids=np.asarray(
-                point_ids
-                if point_ids is not None
-                else np.arange(
-                    np.asarray(amplitudes_delta).reshape(-1).shape[0],
-                    dtype=np.int64,
-                )
-            ),
-            grid_shape_nd=np.asarray(grid_shape_nd),
-            amplitudes_delta=np.asarray(amplitudes_delta),
-            amplitudes_average=np.asarray(amplitudes_average),
-            contribution_reciprocal_points=np.array(
-                [int(contribution_reciprocal_points)],
-                dtype=np.int64,
-            ),
-            total_reciprocal_points=np.array(
-                [int(total_reciprocal_points)],
-                dtype=np.int64,
-            ),
+            )
+        ),
+        "grid_shape_nd": np.asarray(grid_shape_nd),
+        "amplitudes_delta": np.asarray(amplitudes_delta),
+        "amplitudes_average": np.asarray(amplitudes_average),
+        "contribution_reciprocal_points": np.array(
+            [int(contribution_reciprocal_points)],
+            dtype=np.int64,
+        ),
+        "total_reciprocal_points": np.array(
+            [int(total_reciprocal_points)],
+            dtype=np.int64,
+        ),
+    }
+    scratch_path = scratch_dir / shard_path.name
+    if shard_path.suffix in {".h5", ".hdf5"}:
+        _write_hdf5_payload_atomic(
+            scratch_path,
+            payload,
+            attrs={
+                "schema_version": 2,
+                "format": "mosaic.residual_field.shard",
+            },
         )
-    scratch_path = Path(handle.name)
-    if scratch_path.parent == shard_path.parent:
+    else:
+        with tempfile.NamedTemporaryFile(
+            dir=scratch_dir,
+            prefix=f"{shard_path.stem}_",
+            suffix=".npz",
+            delete=False,
+        ) as handle:
+            save_fn = np.savez_compressed if compress else np.savez
+            save_fn(handle, **payload)
+        scratch_path = Path(handle.name)
+    if scratch_path == shard_path:
+        pass
+    elif scratch_path.parent == shard_path.parent:
         scratch_path.replace(shard_path)
     else:
         with tempfile.NamedTemporaryFile(
@@ -1335,7 +1612,9 @@ def persist_residual_field_generation_checkpoint(
     output_dir: str,
     scratch_root: str | None = None,
     shard_storage_root: str | None = None,
-    compress: bool = True,
+    point_start: int | None = None,
+    point_stop: int | None = None,
+    compress: bool = False,
     quiet_logs: bool = False,
 ) -> ResidualFieldShardManifest:
     start_time = time.perf_counter()
@@ -1403,30 +1682,45 @@ def persist_residual_field_generation_checkpoint(
         else shard_path.parent
     )
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=scratch_dir,
-        prefix=f"{shard_path.stem}_",
-        suffix=".npz",
-        delete=False,
-    ) as handle:
-        save_fn = np.savez_compressed if compress else np.savez
-        save_fn(
-            handle,
-            interval_id=np.array([int(interval_ids[0])], dtype=np.int64),
-            contributing_interval_ids=np.asarray(interval_ids, dtype=np.int64),
-            chunk_id=np.array([int(chunk_id)], dtype=np.int64),
-            parameter_digest=np.array([str(parameter_digest)]),
-            point_ids=np.asarray(point_ids, dtype=np.int64),
-            grid_shape_nd=np.asarray(grid_shape_nd, dtype=np.int64),
-            amplitudes_delta=np.asarray(amplitudes_delta, dtype=np.complex128),
-            amplitudes_average=np.asarray(amplitudes_average, dtype=np.complex128),
-            contribution_reciprocal_points=np.array([int(reciprocal_point_count)], dtype=np.int64),
-            total_reciprocal_points=np.array([int(total_reciprocal_points)], dtype=np.int64),
-            partition_id=np.array([-1 if partition_id is None else int(partition_id)], dtype=np.int64),
-            generation_seq=np.array([int(generation_seq)], dtype=np.int64),
+    payload = {
+        "interval_id": np.array([int(interval_ids[0])], dtype=np.int64),
+        "contributing_interval_ids": np.asarray(interval_ids, dtype=np.int64),
+        "chunk_id": np.array([int(chunk_id)], dtype=np.int64),
+        "parameter_digest": np.array([str(parameter_digest)]),
+        "point_ids": np.asarray(point_ids, dtype=np.int64),
+        "grid_shape_nd": np.asarray(grid_shape_nd, dtype=np.int64),
+        "amplitudes_delta": np.asarray(amplitudes_delta, dtype=np.complex128),
+        "amplitudes_average": np.asarray(amplitudes_average, dtype=np.complex128),
+        "contribution_reciprocal_points": np.array([int(reciprocal_point_count)], dtype=np.int64),
+        "total_reciprocal_points": np.array([int(total_reciprocal_points)], dtype=np.int64),
+        "partition_id": np.array([-1 if partition_id is None else int(partition_id)], dtype=np.int64),
+        "generation_seq": np.array([int(generation_seq)], dtype=np.int64),
+        "point_start": np.array([-1 if point_start is None else int(point_start)], dtype=np.int64),
+        "point_stop": np.array([-1 if point_stop is None else int(point_stop)], dtype=np.int64),
+    }
+    scratch_path = scratch_dir / shard_path.name
+    if shard_path.suffix in {".h5", ".hdf5"}:
+        _write_hdf5_payload_atomic(
+            scratch_path,
+            payload,
+            attrs={
+                "schema_version": 2,
+                "format": "mosaic.residual_field.generation",
+            },
         )
-    scratch_path = Path(handle.name)
-    if scratch_path.parent == shard_path.parent:
+    else:
+        with tempfile.NamedTemporaryFile(
+            dir=scratch_dir,
+            prefix=f"{shard_path.stem}_",
+            suffix=".npz",
+            delete=False,
+        ) as handle:
+            save_fn = np.savez_compressed if compress else np.savez
+            save_fn(handle, **payload)
+        scratch_path = Path(handle.name)
+    if scratch_path == shard_path:
+        pass
+    elif scratch_path.parent == shard_path.parent:
         scratch_path.replace(shard_path)
     else:
         with tempfile.NamedTemporaryFile(
@@ -1546,6 +1840,7 @@ def reduce_residual_field_shards_for_chunk(
     parameter_digest: str,
     output_dir: str,
     db_path: str,
+    expected_interval_ids: tuple[int, ...] | None = None,
     manifests: list[ResidualFieldShardManifest] | None = None,
     cleanup_policy: str | bool | None = None,
     shard_storage_root: str | None = None,
@@ -1612,10 +1907,27 @@ def reduce_residual_field_shards_for_chunk(
             return None
     if not committed_shards:
         return None
+    expected_set = (
+        set(int(interval_id) for interval_id in expected_interval_ids)
+        if expected_interval_ids is not None
+        else set()
+    )
+    if expected_interval_ids is not None:
+        committed_interval_ids = {
+            int(interval_id)
+            for manifest in committed_shards
+            for interval_id in manifest.contributing_interval_ids
+        }
+        missing_expected = tuple(sorted(expected_set - committed_interval_ids))
+        if missing_expected:
+            raise RuntimeError(
+                "Residual-field reducer missing expected replacement shard coverage: "
+                f"chunk={int(chunk_id)} intervals={list(missing_expected)}"
+            )
     shard_summary = summarize_residual_field_shards(committed_shards)
     generation_summary = summarize_residual_field_generation_metrics(committed_shards)
 
-    with chunk_mutex(chunk_id):
+    with chunk_mutex(chunk_id, lock_root=output_dir):
         store = artifact_store_factory(output_dir)
         existing_state, applied_set, current_payload, current_average_payload = (
             load_existing_materialized_state(
@@ -1699,20 +2011,11 @@ def reduce_residual_field_shards_for_chunk(
             store.ensure_grid_shape(chunk_id, np.asarray(merged_state.payload.grid_shape_nd))
             if total_reciprocal_points is not None:
                 store.ensure_total_reciprocal_points(chunk_id, total_reciprocal_points)
-            amplitudes_payload = materialize_scattering_payload(
-                current_payload,
-                merged_state.payload.point_ids,
-                merged_state.payload.amplitudes_delta,
-            )
-            amplitudes_average_payload = materialize_scattering_payload(
-                current_average_payload,
-                merged_state.payload.point_ids,
-                merged_state.payload.amplitudes_average,
-            )
-            store.save_chunk_payloads(
+            store.save_chunk_payload_components(
                 chunk_id,
-                amplitudes_payload=amplitudes_payload,
-                amplitudes_average_payload=amplitudes_average_payload,
+                point_ids=merged_state.payload.point_ids,
+                amplitudes_delta=merged_state.payload.amplitudes_delta,
+                amplitudes_average=merged_state.payload.amplitudes_average,
                 reciprocal_point_count=merged_state.payload.reciprocal_point_count,
             )
             store.save_applied_interval_ids(chunk_id, applied_set)
@@ -1721,8 +2024,9 @@ def reduce_residual_field_shards_for_chunk(
         db_path,
         db_manager_factory=db_manager_factory,
     )
-    for interval_id in sorted(set(reduced_interval_ids)):
-        status_updater.mark_saved(interval_id, chunk_id)
+    if expected_interval_ids is None:
+        for interval_id in sorted(set(reduced_interval_ids)):
+            status_updater.mark_saved(interval_id, chunk_id)
 
     representative_interval_id = (
         max(int(interval_id) for interval_id in applied_set)
@@ -1740,11 +2044,29 @@ def reduce_residual_field_shards_for_chunk(
         output_dir=output_dir,
         completion_status=CompletionStatus.COMMITTED,
     )
-    manifest_assessment = assess_residual_field_manifest(
-        manifest,
-        db_path=db_path,
-        db_manager_factory=db_manager_factory,
+    final_incorporated_interval_ids = tuple(
+        sorted(
+            set(int(interval_id) for interval_id in applied_set)
+            | set(int(interval_id) for interval_id in incorporated_interval_ids)
+        )
     )
+    if expected_interval_ids is not None and set(final_incorporated_interval_ids) != expected_set:
+        raise RuntimeError(
+            "Residual-field replacement reducer committed unexpected interval coverage: "
+            f"chunk={int(chunk_id)} expected={list(sorted(expected_set))} "
+            f"actual={list(final_incorporated_interval_ids)}"
+        )
+    if expected_interval_ids is None:
+        manifest_complete = assess_residual_field_manifest(
+            manifest,
+            db_path=db_path,
+            db_manager_factory=db_manager_factory,
+        ).is_complete
+    else:
+        manifest_complete = (
+            not _missing_artifact_kinds(manifest)
+            and not _missing_artifact_paths(manifest.artifacts)
+        )
     reclaimable_shard_keys = tuple(
         sorted(
             manifest_item.artifact_key
@@ -1758,19 +2080,14 @@ def reduce_residual_field_shards_for_chunk(
         parameter_digest=parameter_digest,
         completion_status=(
             CompletionStatus.COMMITTED
-            if manifest_assessment.is_complete
+            if manifest_complete
             else CompletionStatus.MATERIALIZED
         ),
         durable_truth_unit="committed_shard_checkpoint",
         incorporated_shard_keys=tuple(sorted(incorporated_shard_keys)),
-        incorporated_interval_ids=tuple(
-            sorted(
-                set(int(interval_id) for interval_id in applied_set)
-                | set(int(interval_id) for interval_id in incorporated_interval_ids)
-            )
-        ),
+        incorporated_interval_ids=final_incorporated_interval_ids,
         reclaimable_shard_keys=(
-            reclaimable_shard_keys if manifest_assessment.is_complete else ()
+            reclaimable_shard_keys if manifest_complete else ()
         ),
         final_artifacts=manifest.artifacts,
         pending_shard_keys=(),
@@ -1778,6 +2095,21 @@ def reduce_residual_field_shards_for_chunk(
         cleanup_policy=resolved_cleanup_policy,
     )
     write_residual_field_reducer_progress_manifest(progress_manifest)
+    if expected_interval_ids is not None and progress_manifest.completion_status is not CompletionStatus.COMMITTED:
+        raise RuntimeError(
+            "Residual-field replacement reducer did not reach committed state: "
+            f"chunk={int(chunk_id)} expected_intervals={list(sorted(expected_set))}"
+        )
+    if expected_interval_ids is not None:
+        incorporated = set(int(interval_id) for interval_id in progress_manifest.incorporated_interval_ids)
+        if incorporated != expected_set:
+            raise RuntimeError(
+                "Residual-field replacement reducer committed unexpected interval coverage: "
+                f"chunk={int(chunk_id)} expected={list(sorted(expected_set))} "
+                f"actual={list(sorted(incorporated))}"
+            )
+        for interval_id in sorted(incorporated):
+            status_updater.mark_saved(int(interval_id), int(chunk_id))
     if quiet_logs:
         logger.debug(
             "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | checkpoint_writes=%d | checkpoint_bytes=%d | checkpoint_wall=%.3fs | duration=%.3fs",
@@ -1849,7 +2181,7 @@ def persist_residual_field_chunk_result(
     if work_unit.interval_id is None:
         raise ValueError("Residual-field chunk persistence requires interval_id.")
 
-    with chunk_mutex(work_unit.chunk_id):
+    with chunk_mutex(work_unit.chunk_id, lock_root=output_dir):
         store = artifact_store_factory(output_dir)
         store.ensure_grid_shape(work_unit.chunk_id, grid_shape_nd)
         store.ensure_total_reciprocal_points(work_unit.chunk_id, total_reciprocal_points)
@@ -1881,20 +2213,11 @@ def persist_residual_field_chunk_result(
                 if existing_state is not None
                 else new_state
             )
-            amplitudes_payload = materialize_scattering_payload(
-                current_payload,
-                merged_state.payload.point_ids,
-                merged_state.payload.amplitudes_delta,
-            )
-            amplitudes_average_payload = materialize_scattering_payload(
-                current_average_payload,
-                merged_state.payload.point_ids,
-                merged_state.payload.amplitudes_average,
-            )
-            store.save_chunk_payloads(
+            store.save_chunk_payload_components(
                 work_unit.chunk_id,
-                amplitudes_payload=amplitudes_payload,
-                amplitudes_average_payload=amplitudes_average_payload,
+                point_ids=merged_state.payload.point_ids,
+                amplitudes_delta=merged_state.payload.amplitudes_delta,
+                amplitudes_average=merged_state.payload.amplitudes_average,
                 reciprocal_point_count=merged_state.payload.reciprocal_point_count,
             )
             applied_set.add(work_unit.interval_id)
@@ -1953,6 +2276,7 @@ __all__ = [
     "discover_residual_field_shard_manifests",
     "discover_stale_residual_field_generation_manifests",
     "is_residual_field_manifest_complete",
+    "is_residual_field_replacement_complete",
     "is_residual_field_shard_reclaimable",
     "list_reclaimable_residual_field_shards",
     "load_existing_residual_field_partial_result",

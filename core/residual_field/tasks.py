@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Sequence
 
@@ -29,6 +33,10 @@ from core.runtime import handle_worker_gpu_failure, task_progress_enabled
 logger = logging.getLogger(__name__)
 
 _worker_logging_configured = False
+_RIFFT_PAYLOAD_CACHE: "OrderedDict[tuple, tuple[tuple[np.ndarray, np.ndarray], int]]" = OrderedDict()
+_RIFFT_PAYLOAD_CACHE_BYTES = 0
+_RIFFT_PAYLOAD_CACHE_LOCK = threading.Lock()
+_RIFFT_PAYLOAD_CACHE_MAX_BYTES_DEFAULT = 4 * 1024 * 1024 * 1024
 
 
 def _ensure_worker_logging() -> None:
@@ -54,6 +62,88 @@ def _task_progress_enabled(quiet_logs: bool) -> bool:
     return task_progress_enabled(False)
 
 
+def _same_q_grid_presum_enabled() -> bool:
+    raw = os.getenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _riff_payload_cache_enabled() -> bool:
+    raw = os.getenv("MOSAIC_RESIDUAL_RIFFT_PAYLOAD_CACHE")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _riff_payload_cache_max_bytes() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_RIFFT_PAYLOAD_CACHE_MAX_BYTES")
+    try:
+        value = int(raw) if raw is not None else _RIFFT_PAYLOAD_CACHE_MAX_BYTES_DEFAULT
+    except ValueError:
+        value = _RIFFT_PAYLOAD_CACHE_MAX_BYTES_DEFAULT
+    return max(0, int(value))
+
+
+def _riff_payload_cache_key(
+    atoms: np.recarray,
+    work_unit: ResidualFieldWorkUnit,
+) -> tuple:
+    return (
+        id(build_rifft_grid_for_chunk),
+        id(atoms),
+        str(work_unit.parameter_digest),
+        int(work_unit.chunk_id),
+        None if work_unit.partition_id is None else int(work_unit.partition_id),
+        None if work_unit.point_start is None else int(work_unit.point_start),
+        None if work_unit.point_stop is None else int(work_unit.point_stop),
+        int(getattr(atoms, "shape", (len(atoms),))[0]),
+    )
+
+
+def clear_residual_rifft_payload_cache() -> None:
+    global _RIFFT_PAYLOAD_CACHE_BYTES
+    with _RIFFT_PAYLOAD_CACHE_LOCK:
+        _RIFFT_PAYLOAD_CACHE.clear()
+        _RIFFT_PAYLOAD_CACHE_BYTES = 0
+
+
+def _cached_rifft_payload(key: tuple) -> tuple[np.ndarray, np.ndarray] | None:
+    if not _riff_payload_cache_enabled():
+        return None
+    with _RIFFT_PAYLOAD_CACHE_LOCK:
+        entry = _RIFFT_PAYLOAD_CACHE.get(key)
+        if entry is None:
+            return None
+        payload, _size = entry
+        _RIFFT_PAYLOAD_CACHE.move_to_end(key)
+        return payload
+
+
+def _store_rifft_payload_cache(
+    key: tuple,
+    payload: tuple[np.ndarray, np.ndarray],
+) -> None:
+    global _RIFFT_PAYLOAD_CACHE_BYTES
+    if not _riff_payload_cache_enabled():
+        return
+    max_bytes = _riff_payload_cache_max_bytes()
+    if max_bytes <= 0:
+        return
+    payload_bytes = int(payload[0].nbytes + payload[1].nbytes)
+    if payload_bytes > max_bytes:
+        return
+    with _RIFFT_PAYLOAD_CACHE_LOCK:
+        existing = _RIFFT_PAYLOAD_CACHE.pop(key, None)
+        if existing is not None:
+            _RIFFT_PAYLOAD_CACHE_BYTES -= int(existing[1])
+        _RIFFT_PAYLOAD_CACHE[key] = (payload, payload_bytes)
+        _RIFFT_PAYLOAD_CACHE_BYTES += payload_bytes
+        while _RIFFT_PAYLOAD_CACHE_BYTES > max_bytes and _RIFFT_PAYLOAD_CACHE:
+            _old_key, (_old_payload, old_size) = _RIFFT_PAYLOAD_CACHE.popitem(last=False)
+            _RIFFT_PAYLOAD_CACHE_BYTES -= int(old_size)
+
+
 def _normalize_interval_inputs(
     interval_inputs: Path | str | IntervalTask | Sequence[Path | str | IntervalTask],
 ) -> tuple[Path | IntervalTask, ...]:
@@ -70,15 +160,148 @@ def _normalize_interval_inputs(
     return tuple(normalized)
 
 
-def _q_grid_signature(q_grid: np.ndarray) -> tuple:
+def _q_grid_signature(q_grid: np.ndarray, q_grid_digest: str | None = None) -> tuple:
     arr = np.asarray(q_grid)
+    if q_grid_digest:
+        return (tuple(arr.shape), str(arr.dtype), str(q_grid_digest))
     return (tuple(arr.shape), str(arr.dtype), arr.tobytes())
+
+
+def _atoms_to_chunk_data(atoms: np.recarray) -> list[dict]:
+    return [
+        {
+            "coordinates": atoms["coordinates"][index],
+            "dist_from_atom_center": atoms["dist_from_atom_center"][index],
+            "step_in_frac": atoms["step_in_frac"][index],
+        }
+        for index in range(atoms.shape[0])
+    ]
+
+
+def _slice_work_unit_atoms(
+    atoms: np.recarray,
+    work_unit: ResidualFieldWorkUnit,
+) -> np.recarray:
+    if work_unit.point_start is None and work_unit.point_stop is None:
+        return atoms
+    start = int(work_unit.point_start or 0)
+    stop = int(work_unit.point_stop or len(atoms))
+    return atoms[start:stop]
+
+
+def _normalize_rifft_payload(rifft_payload) -> tuple[np.ndarray, np.ndarray]:
+    if hasattr(rifft_payload, "result") and not isinstance(rifft_payload, tuple):
+        rifft_payload = rifft_payload.result()
+    if (
+        not isinstance(rifft_payload, tuple)
+        or len(rifft_payload) != 2
+    ):
+        raise ValueError("Residual-field RIFFT payload must be a (rifft_grid, grid_shape_nd) tuple.")
+    rifft_grid, grid_shape_nd = rifft_payload
+    return (
+        np.asarray(rifft_grid, dtype=np.float64),
+        np.asarray(grid_shape_nd, dtype=np.int64),
+    )
+
+
+def build_residual_rifft_payload(
+    atoms: np.recarray,
+    *,
+    work_unit: ResidualFieldWorkUnit,
+    quiet_logs: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    show_progress = _task_progress_enabled(quiet_logs)
+    cache_key = _riff_payload_cache_key(atoms, work_unit)
+    cached = _cached_rifft_payload(cache_key)
+    if cached is not None:
+        if show_progress:
+            logger.debug(
+                "Residual RIFFT grid cache hit | chunk=%d | partition=%s | rifft_points=%d | bytes=%d",
+                int(work_unit.chunk_id),
+                work_unit.partition_id,
+                int(cached[0].shape[0]),
+                int(cached[0].nbytes + cached[1].nbytes),
+            )
+        return cached
+    partition_atoms = _slice_work_unit_atoms(atoms, work_unit)
+    build_start = time.perf_counter()
+    rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(
+        _atoms_to_chunk_data(partition_atoms)
+    )
+    rifft_grid = np.asarray(rifft_grid, dtype=np.float64)
+    grid_shape_nd = np.asarray(grid_shape_nd, dtype=np.int64)
+    if show_progress:
+        logger.debug(
+            "Residual RIFFT grid build | chunk=%d | partition=%s | points=%d | rifft_points=%d | bytes=%d | duration=%.3fs",
+            int(work_unit.chunk_id),
+            work_unit.partition_id,
+            int(partition_atoms.shape[0]),
+            int(rifft_grid.shape[0]),
+            int(rifft_grid.nbytes + grid_shape_nd.nbytes),
+            time.perf_counter() - build_start,
+        )
+    payload = (rifft_grid, grid_shape_nd)
+    _store_rifft_payload_cache(cache_key, payload)
+    return payload
+
+
+def _pre_sum_same_q_grid_weights(
+    interval_tasks: Sequence[IntervalTask],
+    *,
+    reference_q_grid: np.ndarray,
+) -> np.ndarray:
+    q_point_count = int(np.asarray(reference_q_grid).shape[0])
+    summed_weights = np.zeros((2, q_point_count), dtype=np.complex128)
+    has_intervals = False
+    for interval_task in interval_tasks:
+        q_amp = np.asarray(interval_task.q_amp, dtype=np.complex128).reshape(-1)
+        q_amp_av = np.asarray(interval_task.q_amp_av, dtype=np.complex128).reshape(-1)
+        if q_amp.shape[0] != q_point_count:
+            raise ValueError(
+                "Residual-field interval q_amp length does not match q_grid: "
+                f"interval={int(interval_task.irecip_id)} q_amp={q_amp.shape[0]} q_grid={q_point_count}"
+            )
+        if q_amp_av.shape[0] != q_point_count:
+            raise ValueError(
+                "Residual-field interval q_amp_av length does not match q_grid: "
+                f"interval={int(interval_task.irecip_id)} q_amp_av={q_amp_av.shape[0]} q_grid={q_point_count}"
+            )
+        summed_weights[0] += q_amp
+        summed_weights[0] -= q_amp_av
+        summed_weights[1] += q_amp_av
+        has_intervals = True
+    if not has_intervals:
+        raise ValueError("Residual-field same-q-grid group is empty.")
+    return summed_weights
+
+
+def _validate_same_q_grid_weight_shapes(
+    interval_tasks: Sequence[IntervalTask],
+    *,
+    reference_q_grid: np.ndarray,
+) -> None:
+    q_point_count = int(np.asarray(reference_q_grid).shape[0])
+    if not interval_tasks:
+        raise ValueError("Residual-field same-q-grid group is empty.")
+    for interval_task in interval_tasks:
+        q_amp = np.asarray(interval_task.q_amp).reshape(-1)
+        q_amp_av = np.asarray(interval_task.q_amp_av).reshape(-1)
+        if q_amp.shape[0] != q_point_count:
+            raise ValueError(
+                "Residual-field interval q_amp length does not match q_grid: "
+                f"interval={int(interval_task.irecip_id)} q_amp={q_amp.shape[0]} q_grid={q_point_count}"
+            )
+        if q_amp_av.shape[0] != q_point_count:
+            raise ValueError(
+                "Residual-field interval q_amp_av length does not match q_grid: "
+                f"interval={int(interval_task.irecip_id)} q_amp_av={q_amp_av.shape[0]} q_grid={q_point_count}"
+            )
 
 
 def run_residual_field_interval_chunk_task(
     work_unit: ResidualFieldWorkUnit,
     interval_paths: Path | str | IntervalTask | Sequence[Path | str | IntervalTask],
-    atoms: np.recarray,
+    atoms: np.recarray | None,
     *,
     total_reciprocal_points: int,
     output_dir: str,
@@ -88,6 +311,7 @@ def run_residual_field_interval_chunk_task(
     total_expected_partials: int | None = None,
     owner_local_reducer: bool = False,
     quiet_logs: bool = False,
+    rifft_payload: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> ResidualFieldShardManifest | ResidualFieldAccumulatorStatus | None:
     _ensure_worker_logging()
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
@@ -99,19 +323,6 @@ def run_residual_field_interval_chunk_task(
         loaded_interval_inputs = _normalize_interval_inputs(interval_paths)
         if not loaded_interval_inputs:
             raise ValueError("Residual-field batch task requires at least one interval artifact path.")
-        partition_atoms = atoms
-        if work_unit.point_start is not None or work_unit.point_stop is not None:
-            start = int(work_unit.point_start or 0)
-            stop = int(work_unit.point_stop or len(atoms))
-            partition_atoms = atoms[start:stop]
-        chunk_data = [
-            {
-                "coordinates": partition_atoms["coordinates"][index],
-                "dist_from_atom_center": partition_atoms["dist_from_atom_center"][index],
-                "step_in_frac": partition_atoms["step_in_frac"][index],
-            }
-            for index in range(partition_atoms.shape[0])
-        ]
         if owner_local_reducer:
             if scratch_root is None or db_path is None or total_expected_partials is None:
                 raise ValueError(
@@ -146,7 +357,18 @@ def run_residual_field_interval_chunk_task(
                     contribution_reciprocal_point_count=0,
                     total_reciprocal_points=total_reciprocal_points,
                 )
-        rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(chunk_data)
+        if rifft_payload is None:
+            if atoms is None:
+                raise ValueError(
+                    "Residual-field batch task requires atoms when no RIFFT payload is supplied."
+                )
+            rifft_grid, grid_shape_nd = build_residual_rifft_payload(
+                atoms,
+                work_unit=work_unit,
+                quiet_logs=quiet_logs,
+            )
+        else:
+            rifft_grid, grid_shape_nd = _normalize_rifft_payload(rifft_payload)
         if show_progress:
             logger.debug(
                 "Residual batch start | chunk=%d | partition=%s | intervals=%s | rifft_points=%d",
@@ -165,7 +387,10 @@ def run_residual_field_interval_chunk_task(
         grouped_interval_tasks: dict[tuple, list] = {}
         for interval_task in interval_tasks:
             grouped_interval_tasks.setdefault(
-                _q_grid_signature(interval_task.q_grid),
+                _q_grid_signature(
+                    interval_task.q_grid,
+                    getattr(interval_task, "q_grid_digest", None),
+                ),
                 [],
             ).append(interval_task)
             contribution_reciprocal_points += scattering_contribution_point_count(interval_task)
@@ -173,6 +398,7 @@ def run_residual_field_interval_chunk_task(
             raise ValueError("Residual-field batch task produced no interval contributions.")
         amplitudes_delta = None
         amplitudes_average = None
+        use_presum = _same_q_grid_presum_enabled()
         total_groups = len(grouped_interval_tasks)
         for group_index, grouped_tasks in enumerate(grouped_interval_tasks.values(), start=1):
             reference_q_grid = grouped_tasks[0].q_grid
@@ -186,25 +412,69 @@ def run_residual_field_interval_chunk_task(
                     int(len(grouped_tasks)),
                     int(reference_q_grid.shape[0]),
                 )
-            stacked_weights = []
-            for interval_task in grouped_tasks:
-                stacked_weights.extend(
-                    [
-                        interval_task.q_amp - interval_task.q_amp_av,
-                        interval_task.q_amp_av,
-                    ]
+            if use_presum:
+                inverse_weights = _pre_sum_same_q_grid_weights(
+                    grouped_tasks,
+                    reference_q_grid=reference_q_grid,
                 )
-            stacked_arr = np.stack(stacked_weights, axis=0)
-            del stacked_weights
+                if show_progress:
+                    previous_transforms = 2 * int(len(grouped_tasks))
+                    logger.debug(
+                        "Residual batch same-q-grid pre-sum | chunk=%d | partition=%s | "
+                        "intervals=%d | q_points=%d | transforms_before=%d | transforms_after=2 | saved=%d",
+                        int(work_unit.chunk_id),
+                        work_unit.partition_id,
+                        int(len(grouped_tasks)),
+                        int(reference_q_grid.shape[0]),
+                        int(previous_transforms),
+                        max(0, int(previous_transforms) - 2),
+                    )
+            else:
+                _validate_same_q_grid_weight_shapes(
+                    grouped_tasks,
+                    reference_q_grid=reference_q_grid,
+                )
+                stacked_weights = []
+                for interval_task in grouped_tasks:
+                    stacked_weights.extend(
+                        [
+                            interval_task.q_amp - interval_task.q_amp_av,
+                            interval_task.q_amp_av,
+                        ]
+                    )
+                inverse_weights = np.stack(stacked_weights, axis=0)
+                del stacked_weights
+            inverse_start = time.perf_counter()
             inverse_outputs = execute_inverse_cunufft_super_batch(
                 q_coords=reference_q_grid,
-                weights=stacked_arr,
+                weights=inverse_weights,
                 real_coords=rifft_grid,
                 eps=1e-12,
             )
-            del stacked_arr
-            grouped_delta = np.sum(inverse_outputs[0::2], axis=0, dtype=np.complex128)
-            grouped_average = np.sum(inverse_outputs[1::2], axis=0, dtype=np.complex128)
+            if show_progress:
+                logger.debug(
+                    "Residual batch inverse NUFFT | chunk=%d | partition=%s | group=%d/%d | intervals=%d | transforms=%d | duration=%.3fs",
+                    int(work_unit.chunk_id),
+                    work_unit.partition_id,
+                    int(group_index),
+                    int(total_groups),
+                    int(len(grouped_tasks)),
+                    int(np.asarray(inverse_weights).shape[0]),
+                    time.perf_counter() - inverse_start,
+                )
+            del inverse_weights
+            inverse_outputs = np.asarray(inverse_outputs, dtype=np.complex128)
+            if use_presum:
+                if inverse_outputs.shape[0] != 2:
+                    raise ValueError(
+                        "Residual-field same-q-grid inverse expected two output transforms; "
+                        f"got {inverse_outputs.shape[0]}"
+                    )
+                grouped_delta = inverse_outputs[0]
+                grouped_average = inverse_outputs[1]
+            else:
+                grouped_delta = np.sum(inverse_outputs[0::2], axis=0, dtype=np.complex128)
+                grouped_average = np.sum(inverse_outputs[1::2], axis=0, dtype=np.complex128)
             del inverse_outputs
             if amplitudes_delta is None:
                 amplitudes_delta = grouped_delta
@@ -216,7 +486,8 @@ def run_residual_field_interval_chunk_task(
             else:
                 amplitudes_average += grouped_average
                 del grouped_average
-        point_ids = np.arange(amplitudes_delta.shape[0], dtype=np.int64)
+        point_offset = int(work_unit.point_start or 0)
+        point_ids = point_offset + np.arange(amplitudes_delta.shape[0], dtype=np.int64)
         if owner_local_reducer:
             worker_backend.accept_local_contribution(
                 work_unit,
@@ -268,7 +539,11 @@ def run_residual_field_interval_chunk_task(
             exc_info=True,
         )
         handle_worker_gpu_failure(err, logger=logger)
-        return None
+        raise
 
 
-__all__ = ["run_residual_field_interval_chunk_task"]
+__all__ = [
+    "build_residual_rifft_payload",
+    "clear_residual_rifft_payload_cache",
+    "run_residual_field_interval_chunk_task",
+]
