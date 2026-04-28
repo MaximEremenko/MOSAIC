@@ -65,7 +65,7 @@ class ScatteringStage:
         scattering_calculator_impl = self.scattering_weight_registry.create_calculator(
             context.scattering_weight_selection
         )
-        self.compute_amplitudes(
+        stage_result = self.compute_amplitudes(
             parameters=amplitude_parameters,
             FormFactorFactoryProducer=scattering_calculator_impl,
             MaskStrategy=context.mask_strategy,
@@ -75,4 +75,6 @@ class ScatteringStage:
             point_data_processor=context.artifacts.point_data_processor,
             client=client,
         )
+        if isinstance(stage_result, dict):
+            base_params.update(stage_result)
         return base_params

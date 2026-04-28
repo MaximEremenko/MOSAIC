@@ -25,6 +25,7 @@ class IntervalTask(NamedTuple):
     q_grid: np.ndarray
     q_amp: np.ndarray
     q_amp_av: np.ndarray
+    q_grid_digest: str | None = None
 
 
 def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:

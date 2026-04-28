@@ -4,6 +4,7 @@ import numpy as np
 
 from core.scattering.coefficients import to_numpy
 from core.scattering.context import ScatteringExecutionContext
+from core.residual_field.planning import build_residual_field_parameter_digest
 
 
 def build_base_amplitude_parameters(
@@ -35,6 +36,9 @@ def build_base_amplitude_parameters(
         "vectors": context.structure.vectors,
         "supercell": context.structure.supercell,
         "postprocessing_mode": context.postprocessing_mode,
+        "residual_parameter_digest": build_residual_field_parameter_digest(
+            context.workflow_parameters
+        ),
     }
 
 

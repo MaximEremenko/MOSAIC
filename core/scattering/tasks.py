@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import h5py
 import numpy as np
 
 from core.scattering.artifacts import (
@@ -11,6 +12,7 @@ from core.scattering.artifacts import (
     mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
     persist_scattering_interval_chunk_result,
+    persist_scattering_interval_chunk_shard,
 )
 from core.scattering.contracts import ScatteringArtifactManifest, ScatteringWorkUnit
 from core.scattering.kernels import (
@@ -47,7 +49,32 @@ def _lower_worker_log_levels() -> None:
 
 
 def load_interval_task_payload(interval_path: Path) -> IntervalTask:
-    with np.load(interval_path, mmap_mode="r") as data:
+    path = Path(interval_path)
+    if not path.exists() and path.suffix == ".hdf5":
+        legacy_path = path.with_suffix(".npz")
+        if legacy_path.exists():
+            path = legacy_path
+    if path.suffix in {".h5", ".hdf5"}:
+        with h5py.File(path, "r") as data:
+            element = data["element"][()]
+            if isinstance(element, bytes):
+                element = element.decode("utf-8")
+            q_grid_digest = None
+            if "q_grid_digest" in data:
+                q_grid_digest = data["q_grid_digest"][()]
+                if isinstance(q_grid_digest, bytes):
+                    q_grid_digest = q_grid_digest.decode("ascii")
+                else:
+                    q_grid_digest = str(q_grid_digest)
+            return IntervalTask(
+                int(np.asarray(data["irecip_id"]).reshape(-1)[0]),
+                str(element),
+                np.asarray(data["q_grid"]),
+                np.asarray(data["q_amp"]),
+                np.asarray(data["q_amp_av"]),
+                q_grid_digest,
+            )
+    with np.load(path, mmap_mode="r") as data:
         return IntervalTask(
             int(data["irecip_id"].item()),
             str(data["element"].item()),
@@ -206,7 +233,7 @@ def run_scattering_interval_chunk_task(
         )
         amplitudes_delta = inverse_pair[0]
         amplitudes_average = inverse_pair[1]
-        return persist_scattering_interval_chunk_result(
+        return persist_scattering_interval_chunk_shard(
             work_unit,
             grid_shape_nd=grid_shape_nd,
             total_reciprocal_points=total_reciprocal_points,
@@ -214,7 +241,6 @@ def run_scattering_interval_chunk_task(
             amplitudes_delta=amplitudes_delta,
             amplitudes_average=amplitudes_average,
             output_dir=output_dir,
-            db_path=db_path,
             quiet_logs=quiet_logs,
         )
     except Exception as err:
@@ -226,7 +252,7 @@ def run_scattering_interval_chunk_task(
             exc_info=True,
         )
         handle_worker_gpu_failure(err, logger=logger)
-        return None
+        raise
 
 
 __all__ = [

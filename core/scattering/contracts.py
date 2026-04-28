@@ -81,7 +81,7 @@ def build_interval_artifact_ref(output_dir: str, interval_id: int) -> ArtifactRe
             "interval-precompute",
             interval_id=interval_id,
         ),
-        path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+        path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.hdf5"),
         schema_version=SCATTERING_CONTRACT_SCHEMA_VERSION,
     )
 
