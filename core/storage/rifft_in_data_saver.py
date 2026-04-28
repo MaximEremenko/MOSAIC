@@ -1,11 +1,35 @@
 # data_storage/rifft_in_data_saver.py
 
 import os
+import tempfile
 import h5py
 import numpy as np
 import logging
 
 from core.runtime.log_utils import short_path
+
+
+def _fsync_path(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_parent(path: str) -> None:
+    parent = os.path.dirname(path) or "."
+    try:
+        fd = os.open(parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 class RIFFTInDataSaver:
     """
@@ -68,25 +92,61 @@ class RIFFTInDataSaver:
                     mode = 'w'  # Overwrite/Create mode
                     self.logger.debug(f"{'Overwriting' if os.path.exists(file_path) else 'Creating'} HDF5 file: {file_path}")
 
-                with h5py.File(file_path, mode) as h5file:
-                    for dataset_name, dataset_data in data.items():
-                        if append and dataset_name in h5file:
-                            # Resize dataset to accommodate new data
-                            if dataset_data.ndim > 1:
-                                new_shape = (h5file[dataset_name].shape[0] + dataset_data.shape[0],) + h5file[dataset_name].shape[1:]
+                target_path = file_path
+                temp_path = None
+                if mode == 'w':
+                    fd, temp_path = tempfile.mkstemp(
+                        dir=os.path.dirname(file_path) or ".",
+                        prefix=f".{os.path.basename(file_path)}.",
+                        suffix=".tmp",
+                    )
+                    os.close(fd)
+                    target_path = temp_path
+
+                try:
+                    with h5py.File(target_path, mode) as h5file:
+                        for dataset_name, dataset_data in data.items():
+                            dataset_data = np.asarray(dataset_data)
+                            if append and dataset_name in h5file:
+                                # Resize dataset to accommodate new data
+                                if dataset_data.ndim > 1:
+                                    new_shape = (h5file[dataset_name].shape[0] + dataset_data.shape[0],) + h5file[dataset_name].shape[1:]
+                                else:
+                                    new_shape = (h5file[dataset_name].shape[0] + dataset_data.shape[0],)
+                                h5file[dataset_name].resize(new_shape)
+                                h5file[dataset_name][-dataset_data.shape[0]:] = dataset_data
+                                self.logger.debug(f"Appended {dataset_data.shape[0]} entries to dataset '{dataset_name}'. New shape: {h5file[dataset_name].shape}")
                             else:
-                                new_shape = (h5file[dataset_name].shape[0] + dataset_data.shape[0],)
-                            h5file[dataset_name].resize(new_shape)
-                            h5file[dataset_name][-dataset_data.shape[0]:] = dataset_data
-                            self.logger.debug(f"Appended {dataset_data.shape[0]} entries to dataset '{dataset_name}'. New shape: {h5file[dataset_name].shape}")
-                        else:
-                            # Create or overwrite dataset with maxshape to allow future appends
-                            if dataset_data.ndim > 1:
-                                maxshape = (None,) + dataset_data.shape[1:]
-                            else:
-                                maxshape = (None,)
-                            h5file.create_dataset(dataset_name, data=dataset_data, maxshape=maxshape, chunks=True)
-                            self.logger.debug(f"Dataset '{dataset_name}' {'created' if mode == 'w' else 'overwritten'} with shape {dataset_data.shape}")
+                                # Create or overwrite dataset with maxshape to allow future appends
+                                if dataset_data.ndim > 1:
+                                    maxshape = (None,) + dataset_data.shape[1:]
+                                else:
+                                    maxshape = (None,)
+                                h5file.create_dataset(dataset_name, data=dataset_data, maxshape=maxshape, chunks=True)
+                                self.logger.debug(f"Dataset '{dataset_name}' {'created' if mode == 'w' else 'overwritten'} with shape {dataset_data.shape}")
+                        h5file.flush()
+                    _fsync_path(target_path)
+                    if temp_path is not None:
+                        with h5py.File(temp_path, "r") as h5file:
+                            for dataset_name, dataset_data in data.items():
+                                if dataset_name not in h5file:
+                                    raise OSError(
+                                        f"Atomic HDF5 validation failed: missing dataset {dataset_name!r}"
+                                    )
+                                if h5file[dataset_name].shape != np.asarray(dataset_data).shape:
+                                    raise OSError(
+                                        f"Atomic HDF5 validation failed for {dataset_name!r}: "
+                                        f"{h5file[dataset_name].shape} != {np.asarray(dataset_data).shape}"
+                                    )
+                        os.replace(temp_path, file_path)
+                        _fsync_parent(file_path)
+                        temp_path = None
+                finally:
+                    if temp_path is not None:
+                        try:
+                            os.unlink(temp_path)
+                        except OSError:
+                            pass
                 self.logger.debug(f"Data saved to HDF5 file: {file_path}")
             except Exception as e:
                 self.logger.error(f"Failed to save data to HDF5 file: {e}")

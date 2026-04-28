@@ -95,6 +95,9 @@ class DatabaseManager:
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         return self.processing_state_repository.get_unsaved_interval_chunks()
 
+    def get_interval_chunks(self) -> list[tuple[int, int]]:
+        return self.processing_state_repository.get_interval_chunks()
+
     def mark_interval_precomputed(self, interval_id: int, done: bool = True) -> None:
         self.interval_repository.mark_interval_precomputed(interval_id, done)
 

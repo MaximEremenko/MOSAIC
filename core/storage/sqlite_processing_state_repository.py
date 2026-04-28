@@ -30,6 +30,7 @@ class SQLiteProcessingStateRepository:
                 )
         except sqlite3.Error as exc:
             self.logger.error("insert_interval_chunk_status_batch failed: %s", exc)
+            raise
 
     def associate_point_reciprocal_space_batch(
         self, associations: list[tuple[int, int]]
@@ -60,6 +61,7 @@ class SQLiteProcessingStateRepository:
             self.update_interval_chunk_status(reciprocal_space_id, chunk_id, saved)
         except sqlite3.Error as exc:
             self.logger.error("update_saved_status_for_chunk_or_point failed: %s", exc)
+            raise
 
     def get_unsaved_associations(self) -> list[tuple[int, int]]:
         try:
@@ -105,6 +107,7 @@ class SQLiteProcessingStateRepository:
                 )
         except sqlite3.Error as exc:
             self.logger.error("update_interval_chunk_status failed: %s", exc)
+            raise
 
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         try:
@@ -118,4 +121,18 @@ class SQLiteProcessingStateRepository:
             return cursor.fetchall()
         except sqlite3.Error as exc:
             self.logger.error("get_unsaved_interval_chunks failed: %s", exc)
-            return []
+            raise
+
+    def get_interval_chunks(self) -> list[tuple[int, int]]:
+        try:
+            cursor = self.connection.execute(
+                """
+                SELECT reciprocal_space_id, chunk_id
+                FROM Interval_Chunk_Status
+                ORDER BY reciprocal_space_id, chunk_id
+                """
+            )
+            return cursor.fetchall()
+        except sqlite3.Error as exc:
+            self.logger.error("get_interval_chunks failed: %s", exc)
+            raise

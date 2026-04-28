@@ -1,5 +1,6 @@
 import numpy as np
 import logging
+from contextlib import ExitStack
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 from core.models import PointData
 from core.runtime.log_utils import short_path
@@ -8,7 +9,7 @@ from core.patch_centers.local_grid import (
     GridGenerator2D,
     GridGenerator3D,
 )
-from typing import Optional, List
+from typing import Optional
 import h5py
 import os
 
@@ -122,32 +123,78 @@ class PointDataProcessor:
         dimensionality = coordinates.shape[1]
         self.logger.debug(f"Chunk {chunk_id}: Processing {num_points} uninitialized points with dimensionality {dimensionality}.")
 
-        all_grid_data = []
-        all_amplitude_data = []
-        all_amplitude_data_av = []
-        for i in range(num_points):
-            central_point = coordinates[i]
-            dist = dist_from_atom_center[i]
-            step = step_in_frac[i]
-            central_point_id = central_point_ids[i]
+        amplitude_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes')
+        amplitude_av_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_av')
+        grid_filename = None
+        if self.save_rifft_coordinates:
+            grid_filename = self.data_saver.generate_filename(chunk_id, suffix='_grid')
+        point_counts = np.array(
+            [
+                self._grid_point_count(dimensionality, step, dist)
+                for step, dist in zip(step_in_frac, dist_from_atom_center)
+            ],
+            dtype=np.int64,
+        )
+        total_rows = int(point_counts.sum())
 
-            grid_points, grid_shapeNd = self._generate_grid(chunk_id, dimensionality, step, central_point, dist, central_point_id)
-            amplitude_data = self._generate_amplitude(chunk_id, central_point_id, grid_points)
-            amplitude_data_av = self._generate_amplitude(chunk_id, central_point_id, grid_points)
-            # Collect data for this chunk
-            all_grid_data.append(grid_points)
-            all_amplitude_data.append(amplitude_data)
-            all_amplitude_data_av.append(amplitude_data_av)
-            
-        # Merge all grid_points and amplitudes for this chunk
-        merged_grid_points = np.vstack(all_grid_data) if self.save_rifft_coordinates else None
-        merged_amplitude_data = np.vstack(all_amplitude_data)
-        merged_amplitude_data_av = np.vstack(all_amplitude_data_av)
+        with ExitStack() as stack:
+            amplitude_h5 = stack.enter_context(
+                h5py.File(self._stream_file_path(amplitude_filename), "w")
+            )
+            amplitude_av_h5 = stack.enter_context(
+                h5py.File(self._stream_file_path(amplitude_av_filename), "w")
+            )
+            amplitude_dataset = self._create_stream_dataset(
+                amplitude_h5,
+                "amplitudes",
+                total_rows=total_rows,
+                shape_tail=(2,),
+                dtype=np.complex128,
+            )
+            amplitude_av_dataset = self._create_stream_dataset(
+                amplitude_av_h5,
+                "amplitudes_av",
+                total_rows=total_rows,
+                shape_tail=(2,),
+                dtype=np.complex128,
+            )
+            grid_dataset = None
+            if grid_filename is not None:
+                grid_h5 = stack.enter_context(
+                    h5py.File(self._stream_file_path(grid_filename), "w")
+                )
+                grid_dataset = self._create_stream_dataset(
+                    grid_h5,
+                    "grid_points",
+                    total_rows=total_rows,
+                    shape_tail=(dimensionality,),
+                    dtype=np.float64,
+                )
+
+            self._write_amplitude_runs(
+                amplitude_dataset,
+                amplitude_av_dataset,
+                central_point_ids=central_point_ids,
+                point_counts=point_counts,
+            )
+
+            if grid_dataset is not None:
+                write_start = 0
+                for i in range(num_points):
+                    central_point = coordinates[i]
+                    dist = dist_from_atom_center[i]
+                    step = step_in_frac[i]
+                    central_point_id = central_point_ids[i]
+
+                    grid_points, grid_shapeNd = self._generate_grid(chunk_id, dimensionality, step, central_point, dist, central_point_id)
+                    write_stop = write_start + int(grid_points.shape[0])
+                    grid_dataset[write_start:write_stop] = grid_points
+                    write_start = write_stop
         
         #total_reciprocal_points_filename =  self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
         #self.data_saver.save_data({'ntotal_reciprocal_points': np.zeros([1], dtype = np.int64)}, total_reciprocal_points_filename)    
         total_reciprocal_points_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_ntotal_reciprocal_space_points')
-        if not os.path.exists(total_reciprocal_points_filename):
+        if not os.path.exists(self._stream_file_path(total_reciprocal_points_filename)):
             self.data_saver.save_data(                {
                     'ntotal_reciprocal_space_points': np.array([-1], dtype=np.int64),
                     'ntotal_reciprocal_points': np.array([-1], dtype=np.int64),
@@ -155,12 +202,116 @@ class PointDataProcessor:
                 total_reciprocal_points_filename
             )
         
-        # Save the data for this chunk
-        self._save_chunk_data(chunk_id, merged_grid_points, merged_amplitude_data, merged_amplitude_data_av, np.zeros([1], dtype = int))
+        nreciprocal_space_points_filename = self.data_saver.generate_filename(chunk_id, suffix='_amplitudes_nreciprocal_space_points')
+        self.data_saver.save_data({'nreciprocal_space_points': np.zeros([1], dtype = int)}, nreciprocal_space_points_filename)
+        self.logger.info(f"Chunk {chunk_id}: Amplitudes saved to {amplitude_filename}")
 
         # Mark all points in this chunk as initialized
         self.point_data.grid_amplitude_initialized[mask] = True
         self.logger.debug(f"Chunk {chunk_id}: All uninitialized points marked as initialized.")
+
+    def _stream_file_path(self, filename: str) -> str:
+        if not os.path.exists(self.data_saver.output_dir):
+            os.makedirs(self.data_saver.output_dir)
+        return os.path.join(self.data_saver.output_dir, filename)
+
+    def _create_stream_dataset(
+        self,
+        h5file: h5py.File,
+        dataset_name: str,
+        *,
+        total_rows: int,
+        shape_tail: tuple[int, ...],
+        dtype,
+    ) -> h5py.Dataset:
+        return h5file.create_dataset(
+            dataset_name,
+            shape=(int(total_rows),) + tuple(shape_tail),
+            maxshape=(None,) + tuple(shape_tail),
+            dtype=dtype,
+            chunks=self._stream_chunk_shape(total_rows, shape_tail, dtype),
+            fillvalue=np.array(0, dtype=dtype).item(),
+        )
+
+    def _stream_chunk_shape(
+        self,
+        total_rows: int,
+        shape_tail: tuple[int, ...],
+        dtype,
+    ) -> tuple[int, ...]:
+        row_bytes = int(np.dtype(dtype).itemsize * np.prod(shape_tail or (1,)))
+        target_chunk_bytes = 4 * 1024 * 1024
+        chunk_rows = max(1, target_chunk_bytes // max(1, row_bytes))
+        if total_rows > 0:
+            chunk_rows = min(int(total_rows), chunk_rows)
+        return (int(chunk_rows),) + tuple(shape_tail)
+
+    def _write_amplitude_runs(
+        self,
+        amplitude_dataset: h5py.Dataset,
+        amplitude_av_dataset: h5py.Dataset,
+        *,
+        central_point_ids: np.ndarray,
+        point_counts: np.ndarray,
+    ) -> None:
+        if point_counts.size == 0:
+            return
+        row_bytes = np.dtype(np.complex128).itemsize
+        buffer_rows = max(1, (64 * 1024 * 1024) // row_bytes)
+        buffer = np.empty((buffer_rows,), dtype=np.complex128)
+        write_start = 0
+        fill = 0
+
+        def flush() -> None:
+            nonlocal write_start, fill
+            if fill == 0:
+                return
+            write_stop = write_start + fill
+            block = buffer[:fill]
+            amplitude_dataset[write_start:write_stop, 0] = block
+            amplitude_av_dataset[write_start:write_stop, 0] = block
+            write_start = write_stop
+            fill = 0
+
+        for central_point_id, count_value in zip(central_point_ids, point_counts):
+            remaining = int(count_value)
+            while remaining > 0:
+                capacity = buffer_rows - fill
+                take = min(remaining, capacity)
+                buffer[fill:fill + take] = central_point_id
+                fill += take
+                remaining -= take
+                if fill == buffer_rows:
+                    flush()
+        flush()
+
+    def _grid_point_count(self, dimensionality, step_in_frac, dist) -> int:
+        if dimensionality == 1:
+            return int(self._axis_grid_count(step_in_frac, dist))
+        step_sizes = np.array(
+            [step_in_frac] * dimensionality
+            if np.isscalar(step_in_frac)
+            else step_in_frac,
+            dtype=float,
+        ).reshape(-1)
+        distances = np.array(dist, dtype=float).reshape(-1)
+        if step_sizes.size != dimensionality or distances.size != dimensionality:
+            raise ValueError(
+                f"Expected {dimensionality}D step/dist values, got "
+                f"{step_sizes.size} step values and {distances.size} distance values."
+            )
+        count = 1
+        for step, distance in zip(step_sizes, distances):
+            count *= self._axis_grid_count(step, distance)
+        return int(count)
+
+    def _axis_grid_count(self, step, dist) -> int:
+        step = float(np.asarray(step).reshape(-1)[0])
+        dist = float(np.asarray(dist).reshape(-1)[0])
+        if step <= 0 or dist <= step:
+            return 1
+        epsilon = 1e-12
+        return int(np.arange(-dist, dist + step - epsilon, step).size)
 
     def generate_grid(
         self,
@@ -218,14 +369,9 @@ class PointDataProcessor:
         """
         self.logger.debug(f"Chunk {chunk_id}: Generating amplitude data for central_point_id={central_point_id}")
 
-        # Assign zero values to amplitude
-        amplitude = np.zeros(grid_points.shape[0], dtype=np.complex128)
-
-        # Prepare amplitude data: central_point_id, amplitude
-        amplitude_data = np.hstack((
-            np.full((amplitude.shape[0], 1), central_point_id),
-            amplitude.reshape(-1, 1)
-        ))
+        amplitude_data = np.empty((grid_points.shape[0], 2), dtype=np.complex128)
+        amplitude_data[:, 0] = central_point_id
+        amplitude_data[:, 1] = 0.0
         self.logger.debug(f"Chunk {chunk_id}: Generated amplitude data with shape {amplitude_data.shape}")
 
         return amplitude_data

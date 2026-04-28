@@ -69,6 +69,9 @@ class ProcessingStateRepository(Protocol):
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         ...
 
+    def get_interval_chunks(self) -> list[tuple[int, int]]:
+        ...
+
 
 class ParameterSource(Protocol):
     def load(self, run_file: str = "run_parameters.json") -> tuple[Any, Any]:
@@ -89,4 +92,3 @@ class AmplitudeStore(Protocol):
 
     def generate_filename(self, chunk_id: int, suffix: str = "") -> str:
         ...
-
