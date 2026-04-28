@@ -24,9 +24,12 @@ def _to_plain(value):
 
 def build_decoder_cache_path(parameters: dict, output_dir: str) -> str:
     intervals = parameters.get("reciprocal_space_intervals_all", [])
+    rspace_info = parameters.get("rspace_info", {}) or {}
+    points = parameters.get("points", rspace_info.get("points", []))
     key_obj = {
         "supercell": _to_plain(np.asarray(parameters["supercell"], int)),
         "intervals": _to_plain(intervals),
+        "points": _to_plain(points),
         "q_window_kind": parameters.get("q_window_kind", "cheb"),
         "q_window_at_db": float(parameters.get("q_window_at_db", 100.0)),
         "edge_guard_frac": float(parameters.get("edge_guard_frac", 0.10)),

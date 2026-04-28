@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -239,7 +240,7 @@ def _has_any_decoder(processor) -> bool:
 
 
 def _set_single_decoder(processor, decoder_M, feature_dim: int) -> None:
-    processor._decoder_M = np.asarray(decoder_M, dtype=np.float64, copy=False)
+    processor._decoder_M = np.asarray(decoder_M, dtype=np.float64)
     processor._feature_dim = int(feature_dim)
     processor._decoder_family = None
     processor._decoder_feature_dims = None
@@ -251,7 +252,7 @@ def _set_decoder_family(
     feature_dims: dict[DisplacementDecoderKey, int],
 ) -> None:
     processor._decoder_family = {
-        key: np.asarray(value, dtype=np.float64, copy=False)
+        key: np.asarray(value, dtype=np.float64)
         for key, value in decoder_family.items()
     }
     processor._decoder_feature_dims = {
@@ -406,9 +407,16 @@ def load_required_decoder(cache_path: str, logger):
         raise FileNotFoundError(
             "No usable M-decoder was found at "
             f"'{cache_path}'. Provide a valid processing.decoder.cache_path or "
-            "use processing.decoder.source='compute'."
+            "use processing.decoder.source='compute' or 'current'."
         )
     return decoder, feature_dim
+
+
+def _resolve_decoder_cache_path(cache_path: str, parameters: dict) -> str:
+    path = Path(cache_path)
+    if path.is_dir():
+        return build_decoder_cache_path(parameters, str(path))
+    return str(path)
 
 
 def _set_prepared_decoder_from_source(processor, *, decoder, feature_dim) -> None:
@@ -451,12 +459,24 @@ def train_decoder_from_samples(
     save_decoder_cache(cache_path, processor._decoder_M, processor._feature_dim, logger)
 
 
+def _stack_features_into_columns(features: list[np.ndarray]) -> np.ndarray:
+    """Preallocate an (P, N) column stack. Bitwise-identical to
+    ``np.stack(features, axis=1)`` for 1-D inputs: only copies bytes into a
+    pre-sized buffer, no arithmetic or float-reordering."""
+    P = int(features[0].size)
+    N = len(features)
+    out = np.empty((P, N), dtype=features[0].dtype)
+    for i, f in enumerate(features):
+        out[:, i] = f
+    return out
+
+
 def _stack_decoder_training_samples(
     training_features: list[np.ndarray],
     training_targets: list[np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray, int]:
-    R_data = np.stack(training_features, axis=1)
-    U_data = np.stack(training_targets, axis=1)
+    R_data = _stack_features_into_columns(training_features)
+    U_data = _stack_features_into_columns(training_targets)
     P, N = R_data.shape
     return R_data, U_data, P
 
@@ -468,16 +488,36 @@ def _solve_linear_decoder(
     lam_reg: float,
     logger,
 ) -> np.ndarray:
-    P = int(R_data.shape[0])
-    RR = R_data @ R_data.T
-    UR = U_data @ R_data.T
-    H = RR + float(lam_reg) * np.eye(P)
+    P, N = R_data.shape
+    lam = float(lam_reg)
+    # Pick the smaller normal system: primal (P×P) when P ≤ N, otherwise the
+    # dual / kernel form (N×N) via Rᵀ(RRᵀ+λI_P)⁻¹ = (RᵀR+λI_N)⁻¹Rᵀ. The dual
+    # branch avoids allocating a (P,P) matrix when the feature dim is much
+    # larger than the training-sample count.
+    if P <= N:
+        logger.info(
+            "Solving ridge decoder in primal form: P=%d, N=%d (H is %d×%d).",
+            P, N, P, P,
+        )
+        H = R_data @ R_data.T + lam * np.eye(P)
+        UR = U_data @ R_data.T
+        try:
+            return np.linalg.solve(H, UR.T).T
+        except np.linalg.LinAlgError:
+            logger.warning("Decoder normal matrix H is singular; using pseudo-inverse.")
+            return UR @ np.linalg.pinv(H, rcond=1e-12)
+
+    logger.info(
+        "Solving ridge decoder in dual form: P=%d, N=%d (kernel is %d×%d).",
+        P, N, N, N,
+    )
+    K = R_data.T @ R_data + lam * np.eye(N)
     try:
-        H_inv = np.linalg.inv(H)
+        A = np.linalg.solve(K, R_data.T)
     except np.linalg.LinAlgError:
-        logger.warning("Decoder normal matrix H is singular; using pseudo-inverse.")
-        H_inv = np.linalg.pinv(H, rcond=1e-12)
-    return UR @ H_inv
+        logger.warning("Decoder dual matrix K is singular; using pseudo-inverse.")
+        A = np.linalg.pinv(K, rcond=1e-12) @ R_data.T
+    return U_data @ A
 
 
 def train_decoder_family_from_samples(
@@ -606,7 +646,8 @@ def ensure_decoder(
             "No prepared M-decoder is available for displacement decoding. "
             "Set processing.decoder.source to 'cache' with a valid cache_path, "
             "or use processing.decoder.source='compute' with a separate "
-            "compute_output_directory."
+            "compute_output_directory, or use processing.decoder.source='current' "
+            "to train from current residual artifacts."
         )
 
     if processor._feature_dim is None:
@@ -625,7 +666,7 @@ def apply_decoder(processor, features_all):
             "Decoder-family application requires decoder keys. "
             "Call apply_decoder(...) with decoder_keys_all in family mode."
         )
-    R_all = np.stack(features_all, axis=1)
+    R_all = _stack_features_into_columns(features_all)
     return (processor._decoder_M @ R_all).T
 
 
@@ -642,7 +683,7 @@ def apply_decoder_family(processor, features_all, decoder_keys_all):
         grouped_indices.setdefault(key, []).append(index)
     for key, indices in grouped_indices.items():
         decoder_M = family[key]
-        R_group = np.stack([features_all[index] for index in indices], axis=1)
+        R_group = _stack_features_into_columns([features_all[index] for index in indices])
         U_group = (decoder_M @ R_group).T
         for position, index in enumerate(indices):
             U_all[index, :] = U_group[position, :]
@@ -722,9 +763,19 @@ class DisplacementDecoderSourceService:
             raise RuntimeError(
                 "Displacement decoding now requires an explicit decoder source. "
                 "Set processing.decoder.source to 'cache' with a valid cache_path, "
-                "or to 'compute' with a separate compute_output_directory. "
+                "to 'compute' with a separate compute_output_directory, or to "
+                "'current' to train from current residual artifacts. "
                 "No implicit M-decoder training is performed; this is especially "
                 "important for expensive 3D runs."
+            )
+
+        if policy.mode == "current":
+            return self._prepare_current_decoder_cache(
+                processor=processor,
+                policy=policy,
+                artifacts=artifacts,
+                output_dir=output_dir,
+                logger=logger,
             )
 
         if policy.mode == "cache":
@@ -735,7 +786,11 @@ class DisplacementDecoderSourceService:
                     "processing.decoder.source='compute', or preload a decoder "
                     "family in-memory."
                 )
-            decoder, feature_dim = load_required_decoder(policy.cache_path, logger)
+            resolved_cache_path = _resolve_decoder_cache_path(
+                str(policy.cache_path),
+                processor.parameters,
+            )
+            decoder, feature_dim = load_required_decoder(resolved_cache_path, logger)
             _set_prepared_decoder_from_source(
                 processor,
                 decoder=decoder,
@@ -744,8 +799,8 @@ class DisplacementDecoderSourceService:
             provenance = DecoderSourceProvenance(
                 mode="cache",
                 semantics="precomputed",
-                decoder_cache_path=str(policy.cache_path),
-                source_output_directory=str(Path(policy.cache_path).resolve().parent),
+                decoder_cache_path=str(resolved_cache_path),
+                source_output_directory=str(Path(resolved_cache_path).resolve().parent),
                 feature_dim=feature_dim,
                 loaded_from_cache=True,
                 computed=False,
@@ -768,6 +823,19 @@ class DisplacementDecoderSourceService:
                 decoder=decoder,
                 feature_dim=feature_dim,
             )
+            published_cache_path = build_decoder_cache_path(
+                processor.parameters,
+                output_dir,
+            )
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            if Path(published_cache_path).resolve() != Path(cache_path).resolve():
+                save_decoder_cache(
+                    published_cache_path,
+                    processor._decoder_M,
+                    processor._feature_dim,
+                    logger,
+                )
+            cache_path = published_cache_path
         finalized = DecoderSourceProvenance(
             mode="compute",
             semantics="unmasked-family" if _has_decoder_family(processor) else "unmasked",
@@ -785,6 +853,175 @@ class DisplacementDecoderSourceService:
         processor.decoder_source_provenance = finalized
         save_decoder_provenance(output_dir, finalized.to_mapping(), logger)
         return finalized
+
+    def _collect_decoder_training_samples(
+        self,
+        *,
+        training_processor,
+        artifacts,
+        output_dir: str,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[DisplacementDecoderKey]]:
+        training_features: list[np.ndarray] = []
+        training_targets: list[np.ndarray] = []
+        training_decoder_keys: list[DisplacementDecoderKey] = []
+        max_train = training_processor.parameters.get("linear_max_training_samples")
+        for chunk_id in sorted(artifacts.db_manager.get_pending_chunk_ids()):
+            point_data_list = artifacts.db_manager.get_point_data_for_chunk(int(chunk_id))
+            training_payload = build_decoder_training_payload(
+                training_processor,
+                chunk_id=int(chunk_id),
+                rifft_saver=artifacts.saver,
+                point_data_list=point_data_list,
+                output_dir=output_dir,
+            )
+            training_features.extend(training_payload["features_train"])
+            training_targets.extend(training_payload["u_train"])
+            training_decoder_keys.extend(training_payload["training_decoder_keys"])
+        if max_train is not None:
+            limit = int(max_train)
+            training_features = training_features[:limit]
+            training_targets = training_targets[:limit]
+            training_decoder_keys = training_decoder_keys[:limit]
+        return training_features, training_targets, training_decoder_keys
+
+    def _train_decoder_from_existing_artifacts(
+        self,
+        *,
+        target_processor,
+        training_processor,
+        policy: DisplacementDecoderSourcePolicy,
+        artifacts,
+        output_dir: str,
+        cache_path: str,
+        mode: str,
+        single_semantics: str,
+        family_semantics: str,
+        compute_output_directory: str | None,
+        logger,
+        label: str,
+    ) -> tuple[str | None, DecoderSourceProvenance]:
+        (
+            training_features,
+            training_targets,
+            training_decoder_keys,
+        ) = self._collect_decoder_training_samples(
+            training_processor=training_processor,
+            artifacts=artifacts,
+            output_dir=output_dir,
+        )
+        if policy.assignment == "family":
+            train_decoder_family_from_samples(
+                training_processor,
+                training_features=training_features,
+                training_targets=training_targets,
+                training_decoder_keys=training_decoder_keys,
+                lam_reg=float(training_processor.parameters.get("dog_lambda_reg", 1e-3)),
+                logger=logger,
+                label=label,
+            )
+            target_processor._decoder_family = getattr(training_processor, "_decoder_family", None)
+            target_processor._decoder_feature_dims = getattr(training_processor, "_decoder_feature_dims", None)
+            target_processor._decoder_M = getattr(training_processor, "_decoder_M", None)
+            target_processor._feature_dim = getattr(training_processor, "_feature_dim", None)
+            provenance = DecoderSourceProvenance(
+                mode=mode,
+                semantics=family_semantics,
+                decoder_cache_path="<stage2-in-memory-family>",
+                source_output_directory=str(Path(output_dir).resolve()),
+                compute_output_directory=compute_output_directory,
+                feature_dim=None,
+                loaded_from_cache=False,
+                computed=True,
+            )
+            save_decoder_provenance(output_dir, provenance.to_mapping(), logger)
+            return None, provenance
+
+        train_decoder_from_samples(
+            training_processor,
+            cache_path=cache_path,
+            training_features=training_features,
+            training_targets=training_targets,
+            lam_reg=float(training_processor.parameters.get("dog_lambda_reg", 1e-3)),
+            logger=logger,
+            label=label,
+        )
+        _set_prepared_decoder_from_source(
+            target_processor,
+            decoder=training_processor._decoder_M,
+            feature_dim=training_processor._feature_dim,
+        )
+        provenance = DecoderSourceProvenance(
+            mode=mode,
+            semantics=single_semantics,
+            decoder_cache_path=str(cache_path),
+            source_output_directory=str(Path(output_dir).resolve()),
+            compute_output_directory=compute_output_directory,
+            feature_dim=target_processor._feature_dim,
+            loaded_from_cache=False,
+            computed=True,
+        )
+        save_decoder_provenance(output_dir, provenance.to_mapping(), logger)
+        return cache_path, provenance
+
+    def _prepare_current_decoder_cache(
+        self,
+        *,
+        processor,
+        policy: DisplacementDecoderSourcePolicy,
+        artifacts,
+        output_dir: str,
+        logger,
+    ) -> DecoderSourceProvenance:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        cache_path = build_decoder_cache_path(processor.parameters, output_dir)
+        force_decoder_fresh = bool(policy.fresh_start)
+        if (
+            policy.assignment == "single"
+            and not force_decoder_fresh
+            and Path(cache_path).is_file()
+        ):
+            decoder, feature_dim = load_required_decoder(cache_path, logger)
+            _set_prepared_decoder_from_source(
+                processor,
+                decoder=decoder,
+                feature_dim=feature_dim,
+            )
+            provenance = DecoderSourceProvenance(
+                mode="current",
+                semantics="current-residual",
+                decoder_cache_path=str(cache_path),
+                source_output_directory=str(Path(output_dir).resolve()),
+                feature_dim=feature_dim,
+                loaded_from_cache=True,
+                computed=False,
+            )
+            processor.decoder_source_provenance = provenance
+            save_decoder_provenance(output_dir, provenance.to_mapping(), logger)
+            return provenance
+
+        if not hasattr(artifacts, "db_manager") or not hasattr(artifacts, "saver"):
+            raise RuntimeError(
+                "processing.decoder.source='current' requires current-run residual "
+                "artifacts and a residual-field saver. Run the ALL case through "
+                "residual-field generation before rebuilding the decoder."
+            )
+
+        cache_path, provenance = self._train_decoder_from_existing_artifacts(
+            target_processor=processor,
+            training_processor=processor,
+            policy=policy,
+            artifacts=artifacts,
+            output_dir=output_dir,
+            cache_path=cache_path,
+            mode="current",
+            single_semantics="current-residual",
+            family_semantics="current-residual-family",
+            compute_output_directory=None,
+            logger=logger,
+            label="current residual decoder-source run",
+        )
+        processor.decoder_source_provenance = provenance
+        return provenance
 
     def _compute_decoder_cache(
         self,
@@ -813,13 +1050,19 @@ class DisplacementDecoderSourceService:
         compute_params = self._build_unmasked_workflow_parameters(
             workflow_parameters,
             compute_root,
+            decoder_fresh_start=policy.fresh_start,
         )
         compute_processed_dir = compute_root / "processed_point_data"
         cache_path = build_decoder_cache_path(
             processor.parameters,
             str(compute_processed_dir),
         )
-        if policy.assignment == "single" and Path(cache_path).is_file():
+        force_decoder_fresh = bool(policy.fresh_start)
+        if (
+            policy.assignment == "single"
+            and not force_decoder_fresh
+            and Path(cache_path).is_file()
+        ):
             decoder, feature_dim = load_required_decoder(cache_path, logger)
             _set_prepared_decoder_from_source(
                 processor,
@@ -842,7 +1085,9 @@ class DisplacementDecoderSourceService:
                 logger,
             )
             return cache_path, provenance
-        decoding_context = None
+        if force_decoder_fresh and compute_processed_dir.exists():
+            shutil.rmtree(compute_processed_dir)
+        compute_processed_dir.mkdir(parents=True, exist_ok=True)
         compute_artifacts = None
         try:
             point_data = self.point_selection_service.select(
@@ -889,94 +1134,31 @@ class DisplacementDecoderSourceService:
                 decoding_parameters,
             )
 
-            training_features: list[np.ndarray] = []
-            training_targets: list[np.ndarray] = []
-            training_decoder_keys: list[DisplacementDecoderKey] = []
-            max_train = training_processor.parameters.get("linear_max_training_samples")
-            for chunk_id in sorted(compute_artifacts.db_manager.get_pending_chunk_ids()):
-                point_data_list = compute_artifacts.db_manager.get_point_data_for_chunk(
-                    int(chunk_id)
-                )
-                training_payload = build_decoder_training_payload(
-                    training_processor,
-                    chunk_id=int(chunk_id),
-                    rifft_saver=compute_artifacts.saver,
-                    point_data_list=point_data_list,
-                    output_dir=str(compute_processed_dir),
-                )
-                training_features.extend(training_payload["features_train"])
-                training_targets.extend(training_payload["u_train"])
-                training_decoder_keys.extend(training_payload["training_decoder_keys"])
-            if max_train is not None:
-                limit = int(max_train)
-                training_features = training_features[:limit]
-                training_targets = training_targets[:limit]
-                training_decoder_keys = training_decoder_keys[:limit]
-            if policy.assignment == "family":
-                train_decoder_family_from_samples(
-                    training_processor,
-                    training_features=training_features,
-                    training_targets=training_targets,
-                    training_decoder_keys=training_decoder_keys,
-                    lam_reg=float(training_processor.parameters.get("dog_lambda_reg", 1e-3)),
-                    logger=logger,
-                    label="full/unmasked decoder-source run",
-                )
-                processor._decoder_family = getattr(training_processor, "_decoder_family", None)
-                processor._decoder_feature_dims = getattr(training_processor, "_decoder_feature_dims", None)
-                processor._decoder_M = getattr(training_processor, "_decoder_M", None)
-                processor._feature_dim = getattr(training_processor, "_feature_dim", None)
-                provenance = DecoderSourceProvenance(
-                    mode="compute",
-                    semantics="unmasked-family",
-                    decoder_cache_path="<stage2-in-memory-family>",
-                    source_output_directory=str(compute_processed_dir),
-                    compute_output_directory=str(compute_root),
-                    feature_dim=None,
-                    loaded_from_cache=False,
-                    computed=True,
-                )
-                save_decoder_provenance(
-                    str(compute_processed_dir),
-                    provenance.to_mapping(),
-                    logger,
-                )
-                return None, provenance
-            train_decoder_from_samples(
-                training_processor,
+            return self._train_decoder_from_existing_artifacts(
+                target_processor=processor,
+                training_processor=training_processor,
+                policy=policy,
+                artifacts=compute_artifacts,
+                output_dir=str(compute_processed_dir),
                 cache_path=cache_path,
-                training_features=training_features,
-                training_targets=training_targets,
-                lam_reg=float(training_processor.parameters.get("dog_lambda_reg", 1e-3)),
+                mode="compute",
+                single_semantics="unmasked",
+                family_semantics="unmasked-family",
+                compute_output_directory=str(compute_root),
                 logger=logger,
                 label="full/unmasked decoder-source run",
             )
-            _set_prepared_decoder_from_source(
-                processor,
-                decoder=training_processor._decoder_M,
-                feature_dim=training_processor._feature_dim,
-            )
-            provenance = DecoderSourceProvenance(
-                mode="compute",
-                semantics="unmasked",
-                decoder_cache_path=str(cache_path),
-                source_output_directory=str(compute_processed_dir),
-                compute_output_directory=str(compute_root),
-                feature_dim=processor._feature_dim,
-                loaded_from_cache=False,
-                computed=True,
-            )
-            save_decoder_provenance(
-                str(compute_processed_dir),
-                provenance.to_mapping(),
-                logger,
-            )
-            return cache_path, provenance
         finally:
             if compute_artifacts is not None:
                 compute_artifacts.close()
 
-    def _build_unmasked_workflow_parameters(self, workflow_parameters, compute_root: Path):
+    def _build_unmasked_workflow_parameters(
+        self,
+        workflow_parameters,
+        compute_root: Path,
+        *,
+        decoder_fresh_start: bool | None = None,
+    ):
         payload = workflow_parameters.to_payload()
         peak_info = dict(payload.get("peakInfo", {}))
         peak_info.pop("mask_equation", None)
@@ -988,6 +1170,7 @@ class DisplacementDecoderSourceService:
         struct_info["working_directory"] = str(compute_root)
         payload["structInfo"] = struct_info
         rspace_info = dict(payload.get("rspace_info", {}))
+        rspace_info["fresh_start"] = bool(decoder_fresh_start)
         rspace_info["run_postprocessing"] = False
         original_decoder = dict(rspace_info.get("decoder", {}))
         decoder_payload = {"source": "error"}

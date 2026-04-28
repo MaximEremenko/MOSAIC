@@ -259,6 +259,15 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
             ("decoder_compute_output_directory", "decoderComputeOutputDirectory"),
         )
     )
+    decoder_fresh_start = first_present(
+        decoder,
+        ("fresh_start", "freshStart"),
+    )
+    if decoder_fresh_start is None:
+        decoder_fresh_start = first_present(
+            processing,
+            ("decoder_fresh_start", "decoderFreshStart"),
+        )
     rspace_info["decoder"] = {
         "source": decoder_source,
     }
@@ -266,6 +275,8 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
         rspace_info["decoder"]["cache_path"] = decoder_cache_path
     if decoder_compute_output_directory is not None:
         rspace_info["decoder"]["compute_output_directory"] = decoder_compute_output_directory
+    if decoder_fresh_start is not None:
+        rspace_info["decoder"]["fresh_start"] = as_bool(decoder_fresh_start)
 
     return {
         "schema_version": parameters.get("schema_version", 2),

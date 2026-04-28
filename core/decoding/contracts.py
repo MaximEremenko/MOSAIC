@@ -4,6 +4,20 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
 @dataclass(frozen=True)
 class DecodingRequest:
     output_dir: str
@@ -17,6 +31,7 @@ class DisplacementDecoderSourcePolicy:
     assignment: str = "single"
     cache_path: str | None = None
     compute_output_directory: str | None = None
+    fresh_start: bool | None = None
 
     @classmethod
     def from_mapping(
@@ -34,9 +49,9 @@ class DisplacementDecoderSourcePolicy:
             or mapping.get("decoder_assignment")
             or "single"
         ).strip().lower()
-        if mode not in {"error", "cache", "compute"}:
+        if mode not in {"error", "cache", "compute", "current"}:
             raise ValueError(
-                "processing.decoder.source must be one of: error, cache, compute."
+                "processing.decoder.source must be one of: error, cache, compute, current."
             )
         if assignment not in {"single", "family"}:
             raise ValueError(
@@ -47,6 +62,9 @@ class DisplacementDecoderSourcePolicy:
             mapping.get("compute_output_directory")
             or mapping.get("output_directory")
             or mapping.get("working_directory")
+        )
+        fresh_start = _optional_bool(
+            mapping.get("fresh_start", mapping.get("freshStart", None))
         )
         if mode == "cache" and not cache_path:
             raise ValueError(
@@ -63,6 +81,7 @@ class DisplacementDecoderSourcePolicy:
             compute_output_directory=(
                 str(compute_output_directory) if compute_output_directory else None
             ),
+            fresh_start=fresh_start,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -71,6 +90,8 @@ class DisplacementDecoderSourcePolicy:
             payload["cache_path"] = self.cache_path
         if self.compute_output_directory is not None:
             payload["compute_output_directory"] = self.compute_output_directory
+        if self.fresh_start is not None:
+            payload["fresh_start"] = bool(self.fresh_start)
         return payload
 
 
