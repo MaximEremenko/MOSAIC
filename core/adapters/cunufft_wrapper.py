@@ -13,8 +13,10 @@ rev 2025-08-08-mem
 from __future__ import annotations
 from typing import Callable, Optional
 import copy
+import hashlib
 import logging
 import os
+import threading
 import time
 import warnings
 import numpy as np
@@ -22,6 +24,308 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 _LAST_NUFFT_TELEMETRY = None
+
+
+###############################################################################
+#  Bounded cuFINUFFT Plan cache                                               #
+#                                                                             #
+#  Cache key is the exact set of Plan() + setpts arguments, so a cache hit    #
+#  replays the bit-identical call. Per-plan lock serializes concurrent        #
+#  setpts/execute calls on the same plan (cuFINUFFT Plans are not             #
+#  thread-safe). On CuPy OOM the cache is flushed once and the builder       #
+#  re-runs.                                                                   #
+###############################################################################
+def _coord_sig(arr) -> bytes:
+    if arr is None:
+        return b"\x00" * 8
+    # Accept CuPy arrays (disallow implicit asarray) and NumPy arrays alike.
+    get = getattr(arr, "get", None)
+    if callable(get):
+        try:
+            host = np.ascontiguousarray(get())
+        except Exception:
+            host = np.ascontiguousarray(np.asarray(arr))
+    else:
+        host = np.ascontiguousarray(np.asarray(arr))
+    return hashlib.sha1(host.view(np.uint8).tobytes()).digest()[:8]
+
+
+def _coords_sig(cols) -> bytes:
+    if cols is None:
+        return b"\x00" * 8
+    return b"".join(_coord_sig(c) for c in cols)
+
+
+_PLAN_CACHE_MAX = int(os.getenv("MOSAIC_NUFFT_PLAN_CACHE_MAX", "0"))
+_PLAN_CACHE: "dict[tuple, tuple]" = {}
+_PLAN_CACHE_ORDER: list = []
+_PLAN_CACHE_LOCK = threading.Lock()
+
+
+def _free_cupy_pool_blocks() -> None:
+    """Best-effort: return CuPy pool blocks to the device. Used after a
+    plan cache flush so VRAM held by destroyed plans is actually reclaimable
+    by subsequent allocations."""
+    try:
+        import cupy as cp_mod  # type: ignore
+        cp_mod.get_default_memory_pool().free_all_blocks()
+        try:
+            cp_mod.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_CUPY_POOL_CAPPED = False
+# Default per-worker target = 60% of total VRAM divided by expected worker
+# count. Each Dask worker process has its OWN CuPy pool, so a 65% per-worker
+# cap on N workers asks for N*0.65 of VRAM total, which OOMs. We split the
+# 60% global budget across workers and account for ~30% headroom held by
+# cuFINUFFT plan scratch (which bypasses the pool via raw cudaMalloc).
+_DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT = 0.60
+_DEFAULT_NON_POOL_HEADROOM_PCT = 0.30
+
+
+def _expected_worker_count() -> int:
+    """Best-effort guess at how many workers share this GPU. Used to split
+    the global VRAM budget into per-worker pool caps."""
+    raw = os.getenv("MOSAIC_DASK_WORKER_COUNT")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    raw = os.getenv("DASK_MAX_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return 4  # matches the project default
+
+
+def _apply_cupy_pool_cap() -> None:
+    """Bound CuPy's default memory pool **per worker process** so the
+    cumulative pool footprint across workers stays inside the GPU.
+
+    Resolution order (first match wins):
+        1. ``MOSAIC_CUPY_POOL_LIMIT_BYTES``   — absolute per-worker cap
+        2. ``MOSAIC_CUPY_POOL_LIMIT_GIB``     — per-worker cap in GiB
+        3. ``MOSAIC_CUPY_POOL_LIMIT_PCT``     — per-worker fraction of total
+        4. Auto: ``(global_budget - non_pool_headroom) / N_workers``
+           where global_budget = 0.60 of total VRAM and non_pool_headroom =
+           0.30 of total VRAM (reserved for cuFINUFFT plan internals which
+           bypass the CuPy pool).
+
+    On a 32 GiB GPU with 4 workers, the auto cap is
+        (0.60 - 0.30) * 32 / 4 = 2.4 GiB per worker pool → ~10 GiB pool
+    aggregate + ~10 GiB plan scratch + ~12 GiB free = 60-70% steady-state.
+
+    Idempotent; safe when CuPy is absent.
+    """
+    global _CUPY_POOL_CAPPED
+    if _CUPY_POOL_CAPPED:
+        return
+
+    limit_bytes: int | None = None
+    raw_bytes = os.getenv("MOSAIC_CUPY_POOL_LIMIT_BYTES")
+    raw_gib = os.getenv("MOSAIC_CUPY_POOL_LIMIT_GIB")
+    raw_pct = os.getenv("MOSAIC_CUPY_POOL_LIMIT_PCT")
+
+    if raw_bytes:
+        try:
+            limit_bytes = max(0, int(raw_bytes))
+        except ValueError:
+            limit_bytes = None
+
+    if limit_bytes is None and raw_gib:
+        try:
+            limit_bytes = max(0, int(float(raw_gib) * (1 << 30)))
+        except ValueError:
+            limit_bytes = None
+
+    try:
+        import cupy as cp_mod  # type: ignore
+        try:
+            _free, total_vram = cp_mod.cuda.runtime.memGetInfo()
+        except Exception:
+            total_vram = 0
+    except Exception:
+        return  # CuPy unavailable; nothing to cap
+
+    if total_vram <= 0:
+        return
+
+    if limit_bytes is None:
+        if raw_pct:
+            try:
+                pct = float(raw_pct)
+            except ValueError:
+                pct = _DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT
+            pct = min(max(pct, 0.0), 0.95)
+            limit_bytes = int(pct * total_vram)
+        else:
+            n_workers = _expected_worker_count()
+            usable_pct = max(
+                0.05,
+                _DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT - _DEFAULT_NON_POOL_HEADROOM_PCT,
+            )
+            limit_bytes = int(usable_pct * total_vram / max(1, n_workers))
+
+    if limit_bytes is None or limit_bytes <= 0:
+        return
+
+    try:
+        cp_mod.get_default_memory_pool().set_limit(size=int(limit_bytes))
+        _CUPY_POOL_CAPPED = True
+        logger.info(
+            "CuPy pool capped at %.2f GiB (workers=%d, total_vram=%.2f GiB).",
+            limit_bytes / (1 << 30),
+            _expected_worker_count(),
+            total_vram / (1 << 30),
+        )
+    except Exception as exc:
+        logger.debug("Could not set CuPy pool limit: %s", exc)
+
+
+# Apply at import; safe even when CuPy is absent.
+_apply_cupy_pool_cap()
+_SUCCESSFUL_SUBPROB: "dict[tuple[int, int], int]" = {}
+_SUCCESSFUL_SUBPROB_LOCK = threading.Lock()
+_DEFAULT_SUBPROBS: tuple = (32, 16, 8, 4, 2, 1)
+
+
+def _subprob_order(dim: int, n_trans: int) -> tuple:
+    """Return the retry sequence with the last-known-good size first."""
+    with _SUCCESSFUL_SUBPROB_LOCK:
+        preferred = _SUCCESSFUL_SUBPROB.get((int(dim), int(n_trans)))
+    if preferred is None or preferred not in _DEFAULT_SUBPROBS:
+        return _DEFAULT_SUBPROBS
+    rest = tuple(s for s in _DEFAULT_SUBPROBS if s != preferred)
+    return (preferred,) + rest
+
+
+def _record_successful_subprob(dim: int, n_trans: int, subprob: int) -> None:
+    with _SUCCESSFUL_SUBPROB_LOCK:
+        _SUCCESSFUL_SUBPROB[(int(dim), int(n_trans))] = int(subprob)
+
+
+def _destroy_plan_quietly(plan) -> None:
+    """Release a cuFINUFFT plan without invoking ``__del__`` directly.
+
+    cuFINUFFT exposes the C destroy callback and handle on the Python Plan.
+    Calling ``plan.__del__()`` manually is unsafe because the Python wrapper
+    remains live and may be finalized again later. Destroy the handle and
+    poison the wrapper state instead, matching the library finalizer's
+    idempotency contract.
+    """
+    if plan is None:
+        return
+    destroy_plan = getattr(plan, "_destroy_plan", None)
+    handle = getattr(plan, "_plan", None)
+    if not callable(destroy_plan) or handle is None:
+        return
+    destroyed = False
+    try:
+        status = destroy_plan(handle)
+        if status:
+            logger.debug("cuFINUFFT plan destroy returned status %s", status)
+        else:
+            destroyed = True
+    except Exception as exc:
+        logger.debug("cuFINUFFT plan destroy swallowed error: %s", exc)
+    if destroyed:
+        try:
+            plan._plan = None
+        except Exception:
+            pass
+        try:
+            plan._references = []
+        except Exception:
+            pass
+
+
+def _clear_plan_cache() -> None:
+    """Drop all cached plans and return CuPy pool blocks to the device.
+    Called on CuPy OOM or external pool flush."""
+    with _PLAN_CACHE_LOCK:
+        victims = list(_PLAN_CACHE.values())
+        _PLAN_CACHE.clear()
+        _PLAN_CACHE_ORDER.clear()
+    for plan, per_plan_lock in victims:
+        with per_plan_lock:
+            _destroy_plan_quietly(plan)
+    _free_cupy_pool_blocks()
+
+
+def _evict_one_locked() -> None:
+    if not _PLAN_CACHE_ORDER:
+        return
+    oldest = _PLAN_CACHE_ORDER.pop(0)
+    victim = _PLAN_CACHE.pop(oldest, None)
+    if victim is not None:
+        plan, per_plan_lock = victim
+        with per_plan_lock:
+            _destroy_plan_quietly(plan)
+        # Return CuPy pool blocks held by the destroyed plan so the next
+        # allocation can actually use the freed VRAM.
+        _free_cupy_pool_blocks()
+
+
+def _plan_cache_get_or_build(key: tuple, builder):
+    """Return ``(plan, per_plan_lock, cached)``.
+
+    When ``_PLAN_CACHE_MAX <= 0`` the cache is disabled — a fresh Plan is
+    built and the caller is responsible for destroying it once done. This
+    is the default and the safe choice on a single GPU shared by multiple
+    Dask worker processes: cuFINUFFT plan scratch is allocated via raw
+    ``cudaMalloc`` and **bypasses the CuPy pool**, so leaving plans alive
+    pins VRAM that no pool cap can reclaim.
+    """
+    if _PLAN_CACHE_MAX <= 0:
+        plan = builder()
+        return (plan, threading.Lock(), False)
+
+    with _PLAN_CACHE_LOCK:
+        entry = _PLAN_CACHE.get(key)
+        if entry is not None:
+            try:
+                _PLAN_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            _PLAN_CACHE_ORDER.append(key)
+            plan, per_plan_lock = entry
+            return (plan, per_plan_lock, True)
+
+    plan = builder()
+    per_plan_lock = threading.Lock()
+
+    with _PLAN_CACHE_LOCK:
+        existing = _PLAN_CACHE.get(key)
+        if existing is not None:
+            _destroy_plan_quietly(plan)
+            try:
+                _PLAN_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            _PLAN_CACHE_ORDER.append(key)
+            existing_plan, existing_lock = existing
+            return (existing_plan, existing_lock, True)
+        while len(_PLAN_CACHE_ORDER) >= max(1, _PLAN_CACHE_MAX):
+            _evict_one_locked()
+        _PLAN_CACHE[key] = (plan, per_plan_lock)
+        _PLAN_CACHE_ORDER.append(key)
+        return (plan, per_plan_lock, True)
+
+
+def _plan_cache_stats() -> dict:
+    with _PLAN_CACHE_LOCK:
+        return {
+            "size": len(_PLAN_CACHE_ORDER),
+            "max": _PLAN_CACHE_MAX,
+            "keys": list(_PLAN_CACHE_ORDER),
+        }
 
 ###############################################################################
 #  Global CPU-only switch                                                     #
@@ -1389,27 +1693,68 @@ def _execute_inverse_batch_gpu(
     n_trans: int,
     eps: float,
 ):
+    """Inverse type-3 NUFFT with bounded-cache plan reuse.
+
+    Plan cache is keyed only on the Plan() constructor arguments
+    ``(dim, type=3, isign=-1, n_trans, eps, dtype, gpu_maxsubprobsize)``.
+    Different point sets reuse the same cached Plan via ``setpts()`` —
+    that is the operation cuFINUFFT is built around amortizing. The point
+    coords are NOT part of the cache key, so the cache stays small (≈ 6
+    distinct subprobs × small set of n_trans values) regardless of how
+    many distinct geometries the workload exposes. Both ``setpts`` and
+    ``execute`` happen under the per-plan lock because cuFINUFFT Plans
+    are not thread-safe.
+    """
     import cufinufft                   # type: ignore
 
-    subprobs = (32, 16, 8, 4, 2, 1)
+    subprobs = _subprob_order(dim, n_trans)
+    oom_retry_done = False
+
     for s in subprobs:
-        try:
-            plan = cufinufft.Plan(
+        cache_key = (int(dim), 3, -1, int(n_trans), float(eps), int(s))
+
+        def _build(_s=s):
+            return cufinufft.Plan(
                 3,
                 dim,
                 n_trans=n_trans,
                 eps=eps,
                 isign=-1,
                 dtype="complex128",
-                **_build_gpu_launch_kwargs(gpu_maxsubprobsize=s),
+                **_build_gpu_launch_kwargs(gpu_maxsubprobsize=_s),
             )
-            _set_type3_points(
-                plan,
-                dim=dim,
-                source_cols=resident_cols,
-                target_cols=target_cols,
-            )
-            return plan.execute(d_weights)
+
+        def _do_call():
+            plan, per_plan_lock, cached = _plan_cache_get_or_build(cache_key, _build)
+            try:
+                with per_plan_lock:
+                    # Re-bind points for this call (cheap relative to Plan ctor).
+                    _set_type3_points(
+                        plan,
+                        dim=dim,
+                        source_cols=resident_cols,
+                        target_cols=target_cols,
+                    )
+                    return plan.execute(d_weights)
+            finally:
+                # When the cache is disabled, destroy the plan immediately so
+                # cuFINUFFT scratch (allocated via raw cudaMalloc, bypassing
+                # the CuPy pool) is reclaimed before the next call. This is
+                # the only mechanism that bounds plan-internal VRAM under
+                # multi-process workers on a single GPU.
+                if not cached:
+                    _destroy_plan_quietly(plan)
+
+        try:
+            result = _do_call()
+            _record_successful_subprob(dim, n_trans, s)
+            # Best-effort: return any pool blocks released by the call back
+            # to the device. Live cuFINUFFT Plan internals (kept alive by
+            # the cache) are NOT in the free list; only this task's
+            # working scratch is. Without this, the pool monotonically
+            # grows under concurrent task load.
+            _free_cupy_pool_blocks()
+            return result
         except (
             cp.cuda.memory.OutOfMemoryError,
             RuntimeError,
@@ -1417,6 +1762,23 @@ def _execute_inverse_batch_gpu(
             cp.cuda.runtime.CUDARuntimeError,
             cp.cuda.driver.CUDADriverError,
         ) as e:
+            if (
+                cp is not None
+                and isinstance(e, cp.cuda.memory.OutOfMemoryError)
+                and not oom_retry_done
+            ):
+                # Drop cache + free pool blocks, then retry at this subprob.
+                _clear_plan_cache()
+                oom_retry_done = True
+                try:
+                    result = _do_call()
+                    _record_successful_subprob(dim, n_trans, s)
+                    _free_cupy_pool_blocks()
+                    return result
+                except Exception as e2:
+                    if _is_retryable_resource_error(e2):
+                        continue
+                    raise
             if _is_retryable_resource_error(e):
                 continue
             raise

@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 from dask.distributed import Client
-	
+
 from core.runtime.dask_helpers import ensure_dask_client
 
 # Public symbols re‑exported for convenience
@@ -30,6 +30,25 @@ __all__ = ["get_client", "default_log_dir", "set_log_dir_for_run"]
 
 # Singleton cache so repeated calls return the same Client
 _CLIENT: Optional[Client] = None
+
+
+def _env_bool(name: str, default: bool | None = None) -> bool | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    import logging as _lg
+    _lg.getLogger(__name__).warning(
+        "Ignoring invalid boolean %s=%r; using %s",
+        name,
+        raw,
+        default,
+    )
+    return default
 
 
 def _build_job_extra(log_dir: Path) -> list[str]:
@@ -75,18 +94,43 @@ def get_client() -> Client:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     extra = {}
-    if os.getenv("DASK_BACKEND", "local") in {"sge", "slurm", "pbs", "lsf", "oar"}:
+    configured_backend = os.getenv("DASK_BACKEND")
+    if configured_backend in {"sge", "slurm", "pbs", "lsf", "oar"}:
         extra["job_extra_directives"] = _build_job_extra(log_dir)
 
+    threads_per_worker = int(os.getenv("DASK_THREADS_PER_WORKER", "4"))
+
+    # NUFFT supply per worker: default to one in-flight cuFINUFFT call per
+    # worker. Extra threads help Python-side orchestration, but concurrent
+    # cuFINUFFT plans on one GPU mostly multiply raw cudaMalloc scratch and
+    # exhaust VRAM. Advanced users can still raise this after measuring.
+    _raw = os.getenv("MOSAIC_NUFFT_SLOTS_PER_WORKER")
+    if _raw is None or _raw.strip() == "":
+        nufft_slots_per_worker = 1
+    else:
+        try:
+            nufft_slots_per_worker = max(1, int(_raw))
+        except ValueError:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "Ignoring invalid MOSAIC_NUFFT_SLOTS_PER_WORKER=%r; "
+                "using one slot per worker",
+                _raw,
+            )
+            nufft_slots_per_worker = 1
+
+    processes = _env_bool("DASK_PROCESSES")
+
     _CLIENT = ensure_dask_client(
-        backend=os.getenv("DASK_BACKEND", "local"),
+        backend=configured_backend,
         max_workers=int(os.getenv("DASK_MAX_WORKERS", "4")),
-        threads_per_worker=int(os.getenv("DASK_THREADS_PER_WORKER", "4")),
+        threads_per_worker=threads_per_worker,
+        processes=processes,
         gpu=int(os.getenv("GPUS_PER_JOB", "0")),
         worker_dashboard=bool(int(os.getenv("DASK_WORKER_DASHBOARD", "0"))),
         python=os.getenv("DASK_PYTHON", sys.executable),
         scheduler_options={"host": os.getenv("DASK_SCHEDULER_HOST", "0.0.0.0")},
-        resources={"nufft": 1},
+        resources={"nufft": nufft_slots_per_worker},
         **extra,                         # ← only present for job‑queue back‑ends
     )
     return _CLIENT

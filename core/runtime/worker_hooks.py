@@ -1,16 +1,54 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import logging
 import os
+import sys
 import tempfile
+import threading
 from contextlib import AbstractContextManager
 from pathlib import Path
 
-from core.adapters.cunufft_wrapper import free_gpu_memory, set_cpu_only
-
 
 logger = logging.getLogger(__name__)
+
+
+def free_gpu_memory() -> None:
+    """Release GPU memory only if the NUFFT wrapper has already been loaded.
+
+    Importing ``core.adapters.cunufft_wrapper`` probes CuPy/CUDA and can create
+    CUDA process state. Runtime helpers import this module for non-GPU paths, so
+    cleanup must not import the GPU adapter just to discover there is nothing to
+    clean.
+    """
+    module = sys.modules.get("core.adapters.cunufft_wrapper")
+    cleanup = getattr(module, "free_gpu_memory", None) if module is not None else None
+    if callable(cleanup):
+        cleanup()
+
+
+def set_cpu_only(flag: bool) -> None:
+    from core.adapters.cunufft_wrapper import set_cpu_only as _set_cpu_only
+
+    _set_cpu_only(flag)
+
+
+def _malloc_trim() -> None:
+    """Return freed glibc arenas to the OS.
+
+    No-op on non-glibc platforms (macOS, musl, Windows). All failures are
+    swallowed because this is purely a memory hygiene hint.
+    """
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        trim = getattr(libc, "malloc_trim", None)
+        if trim is None:
+            return
+        trim.argtypes = [ctypes.c_size_t]
+        trim(0)
+    except Exception:
+        return
 
 
 class _NoopLock(AbstractContextManager):
@@ -21,10 +59,54 @@ class _NoopLock(AbstractContextManager):
         return False
 
 
+_FILE_LOCKS_GUARD = threading.Lock()
+_FILE_LOCKS: dict[str, threading.RLock] = {}
+
+
+class _FileChunkLock(AbstractContextManager):
+    def __init__(self, path: Path):
+        self.path = path
+        self._thread_lock: threading.RLock | None = None
+        self._handle = None
+
+    def __enter__(self):
+        lock_key = str(self.path)
+        with _FILE_LOCKS_GUARD:
+            self._thread_lock = _FILE_LOCKS.setdefault(lock_key, threading.RLock())
+        self._thread_lock.acquire()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+b")
+        try:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            # The thread lock still serializes in-process writers on platforms
+            # without fcntl; Linux/WSL/HPC shared filesystems use fcntl here.
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._handle is not None:
+                try:
+                    import fcntl
+
+                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                self._handle.close()
+        finally:
+            self._handle = None
+            if self._thread_lock is not None:
+                self._thread_lock.release()
+            self._thread_lock = None
+        return False
+
+
 def _cleanup_process_local_reducers() -> None:
-    try:
-        from core.residual_field import backend as residual_backend
-    except Exception:
+    residual_backend = sys.modules.get("core.residual_field.backend")
+    if residual_backend is None:
         return
     for name in (
         "clear_process_local_residual_field_backends",
@@ -51,6 +133,13 @@ def _final_cleanup() -> None:
             resource_tracker.unregister(shm_name, "shared_memory")
     except Exception:
         pass
+    _malloc_trim()
+
+
+def trim_worker_memory() -> None:
+    """Drop reclaimable native/GPU pools without clearing live reducer state."""
+    free_gpu_memory()
+    _malloc_trim()
 
 
 def _safe_chunk_lock(name: str):
@@ -73,7 +162,10 @@ def _safe_chunk_lock(name: str):
         return _NoopLock()
 
 
-def chunk_mutex(chunk_id: int):
+def chunk_mutex(chunk_id: int, *, lock_root: str | os.PathLike | None = None):
+    if lock_root is not None:
+        root = Path(lock_root)
+        return _FileChunkLock(root / ".mosaic_locks" / f"chunk_{int(chunk_id)}.lock")
     return _safe_chunk_lock(f"chunk-{chunk_id}")
 
 
@@ -192,13 +284,108 @@ class CuPyCleanup:
         _final_cleanup()
 
 
+class _PerTaskHeapTrim:
+    """WorkerPlugin that returns CuPy mempool blocks and glibc arenas to the
+    OS/device after each task. Fires strictly after a task's result has been
+    produced, so it cannot affect output.
+
+    Why ``MOSAIC_HEAP_TRIM_EVERY`` defaults to ``1`` (every task):
+        CuPy's default memory pool retains *all* freed blocks for reuse,
+        unbounded. With 16 concurrent in-flight tasks each holding ~500 MB
+        of working scratch (rifft target buffers, NUFFT outputs), the pool
+        can grow to fill VRAM in seconds. ``free_all_blocks()`` only releases
+        UNREFERENCED blocks, so it does NOT touch live cuFINUFFT Plan objects
+        in the plan cache; it only returns the per-task working scratch
+        that the task itself just released by going out of scope.
+
+    Adaptive trim trigger: if the CuPy default pool reports >= the
+    fraction set by ``MOSAIC_GPU_TRIM_AT_PCT`` (default 0.50) of total VRAM
+    used, the trim runs unconditionally regardless of throttle counter.
+
+    Pickle-safe: the instance lock is stripped on pickle and recreated on
+    unpickle so distributed can ship the plugin to worker processes.
+    """
+
+    name = "mosaic-heap-trim"
+
+    def __init__(self) -> None:
+        self._n = 0
+        self._lock = threading.Lock()
+        try:
+            self._every = max(1, int(os.getenv("MOSAIC_HEAP_TRIM_EVERY", "1")))
+        except ValueError:
+            self._every = 1
+        try:
+            self._pressure_pct = float(os.getenv("MOSAIC_GPU_TRIM_AT_PCT", "0.50"))
+        except ValueError:
+            self._pressure_pct = 0.50
+
+    def __getstate__(self):
+        # threading.Lock cannot be pickled; rebuild on the worker side.
+        state = dict(self.__dict__)
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+        if "_n" not in self.__dict__:
+            self._n = 0
+        if "_every" not in self.__dict__:
+            self._every = 1
+        if "_pressure_pct" not in self.__dict__:
+            self._pressure_pct = 0.50
+
+    def setup(self, worker):
+        return None
+
+    def teardown(self, worker):
+        _malloc_trim()
+
+    def _under_gpu_pressure(self) -> bool:
+        try:
+            import cupy as cp  # type: ignore
+
+            free, total = cp.cuda.runtime.memGetInfo()
+            if total <= 0:
+                return False
+            used_frac = 1.0 - (float(free) / float(total))
+            return used_frac >= self._pressure_pct
+        except Exception:
+            return False
+
+    def transition(self, key, start, finish, **kwargs):
+        if finish != "released":
+            return
+        with self._lock:
+            self._n += 1
+            scheduled = (self._n % self._every) == 0
+        # Always trim under pressure even if not scheduled.
+        if not (scheduled or self._under_gpu_pressure()):
+            return
+        try:
+            import cupy as cp  # type: ignore
+
+            cp.get_default_memory_pool().free_all_blocks()
+            try:
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        trim_worker_memory()
+
+
 atexit.register(_final_cleanup)
 
 __all__ = [
     "CuPyCleanup",
+    "_PerTaskHeapTrim",
+    "_malloc_trim",
     "chunk_mutex",
     "handle_worker_gpu_failure",
     "is_gpu_runtime_error",
     "register_cleanup_plugin",
     "resolve_worker_scratch_root",
+    "trim_worker_memory",
 ]

@@ -56,6 +56,18 @@ DEFAULT_TASK_RETRIES = 4
 #  Configuration helpers                                                      #
 # --------------------------------------------------------------------------- #
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value {value!r}")
+
 def _load_external_config() -> Dict[str, Any]:
     """Return dict parsed from file pointed to by $MOSAIC_DASK_CONFIG.
 
@@ -89,7 +101,7 @@ def ensure_dask_client(
     max_workers: int = 2,
     *,
     threads_per_worker: int = 2,
-    processes: bool = True,
+    processes: bool | None = None,
     backend: _BACKENDS | None = None,
     gpu: int | None = None,  # GPUs *per job*
     dashboard: bool = True,
@@ -136,6 +148,15 @@ def ensure_dask_client(
         cfg_file.get("threads_per_worker"),
         cast=int,
     )
+    processes = _pick(
+        "processes",
+        processes,
+        os.getenv("DASK_PROCESSES"),
+        cfg_file.get("processes"),
+        cast=_as_bool,
+    )
+    if processes is None:
+        processes = True
     gpu = _pick("gpu", gpu, os.getenv("GPUS_PER_JOB"), cfg_file.get("gpu"), cast=int)
 
     if worker_dashboard is None:
@@ -147,14 +168,16 @@ def ensure_dask_client(
             cast=lambda v: bool(int(v)) if isinstance(v, str) else bool(v),
         )
 
-    backend = (
-        backend
-        or os.getenv("DASK_BACKEND")
-        or cfg_file.get("backend")
-        or _auto_backend()
-        or "local"
-    ).lower()
-    
+    auto_backend = _auto_backend()
+    explicit_backend = backend or os.getenv("DASK_BACKEND") or cfg_file.get("backend")
+    backend = (explicit_backend or auto_backend or "local").lower()
+    if str(explicit_backend or "").lower() == "local" and auto_backend is not None:
+        logger.warning(
+            "HPC environment looks like %s, but Dask backend is explicitly local. "
+            "This disables job-queue worker scheduling for the run.",
+            auto_backend,
+        )
+
     # if backend in {"single-threaded", "sync", "synchronous"}:
     # # Do NOT try to reuse a distributed Client; we want true in-thread execution
     # # so that pdb/cProfile/etc. work normally.
@@ -184,23 +207,59 @@ def ensure_dask_client(
     if worker_dashboard is None:
         worker_dashboard = dashboard
 
+    # Worker-env hygiene: bound glibc arena count so freed blocks actually
+    # return to the OS (classic cause of "unmanaged memory" growth in dask
+    # workers). Only injected when the user has NOT already set the key,
+    # and only for glibc-sensitive knobs that are math-neutral.
+    _mem_env = {"MALLOC_ARENA_MAX": "2"}
+    _worker_env = {k: v for k, v in _mem_env.items() if k not in os.environ}
+
     # ────────── single‑node back‑ends ──────────
+    # LocalCluster / LocalCUDACluster accept ``resources=`` via the
+    # ``**worker_kwargs`` catch-all — forwarded to Worker.__init__. Pass it
+    # through at the top level (wrapping in an explicit ``worker_kwargs``
+    # dict would make Worker receive ``worker_kwargs=...`` as an unknown
+    # kwarg and crash the Nanny).
     if backend == "local":
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
         cluster_kw.pop("job_extra_directives", None)
         cluster_kw.pop("python", None)
         cluster_kw.pop("scheduler_options", None)
-        return Client(
+        user_env = cluster_kw.get("env", {})
+        if bool(processes):
+            if isinstance(user_env, dict):
+                cluster_kw["env"] = {**_worker_env, **user_env}
+        else:
+            # In-process/threaded LocalCluster uses distributed.Worker, whose
+            # constructor does not accept env=. The current process environment
+            # is already the worker environment in this mode.
+            cluster_kw.pop("env", None)
+            # Multiple threaded Worker objects share one Python process, so the
+            # default LocalCluster memory_limit="auto" divides machine RAM by
+            # n_workers but every Worker observes the same process RSS. That is
+            # the root of false "Worker is at 80% memory usage. Pausing worker"
+            # messages for processes=False runs. Disable Dask's per-worker RSS
+            # limiter in this mode unless the caller explicitly configured it.
+            cluster_kw.setdefault(
+                "memory_limit",
+                os.getenv(
+                    "DASK_MEMORY_LIMIT",
+                    cfg_file.get("memory_limit", cfg_file.get("memory", 0)),
+                ),
+            )
+        client = Client(
             LocalCluster(
                 n_workers=max_workers,
                 threads_per_worker=threads_per_worker,
-                processes=processes,
+                processes=bool(processes),
                 dashboard_address=":8787" if dashboard else None,
                # worker_dashboard=worker_dashboard,
                 local_directory=local_directory,
                 **cluster_kw,
             )
         )
+        _register_heap_trim_plugin(client)
+        return client
 
     if backend == "cuda-local":
         from dask_cuda import LocalCUDACluster
@@ -208,7 +267,10 @@ def ensure_dask_client(
         cluster_kw.pop("python", None)
         cluster_kw.pop("scheduler_options", None)
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
-        return Client(
+        user_env = cluster_kw.get("env", {})
+        if isinstance(user_env, dict):
+            cluster_kw["env"] = {**_worker_env, **user_env}
+        client = Client(
             LocalCUDACluster(
                 n_workers=max_workers,
                 protocol=os.getenv("DASK_COMM_PROTOCOL", "tcp"),
@@ -220,6 +282,8 @@ def ensure_dask_client(
                 **cluster_kw,
             )
         )
+        _register_heap_trim_plugin(client)
+        return client
 
     # ────────── job‑queue family ──────────
     if backend in {"sge", "slurm", "pbs", "lsf", "oar"}:
@@ -266,9 +330,13 @@ def ensure_dask_client(
         if dashboard:
             sched_opts.setdefault("dashboard_address", ":8787")
 
-        # Merge user overrides *after* defaults so user wins
+        # Merge user overrides *after* defaults so user wins.
+        # dask-jobqueue constructors do not accept Worker(resources=...) at
+        # the cluster level; that has to be forwarded to the worker command.
         merged = {**defaults, **cluster_kw}
-        merged.pop("resources", None)  # hard‑remove if user passed it by habit
+        resource_args = _resource_worker_args(merged.pop("resources", None))
+        if resource_args:
+            _append(merged, "worker_extra_args", *resource_args)
 
         cluster = Cluster(**merged)
         cluster.scale(jobs=max_workers)
@@ -393,7 +461,6 @@ class SyncClient:
     def close(self): return None
 
 
-    
     def register_worker_plugin(self, plugin, name=None):
         """Ignore worker plugins in sync mode."""
         import warnings
@@ -403,15 +470,15 @@ class SyncClient:
             RuntimeWarning,
         )
         return None
-   
+
     def run(self, func, *args, **kwargs):
         """Simulate client.run: call the function locally once."""
         return func(*args, **kwargs)
-   
+
     def get_worker(self):
         """No worker concept in sync mode."""
         return None
-    
+
     def submit(self, func, *args, **kwargs):
             # kwargs accepted by distributed.Client.submit but NOT your function
             dist_only = {
@@ -452,9 +519,9 @@ class SyncClient:
         if len(iterables) == 1:
             return [_ImmediateFuture(func(x, **safe_kwargs)) for x in iterables[0]]
         else:
-            return [_ImmediateFuture(func(*xs, **safe_kwargs)) for xs in zip(*iterables)]     
-        
-     
+            return [_ImmediateFuture(func(*xs, **safe_kwargs)) for xs in zip(*iterables)]
+
+
 def _auto_backend() -> Optional[str]:
     env = os.environ
     if "SLURM_JOB_ID" in env:
@@ -507,15 +574,65 @@ def _append(d: Dict[str, Any], key: str, *items: str) -> None:
     d[key] = lst
 
 
+def _resource_worker_args(resources: Any) -> tuple[str, ...]:
+    if not isinstance(resources, dict) or not resources:
+        return ()
+    parts: list[str] = []
+    for name, value in sorted(resources.items()):
+        if value is None:
+            continue
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            numeric = value
+        parts.append(f"{name}={numeric}")
+    if not parts:
+        return ()
+    return ("--resources", ",".join(parts))
+
+
+def _register_heap_trim_plugin(client) -> None:
+    """Attach the per-task heap-trim WorkerPlugin. Best-effort; silent on
+    failure. No-op for SyncClient / clients without register_worker_plugin."""
+    try:
+        if client is None or not hasattr(client, "register_worker_plugin"):
+            return
+        if is_sync_client(client):
+            return
+        from core.runtime.worker_hooks import _PerTaskHeapTrim
+
+        client.register_worker_plugin(_PerTaskHeapTrim(), name="mosaic-heap-trim")
+    except Exception:
+        return
+
+
 # --------------------------------------------------------------------------- #
 #  Convenience for interactive sessions                                      #
 # --------------------------------------------------------------------------- #
 
 def shutdown_dask() -> None:
+    client = None
     try:
-        client = get_client()
-        client.close()
-        getattr(client, "cluster", None) and client.cluster.close()
+        try:
+            import core.runtime.dask_client as _dask_client
+            client = _dask_client._CLIENT
+        except Exception:
+            _dask_client = None
+        if client is None:
+            client = get_client()
+        cluster = getattr(client, "cluster", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+        cluster_close = getattr(cluster, "close", None)
+        if callable(cluster_close):
+            cluster_close()
         logger.info("Dask client closed.")
     except ValueError:
         logger.info("No active Dask client.")
+    finally:
+        try:
+            import core.runtime.dask_client as _dask_client
+            _dask_client._CLIENT = None
+        except Exception:
+            pass
