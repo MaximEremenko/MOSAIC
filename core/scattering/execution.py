@@ -13,7 +13,11 @@ from core.residual_field.backend import (
     is_same_node_local_client,
     resolve_residual_field_reducer_backend_kind,
 )
-from core.residual_field.artifacts import reduce_residual_field_shards_for_chunk
+from core.residual_field.artifacts import (
+    load_stage2_replacement_expected_manifest,
+    reduce_residual_field_shards_for_chunk,
+    write_stage2_replacement_expected_manifest,
+)
 from core.residual_field.contracts import ResidualFieldWorkUnit
 from core.scattering.artifacts import (
     is_interval_artifact_committed,
@@ -996,6 +1000,17 @@ def run_stage2_replacement_execution(
     )
     if not work_units:
         logger.info("Stage-2 replacement skipped – no unsaved interval/chunk pairs.")
+        existing_expected = load_stage2_replacement_expected_manifest(
+            output_dir=output_dir,
+            parameter_digest=parameter_digest,
+        )
+        if existing_expected is not None:
+            return existing_expected
+        write_stage2_replacement_expected_manifest(
+            output_dir=output_dir,
+            parameter_digest=parameter_digest,
+            expected_by_chunk={},
+        )
         return {}
 
     expected_by_chunk: dict[int, tuple[int, ...]] = {
@@ -1012,6 +1027,11 @@ def run_stage2_replacement_execution(
         )
         for chunk_id in sorted({int(work_unit.chunk_id) for work_unit in work_units})
     }
+    write_stage2_replacement_expected_manifest(
+        output_dir=output_dir,
+        parameter_digest=parameter_digest,
+        expected_by_chunk=expected_by_chunk,
+    )
     rec = point_list_to_recarray(point_data_list)
 
     if client is None or is_sync_client(client):

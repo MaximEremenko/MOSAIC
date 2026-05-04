@@ -24,3 +24,89 @@ def test_set_log_dir_for_run_preserves_explicit_env(monkeypatch, tmp_path):
     log_dir = set_log_dir_for_run(tmp_path / "run")
     assert os.environ["MOSAIC_LOG_DIR"] == str(explicit)
     assert log_dir == explicit
+
+
+def test_get_client_defaults_nufft_supply_to_one(monkeypatch, tmp_path):
+    import core.runtime.dask_client as dask_client
+
+    captured = {}
+
+    def fake_ensure(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(dask_client, "ensure_dask_client", fake_ensure)
+    monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("DASK_THREADS_PER_WORKER", "4")
+    monkeypatch.delenv("MOSAIC_NUFFT_SLOTS_PER_WORKER", raising=False)
+    dask_client._CLIENT = None
+    try:
+        dask_client.get_client()
+    finally:
+        dask_client._CLIENT = None
+
+    assert captured["threads_per_worker"] == 4
+    assert captured["resources"] == {"nufft": 1}
+
+
+def test_get_client_honors_processes_env(monkeypatch, tmp_path):
+    import core.runtime.dask_client as dask_client
+
+    captured = {}
+
+    def fake_ensure(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(dask_client, "ensure_dask_client", fake_ensure)
+    monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("DASK_PROCESSES", "0")
+    dask_client._CLIENT = None
+    try:
+        dask_client.get_client()
+    finally:
+        dask_client._CLIENT = None
+
+    assert captured["processes"] is False
+
+
+def test_get_client_defers_processes_to_config_when_env_unset(monkeypatch, tmp_path):
+    import core.runtime.dask_client as dask_client
+
+    captured = {}
+
+    def fake_ensure(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(dask_client, "ensure_dask_client", fake_ensure)
+    monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.delenv("DASK_PROCESSES", raising=False)
+    dask_client._CLIENT = None
+    try:
+        dask_client.get_client()
+    finally:
+        dask_client._CLIENT = None
+
+    assert captured["processes"] is None
+
+
+def test_get_client_allows_explicit_nufft_supply_override(monkeypatch, tmp_path):
+    import core.runtime.dask_client as dask_client
+
+    captured = {}
+
+    def fake_ensure(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(dask_client, "ensure_dask_client", fake_ensure)
+    monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("MOSAIC_NUFFT_SLOTS_PER_WORKER", "2")
+    dask_client._CLIENT = None
+    try:
+        dask_client.get_client()
+    finally:
+        dask_client._CLIENT = None
+
+    assert captured["resources"] == {"nufft": 2}

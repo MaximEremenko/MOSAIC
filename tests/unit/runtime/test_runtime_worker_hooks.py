@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 from core.runtime.worker_hooks import (
     _final_cleanup,
+    chunk_mutex,
     handle_worker_gpu_failure,
     register_cleanup_plugin,
     resolve_worker_scratch_root,
@@ -84,3 +86,33 @@ def test_resolve_worker_scratch_root_uses_preferred_or_env(monkeypatch, tmp_path
 
     assert resolved_preferred == os.fspath(preferred / "mosaic" / "residual_field" / "local")
     assert resolved_env == os.fspath(env_root / "mosaic" / "residual_field" / "local")
+
+
+def test_chunk_mutex_does_not_instantiate_distributed_lock_when_lock_root_available(
+    monkeypatch,
+    tmp_path,
+):
+    lock_calls = []
+
+    class FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+    def fake_lock(*args, **kwargs):
+        lock_calls.append((args, kwargs))
+        raise AssertionError("dask.distributed.Lock should not guard artifact writes")
+
+    distributed_module = ModuleType("distributed")
+    distributed_module.get_client = lambda: FakeClient()
+    dask_module = ModuleType("dask")
+    dask_distributed_module = ModuleType("dask.distributed")
+    dask_distributed_module.Lock = fake_lock
+    dask_module.distributed = dask_distributed_module
+
+    monkeypatch.setitem(sys.modules, "distributed", distributed_module)
+    monkeypatch.setitem(sys.modules, "dask", dask_module)
+    monkeypatch.setitem(sys.modules, "dask.distributed", dask_distributed_module)
+
+    with chunk_mutex(7, lock_root=tmp_path / "artifact-root"):
+        pass
+
+    assert lock_calls == []

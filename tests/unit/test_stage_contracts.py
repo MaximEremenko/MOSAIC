@@ -37,7 +37,7 @@ def test_scattering_work_unit_and_manifest_are_deterministic(tmp_path):
     assert work_unit.retry.idempotency_key == "scattering:interval-chunk:7:3"
     assert work_unit.chunk_artifact_prefix.endswith("point_data_chunk_3")
     assert work_unit.interval_artifact is not None
-    assert work_unit.interval_artifact.path.endswith("precomputed_intervals/interval_7.npz")
+    assert work_unit.interval_artifact.path.endswith("precomputed_intervals/interval_7.hdf5")
 
     manifest = ScatteringArtifactManifest.from_work_unit(
         work_unit,

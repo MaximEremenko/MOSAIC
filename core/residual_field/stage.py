@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import logging
 
-from core.residual_field.artifacts import is_residual_field_replacement_complete
+from core.residual_field.artifacts import (
+    is_residual_field_replacement_complete,
+    load_stage2_replacement_expected_manifest,
+    normalize_stage2_replacement_expected_by_chunk,
+)
 from core.residual_field.execution import run_residual_field_stage
 from core.residual_field.planning import build_residual_field_parameter_digest
 from core.models import StructureData, WorkflowParameters
 
 
 logger = logging.getLogger(__name__)
+_STAGE2_REPLACEMENT_EXPECTED_KEY = "stage2_replacement_expected_by_chunk"
 
 
 def _stage2_replacement_enabled(workflow_parameters: WorkflowParameters) -> bool:
@@ -28,29 +33,26 @@ def _stage2_replacement_enabled(workflow_parameters: WorkflowParameters) -> bool
 def _replacement_expected_by_chunk(
     scattering_parameters: dict[str, object],
 ) -> dict[int, tuple[int, ...]]:
-    raw = scattering_parameters.get("stage2_replacement_expected_by_chunk", {}) or {}
-    if not isinstance(raw, dict):
-        return {}
-    expected: dict[int, tuple[int, ...]] = {}
-    for chunk_id, interval_ids in raw.items():
-        expected[int(chunk_id)] = tuple(
-            sorted(int(interval_id) for interval_id in interval_ids)
-        )
-    return expected
+    raw = scattering_parameters.get(_STAGE2_REPLACEMENT_EXPECTED_KEY, {})
+    return normalize_stage2_replacement_expected_by_chunk(raw)
 
 
-def _replacement_expected_by_chunk_from_db(artifacts) -> dict[int, tuple[int, ...]]:
-    db_manager = getattr(artifacts, "db_manager", None)
-    get_interval_chunks = getattr(db_manager, "get_interval_chunks", None)
-    if not callable(get_interval_chunks):
-        return {}
-    grouped: dict[int, set[int]] = {}
-    for interval_id, chunk_id in get_interval_chunks():
-        grouped.setdefault(int(chunk_id), set()).add(int(interval_id))
-    return {
-        chunk_id: tuple(sorted(interval_ids))
-        for chunk_id, interval_ids in sorted(grouped.items())
-    }
+def _resolve_replacement_expected_by_chunk(
+    *,
+    scattering_parameters: dict[str, object],
+    artifacts,
+    parameter_digest: str,
+) -> tuple[dict[int, tuple[int, ...]], str]:
+    if _STAGE2_REPLACEMENT_EXPECTED_KEY in scattering_parameters:
+        return _replacement_expected_by_chunk(scattering_parameters), "scattering"
+
+    expected_from_manifest = load_stage2_replacement_expected_manifest(
+        output_dir=artifacts.output_dir,
+        parameter_digest=parameter_digest,
+    )
+    if expected_from_manifest is not None:
+        return expected_from_manifest, "manifest"
+    return {}, "absent"
 
 
 def _reset_expected_interval_chunks(artifacts, expected_by_chunk: dict[int, tuple[int, ...]]) -> None:
@@ -76,15 +78,16 @@ class ResidualFieldStage:
         if scattering_parameters is None:
             scattering_parameters = {}
         if _stage2_replacement_enabled(workflow_parameters):
-            expected_by_chunk = (
-                _replacement_expected_by_chunk_from_db(artifacts)
-                or _replacement_expected_by_chunk(scattering_parameters)
+            parameter_digest = str(
+                scattering_parameters.get("residual_parameter_digest")
+                or build_residual_field_parameter_digest(workflow_parameters)
+            )
+            expected_by_chunk, expected_source = _resolve_replacement_expected_by_chunk(
+                scattering_parameters=scattering_parameters,
+                artifacts=artifacts,
+                parameter_digest=parameter_digest,
             )
             if expected_by_chunk:
-                parameter_digest = str(
-                    scattering_parameters.get("residual_parameter_digest")
-                    or build_residual_field_parameter_digest(workflow_parameters)
-                )
                 complete_by_chunk = {
                     chunk_id: is_residual_field_replacement_complete(
                         chunk_id=int(chunk_id),
@@ -106,6 +109,11 @@ class ResidualFieldStage:
                     sorted(chunk_id for chunk_id, complete in complete_by_chunk.items() if not complete),
                 )
                 _reset_expected_interval_chunks(artifacts, expected_by_chunk)
+            elif expected_source in {"scattering", "manifest"}:
+                logger.info(
+                    "Residual-field skipped: Stage-2 replacement expected no residual chunks."
+                )
+                return scattering_parameters
             elif not scattering_parameters:
                 return {}
         elif not scattering_parameters:

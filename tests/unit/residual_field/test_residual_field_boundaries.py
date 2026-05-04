@@ -1,4 +1,5 @@
 import logging
+import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,9 +26,11 @@ from core.residual_field.planning import (
 from core.residual_field.execution import (
     _build_task_reducer_backend,
     _cap_async_max_inflight,
+    _cluster_host_memory_pressure,
     _distributed_owner_affinity_enabled,
     _distributed_owner_local_reducer_supported,
     _residual_partition_runtime_policy,
+    _trim_workers_for_memory_pressure,
     run_residual_field_stage,
 )
 from core.residual_field.contracts import (
@@ -35,7 +38,10 @@ from core.residual_field.contracts import (
     ResidualFieldWorkUnit,
 )
 from core.residual_field.stage import ResidualFieldStage
-from core.residual_field.tasks import run_residual_field_interval_chunk_task
+from core.residual_field.tasks import (
+    build_residual_rifft_payload,
+    run_residual_field_interval_chunk_task,
+)
 from core.scattering.kernels import IntervalTask
 from core.storage.database_manager import DatabaseManager
 
@@ -835,6 +841,14 @@ def test_adaptive_partition_plan_enters_hysteresis_dead_zone_for_3d_cutover():
 
 
 def test_residual_partition_runtime_policy_includes_hysteresis_overrides(monkeypatch):
+    zero_budget_policy = _residual_partition_runtime_policy(
+        SimpleNamespace(runtime_info={}),
+        default_target_bytes=0,
+        effective_nufft_workers=4,
+    )
+    assert zero_budget_policy["target_partition_bytes"] == 256 * 1024 * 1024
+    assert zero_budget_policy["target_partition_bytes_3d"] == 128 * 1024 * 1024
+
     policy = _residual_partition_runtime_policy(
         SimpleNamespace(
             runtime_info={
@@ -1318,11 +1332,11 @@ def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
             return True
 
     task_submit_workers = []
-    scheduler_states = [
-        {"worker-a": {"resources": {"nufft": 1}}, "worker-b": {"resources": {"nufft": 1}}},
-        {"worker-a": {"resources": {"nufft": 1}}, "worker-b": {"resources": {"nufft": 1}}},
-        {"worker-b": {"resources": {"nufft": 1}}},
-    ]
+    both_workers = {
+        "worker-a": {"resources": {"nufft": 1}},
+        "worker-b": {"resources": {"nufft": 1}},
+    }
+    scheduler_states = [both_workers, both_workers, both_workers, both_workers, {"worker-b": {"resources": {"nufft": 1}}}]
 
     class _FakeClient:
         loop = SimpleNamespace(asyncio_loop=object())
@@ -1434,6 +1448,271 @@ def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
     )
 
     assert task_submit_workers == [["worker-a"], ["worker-b"]]
+
+
+def test_residual_field_final_drain_retries_failed_owner_local_batch(
+    monkeypatch,
+    tmp_path,
+):
+    work_unit = ResidualFieldWorkUnit.interval_chunk_batch(
+        interval_ids=(189, 190, 191, 192),
+        chunk_id=0,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    ).with_partition(partition_id=6, point_start=0, point_stop=1)
+    fake_backend = _FakeDistributedOwnerLocalBackend()
+    attempts = []
+    finalized = []
+
+    class _FakeFuture:
+        def __init__(self, *, value=None, exc=None, on_result=None):
+            self._value = value
+            self._exc = exc
+            self._on_result = on_result
+            self.status = "error" if exc is not None else "finished"
+
+        def done(self):
+            return False
+
+        def result(self):
+            if self._exc is not None:
+                raise self._exc
+            if self._on_result is not None:
+                self._on_result()
+                self._on_result = None
+            return self._value
+
+        def exception(self, timeout=None):
+            return self._exc
+
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {"workers": {"worker-a": {"resources": {"nufft": 8}}}}
+
+        def scatter(self, data, **kwargs):
+            return data
+
+        def submit(self, func, *args, **kwargs):
+            if kwargs.get("key", "").startswith("residual-"):
+                attempts.append(kwargs["key"])
+                if len(attempts) == 1:
+                    return _FakeFuture(exc=RuntimeError("transient boom"))
+                status = ResidualFieldAccumulatorStatus(
+                    artifact_key=work_unit.artifact_key,
+                    chunk_id=work_unit.chunk_id,
+                    parameter_digest=work_unit.parameter_digest,
+                    interval_ids=work_unit.interval_ids,
+                    partition_id=work_unit.partition_id,
+                    contribution_reciprocal_point_count=1,
+                    total_reciprocal_points=1,
+                )
+
+                def _mark_durable():
+                    fake_backend.durable_by_target[(0, 6)] = set(work_unit.interval_ids)
+
+                return _FakeFuture(value=status, on_result=_mark_durable)
+            call_kwargs = dict(kwargs)
+            for reserved_key in (
+                "key",
+                "pure",
+                "workers",
+                "allow_other_workers",
+                "resources",
+                "retries",
+            ):
+                call_kwargs.pop(reserved_key, None)
+            return _FakeFuture(value=func(*args, **call_kwargs))
+
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_residual_field_reducer_backend",
+        lambda *args, **kwargs: fake_backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._build_task_reducer_backend",
+        lambda backend: backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_residual_field_work_units",
+        lambda *args, **kwargs: [work_unit],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.point_list_to_recarray",
+        lambda *args, **kwargs: np.array(
+            [([0.0], [0.1], [0.05], 0)],
+            dtype=[
+                ("coordinates", object),
+                ("dist_from_atom_center", object),
+                ("step_in_frac", object),
+                ("chunk_id", np.int64),
+            ],
+        ).view(np.recarray),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.yield_futures_with_results",
+        lambda futures, client: (
+            (future, False if getattr(future, "_exc", None) is not None else True)
+            for future in futures
+        ),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._flush_local_reducer_targets_or_raise",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._inspect_owner_local_reducer_targets_or_raise",
+        lambda **kwargs: {
+            (0, 6): fake_backend.inspect_local_reducer_target(
+                chunk_id=0,
+                parameter_digest="abc123",
+                output_dir=str(tmp_path),
+                partition_id=6,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.finalize_process_local_residual_chunk",
+        lambda *args, **kwargs: finalized.append(kwargs["chunk_id"]) or {"chunk_id": kwargs["chunk_id"]},
+    )
+
+    run_residual_field_stage(
+        workflow_parameters=SimpleNamespace(runtime_info={}),
+        structure=SimpleNamespace(supercell=np.array([1])),
+        artifacts=SimpleNamespace(
+            db_manager=SimpleNamespace(
+                get_unsaved_interval_chunks=lambda: [(189, 0)],
+                get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 0}],
+                db_path=str(tmp_path / "state.db"),
+            ),
+            padded_intervals=[{"h_range": (0.0, 0.0)}],
+            output_dir=str(tmp_path),
+            transient_interval_payloads={},
+        ),
+        client=_FakeClient(),
+    )
+
+    assert len(attempts) == 2
+    assert fake_backend.durable_by_target[(0, 6)] == {189, 190, 191, 192}
+    assert finalized == [0]
+
+
+def test_residual_field_final_drain_raises_before_finalize_when_retries_exhaust(
+    monkeypatch,
+    tmp_path,
+):
+    work_unit = ResidualFieldWorkUnit.interval_chunk_batch(
+        interval_ids=(189, 190, 191, 192),
+        chunk_id=0,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    ).with_partition(partition_id=6, point_start=0, point_stop=1)
+    fake_backend = _FakeDistributedOwnerLocalBackend()
+    attempts = []
+    finalized = []
+
+    class _FailedFuture:
+        status = "error"
+        _exc = RuntimeError("permanent boom")
+
+        def done(self):
+            return False
+
+        def result(self):
+            raise self._exc
+
+        def exception(self, timeout=None):
+            return self._exc
+
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {"workers": {"worker-a": {"resources": {"nufft": 8}}}}
+
+        def scatter(self, data, **kwargs):
+            return data
+
+        def submit(self, func, *args, **kwargs):
+            if kwargs.get("key", "").startswith("residual-"):
+                attempts.append(kwargs["key"])
+                return _FailedFuture()
+            return _FailedFuture()
+
+    monkeypatch.setattr("core.residual_field.execution.DEFAULT_TASK_RETRIES", 1)
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_residual_field_reducer_backend",
+        lambda *args, **kwargs: fake_backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._build_task_reducer_backend",
+        lambda backend: backend,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_residual_field_work_units",
+        lambda *args, **kwargs: [work_unit],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.point_list_to_recarray",
+        lambda *args, **kwargs: np.array(
+            [([0.0], [0.1], [0.05], 0)],
+            dtype=[
+                ("coordinates", object),
+                ("dist_from_atom_center", object),
+                ("step_in_frac", object),
+                ("chunk_id", np.int64),
+            ],
+        ).view(np.recarray),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.yield_futures_with_results",
+        lambda futures, client: ((future, False) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.finalize_process_local_residual_chunk",
+        lambda *args, **kwargs: finalized.append(kwargs["chunk_id"]) or None,
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_residual_field_stage(
+            workflow_parameters=SimpleNamespace(runtime_info={}),
+            structure=SimpleNamespace(supercell=np.array([1])),
+            artifacts=SimpleNamespace(
+                db_manager=SimpleNamespace(
+                    get_unsaved_interval_chunks=lambda: [(189, 0)],
+                    get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 0}],
+                    db_path=str(tmp_path / "state.db"),
+                ),
+                padded_intervals=[{"h_range": (0.0, 0.0)}],
+                output_dir=str(tmp_path),
+                transient_interval_payloads={},
+            ),
+            client=_FakeClient(),
+        )
+
+    message = str(excinfo.value)
+    assert "chunk=0" in message
+    assert "partition=6" in message
+    assert "intervals=189,190,191,192" in message
+    assert "permanent boom" in message
+    assert len(attempts) == 2
+    assert finalized == []
 
 
 def test_distributed_owner_affinity_defaults_to_true():
@@ -2059,10 +2338,15 @@ def test_residual_field_async_stage_passes_hysteresis_policy_into_partition_plan
         "core.residual_field.execution.point_list_to_recarray",
         lambda *args, **kwargs: np.array(
             [
-                ([0.0, 0.0], 3),
-                ([1.0, 1.0], 3),
+                ([0.0, 0.0], [0.1, 0.1], [0.05, 0.05], 3),
+                ([1.0, 1.0], [0.1, 0.1], [0.05, 0.05], 3),
             ],
-            dtype=[("coordinates", object), ("chunk_id", np.int64)],
+            dtype=[
+                ("coordinates", object),
+                ("dist_from_atom_center", object),
+                ("step_in_frac", object),
+                ("chunk_id", np.int64),
+            ],
         ).view(np.recarray),
     )
     monkeypatch.setattr(
@@ -2114,6 +2398,7 @@ def test_residual_field_async_stage_passes_hysteresis_policy_into_partition_plan
 
     assert planner_kwargs["hysteresis_low_factor"] == pytest.approx(0.7)
     assert planner_kwargs["hysteresis_high_factor"] == pytest.approx(1.3)
+    assert planner_kwargs["effective_nufft_workers"] == 1
     assert any(
         "Residual-field partition plan | chunk=3" in message
         and "hysteresis_band=70-130" in message
@@ -2448,7 +2733,7 @@ def test_residual_field_async_distributed_stage_remaps_missing_owner_for_finaliz
     )
 
 
-def test_residual_field_async_local_max_inflight_is_capped_to_worker_capacity(monkeypatch):
+def test_residual_field_async_local_max_inflight_prefetches_by_default(monkeypatch):
     class _FakeClient:
         loop = SimpleNamespace(asyncio_loop=object())
 
@@ -2464,9 +2749,249 @@ def test_residual_field_async_local_max_inflight_is_capped_to_worker_capacity(mo
 
     monkeypatch.setenv("DASK_BACKEND", "local")
     try:
-        assert _cap_async_max_inflight(client=_FakeClient(), requested=5000) == 4
+        assert _cap_async_max_inflight(client=_FakeClient(), requested=5000) == 8
     finally:
         monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+
+def test_residual_field_async_local_queue_prefetch_uses_capacity_multiplier(monkeypatch):
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {
+                "workers": {
+                    "worker-1": {"resources": {"nufft": 1}},
+                    "worker-2": {"resources": {"nufft": 1}},
+                    "worker-3": {"resources": {"nufft": 1}},
+                    "worker-4": {"resources": {"nufft": 1}},
+                }
+            }
+
+    monkeypatch.setenv("DASK_BACKEND", "local")
+    try:
+        assert (
+            _cap_async_max_inflight(
+                client=_FakeClient(),
+                requested=5000,
+                prefetch_factor=3,
+            )
+            == 12
+        )
+        assert (
+            _cap_async_max_inflight(
+                client=_FakeClient(),
+                requested=5000,
+                prefetch_factor=99,
+            )
+            == 32
+        )
+    finally:
+        monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+
+def test_residual_field_async_reuses_one_rifft_payload_future_per_target(
+    monkeypatch,
+    tmp_path,
+):
+    work_units = [
+        ResidualFieldWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        ResidualFieldWorkUnit.interval_chunk(
+            interval_id=2,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+    ]
+
+    class _FakeFuture:
+        def __init__(self, value):
+            self._value = value
+            self.release_count = 0
+
+        def result(self):
+            return self._value
+
+        def done(self):
+            return True
+
+        def release(self):
+            self.release_count += 1
+
+    grid_future = _FakeFuture(
+        (
+            np.array([[0.0]], dtype=np.float64),
+            np.array([[1]], dtype=np.int64),
+        )
+    )
+    residual_rifft_payloads = []
+    grid_submits = {"count": 0}
+
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {"workers": {"worker-a": {"resources": {"nufft": 1}}}}
+
+        def scatter(self, data, **kwargs):
+            return data
+
+        def submit(self, func, *args, **kwargs):
+            if getattr(func, "__name__", "") == "build_residual_rifft_payload":
+                grid_submits["count"] += 1
+                return grid_future
+            if kwargs.get("key", "").startswith("residual-"):
+                residual_rifft_payloads.append(kwargs["rifft_payload"])
+                work_unit = args[0]
+                return _FakeFuture(
+                    ResidualFieldAccumulatorStatus(
+                        artifact_key=work_unit.artifact_key,
+                        chunk_id=work_unit.chunk_id,
+                        parameter_digest=work_unit.parameter_digest,
+                        interval_ids=work_unit.interval_ids,
+                        partition_id=work_unit.partition_id,
+                        contribution_reciprocal_point_count=1,
+                        total_reciprocal_points=1,
+                    )
+                )
+            return _FakeFuture(True)
+
+    monkeypatch.setenv("DASK_BACKEND", "local")
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_residual_field_reducer_backend",
+        lambda *args, **kwargs: _FakeLocalReducerBackend(),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.resolve_worker_scratch_root",
+        lambda preferred, stage: str(tmp_path / "scratch"),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.build_residual_field_work_units",
+        lambda *args, **kwargs: work_units,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.reciprocal_space_points_counter",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.point_list_to_recarray",
+        lambda *args, **kwargs: np.array(
+            [([0.0], [0.1], [0.05], 3)],
+            dtype=[
+                ("coordinates", object),
+                ("dist_from_atom_center", object),
+                ("step_in_frac", object),
+                ("chunk_id", np.int64),
+            ],
+        ).view(np.recarray),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.yield_futures_with_results",
+        lambda futures, client: ((future, future.result()) for future in futures),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._flush_local_reducer_targets_or_raise",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._inspect_owner_local_reducer_targets_or_raise",
+        lambda **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution._validate_local_durable_coverage_or_raise",
+        lambda **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.execution.finalize_process_local_residual_chunk",
+        lambda *args, **kwargs: {"chunk_id": kwargs["chunk_id"]},
+    )
+
+    try:
+        run_residual_field_stage(
+            workflow_parameters=SimpleNamespace(
+                runtime_info={"residual_reuse_rifft_payload": True}
+            ),
+            structure=SimpleNamespace(supercell=np.array([1])),
+            artifacts=SimpleNamespace(
+                db_manager=SimpleNamespace(
+                    get_unsaved_interval_chunks=lambda: [(1, 3), (2, 3)],
+                    get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
+                    db_path=str(tmp_path / "state.db"),
+                ),
+                padded_intervals=[{"h_range": (0.0, 0.0)}],
+                output_dir=str(tmp_path),
+                transient_interval_payloads={},
+            ),
+            client=_FakeClient(),
+        )
+    finally:
+        monkeypatch.delenv("DASK_BACKEND", raising=False)
+
+    assert grid_submits["count"] == 1
+    assert residual_rifft_payloads == [grid_future, grid_future]
+    assert grid_future.release_count == 1
+
+
+def test_residual_field_detects_worker_memory_pressure():
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {
+                "workers": {
+                    "worker-ok": {
+                        "memory_limit": 1000,
+                        "metrics": {"memory": 500},
+                    },
+                    "worker-hot": {
+                        "memory_limit": 1000,
+                        "metrics": {"memory": 730},
+                    },
+                }
+            }
+
+    assert _cluster_host_memory_pressure(_FakeClient(), threshold=0.72)
+
+
+def test_residual_field_ignores_disabled_worker_memory_limit():
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def scheduler_info(self):
+            return {
+                "workers": {
+                    "worker-threaded": {
+                        "memory_limit": 0,
+                        "metrics": {"memory": 10**12},
+                    },
+                }
+            }
+
+    assert not _cluster_host_memory_pressure(_FakeClient(), threshold=0.72)
+
+
+def test_residual_field_memory_pressure_trim_runs_worker_hook(monkeypatch):
+    calls = {"count": 0}
+
+    def fake_trim():
+        calls["count"] += 1
+
+    class _FakeClient:
+        loop = SimpleNamespace(asyncio_loop=object())
+
+        def run(self, func):
+            func()
+
+    monkeypatch.setattr("core.runtime.worker_hooks.trim_worker_memory", fake_trim)
+
+    _trim_workers_for_memory_pressure(_FakeClient())
+
+    assert calls["count"] == 1
 
 
 def test_task_reducer_backend_clone_drops_live_local_accumulators():
@@ -2475,15 +3000,24 @@ def test_task_reducer_backend_clone_drops_live_local_accumulators():
         shard_storage_root_override="/tmp/shared-shards",
         local_accumulator_max_ram_bytes=123456,
     )
-    backend._local_accumulators[(3, "abc123")] = object()
+    key = (3, "abc123", None)
+    backend._local_accumulators[key] = object()
+    backend._local_accumulator_lock(key)
 
     task_backend = _build_task_reducer_backend(backend)
+    round_tripped = pickle.loads(pickle.dumps(task_backend))
 
     assert task_backend is not backend
     assert task_backend.layout.kind == "local_restartable"
     assert task_backend.shard_storage_root_override == "/tmp/shared-shards"
     assert task_backend.local_accumulator_max_ram_bytes == 123456
     assert task_backend._local_accumulators == {}
+    assert task_backend._local_accumulator_locks == {}
+    assert round_tripped.layout.kind == "local_restartable"
+    assert round_tripped.shard_storage_root_override == "/tmp/shared-shards"
+    assert round_tripped.local_accumulator_max_ram_bytes == 123456
+    assert round_tripped._local_accumulators == {}
+    assert round_tripped._local_accumulator_locks == {}
 
 
 def test_residual_field_async_stage_logs_main_process_progress_when_enabled(
@@ -2798,6 +3332,148 @@ def test_residual_field_interval_chunk_task_accepts_direct_interval_payloads(mon
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([8.0 + 0.0j]))
 
 
+def test_residual_field_interval_chunk_task_uses_supplied_rifft_payload(monkeypatch, tmp_path):
+    reducer_backend = _CapturingReducerBackend("manifest")
+    captured = {}
+    build_calls = {"count": 0}
+
+    def _unexpected_grid_build(chunk_data):
+        build_calls["count"] += 1
+        raise AssertionError("RIFFT grid should come from supplied payload")
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        _unexpected_grid_build,
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: np.array([[11.0 + 0.0j, 12.0 + 0.0j], [13.0 + 0.0j, 14.0 + 0.0j]]),
+    )
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        IntervalTask(
+            1,
+            "All",
+            np.array([[0.0]], dtype=np.float64),
+            np.array([2.0 + 0.0j]),
+            np.array([1.0 + 0.0j]),
+        ),
+        None,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=reducer_backend,
+        quiet_logs=True,
+        rifft_payload=(
+            np.array([[0.0], [1.0]], dtype=np.float64),
+            np.array([[2]], dtype=np.int64),
+        ),
+    )
+
+    assert result == "manifest"
+    assert build_calls["count"] == 0
+    captured.update(reducer_backend.calls[0])
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([11.0 + 0.0j, 12.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([13.0 + 0.0j, 14.0 + 0.0j]))
+
+
+def test_residual_field_interval_chunk_task_uses_stored_q_grid_digest(monkeypatch, tmp_path):
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
+    )
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(1, 2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (
+            IntervalTask(
+                1,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([2.0 + 0.0j]),
+                np.array([1.0 + 0.0j]),
+                "digest-a",
+            ),
+            IntervalTask(
+                2,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([3.0 + 0.0j]),
+                np.array([1.0 + 0.0j]),
+                "digest-a",
+            ),
+        ),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=_CapturingReducerBackend("manifest"),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+
+
+def test_build_residual_rifft_payload_slices_partition_atoms(monkeypatch, tmp_path):
+    atoms = np.array(
+        [
+            ([0.0], [0.1], [0.05]),
+            ([1.0], [0.2], [0.06]),
+            ([2.0], [0.3], [0.07]),
+        ],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+
+    def fake_grid_build(chunk_data):
+        captured["coordinates"] = [float(np.asarray(row["coordinates"])[0]) for row in chunk_data]
+        return np.array([[0.0], [1.0]], dtype=np.float64), np.array([[2]], dtype=np.int64)
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        fake_grid_build,
+    )
+
+    rifft_grid, grid_shape_nd = build_residual_rifft_payload(
+        atoms,
+        work_unit=ResidualFieldWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ).with_partition(partition_id=1, point_start=1, point_stop=3),
+        quiet_logs=True,
+    )
+
+    np.testing.assert_allclose(rifft_grid, np.array([[0.0], [1.0]], dtype=np.float64))
+    np.testing.assert_array_equal(grid_shape_nd, np.array([[2]], dtype=np.int64))
+    assert captured["coordinates"] == [1.0, 2.0]
+
+
 def test_residual_field_interval_chunk_task_returns_small_status_for_local_backend(
     monkeypatch,
     tmp_path,
@@ -3107,6 +3783,7 @@ def test_residual_field_interval_chunk_task_slices_partition_atoms_for_owner_loc
 
 
 def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(monkeypatch, tmp_path):
+    monkeypatch.delenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", raising=False)
     interval_path_1 = tmp_path / "interval_1.npz"
     interval_path_2 = tmp_path / "interval_2.npz"
     for path, interval_id, q_amp in (
@@ -3131,23 +3808,22 @@ def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(m
     )
     captured = {}
     calls = {"count": 0}
+    submitted_weights = []
 
     monkeypatch.setattr(
         "core.residual_field.tasks.build_rifft_grid_for_chunk",
         lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
     )
+
+    def fake_super_batch(**kwargs):
+        calls["count"] += 1
+        weights = np.asarray(kwargs["weights"], dtype=np.complex128)
+        submitted_weights.append(weights.copy())
+        return weights
+
     monkeypatch.setattr(
         "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
-        lambda **kwargs: calls.__setitem__("count", calls["count"] + 1)
-        or np.array(
-            [
-                [1.0 + 0.0j],
-                [2.0 + 0.0j],
-                [3.0 + 0.0j],
-                [4.0 + 0.0j],
-            ],
-            dtype=np.complex128,
-        ),
+        fake_super_batch,
     )
     reducer_backend = _CapturingReducerBackend("manifest")
 
@@ -3168,7 +3844,85 @@ def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(m
 
     assert result == "manifest"
     assert calls["count"] == 1
+    assert len(submitted_weights) == 1
+    np.testing.assert_allclose(
+        submitted_weights[0],
+        np.array([[4.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
+    )
     captured.update(reducer_backend.calls[0])
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([4.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([2.0 + 0.0j]))
+
+
+def test_residual_field_interval_chunk_task_can_disable_same_q_grid_presum(monkeypatch, tmp_path):
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    submitted_weights = []
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", "0")
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+
+    def fake_super_batch(**kwargs):
+        weights = np.asarray(kwargs["weights"], dtype=np.complex128)
+        submitted_weights.append(weights.copy())
+        return np.array(
+            [
+                [1.0 + 0.0j],
+                [2.0 + 0.0j],
+                [3.0 + 0.0j],
+                [4.0 + 0.0j],
+            ],
+            dtype=np.complex128,
+        )
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        fake_super_batch,
+    )
+    reducer_backend = _CapturingReducerBackend("manifest")
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(1, 2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (
+            IntervalTask(
+                1,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([2.0 + 0.0j]),
+                np.array([1.0 + 0.0j]),
+            ),
+            IntervalTask(
+                2,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([4.0 + 0.0j]),
+                np.array([1.0 + 0.0j]),
+            ),
+        ),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=reducer_backend,
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    assert submitted_weights[0].shape == (4, 1)
+    captured = reducer_backend.calls[0]
     np.testing.assert_allclose(captured["amplitudes_delta"], np.array([4.0 + 0.0j]))
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
 
@@ -3209,7 +3963,12 @@ def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypa
     )
 
     def fake_super_batch(**kwargs):
-        calls.append(np.asarray(kwargs["q_coords"]).copy())
+        calls.append(
+            (
+                np.asarray(kwargs["q_coords"]).copy(),
+                np.asarray(kwargs["weights"], dtype=np.complex128).copy(),
+            )
+        )
         if np.allclose(kwargs["q_coords"], np.array([[0.0]], dtype=np.float64)):
             return np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128)
         return np.array([[3.0 + 0.0j], [4.0 + 0.0j]], dtype=np.complex128)
@@ -3237,6 +3996,166 @@ def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypa
 
     assert result == "manifest"
     assert len(calls) == 2
+    for _q_coords, weights in calls:
+        assert weights.shape == (2, 1)
     captured.update(reducer_backend.calls[0])
     np.testing.assert_allclose(captured["amplitudes_delta"], np.array([4.0 + 0.0j]))
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
+
+
+def test_residual_field_interval_chunk_task_pre_sum_matches_linear_inverse(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", "1")
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    q_grid = np.array([[0.0], [1.0]], dtype=np.float64)
+    interval_1 = IntervalTask(
+        1,
+        "All",
+        q_grid,
+        np.array([2.0 + 1.0j, 5.0 - 1.0j], dtype=np.complex128),
+        np.array([1.0 + 0.5j, 2.0 + 0.0j], dtype=np.complex128),
+    )
+    interval_2 = IntervalTask(
+        2,
+        "All",
+        q_grid,
+        np.array([4.0 - 1.0j, 7.0 + 2.0j], dtype=np.complex128),
+        np.array([0.5 + 0.0j, 1.0 + 1.0j], dtype=np.complex128),
+    )
+    transform = np.array(
+        [[1.0 + 0.0j, 2.0 + 0.0j], [0.5 + 0.0j, -1.0 + 0.0j]],
+        dtype=np.complex128,
+    )
+    captured = {}
+    submitted_weights = []
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (
+            np.array([[0.0], [1.0]], dtype=np.float64),
+            np.array([[2]], dtype=np.int64),
+        ),
+    )
+
+    def fake_linear_inverse(**kwargs):
+        weights = np.asarray(kwargs["weights"], dtype=np.complex128)
+        submitted_weights.append(weights.copy())
+        return weights @ transform
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        fake_linear_inverse,
+    )
+    reducer_backend = _CapturingReducerBackend("manifest")
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(1, 2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (interval_1, interval_2),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=reducer_backend,
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    expected_delta_weights = (
+        (interval_1.q_amp - interval_1.q_amp_av)
+        + (interval_2.q_amp - interval_2.q_amp_av)
+    )
+    expected_average_weights = interval_1.q_amp_av + interval_2.q_amp_av
+    np.testing.assert_allclose(
+        submitted_weights[0],
+        np.stack((expected_delta_weights, expected_average_weights), axis=0),
+    )
+    old_delta = np.stack(
+        (
+            interval_1.q_amp - interval_1.q_amp_av,
+            interval_2.q_amp - interval_2.q_amp_av,
+        ),
+        axis=0,
+    ) @ transform
+    old_average = np.stack((interval_1.q_amp_av, interval_2.q_amp_av), axis=0) @ transform
+    captured.update(reducer_backend.calls[0])
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.sum(old_delta, axis=0))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.sum(old_average, axis=0))
+
+
+def test_residual_field_interval_chunk_task_rejects_mismatched_q_weight_lengths(
+    monkeypatch,
+    tmp_path,
+):
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
+    )
+
+    with pytest.raises(ValueError, match="q_amp length does not match q_grid"):
+        run_residual_field_interval_chunk_task(
+            ResidualFieldWorkUnit.interval_chunk(
+                interval_id=1,
+                chunk_id=3,
+                parameter_digest="abc123",
+                output_dir=str(tmp_path),
+            ),
+            IntervalTask(
+                1,
+                "All",
+                np.array([[0.0], [1.0]], dtype=np.float64),
+                np.array([2.0 + 0.0j], dtype=np.complex128),
+                np.array([1.0 + 0.0j], dtype=np.complex128),
+            ),
+            atoms,
+            total_reciprocal_points=11,
+            output_dir=str(tmp_path),
+            reducer_backend=_CapturingReducerBackend("manifest"),
+            quiet_logs=True,
+        )
+
+    with pytest.raises(ValueError, match="q_amp_av length does not match q_grid"):
+        run_residual_field_interval_chunk_task(
+            ResidualFieldWorkUnit.interval_chunk(
+                interval_id=1,
+                chunk_id=3,
+                parameter_digest="abc123",
+                output_dir=str(tmp_path),
+            ),
+            IntervalTask(
+                1,
+                "All",
+                np.array([[0.0], [1.0]], dtype=np.float64),
+                np.array([2.0 + 0.0j, 3.0 + 0.0j], dtype=np.complex128),
+                np.array([1.0 + 0.0j], dtype=np.complex128),
+            ),
+            atoms,
+            total_reciprocal_points=11,
+            output_dir=str(tmp_path),
+            reducer_backend=_CapturingReducerBackend("manifest"),
+            quiet_logs=True,
+        )

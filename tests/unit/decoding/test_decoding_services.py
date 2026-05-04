@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -209,6 +210,41 @@ def test_build_decoder_cache_path_is_stable(tmp_path):
     assert path1 == path2
 
 
+def test_build_decoder_cache_path_includes_patch_window(tmp_path):
+    params = {
+        "supercell": np.array([4, 4, 4]),
+        "reciprocal_space_intervals_all": [{"h_range": (0.0, 1.0)}],
+        "rspace_info": {
+            "points": [
+                {
+                    "elementSymbol": "O",
+                    "referenceNumber": 2,
+                    "distFromAtomCenter": [0.3, 0.3, 0.3],
+                    "stepInAngstrom": [0.05, 0.05, 0.05],
+                }
+            ]
+        },
+    }
+    changed = {
+        **params,
+        "rspace_info": {
+            "points": [
+                {
+                    "elementSymbol": "O",
+                    "referenceNumber": 2,
+                    "distFromAtomCenter": [0.5, 0.5, 0.5],
+                    "stepInAngstrom": [0.05, 0.05, 0.05],
+                }
+            ]
+        },
+    }
+
+    assert build_decoder_cache_path(params, str(tmp_path)) != build_decoder_cache_path(
+        changed,
+        str(tmp_path),
+    )
+
+
 def test_resolve_output_dir_prefers_explicit_path(tmp_path):
     path = resolve_output_dir(None, chunk_id=0, output_dir=str(tmp_path / "out"))
     assert path == str(tmp_path / "out")
@@ -218,6 +254,15 @@ def test_decoder_source_policy_defaults_and_validates():
     policy = DisplacementDecoderSourcePolicy.from_mapping(None)
     assert policy.mode == "error"
     assert policy.assignment == "single"
+    assert policy.fresh_start is None
+    assert DisplacementDecoderSourcePolicy.from_mapping(
+        {"source": "compute", "compute_output_directory": "/tmp/full", "fresh_start": "yes"}
+    ).fresh_start is True
+    current_policy = DisplacementDecoderSourcePolicy.from_mapping(
+        {"source": "current", "fresh_start": "yes"}
+    )
+    assert current_policy.mode == "current"
+    assert current_policy.fresh_start is True
     with pytest.raises(ValueError, match="cache_path"):
         DisplacementDecoderSourcePolicy.from_mapping({"source": "cache"})
     with pytest.raises(ValueError, match="compute_output_directory"):
@@ -516,10 +561,209 @@ def test_decoder_source_service_cache_mode_loads_existing_decoder(tmp_path):
     np.testing.assert_allclose(processor._decoder_M, np.eye(2))
 
 
+def test_decoder_source_service_cache_mode_accepts_cache_directory(tmp_path):
+    cache_dir = tmp_path / "all" / "processed_point_data"
+    cache_dir.mkdir(parents=True)
+    params = {
+        "postprocessing_mode": "displacement",
+        "supercell": np.array([4]),
+        "reciprocal_space_intervals_all": [{"h_range": (0.0, 1.0)}],
+        "decoder": {"source": "cache", "cache_path": str(cache_dir)},
+        "original_coords": np.array([[0.0]]),
+        "average_coords": np.array([[0.0]]),
+    }
+    cache_path = build_decoder_cache_path(params, str(cache_dir))
+    save_decoder_cache(cache_path, np.eye(2), 2, logger=_NoopLogger())
+    service = DisplacementDecoderSourceService(
+        point_selection_service=SimpleNamespace(),
+        reciprocal_space_service=SimpleNamespace(),
+        scattering_stage=SimpleNamespace(),
+        residual_field_stage=SimpleNamespace(),
+    )
+    processor = SimpleNamespace(
+        parameters=params,
+        decoder_source_policy=DisplacementDecoderSourcePolicy(
+            mode="cache",
+            cache_path=str(cache_dir),
+        ),
+        _decoder_M=None,
+        _feature_dim=None,
+        decoder_source_provenance=None,
+    )
+    artifacts = SimpleNamespace(output_dir=str(tmp_path / "masked"))
+
+    provenance = service.prepare(
+        processor=processor,
+        workflow_parameters=SimpleNamespace(),
+        structure=SimpleNamespace(),
+        artifacts=artifacts,
+        client=None,
+    )
+
+    assert provenance is not None
+    assert provenance.decoder_cache_path == cache_path
+    assert provenance.source_output_directory == str(cache_dir.resolve())
+    assert provenance.loaded_from_cache is True
+    np.testing.assert_allclose(processor._decoder_M, np.eye(2))
+
+
+def test_decoder_source_service_current_mode_loads_existing_current_decoder(tmp_path):
+    output_dir = tmp_path / "all" / "processed_point_data"
+    output_dir.mkdir(parents=True)
+    residual_marker = output_dir / "residual_chunk_0_amplitudes.hdf5"
+    residual_marker.write_text("existing residual artifact", encoding="utf-8")
+    params = {
+        "postprocessing_mode": "displacement",
+        "supercell": np.array([4]),
+        "reciprocal_space_intervals_all": [{"h_range": (0.0, 1.0)}],
+        "decoder": {"source": "current"},
+        "original_coords": np.array([[0.0]]),
+        "average_coords": np.array([[0.0]]),
+    }
+    cache_path = build_decoder_cache_path(params, str(output_dir))
+    save_decoder_cache(cache_path, np.eye(2), 2, logger=_NoopLogger())
+    service = DisplacementDecoderSourceService(
+        point_selection_service=SimpleNamespace(),
+        reciprocal_space_service=SimpleNamespace(),
+        scattering_stage=SimpleNamespace(),
+        residual_field_stage=SimpleNamespace(),
+    )
+    processor = SimpleNamespace(
+        parameters=params,
+        decoder_source_policy=DisplacementDecoderSourcePolicy(mode="current"),
+        _decoder_M=None,
+        _feature_dim=None,
+        decoder_source_provenance=None,
+    )
+
+    provenance = service.prepare(
+        processor=processor,
+        workflow_parameters=SimpleNamespace(),
+        structure=SimpleNamespace(),
+        artifacts=SimpleNamespace(output_dir=str(output_dir)),
+        client=None,
+    )
+
+    assert provenance is not None
+    assert provenance.mode == "current"
+    assert provenance.semantics == "current-residual"
+    assert provenance.decoder_cache_path == cache_path
+    assert provenance.loaded_from_cache is True
+    assert provenance.computed is False
+    assert residual_marker.exists()
+    np.testing.assert_allclose(processor._decoder_M, np.eye(2))
+
+
+def test_decoder_source_service_current_mode_fresh_start_rebuilds_only_decoder(
+    tmp_path,
+    monkeypatch,
+):
+    output_dir = tmp_path / "all" / "processed_point_data"
+    output_dir.mkdir(parents=True)
+    residual_marker = output_dir / "residual_chunk_0_amplitudes.hdf5"
+    residual_marker.write_text("existing residual artifact", encoding="utf-8")
+    point_spec = {
+        "elementSymbol": "O",
+        "referenceNumber": 1,
+        "distFromAtomCenter": [0.2],
+        "stepInAngstrom": [0.1],
+    }
+    params = {
+        **_patch_validation_parameters([1]),
+        "rspace_info": {
+            "mode": "displacement",
+            "fresh_start": False,
+            "points": [point_spec],
+            "decoder": {
+                "source": "current",
+                "fresh_start": True,
+            },
+        },
+        "decoder": {
+            "source": "current",
+            "fresh_start": True,
+        },
+        "original_coords": np.array([[0.0]], dtype=np.float64),
+        "average_coords": np.array([[0.0]], dtype=np.float64),
+    }
+    cache_path = build_decoder_cache_path(params, str(output_dir))
+    cached_decoder = np.full((1, 5), 99.0, dtype=np.float64)
+    save_decoder_cache(cache_path, cached_decoder, 5, logger=_NoopLogger())
+    point_row = _point_row(central_point_id=0, dist=[0.2], step=[0.1])
+    service = DisplacementDecoderSourceService(
+        point_selection_service=SimpleNamespace(
+            select=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("current decoder mode should not reselect points")
+            )
+        ),
+        reciprocal_space_service=SimpleNamespace(
+            prepare=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("current decoder mode should not prepare a decoder run")
+            )
+        ),
+        scattering_stage=SimpleNamespace(
+            execute=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("current decoder mode should not run scattering")
+            )
+        ),
+        residual_field_stage=SimpleNamespace(
+            execute=lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("current decoder mode should not run residual fields")
+            )
+        ),
+    )
+    processor = SimpleNamespace(
+        parameters=params,
+        decoder_source_policy=DisplacementDecoderSourcePolicy(
+            mode="current",
+            fresh_start=True,
+        ),
+        _decoder_M=None,
+        _feature_dim=None,
+        decoder_source_provenance=None,
+    )
+    monkeypatch.setattr(
+        "core.decoding.decoder_service.build_decoder_training_payload",
+        lambda *args, **kwargs: {
+            "features_train": [np.ones(5, dtype=np.float64)],
+            "u_train": [np.array([0.25], dtype=np.float64)],
+            "training_decoder_keys": [],
+        },
+    )
+
+    provenance = service.prepare(
+        processor=processor,
+        workflow_parameters=SimpleNamespace(),
+        structure=SimpleNamespace(),
+        artifacts=SimpleNamespace(
+            output_dir=str(output_dir),
+            saver=SimpleNamespace(),
+            db_manager=SimpleNamespace(
+                get_pending_chunk_ids=lambda: [0],
+                get_point_data_for_chunk=lambda chunk_id: [point_row],
+            ),
+        ),
+        client=None,
+    )
+
+    recomputed_decoder, feature_dim = load_decoder_cache(cache_path, logger=_NoopLogger())
+    assert provenance is not None
+    assert provenance.mode == "current"
+    assert provenance.semantics == "current-residual"
+    assert provenance.loaded_from_cache is False
+    assert provenance.computed is True
+    assert feature_dim == 5
+    assert processor._feature_dim == 5
+    assert residual_marker.exists()
+    assert not np.allclose(recomputed_decoder, cached_decoder)
+
+
 def test_decoder_source_service_compute_mode_reuses_valid_full_decoder(tmp_path, monkeypatch):
     compute_root = tmp_path / "full_decoder"
     processed_dir = compute_root / "processed_point_data"
     processed_dir.mkdir(parents=True)
+    stale_marker = processed_dir / "stale.txt"
+    stale_marker.write_text("decoder source artifacts", encoding="utf-8")
     params = {
         "supercell": np.array([4]),
         "reciprocal_space_intervals_all": [{"h_range": (0.0, 1.0)}],
@@ -561,7 +805,7 @@ def test_decoder_source_service_compute_mode_reuses_valid_full_decoder(tmp_path,
         schema_version=2,
         struct_info={"dimension": 1, "working_directory": str(tmp_path / "masked")},
         peak_info={"reciprocal_space_limits": []},
-        rspace_info={"mode": "displacement"},
+        rspace_info={"mode": "displacement", "fresh_start": True},
         runtime_info={},
     )
     artifacts = SimpleNamespace(output_dir=str(tmp_path / "masked"))
@@ -569,7 +813,7 @@ def test_decoder_source_service_compute_mode_reuses_valid_full_decoder(tmp_path,
     monkeypatch.setattr(
         service,
         "_build_unmasked_workflow_parameters",
-        lambda workflow_parameters, compute_root: workflow_parameters,
+        lambda workflow_parameters, compute_root, **kwargs: workflow_parameters,
     )
     provenance = service.prepare(
         processor=processor,
@@ -581,6 +825,266 @@ def test_decoder_source_service_compute_mode_reuses_valid_full_decoder(tmp_path,
 
     assert provenance is not None
     assert provenance.mode == "compute"
+    published_cache_path = build_decoder_cache_path(params, str(tmp_path / "masked"))
+    assert provenance.decoder_cache_path == published_cache_path
     assert provenance.loaded_from_cache is True
     assert provenance.computed is False
     assert processor._feature_dim == 2
+    assert stale_marker.exists()
+    assert Path(published_cache_path).exists()
+
+
+def test_decoder_source_service_compute_mode_rebuilds_stale_decoder_cache(
+    tmp_path,
+    monkeypatch,
+):
+    compute_root = tmp_path / "full_decoder"
+    processed_dir = compute_root / "processed_point_data"
+    processed_dir.mkdir(parents=True)
+    stale_marker = processed_dir / "stale.txt"
+    stale_marker.write_text("old artifacts", encoding="utf-8")
+    point_spec = {
+        "elementSymbol": "O",
+        "referenceNumber": 1,
+        "distFromAtomCenter": [0.2],
+        "stepInAngstrom": [0.1],
+    }
+    params = {
+        **_patch_validation_parameters([1]),
+        "rspace_info": {
+            "mode": "displacement",
+            "fresh_start": True,
+            "points": [point_spec],
+            "decoder": {
+                "source": "compute",
+                "compute_output_directory": str(compute_root),
+                "fresh_start": True,
+            },
+        },
+        "decoder": {
+            "source": "compute",
+            "compute_output_directory": str(compute_root),
+            "fresh_start": True,
+        },
+        "original_coords": np.array([[0.0]], dtype=np.float64),
+        "average_coords": np.array([[0.0]], dtype=np.float64),
+    }
+    cache_path = build_decoder_cache_path(params, str(processed_dir))
+    save_decoder_cache(cache_path, np.eye(3), 3, logger=_NoopLogger())
+    point_row = _point_row(central_point_id=0, dist=[0.2], step=[0.1])
+
+    class _FakeArtifacts(SimpleNamespace):
+        def close(self):
+            return None
+
+    fake_artifacts = _FakeArtifacts(
+        output_dir=str(processed_dir),
+        padded_intervals=[{"h_range": (0.0, 1.0)}],
+        saver=SimpleNamespace(),
+        point_data_processor=SimpleNamespace(),
+        db_manager=SimpleNamespace(
+            get_pending_chunk_ids=lambda: [0],
+            get_point_data_for_chunk=lambda chunk_id: [point_row],
+        ),
+    )
+    service = DisplacementDecoderSourceService(
+        point_selection_service=SimpleNamespace(select=lambda request: SimpleNamespace()),
+        reciprocal_space_service=SimpleNamespace(
+            prepare=lambda **kwargs: fake_artifacts,
+        ),
+        scattering_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        residual_field_stage=SimpleNamespace(execute=lambda **kwargs: None),
+    )
+    processor = SimpleNamespace(
+        parameters=params,
+        decoder_source_policy=DisplacementDecoderSourcePolicy(
+            mode="compute",
+            compute_output_directory=str(compute_root),
+            fresh_start=True,
+        ),
+        _decoder_M=None,
+        _feature_dim=None,
+        decoder_source_provenance=None,
+    )
+    workflow_parameters = WorkflowParameters(
+        schema_version=2,
+        struct_info={"dimension": 1, "working_directory": str(tmp_path / "masked")},
+        peak_info={"reciprocal_space_limits": []},
+        rspace_info={
+            "mode": "displacement",
+            "fresh_start": False,
+            "points": [point_spec],
+        },
+        runtime_info={},
+    )
+    structure = SimpleNamespace(
+        supercell=np.array([4], dtype=np.int64),
+        original_coords=np.array([[0.0]], dtype=np.float64),
+        average_coords=np.array([[0.0]], dtype=np.float64),
+        cells_origin=np.array([[0]], dtype=np.int64),
+        elements=np.array(["O"], dtype=object),
+        refnumbers=np.array([1], dtype=np.int64),
+        vectors=np.array([[1.0]], dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        "core.decoding.decoder_service.build_decoder_training_payload",
+        lambda *args, **kwargs: {
+            "features_train": [np.ones(5, dtype=np.float64)],
+            "u_train": [np.array([0.25], dtype=np.float64)],
+            "training_decoder_keys": [],
+        },
+    )
+
+    provenance = service.prepare(
+        processor=processor,
+        workflow_parameters=workflow_parameters,
+        structure=structure,
+        artifacts=SimpleNamespace(
+            output_dir=str(tmp_path / "masked"),
+            db_manager=SimpleNamespace(
+                get_pending_chunk_ids=lambda: [0],
+                get_point_data_for_chunk=lambda chunk_id: [point_row],
+            ),
+        ),
+        client=None,
+    )
+
+    assert provenance is not None
+    assert provenance.mode == "compute"
+    assert provenance.loaded_from_cache is False
+    assert provenance.computed is True
+    assert processor._feature_dim == 5
+    assert not stale_marker.exists()
+
+
+def test_decoder_source_service_compute_mode_fresh_start_rebuilds_valid_decoder_cache(
+    tmp_path,
+    monkeypatch,
+):
+    compute_root = tmp_path / "full_decoder"
+    processed_dir = compute_root / "processed_point_data"
+    processed_dir.mkdir(parents=True)
+    stale_marker = processed_dir / "stale.txt"
+    stale_marker.write_text("old decoder artifacts", encoding="utf-8")
+    masked_root = tmp_path / "masked"
+    masked_root.mkdir()
+    keep_marker = masked_root / "keep.txt"
+    keep_marker.write_text("main run artifact", encoding="utf-8")
+    point_spec = {
+        "elementSymbol": "O",
+        "referenceNumber": 1,
+        "distFromAtomCenter": [0.2],
+        "stepInAngstrom": [0.1],
+    }
+    params = {
+        **_patch_validation_parameters([1]),
+        "rspace_info": {
+            "mode": "displacement",
+            "fresh_start": False,
+            "points": [point_spec],
+            "decoder": {
+                "source": "compute",
+                "compute_output_directory": str(compute_root),
+                "fresh_start": True,
+            },
+        },
+        "decoder": {
+            "source": "compute",
+            "compute_output_directory": str(compute_root),
+            "fresh_start": True,
+        },
+        "original_coords": np.array([[0.0]], dtype=np.float64),
+        "average_coords": np.array([[0.0]], dtype=np.float64),
+    }
+    cache_path = build_decoder_cache_path(params, str(processed_dir))
+    cached_decoder = np.full((1, 5), 99.0, dtype=np.float64)
+    save_decoder_cache(cache_path, cached_decoder, 5, logger=_NoopLogger())
+    point_row = _point_row(central_point_id=0, dist=[0.2], step=[0.1])
+
+    class _FakeArtifacts(SimpleNamespace):
+        def close(self):
+            return None
+
+    fake_artifacts = _FakeArtifacts(
+        output_dir=str(processed_dir),
+        padded_intervals=[{"h_range": (0.0, 1.0)}],
+        saver=SimpleNamespace(),
+        point_data_processor=SimpleNamespace(),
+        db_manager=SimpleNamespace(
+            get_pending_chunk_ids=lambda: [0],
+            get_point_data_for_chunk=lambda chunk_id: [point_row],
+        ),
+    )
+    service = DisplacementDecoderSourceService(
+        point_selection_service=SimpleNamespace(select=lambda request: SimpleNamespace()),
+        reciprocal_space_service=SimpleNamespace(
+            prepare=lambda **kwargs: fake_artifacts,
+        ),
+        scattering_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        residual_field_stage=SimpleNamespace(execute=lambda **kwargs: None),
+    )
+    processor = SimpleNamespace(
+        parameters=params,
+        decoder_source_policy=DisplacementDecoderSourcePolicy(
+            mode="compute",
+            compute_output_directory=str(compute_root),
+            fresh_start=True,
+        ),
+        _decoder_M=None,
+        _feature_dim=None,
+        decoder_source_provenance=None,
+    )
+    workflow_parameters = WorkflowParameters(
+        schema_version=2,
+        struct_info={"dimension": 1, "working_directory": str(masked_root)},
+        peak_info={"reciprocal_space_limits": []},
+        rspace_info={
+            "mode": "displacement",
+            "fresh_start": False,
+            "points": [point_spec],
+        },
+        runtime_info={},
+    )
+    structure = SimpleNamespace(
+        supercell=np.array([4], dtype=np.int64),
+        original_coords=np.array([[0.0]], dtype=np.float64),
+        average_coords=np.array([[0.0]], dtype=np.float64),
+        cells_origin=np.array([[0]], dtype=np.int64),
+        elements=np.array(["O"], dtype=object),
+        refnumbers=np.array([1], dtype=np.int64),
+        vectors=np.array([[1.0]], dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        "core.decoding.decoder_service.build_decoder_training_payload",
+        lambda *args, **kwargs: {
+            "features_train": [np.ones(5, dtype=np.float64)],
+            "u_train": [np.array([0.25], dtype=np.float64)],
+            "training_decoder_keys": [],
+        },
+    )
+
+    provenance = service.prepare(
+        processor=processor,
+        workflow_parameters=workflow_parameters,
+        structure=structure,
+        artifacts=SimpleNamespace(
+            output_dir=str(masked_root),
+            db_manager=SimpleNamespace(
+                get_pending_chunk_ids=lambda: [0],
+                get_point_data_for_chunk=lambda chunk_id: [point_row],
+            ),
+        ),
+        client=None,
+    )
+
+    recomputed_decoder, feature_dim = load_decoder_cache(cache_path, logger=_NoopLogger())
+    assert provenance is not None
+    assert provenance.mode == "compute"
+    assert provenance.loaded_from_cache is False
+    assert provenance.computed is True
+    assert feature_dim == 5
+    assert processor._feature_dim == 5
+    assert not np.allclose(recomputed_decoder, cached_decoder)
+    assert not stale_marker.exists()
+    assert processed_dir.exists()
+    assert keep_marker.exists()

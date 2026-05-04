@@ -26,6 +26,7 @@ from core.residual_field.artifacts import (
     discover_stale_residual_field_generation_manifests,
     discover_residual_field_reducer_progress_manifest,
     discover_residual_field_shard_manifests,
+    is_residual_field_replacement_complete,
     is_residual_field_shard_reclaimable,
     list_reclaimable_residual_field_shards,
     load_residual_field_generation_metadata,
@@ -34,7 +35,10 @@ from core.residual_field.artifacts import (
     reduce_residual_field_shards_for_chunk,
     write_residual_field_reducer_progress_manifest,
 )
-from core.residual_field.local_accumulator import build_local_accumulator_snapshot_path
+from core.residual_field.local_accumulator import (
+    LiveLocalAccumulator,
+    build_local_accumulator_snapshot_path,
+)
 from core.residual_field.contracts import (
     ResidualFieldReducerProgressManifest,
     ResidualFieldWorkUnit,
@@ -154,6 +158,7 @@ def test_residual_field_batch_shard_checkpoint_uses_single_durable_manifest(tmp_
     assert Path(manifest.artifacts[1].path).exists()
     scratch_shard_dir = scratch_root / "residual_shards" / "chunk_3"
     assert list(scratch_shard_dir.glob("*.npz")) == []
+    assert list(scratch_shard_dir.glob("*.hdf5")) == []
 
 
 def test_residual_field_reducer_is_single_writer_for_final_chunk_artifacts(tmp_path):
@@ -597,10 +602,176 @@ def test_local_backend_target_flush_and_process_local_inspection_helpers(tmp_pat
             db_path=db.db_path,
         ) is False
         assert after is not None
+        assert after["has_live_accumulator"] is True
         assert after["live_dirty"] is False
         assert after["durable_snapshot_seq"] == 1
         assert after["durable_interval_ids"] == (interval_id,)
         assert Path(str(after["durable_snapshot_path"])).exists()
+    finally:
+        db.close()
+
+
+def test_local_backend_flush_keeps_and_reuses_accumulator(tmp_path):
+    clear_process_local_residual_field_backends()
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    template_backend = build_residual_field_reducer_backend("local_restartable")
+    backend = get_process_local_residual_field_backend(template_backend)
+    scratch_root = str(tmp_path / "scratch")
+    try:
+        interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
+        work_unit_1 = ResidualFieldWorkUnit.interval_chunk(
+            interval_id=interval_id_1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ).with_partition(partition_id=7, point_start=0, point_stop=1)
+        work_unit_2 = ResidualFieldWorkUnit.interval_chunk(
+            interval_id=interval_id_2,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ).with_partition(partition_id=7, point_start=0, point_stop=1)
+
+        common_kwargs = dict(
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            point_ids=np.array([10, 11]),
+            output_dir=str(tmp_path),
+            scratch_root=scratch_root,
+            db_path=db.db_path,
+            total_expected_partials=8,
+        )
+        backend.accept_local_contribution(
+            work_unit_1,
+            contribution_reciprocal_points=5,
+            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
+            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
+            **common_kwargs,
+        )
+        assert backend.flush_local_reducer_target(
+            chunk_id=3,
+            parameter_digest="abc123",
+            partition_id=7,
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+        ) is True
+        key = (3, "abc123", 7)
+        assert key in backend._local_accumulators
+        accumulator = backend._local_accumulators[key]
+        assert accumulator.durable_interval_ids == {interval_id_1}
+
+        backend.accept_local_contribution(
+            work_unit_2,
+            contribution_reciprocal_points=7,
+            amplitudes_delta=np.array([3 + 0j, 4 + 0j]),
+            amplitudes_average=np.array([0.25 + 0j, 0.5 + 0j]),
+            **common_kwargs,
+        )
+        assert backend.flush_local_reducer_target(
+            chunk_id=3,
+            parameter_digest="abc123",
+            partition_id=7,
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+        ) is True
+        assert backend._local_accumulators[key] is accumulator
+
+        target_state = backend.inspect_local_reducer_target(
+            chunk_id=3,
+            parameter_digest="abc123",
+            partition_id=7,
+            output_dir=str(tmp_path),
+            include_payload=True,
+        )
+
+        assert target_state is not None
+        assert target_state["has_live_accumulator"] is True
+        assert target_state["live_dirty"] is False
+        assert target_state["durable_interval_ids"] == (interval_id_1, interval_id_2)
+        payload = target_state["durable_snapshot_payload"]
+        np.testing.assert_allclose(
+            payload["amplitudes_delta"],
+            np.array([4 + 0j, 6 + 0j]),
+        )
+        np.testing.assert_allclose(
+            payload["amplitudes_average"],
+            np.array([0.75 + 0j, 1.25 + 0j]),
+        )
+    finally:
+        clear_process_local_residual_field_backends()
+        db.close()
+
+
+def test_live_local_accumulator_cleanup_closes_memmaps(tmp_path):
+    work_unit = ResidualFieldWorkUnit.interval_chunk(
+        interval_id=7,
+        chunk_id=3,
+        parameter_digest="abc123",
+        output_dir=str(tmp_path),
+    )
+    accumulator = LiveLocalAccumulator.from_arrays(
+        work_unit,
+        point_ids=np.array([10, 11]),
+        grid_shape_nd=np.array([[2]]),
+        total_reciprocal_points=11,
+        amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
+        amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
+        scratch_root=str(tmp_path / "scratch"),
+        max_ram_bytes=0,
+    )
+    delta_path = accumulator.live_dir / "amplitudes_delta.npy"
+    average_path = accumulator.live_dir / "amplitudes_average.npy"
+    delta_mmap = accumulator.amplitudes_delta._mmap
+    average_mmap = accumulator.amplitudes_average._mmap
+
+    assert isinstance(accumulator.amplitudes_delta, np.memmap)
+    assert delta_path.exists()
+    assert average_path.exists()
+
+    accumulator.cleanup_live_files()
+
+    assert accumulator.amplitudes_delta is None
+    assert accumulator.amplitudes_average is None
+    assert getattr(delta_mmap, "closed", True) is True
+    assert getattr(average_mmap, "closed", True) is True
+    assert not delta_path.exists()
+    assert not average_path.exists()
+
+
+def test_local_backend_default_accumulator_keeps_small_targets_in_ram(tmp_path):
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    scratch_root = str(tmp_path / "scratch")
+    try:
+        interval_id, _ = _seed_db_for_chunk(db)
+        backend = build_residual_field_reducer_backend("local_restartable")
+        partial = backend.build_local_partial(
+            ResidualFieldWorkUnit.interval_chunk(
+                interval_id=interval_id,
+                chunk_id=3,
+                parameter_digest="abc123",
+                output_dir=str(tmp_path),
+            ),
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            contribution_reciprocal_points=5,
+            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
+            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
+            point_ids=np.array([10, 11]),
+        )
+
+        backend.accept_partial(
+            partial,
+            output_dir=str(tmp_path),
+            scratch_root=scratch_root,
+            db_path=db.db_path,
+            total_expected_partials=8,
+        )
+
+        accumulator = next(iter(backend._local_accumulators.values()))
+        assert backend.local_accumulator_max_ram_bytes == 256 * 1024 * 1024
+        assert accumulator.storage_mode == "ram"
+        assert accumulator.live_dir is None
+        assert not isinstance(accumulator.amplitudes_delta, np.memmap)
     finally:
         db.close()
 
@@ -848,6 +1019,95 @@ def test_local_backend_finalize_chunk_concatenates_disjoint_partition_snapshots(
         assert nrec == 12
         np.testing.assert_allclose(shape_nd, np.array([[2], [2]]))
         assert applied == {interval_id_1, interval_id_2}
+        progress = discover_residual_field_reducer_progress_manifest(
+            output_dir=str(tmp_path),
+            chunk_id=3,
+            parameter_digest="abc123",
+        )
+        assert progress is not None
+        assert progress.completion_status is CompletionStatus.COMMITTED
+        assert set(progress.incorporated_shard_keys)
+        assert db.get_unsaved_interval_chunks() == []
+    finally:
+        db.close()
+
+
+def test_local_backend_repairs_db_from_committed_progress_without_snapshots(tmp_path):
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    scratch_root = str(tmp_path / "scratch")
+    try:
+        interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
+        backend = build_residual_field_reducer_backend("local_restartable")
+        partial_1 = backend.build_local_partial(
+            ResidualFieldWorkUnit.interval_chunk(
+                interval_id=interval_id_1,
+                chunk_id=3,
+                parameter_digest="abc123",
+                output_dir=str(tmp_path),
+            ).with_partition(partition_id=0, point_start=0, point_stop=1),
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            contribution_reciprocal_points=5,
+            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
+            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
+            point_ids=np.array([0, 1]),
+        )
+        partial_2 = backend.build_local_partial(
+            ResidualFieldWorkUnit.interval_chunk(
+                interval_id=interval_id_2,
+                chunk_id=3,
+                parameter_digest="abc123",
+                output_dir=str(tmp_path),
+            ).with_partition(partition_id=1, point_start=2, point_stop=3),
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            contribution_reciprocal_points=7,
+            amplitudes_delta=np.array([3 + 0j, 4 + 0j]),
+            amplitudes_average=np.array([0.25 + 0j, 0.5 + 0j]),
+            point_ids=np.array([0, 1]),
+        )
+        backend.accept_partial(
+            partial_1,
+            output_dir=str(tmp_path),
+            scratch_root=scratch_root,
+            db_path=db.db_path,
+            total_expected_partials=1,
+        )
+        backend.accept_partial(
+            partial_2,
+            output_dir=str(tmp_path),
+            scratch_root=scratch_root,
+            db_path=db.db_path,
+            total_expected_partials=1,
+        )
+        first_manifest = backend.finalize_chunk(
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+            cleanup_policy="off",
+            scratch_root=scratch_root,
+            quiet_logs=True,
+        )
+        assert first_manifest is not None
+
+        db.update_interval_chunk_status(interval_id_1, 3, saved=0)
+        db.update_interval_chunk_status(interval_id_2, 3, saved=0)
+        assert db.get_unsaved_interval_chunks() == [(interval_id_1, 3), (interval_id_2, 3)]
+        assert list((tmp_path / "residual_shards" / "chunk_3").glob("local_accumulator*.npz")) == []
+
+        repaired_manifest = backend.finalize_chunk(
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+            cleanup_policy="off",
+            scratch_root=scratch_root,
+            quiet_logs=True,
+        )
+
+        assert repaired_manifest is not None
+        assert db.get_unsaved_interval_chunks() == []
     finally:
         db.close()
 
@@ -900,6 +1160,7 @@ def test_local_backend_file_backed_accumulator_path_works(tmp_path):
         assert live_dir.exists()
         assert any(live_dir.glob("*.npy"))
         assert snapshot_path.exists()
+        assert backend._local_accumulators
     finally:
         db.close()
 
@@ -1059,6 +1320,156 @@ def test_residual_field_reducer_progress_and_reclaimability_are_persisted(tmp_pa
             db_path=db.db_path,
         )
         assert [manifest.artifact_key for manifest in reclaimable] == [persisted_shard.artifact_key]
+    finally:
+        db.close()
+
+
+def test_stage2_replacement_residual_reduce_requires_expected_coverage(tmp_path):
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    try:
+        interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
+        work_unit = ResidualFieldWorkUnit.interval_chunk(
+            interval_id=interval_id_1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        )
+        persist_residual_field_shard_checkpoint(
+            work_unit,
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            contribution_reciprocal_points=5,
+            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
+            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
+            point_ids=np.array([10, 11]),
+            output_dir=str(tmp_path),
+            quiet_logs=True,
+        )
+
+        with pytest.raises(RuntimeError, match="missing expected replacement shard coverage"):
+            reduce_residual_field_shards_for_chunk(
+                chunk_id=3,
+                parameter_digest="abc123",
+                expected_interval_ids=(interval_id_1, interval_id_2),
+                output_dir=str(tmp_path),
+                db_path=db.db_path,
+                quiet_logs=True,
+            )
+
+        assert set(db.get_unsaved_interval_chunks()) == {
+            (interval_id_1, 3),
+            (interval_id_2, 3),
+        }
+    finally:
+        db.close()
+
+
+def test_stage2_replacement_residual_reduce_commits_canonical_outputs(tmp_path):
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    try:
+        interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
+        work_unit = ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(interval_id_1, interval_id_2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        )
+        persist_residual_field_shard_checkpoint(
+            work_unit,
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            contribution_reciprocal_points=12,
+            amplitudes_delta=np.array([4 + 0j, 6 + 0j]),
+            amplitudes_average=np.array([0.75 + 0j, 1.25 + 0j]),
+            point_ids=np.array([10, 11]),
+            output_dir=str(tmp_path),
+            quiet_logs=True,
+        )
+
+        reduce_residual_field_shards_for_chunk(
+            chunk_id=3,
+            parameter_digest="abc123",
+            expected_interval_ids=(interval_id_1, interval_id_2),
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+            cleanup_policy="off",
+            quiet_logs=True,
+        )
+
+        assert (tmp_path / "residual_chunk_3_amplitudes.hdf5").exists()
+        assert not (tmp_path / "point_data_chunk_3_amplitudes.hdf5").exists()
+        assert is_residual_field_replacement_complete(
+            chunk_id=3,
+            parameter_digest="abc123",
+            expected_interval_ids=(interval_id_1, interval_id_2),
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+        )
+        assert db.get_unsaved_interval_chunks() == []
+    finally:
+        db.close()
+
+
+def test_stage2_replacement_commits_progress_before_sqlite_mark_saved(tmp_path):
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    try:
+        interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
+        work_unit = ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(interval_id_1, interval_id_2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        )
+        persist_residual_field_shard_checkpoint(
+            work_unit,
+            grid_shape_nd=np.array([[2]]),
+            total_reciprocal_points=11,
+            contribution_reciprocal_points=12,
+            amplitudes_delta=np.array([4 + 0j, 6 + 0j]),
+            amplitudes_average=np.array([0.75 + 0j, 1.25 + 0j]),
+            point_ids=np.array([10, 11]),
+            output_dir=str(tmp_path),
+            quiet_logs=True,
+        )
+
+        class FailingDb:
+            def update_interval_chunk_status(self, *args, **kwargs):
+                raise RuntimeError("sqlite unavailable")
+
+            def close(self):
+                return None
+
+        with pytest.raises(RuntimeError, match="sqlite unavailable"):
+            reduce_residual_field_shards_for_chunk(
+                chunk_id=3,
+                parameter_digest="abc123",
+                expected_interval_ids=(interval_id_1, interval_id_2),
+                output_dir=str(tmp_path),
+                db_path=db.db_path,
+                db_manager_factory=lambda path: FailingDb(),
+                quiet_logs=True,
+            )
+
+        progress = discover_residual_field_reducer_progress_manifest(
+            output_dir=str(tmp_path),
+            chunk_id=3,
+            parameter_digest="abc123",
+        )
+        assert progress is not None
+        assert progress.completion_status is CompletionStatus.COMMITTED
+        assert set(db.get_unsaved_interval_chunks()) == {
+            (interval_id_1, 3),
+            (interval_id_2, 3),
+        }
+
+        assert is_residual_field_replacement_complete(
+            chunk_id=3,
+            parameter_digest="abc123",
+            expected_interval_ids=(interval_id_1, interval_id_2),
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+        )
+        assert db.get_unsaved_interval_chunks() == []
     finally:
         db.close()
 

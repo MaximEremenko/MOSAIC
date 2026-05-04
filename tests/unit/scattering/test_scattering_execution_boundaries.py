@@ -205,7 +205,7 @@ def test_execution_serial_precompute_uses_work_units(monkeypatch, tmp_path):
         client=None,
     )
 
-    assert paths == [tmp_path / "precomputed_intervals" / "interval_1.npz"]
+    assert paths == [tmp_path / "precomputed_intervals" / "interval_1.hdf5"]
 
 
 def test_execution_local_fast_precompute_caches_payload_without_writing_interval_artifact(
@@ -264,7 +264,7 @@ def test_execution_local_fast_precompute_caches_payload_without_writing_interval
     assert paths == []
     assert 1 in payload_cache
     assert payload_cache[1].irecip_id == 1
-    assert not (tmp_path / "precomputed_intervals" / "interval_1.npz").exists()
+    assert not (tmp_path / "precomputed_intervals" / "interval_1.hdf5").exists()
 
 
 def test_execution_async_local_fast_precompute_caches_scattered_payload_once(
@@ -459,7 +459,7 @@ def test_execution_async_local_fast_precompute_falls_back_to_required_transport_
 
     monkeypatch.delenv("DASK_BACKEND", raising=False)
 
-    assert [path.name for path in paths] == ["interval_1.npz", "interval_2.npz"]
+    assert [path.name for path in paths] == ["interval_1.hdf5", "interval_2.hdf5"]
     assert payload_cache == {}
     assert len(client.scatter_calls) == 5
     assert all(call[1].get("broadcast") is True for call in client.scatter_calls)
@@ -560,7 +560,7 @@ def test_execution_async_local_fast_precompute_falls_back_to_required_transport_
 
     monkeypatch.delenv("DASK_BACKEND", raising=False)
 
-    assert [path.name for path in paths] == ["interval_1.npz"]
+    assert [path.name for path in paths] == ["interval_1.hdf5"]
     assert payload_cache == {}
     assert len(client.scatter_calls) == 5
     assert all(call[1].get("broadcast") is True for call in client.scatter_calls)
@@ -644,7 +644,7 @@ def test_execution_durable_precompute_scatter_shared_inputs_once_and_keeps_requi
         client=client,
     )
 
-    assert [path.name for path in paths] == ["interval_1.npz", "interval_2.npz"]
+    assert [path.name for path in paths] == ["interval_1.hdf5", "interval_2.hdf5"]
     assert len(client.scatter_calls) == 5
     assert len(client.submit_calls) == 2
     assert all(call[1].get("broadcast") is True for call in client.scatter_calls)
@@ -699,7 +699,7 @@ def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_pa
         lambda **kwargs: calls.__setitem__("count", calls["count"] + 1) or np.array([[3.0 + 0.0j], [4.0 + 0.0j]]),
     )
     monkeypatch.setattr(
-        "core.scattering.tasks.persist_scattering_interval_chunk_result",
+        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
         lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
     )
 
