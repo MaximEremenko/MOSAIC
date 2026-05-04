@@ -38,6 +38,18 @@ dependencies = [
   "tqdm",
 ]
 
+[project.optional-dependencies]
+cuda12 = [
+  "cupy-cuda12x",
+  "cufinufft==2.5.1",
+  "dask-cuda>=26.4",
+]
+cuda11 = [
+  "cupy-cuda11x",
+  "cufinufft",
+  "dask-cuda",
+]
+
 [project.urls]
 Homepage = "https://github.com/MaximEremenko/MOSAIC"
 Repository = "https://github.com/MaximEremenko/MOSAIC"

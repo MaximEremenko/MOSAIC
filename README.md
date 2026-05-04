@@ -59,6 +59,8 @@ research-scale use.
 
 ## Installation
 
+### CPU (default)
+
 Conda is the recommended path:
 
 ```bash
@@ -73,12 +75,50 @@ Minimal editable install in an existing Python environment:
 pip install -e .
 ```
 
-Practical requirements:
+### CUDA / GPU
+
+Two supported paths:
+
+**1. Conda env file (CUDA 12.4 wheel stack, recommended).**
+
+```bash
+conda env create -f core/environment_cuda.yml
+conda activate mosaic
+pip install -e .
+```
+
+This installs `cuda-toolkit=12.4.0`, `cupy-cuda12x`,
+`cufinufft==2.5.1`, and `dask-cuda>=26.4`.
+
+**2. `setup_mosaic.sh` (same CUDA 12.4 stack, scripted).**
+
+The script creates or updates the `mosaic` conda environment, installs MOSAIC
+editable, installs the same CUDA wheel stack, and adds a conda activation hook
+so cuFINUFFT can find the CUDA 12 runtime libraries inside the environment:
+
+```bash
+./setup_mosaic.sh
+conda activate mosaic
+```
+
+Pip-only CUDA install is also supported once compatible CUDA 12 runtime
+libraries and a compatible NVIDIA driver are already available on the system:
+
+```bash
+pip install -e '.[cuda12]'
+```
+
+The tested CUDA stack is CUDA 12.4 + `cupy-cuda12x` + `cufinufft==2.5.1`.
+The `cufinufft` wheel links against CUDA 12 libraries, so a CUDA-13-only
+runtime is not a supported wheel-based setup.
+
+### Practical requirements
 
 - Python 3.11+
 - Linux or WSL
 - CPU-only execution works out of the box
-- GPU acceleration and Dask-based parallel execution are optional
+- GPU acceleration and Dask-based parallel execution are optional; GPU mode
+  requires CuPy, cuFINUFFT, and `dask-cuda`
 
 ## Quick Start
 

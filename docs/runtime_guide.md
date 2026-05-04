@@ -74,6 +74,13 @@ A typical single-GPU launch is:
 CUDA_VISIBLE_DEVICES=0 conda run -n mosaic python -m core.main examples/config_2D/chemical_ordering/run_parameters.json
 ```
 
+GPU execution requires a CUDA-enabled MOSAIC install. See the
+[CUDA / GPU section of the README](../README.md#cuda--gpu) for the supported
+paths (`core/environment_cuda.yml`, the `[cuda12]` pip extra, or
+`setup_mosaic.sh`). The tested wheel stack is CUDA 12.4 + `cupy-cuda12x` +
+`cufinufft==2.5.1` + `dask-cuda>=26.4`; the `cufinufft` wheel needs CUDA 12
+runtime libraries visible at runtime.
+
 Notes:
 
 - `cuda-local` requires `dask-cuda` in the active environment.
