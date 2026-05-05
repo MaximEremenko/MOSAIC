@@ -16,6 +16,7 @@ from core.residual_field.backend import (
     build_residual_field_reducer_backend,
     get_process_local_residual_field_backend,
 )
+from core.scattering.accumulation import apply_half_space_conjugate_reconstruction
 from core.scattering.kernels import build_rifft_grid_for_chunk
 from core.scattering.kernels import IntervalTask
 from core.scattering.tasks import load_interval_task_payload, scattering_contribution_point_count
@@ -387,9 +388,12 @@ def run_residual_field_interval_chunk_task(
         grouped_interval_tasks: dict[tuple, list] = {}
         for interval_task in interval_tasks:
             grouped_interval_tasks.setdefault(
-                _q_grid_signature(
-                    interval_task.q_grid,
-                    getattr(interval_task, "q_grid_digest", None),
+                (
+                    _q_grid_signature(
+                        interval_task.q_grid,
+                        getattr(interval_task, "q_grid_digest", None),
+                    ),
+                    interval_task.half_space_role,
                 ),
                 [],
             ).append(interval_task)
@@ -475,6 +479,16 @@ def run_residual_field_interval_chunk_task(
             else:
                 grouped_delta = np.sum(inverse_outputs[0::2], axis=0, dtype=np.complex128)
                 grouped_average = np.sum(inverse_outputs[1::2], axis=0, dtype=np.complex128)
+            grouped_delta = apply_half_space_conjugate_reconstruction(
+                grouped_delta,
+                reference_q_grid,
+                grouped_tasks[0].half_space_role,
+            )
+            grouped_average = apply_half_space_conjugate_reconstruction(
+                grouped_average,
+                reference_q_grid,
+                grouped_tasks[0].half_space_role,
+            )
             del inverse_outputs
             if amplitudes_delta is None:
                 amplitudes_delta = grouped_delta

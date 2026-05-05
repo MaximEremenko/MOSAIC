@@ -6,6 +6,15 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from core.scattering.accumulation import (
+    apply_half_space_conjugate_reconstruction,
+    half_space_conjugate_reconstruction_required,
+)
+from core.scattering.half_space import (
+    classify_interval_half_space_role,
+    half_space_role_multiplicity,
+    normalize_half_space_role,
+)
 from core.scattering.artifacts import (
     build_scattering_interval_manifest,
     is_interval_artifact_committed,
@@ -66,27 +75,62 @@ def load_interval_task_payload(interval_path: Path) -> IntervalTask:
                     q_grid_digest = q_grid_digest.decode("ascii")
                 else:
                     q_grid_digest = str(q_grid_digest)
+            half_space_role = (
+                normalize_half_space_role(data["half_space_role"][()])
+                if "half_space_role" in data
+                else "legacy"
+            )
+            reciprocal_multiplicity = (
+                int(np.asarray(data["reciprocal_multiplicity"]).reshape(-1)[0])
+                if "reciprocal_multiplicity" in data
+                else 0
+            )
             return IntervalTask(
                 int(np.asarray(data["irecip_id"]).reshape(-1)[0]),
                 str(element),
                 np.asarray(data["q_grid"]),
                 np.asarray(data["q_amp"]),
                 np.asarray(data["q_amp_av"]),
-                q_grid_digest,
+                q_grid_digest=q_grid_digest,
+                half_space_role=half_space_role,
+                reciprocal_multiplicity=reciprocal_multiplicity,
             )
     with np.load(path, mmap_mode="r") as data:
+        half_space_role = (
+            normalize_half_space_role(data["half_space_role"])
+            if "half_space_role" in data.files
+            else "legacy"
+        )
+        reciprocal_multiplicity = (
+            int(np.asarray(data["reciprocal_multiplicity"]).ravel()[0])
+            if "reciprocal_multiplicity" in data.files
+            else 0
+        )
+        q_grid_digest = None
+        if "q_grid_digest" in data.files:
+            q_grid_digest = data["q_grid_digest"].item()
+            if isinstance(q_grid_digest, bytes):
+                q_grid_digest = q_grid_digest.decode("ascii")
+            else:
+                q_grid_digest = str(q_grid_digest)
         return IntervalTask(
             int(data["irecip_id"].item()),
             str(data["element"].item()),
             data["q_grid"],
             data["q_amp"],
             data["q_amp_av"],
+            q_grid_digest=q_grid_digest,
+            half_space_role=half_space_role,
+            reciprocal_multiplicity=reciprocal_multiplicity,
         )
 
 
 def scattering_contribution_point_count(interval_task: IntervalTask) -> int:
     q_grid = interval_task.q_grid
-    if q_grid.shape[1] > 2 and np.max(np.abs(q_grid[:, 2])) > 1e-7:
+    multiplicity = half_space_role_multiplicity(interval_task.half_space_role)
+    if multiplicity is not None:
+        return int(q_grid.shape[0]) * int(multiplicity)
+    if half_space_conjugate_reconstruction_required(q_grid, interval_task.half_space_role):
         return int(q_grid.shape[0]) * 2
     return int(q_grid.shape[0])
 
@@ -140,7 +184,13 @@ def compute_scattering_interval_payload(
     if not contributions:
         return None
 
-    return aggregate_interval_contributions(contributions, use_coeff=use_coeff)
+    interval_task = aggregate_interval_contributions(contributions, use_coeff=use_coeff)
+    half_space_role = classify_interval_half_space_role(interval, supercell)
+    reciprocal_multiplicity = int(half_space_role_multiplicity(half_space_role) or 1)
+    return interval_task._replace(
+        half_space_role=half_space_role,
+        reciprocal_multiplicity=reciprocal_multiplicity,
+    )
 
 
 def run_scattering_interval_task(
@@ -231,8 +281,16 @@ def run_scattering_interval_chunk_task(
             real_coords=rifft_grid,
             eps=1e-12,
         )
-        amplitudes_delta = inverse_pair[0]
-        amplitudes_average = inverse_pair[1]
+        amplitudes_delta = apply_half_space_conjugate_reconstruction(
+            inverse_pair[0],
+            interval_task.q_grid,
+            interval_task.half_space_role,
+        )
+        amplitudes_average = apply_half_space_conjugate_reconstruction(
+            inverse_pair[1],
+            interval_task.q_grid,
+            interval_task.half_space_role,
+        )
         return persist_scattering_interval_chunk_shard(
             work_unit,
             grid_shape_nd=grid_shape_nd,

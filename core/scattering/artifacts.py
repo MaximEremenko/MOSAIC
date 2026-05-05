@@ -621,6 +621,14 @@ def persist_precomputed_interval_artifact(
             "q_amp": np.asarray(interval_task.q_amp),
             "q_amp_av": np.asarray(interval_task.q_amp_av),
             "q_grid_digest": np.asarray(_q_grid_digest(interval_task.q_grid), dtype=h5py.string_dtype("ascii")),
+            "half_space_role": np.asarray(
+                str(interval_task.half_space_role),
+                dtype=h5py.string_dtype("ascii"),
+            ),
+            "reciprocal_multiplicity": np.array(
+                [int(interval_task.reciprocal_multiplicity)],
+                dtype=np.int64,
+            ),
         },
         attrs={
             "schema_version": 2,

@@ -11,6 +11,11 @@ import numpy as np
 
 from core.qspace.masking.mask_strategies import EqBasedStrategy, get_last_eq_mask_telemetry
 from core.runtime.progress import timed
+from core.scattering.half_space import (
+    HALF_SPACE_ROLE_LEGACY,
+    classify_interval_half_space_role,
+    half_space_role_multiplicity,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -26,6 +31,8 @@ class IntervalTask(NamedTuple):
     q_amp: np.ndarray
     q_amp_av: np.ndarray
     q_grid_digest: str | None = None
+    half_space_role: str = HALF_SPACE_ROLE_LEGACY
+    reciprocal_multiplicity: int = 0
 
 
 def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:
@@ -34,11 +41,15 @@ def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:
         rng = iv.get(f"{axis}_range")
         if rng is not None:
             out[f"{axis}_start"], out[f"{axis}_end"] = rng
+        elif f"{axis}_start" in iv or f"{axis}_end" in iv:
+            out[f"{axis}_start"] = iv.get(f"{axis}_start", 0.0)
+            out[f"{axis}_end"] = iv.get(f"{axis}_end", 0.0)
     return out
 
 
 def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.ndarray) -> int:
     supercell = np.asarray(supercell, dtype=float)
+    interval = _to_interval_dict(interval)
     step = 1.0 / supercell
     dim = len(supercell)
 
@@ -57,10 +68,9 @@ def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.nd
         else 1
     )
 
-    total = h_n * k_n * l_n
-    if dim > 2 and not (interval["l_start"] == 0 and interval["l_end"] == 0):
-        total *= 2
-    return total
+    role = classify_interval_half_space_role(interval, supercell)
+    multiplicity = half_space_role_multiplicity(role)
+    return int(h_n * k_n * l_n * int(multiplicity or 1))
 
 
 def _call_generate_mask(mask_strategy, hkl: np.ndarray, mask_params: Dict[str, Any]):
@@ -351,6 +361,7 @@ def generate_q_space_grid(
     supercell: np.ndarray,
 ) -> np.ndarray:
     supercell = np.asarray(supercell, dtype=float)
+    interval = _to_interval_dict(interval)
     int_supercell = np.round(supercell).astype(int)
     axis_values = _get_axis_values(
         interval,

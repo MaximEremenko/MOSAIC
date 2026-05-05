@@ -1,12 +1,18 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from core.scattering.accumulation import (
+    HALF_SPACE_ROLE_POSITIVE_HALF,
+    HALF_SPACE_ROLE_ZERO_PLANE,
+    apply_half_space_conjugate_reconstruction,
     apply_scattering_partial_result,
     build_scattering_partial_result,
+    half_space_conjugate_reconstruction_required,
 )
 from core.scattering.calculator import compute_amplitudes_delta
+from core.scattering.half_space import classify_interval_half_space_role
 from core.scattering.planning import build_scattering_execution_plan
 
 
@@ -89,6 +95,101 @@ def test_scattering_accumulation_builds_and_applies_partial_results():
         np.array([1.0 + 0.0j, 0.5 + 0.0j]),
     )
     assert mirrored_count == 10
+
+
+def test_half_space_conjugate_reconstruction_keeps_zero_plane_once():
+    values = np.array([1.0 + 2.0j, 3.0 - 4.0j], dtype=np.complex128)
+    zero_plane_q = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    positive_l_q = np.array(
+        [
+            [0.0, 0.0, 0.25],
+            [1.0, 0.0, 0.50],
+        ],
+        dtype=np.float64,
+    )
+
+    assert not half_space_conjugate_reconstruction_required(zero_plane_q)
+    np.testing.assert_allclose(
+        apply_half_space_conjugate_reconstruction(values, zero_plane_q),
+        values,
+    )
+
+    assert half_space_conjugate_reconstruction_required(positive_l_q)
+    np.testing.assert_allclose(
+        apply_half_space_conjugate_reconstruction(values, positive_l_q),
+        np.array([2.0 + 0.0j, 6.0 + 0.0j], dtype=np.complex128),
+    )
+
+    mixed_zero_positive_q = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.50],
+        ],
+        dtype=np.float64,
+    )
+    mixed_positive_negative_q = np.array(
+        [
+            [0.0, 0.0, 0.25],
+            [1.0, 0.0, -0.50],
+        ],
+        dtype=np.float64,
+    )
+
+    with pytest.raises(ValueError, match="mixes L=0"):
+        half_space_conjugate_reconstruction_required(mixed_zero_positive_q)
+    with pytest.raises(ValueError, match="positive- and negative-L"):
+        half_space_conjugate_reconstruction_required(mixed_positive_negative_q)
+
+
+def test_half_space_reconstruction_uses_interval_role_before_cartesian_qz():
+    values = np.array([1.0 + 2.0j], dtype=np.complex128)
+
+    np.testing.assert_allclose(
+        apply_half_space_conjugate_reconstruction(
+            values,
+            np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
+            HALF_SPACE_ROLE_POSITIVE_HALF,
+        ),
+        np.array([2.0 + 0.0j], dtype=np.complex128),
+    )
+    np.testing.assert_allclose(
+        apply_half_space_conjugate_reconstruction(
+            values,
+            np.array([[0.0, 0.0, 1.0]], dtype=np.float64),
+            HALF_SPACE_ROLE_ZERO_PLANE,
+        ),
+        values,
+    )
+
+
+def test_interval_half_space_role_is_classified_from_hkl_l_indices():
+    supercell = np.array([4.0, 4.0, 4.0])
+
+    assert (
+        classify_interval_half_space_role(
+            {"h_range": (0.0, 1.0), "k_range": (0.0, 1.0), "l_range": (0.0, 0.0)},
+            supercell,
+        )
+        == HALF_SPACE_ROLE_ZERO_PLANE
+    )
+    assert (
+        classify_interval_half_space_role(
+            {"h_range": (0.0, 1.0), "k_range": (0.0, 1.0), "l_range": (0.25, 1.0)},
+            supercell,
+        )
+        == HALF_SPACE_ROLE_POSITIVE_HALF
+    )
+    with pytest.raises(ValueError, match="mixes L=0"):
+        classify_interval_half_space_role(
+            {"h_range": (0.0, 1.0), "k_range": (0.0, 1.0), "l_range": (0.0, 1.0)},
+            supercell,
+        )
 
 
 def test_calculator_delegates_to_execution(monkeypatch):
