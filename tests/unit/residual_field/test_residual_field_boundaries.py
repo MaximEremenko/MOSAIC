@@ -36,6 +36,7 @@ from core.residual_field.contracts import (
 )
 from core.residual_field.stage import ResidualFieldStage
 from core.residual_field.tasks import run_residual_field_interval_chunk_task
+from core.scattering.accumulation import HALF_SPACE_ROLE_POSITIVE_HALF
 from core.scattering.kernels import IntervalTask
 from core.storage.database_manager import DatabaseManager
 
@@ -2748,6 +2749,62 @@ def test_residual_field_interval_chunk_task_uses_batched_inverse(monkeypatch, tm
     captured.update(reducer_backend.calls[0])
     np.testing.assert_allclose(captured["amplitudes_delta"], np.array([5.0 + 0.0j]))
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
+
+
+def test_residual_field_interval_chunk_task_reconstructs_positive_half_space(
+    monkeypatch,
+    tmp_path,
+):
+    interval_path = tmp_path / "interval_1.npz"
+    np.savez(
+        interval_path,
+        irecip_id=np.array([1], dtype=np.int64),
+        element=np.array(["All"]),
+        q_grid=np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+        half_space_role=np.array(HALF_SPACE_ROLE_POSITIVE_HALF),
+        reciprocal_multiplicity=np.array([2], dtype=np.int64),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    reducer_backend = _CapturingReducerBackend("manifest")
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        lambda **kwargs: np.array([[5.0 + 2.0j], [6.0 - 3.0j]], dtype=np.complex128),
+    )
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        interval_path,
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=reducer_backend,
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    captured = reducer_backend.calls[0]
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([10.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([12.0 + 0.0j]))
+    assert captured["contribution_reciprocal_points"] == 2
 
 
 def test_residual_field_interval_chunk_task_accepts_direct_interval_payloads(monkeypatch, tmp_path):

@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from core.scattering.half_space import (
+    HALF_SPACE_ROLE_FULL,
+    HALF_SPACE_ROLE_LEGACY,
+    HALF_SPACE_ROLE_POSITIVE_HALF,
+    HALF_SPACE_ROLE_ZERO_PLANE,
+    apply_half_space_conjugate_reconstruction,
+    half_space_conjugate_reconstruction_required,
+)
 from core.scattering.contracts import (
     ScatteringPartialResult,
     merge_scattering_partial_results,
@@ -131,12 +139,18 @@ def apply_scattering_partial_result(
 
 
 __all__ = [
+    "HALF_SPACE_ROLE_FULL",
+    "HALF_SPACE_ROLE_LEGACY",
+    "HALF_SPACE_ROLE_POSITIVE_HALF",
+    "HALF_SPACE_ROLE_ZERO_PLANE",
     "ScatteringPartialResult",
+    "apply_half_space_conjugate_reconstruction",
     "apply_scattering_partial_result",
     "build_scattering_partial_result",
     "build_scattering_partial_result_from_payloads",
     "extract_amplitude_values",
     "extract_point_ids_from_payload",
+    "half_space_conjugate_reconstruction_required",
     "materialize_scattering_payload",
     "merge_scattering_partial_results",
     "scattering_partial_result_identity",

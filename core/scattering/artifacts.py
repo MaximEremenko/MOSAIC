@@ -537,6 +537,11 @@ def persist_precomputed_interval_artifact(
             q_grid=interval_task.q_grid,
             q_amp=interval_task.q_amp,
             q_amp_av=interval_task.q_amp_av,
+            half_space_role=np.array(interval_task.half_space_role),
+            reciprocal_multiplicity=np.array(
+                [int(interval_task.reciprocal_multiplicity)],
+                dtype=np.int64,
+            ),
         )
     Path(handle.name).replace(out_path)
     _IntervalPrecomputeStateUpdater(

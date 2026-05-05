@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from core.scattering.accumulation import (
+    HALF_SPACE_ROLE_POSITIVE_HALF,
     build_scattering_partial_result,
     build_scattering_partial_result_from_payloads,
     materialize_scattering_payload,
@@ -23,7 +24,11 @@ from core.scattering.planning import (
     build_scattering_interval_lookup,
     build_scattering_precompute_work_units,
 )
-from core.scattering.tasks import run_scattering_interval_chunk_task
+from core.scattering.tasks import (
+    compute_scattering_interval_payload,
+    load_interval_task_payload,
+    run_scattering_interval_chunk_task,
+)
 from core.contracts import CompletionStatus
 from core.storage.database_manager import DatabaseManager
 
@@ -92,6 +97,8 @@ def test_artifacts_persist_interval_artifact_marks_precomputed(tmp_path):
             np.array([[0.0]]),
             np.array([1 + 0j]),
             np.array([0 + 0j]),
+            HALF_SPACE_ROLE_POSITIVE_HALF,
+            2,
         )
 
         manifest = persist_precomputed_interval_artifact(
@@ -103,8 +110,53 @@ def test_artifacts_persist_interval_artifact_marks_precomputed(tmp_path):
         assert db.is_interval_precomputed(interval_id) is True
         assert manifest.completion_status is CompletionStatus.COMMITTED
         assert manifest.artifacts[0].path is not None
+        loaded = load_interval_task_payload(manifest.artifacts[0].path)
+        assert loaded.half_space_role == HALF_SPACE_ROLE_POSITIVE_HALF
+        assert loaded.reciprocal_multiplicity == 2
     finally:
         db.close()
+
+
+def test_compute_scattering_interval_payload_attaches_hkl_half_space_role(monkeypatch):
+    monkeypatch.setattr(
+        "core.scattering.tasks.generate_q_space_grid_sync",
+        lambda *args, **kwargs: np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.compute_interval_coeff_contribution",
+        lambda interval, q_grid, *args, **kwargs: (
+            interval["id"],
+            "All",
+            q_grid,
+            np.array([1.0 + 0.0j], dtype=np.complex128),
+            np.array([0.0 + 0.0j], dtype=np.complex128),
+        ),
+    )
+
+    interval_task = compute_scattering_interval_payload(
+        {
+            "id": 1,
+            "h_range": (0.0, 0.0),
+            "k_range": (0.0, 0.0),
+            "l_range": (0.25, 0.5),
+        },
+        B_=np.eye(3),
+        mask_params={},
+        MaskStrategy=None,
+        supercell=np.array([4.0, 4.0, 4.0]),
+        original_coords=np.zeros((1, 3), dtype=np.float64),
+        cells_origin=np.zeros((1, 3), dtype=np.float64),
+        elements_arr=np.array(["Li"], dtype=object),
+        charge=0.0,
+        use_coeff=True,
+        coeff_val=np.array([1.0], dtype=np.float64),
+        unique_elements=["Li"],
+        ff_factory=None,
+    )
+
+    assert interval_task is not None
+    assert interval_task.half_space_role == HALF_SPACE_ROLE_POSITIVE_HALF
+    assert interval_task.reciprocal_multiplicity == 2
 
 
 def test_artifacts_persist_chunk_result_updates_saved_state_and_artifacts(tmp_path):
@@ -722,3 +774,62 @@ def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_pa
     assert calls["count"] == 1
     np.testing.assert_allclose(captured["amplitudes_delta"], np.array([3.0 + 0.0j]))
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))
+
+
+def test_scattering_interval_chunk_task_reconstructs_positive_half_space(
+    monkeypatch,
+    tmp_path,
+):
+    interval_path = tmp_path / "interval_1.npz"
+    np.savez(
+        interval_path,
+        irecip_id=np.array([1], dtype=np.int64),
+        element=np.array(["All"]),
+        q_grid=np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+        half_space_role=np.array(HALF_SPACE_ROLE_POSITIVE_HALF),
+        reciprocal_multiplicity=np.array([2], dtype=np.int64),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "core.scattering.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
+        lambda **kwargs: np.array([[3.0 + 2.0j], [4.0 - 1.0j]], dtype=np.complex128),
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.persist_scattering_interval_chunk_result",
+        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
+    )
+
+    result = run_scattering_interval_chunk_task(
+        ScatteringWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            dimension=3,
+            output_dir=str(tmp_path),
+        ),
+        interval_path,
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        db_path=str(tmp_path / "state.db"),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([6.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([8.0 + 0.0j]))
+    assert captured["contribution_reciprocal_points"] == 2
