@@ -62,4 +62,7 @@ ChangeLog
 
 # Environment
 .env
+.venv/
+.uv-cache/
+.mosaic_cuda_env
 .vscode/

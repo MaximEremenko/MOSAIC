@@ -43,6 +43,7 @@ cuda12 = [
   "cupy-cuda12x",
   "cufinufft==2.5.1",
   "dask-cuda>=26.4",
+  "cuda-bindings>=12,<13",
 ]
 cuda11 = [
   "cupy-cuda11x",
