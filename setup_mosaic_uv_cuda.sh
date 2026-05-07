@@ -6,10 +6,12 @@ set -Eeuo pipefail
 # Default path:
 #   - install basic apt prerequisites when missing
 #   - install uv when missing
-#   - install NVIDIA CUDA 12.4 toolkit/runtime when CUDA 12 libs are missing
 #   - create .venv with uv-managed Python 3.11
-#   - install MOSAIC editable with the cuda12 extra
+#   - install MOSAIC editable with the cuda12 extra and PyPI CUDA runtime libs
 #   - write .mosaic_cuda_env and wire it into .venv/bin/activate
+#
+# System CUDA apt installation is optional. The default avoids cuda-toolkit-12-4
+# on Ubuntu 24.04, where old toolkit packages can require libtinfo5.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -17,13 +19,13 @@ cd "$SCRIPT_DIR"
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 VENV_DIR="${VENV_DIR:-.venv}"
 CUDA_MAJOR_MINOR="${CUDA_MAJOR_MINOR:-12.4}"
-CUDA_APT_PACKAGE="${CUDA_APT_PACKAGE:-cuda-toolkit-12-4}"
+CUDA_APT_PACKAGE="${CUDA_APT_PACKAGE:-cuda-libraries-12-4}"
 UV_CACHE_DIR="${UV_CACHE_DIR:-${HOME}/.cache/uv}"
 UV_LINK_MODE="${UV_LINK_MODE:-copy}"
 MOSAIC_REQUIRE_GPU="${MOSAIC_REQUIRE_GPU:-0}"
 
 INSTALL_APT=1
-INSTALL_CUDA_APT=1
+INSTALL_CUDA_APT=0
 RUN_SMOKE=0
 GPU_CHECK=1
 INSTALL_HPC_EXTRAS=0
@@ -38,8 +40,9 @@ Ubuntu environment with the Windows NVIDIA driver already installed.
 Options:
   --python VERSION       Python version for uv to install/use (default: 3.11)
   --venv PATH            Virtual environment path (default: .venv)
-  --no-apt               Do not install apt prerequisites or CUDA toolkit
-  --no-cuda-apt          Do not install NVIDIA CUDA packages through apt
+  --no-apt               Do not install apt prerequisites
+  --cuda-apt             Also install NVIDIA CUDA libraries through apt
+  --no-cuda-apt          Do not install NVIDIA CUDA packages through apt (default)
   --no-gpu-check         Skip CUDA device visibility check
   --hpc-extras           Also install dask-jobqueue and dask-mpi
   --smoke                Run the small CPU-only MOSAIC smoke example
@@ -50,7 +53,7 @@ Environment overrides:
   VENV_DIR=.venv
   UV_CACHE_DIR=/tmp/uv-cache
   CUDA_MAJOR_MINOR=12.4
-  CUDA_APT_PACKAGE=cuda-toolkit-12-4
+  CUDA_APT_PACKAGE=cuda-libraries-12-4
   MOSAIC_CUDA_HOME=/usr/local/cuda-12.4
   MOSAIC_REQUIRE_GPU=1
 
@@ -118,7 +121,10 @@ parse_args() {
                 ;;
             --no-apt)
                 INSTALL_APT=0
-                INSTALL_CUDA_APT=0
+                shift
+                ;;
+            --cuda-apt|--system-cuda)
+                INSTALL_CUDA_APT=1
                 shift
                 ;;
             --no-cuda-apt|--skip-cuda-apt)
@@ -258,19 +264,74 @@ find_cuda_home() {
     return 1
 }
 
-cuda_repo_id() {
-    if is_wsl; then
-        printf 'wsl-ubuntu\n'
-        return 0
+print_unique_existing_dirs() {
+    local seen=":"
+    local dir
+
+    for dir in "$@"; do
+        [[ -n "$dir" && -d "$dir" ]] || continue
+        case "$seen" in
+            *":$dir:"*) continue ;;
+        esac
+        seen="${seen}${dir}:"
+        printf '%s\n' "$dir"
+    done
+}
+
+collect_python_cuda_lib_dirs() {
+    local venv_path="$1"
+    local dir first_match
+
+    [[ -d "$venv_path/lib" ]] || return 0
+
+    while IFS= read -r dir; do
+        case "$dir" in
+            */site-packages/nvidia/*/lib) ;;
+            *) continue ;;
+        esac
+        first_match="$(find "$dir" -maxdepth 1 -type f -name 'lib*.so*' -print -quit 2>/dev/null || true)"
+        if [[ -n "$first_match" ]]; then
+            printf '%s\n' "$dir"
+        fi
+    done < <(find "$venv_path/lib" -type d -path '*/site-packages/nvidia/*/lib' 2>/dev/null | sort)
+}
+
+collect_cuda_lib_dirs() {
+    local venv_path="$1"
+    local system_cuda_home=""
+    local system_cuda_lib_dir=""
+    local dirs=()
+
+    if [[ -d /usr/lib/wsl/lib ]]; then
+        dirs+=("/usr/lib/wsl/lib")
     fi
 
+    while IFS= read -r dir; do
+        dirs+=("$dir")
+    done < <(collect_python_cuda_lib_dirs "$venv_path")
+
+    if system_cuda_home="$(find_cuda_home 2>/dev/null)"; then
+        if system_cuda_lib_dir="$(cuda_lib_dir_for_home "$system_cuda_home" 2>/dev/null)"; then
+            dirs+=("$system_cuda_lib_dir")
+        fi
+    fi
+
+    print_unique_existing_dirs "${dirs[@]}"
+}
+
+cuda_repo_id() {
     if [[ -r /etc/os-release ]]; then
         # shellcheck disable=SC1091
         . /etc/os-release
-        if [[ -n "${VERSION_ID:-}" ]]; then
+        if [[ "${ID:-}" == "ubuntu" && -n "${VERSION_ID:-}" ]]; then
             printf 'ubuntu%s\n' "${VERSION_ID//./}"
             return 0
         fi
+    fi
+
+    if is_wsl; then
+        printf 'wsl-ubuntu\n'
+        return 0
     fi
 
     die "Could not determine Ubuntu release for CUDA apt repo"
@@ -288,7 +349,7 @@ install_cuda_toolkit() {
     command -v dpkg >/dev/null 2>&1 || die "dpkg is required to install the NVIDIA CUDA apt keyring"
 
     if is_wsl; then
-        log "Installing CUDA toolkit from NVIDIA's WSL apt repository"
+        log "Installing CUDA libraries from NVIDIA's CUDA apt repository for this Ubuntu release"
     else
         warn "This does not look like WSL. The script will use the Ubuntu CUDA repo and install $CUDA_APT_PACKAGE, not a display driver."
     fi
@@ -312,8 +373,13 @@ install_cuda_toolkit() {
 install_python_env() {
     local venv_path="$1"
 
-    log "Installing Python $PYTHON_VERSION with uv if needed"
-    "$UV_BIN" python install "$PYTHON_VERSION"
+    if [[ "$PYTHON_VERSION" == */* ]]; then
+        [[ -x "$PYTHON_VERSION" ]] || die "Python path is not executable: $PYTHON_VERSION"
+        log "Using Python interpreter at $PYTHON_VERSION"
+    else
+        log "Installing Python $PYTHON_VERSION with uv if needed"
+        "$UV_BIN" python install "$PYTHON_VERSION"
+    fi
 
     log "Creating/updating virtual environment at $venv_path"
     "$UV_BIN" venv --python "$PYTHON_VERSION" "$venv_path"
@@ -329,19 +395,22 @@ install_python_env() {
 
 write_cuda_env() {
     local cuda_home="$1"
-    local cuda_lib_dir="$2"
+    shift
+    local cuda_lib_dirs=("$@")
     local env_file="$SCRIPT_DIR/.mosaic_cuda_env"
-    local q_cuda_home q_cuda_lib_dir q_wsl_lib
+    local q_cuda_home joined_dirs dir
 
     q_cuda_home="$(shell_quote "$cuda_home")"
-    q_cuda_lib_dir="$(shell_quote "$cuda_lib_dir")"
-    q_wsl_lib="$(shell_quote "/usr/lib/wsl/lib")"
+    joined_dirs=""
+    for dir in "${cuda_lib_dirs[@]}"; do
+        joined_dirs="${joined_dirs}${joined_dirs:+:}${dir}"
+    done
 
     log "Writing CUDA runtime environment to $env_file"
     cat > "$env_file" <<EOF
 # Generated by setup_mosaic_uv_cuda.sh. Safe to source from bash.
 export MOSAIC_CUDA_HOME=${q_cuda_home}
-export MOSAIC_CUDA_LIB_DIR=${q_cuda_lib_dir}
+export MOSAIC_CUDA_LIB_DIRS=$(shell_quote "$joined_dirs")
 
 _mosaic_prepend_ld_library_path() {
     [ -d "\$1" ] || return 0
@@ -351,8 +420,14 @@ _mosaic_prepend_ld_library_path() {
     esac
 }
 
-_mosaic_prepend_ld_library_path ${q_wsl_lib}
-_mosaic_prepend_ld_library_path ${q_cuda_lib_dir}
+EOF
+
+    for ((idx=${#cuda_lib_dirs[@]} - 1; idx>=0; idx--)); do
+        dir="${cuda_lib_dirs[$idx]}"
+        printf '_mosaic_prepend_ld_library_path %s\n' "$(shell_quote "$dir")" >> "$env_file"
+    done
+
+    cat >> "$env_file" <<'EOF'
 unset -f _mosaic_prepend_ld_library_path
 EOF
 }
@@ -484,7 +559,8 @@ run_smoke_example() {
 main() {
     parse_args "$@"
 
-    local venv_path cuda_home cuda_lib_dir
+    local venv_path cuda_home
+    local cuda_lib_dirs=()
     venv_path="$(abs_path "$VENV_DIR")"
 
     log "MOSAIC uv CUDA setup"
@@ -497,16 +573,30 @@ main() {
     ensure_uv_cache
     ensure_apt_prereqs
     ensure_uv
-    install_cuda_toolkit
-
-    cuda_home="$(find_cuda_home)" || die "CUDA 12 runtime libraries were not found"
-    cuda_lib_dir="$(cuda_lib_dir_for_home "$cuda_home")" || die "Could not find CUDA runtime library directory for $cuda_home"
-
-    log "Using CUDA home: $cuda_home"
-    log "Using CUDA lib dir: $cuda_lib_dir"
+    if [[ "$INSTALL_CUDA_APT" -eq 1 ]]; then
+        install_cuda_toolkit
+    else
+        log "Skipping system CUDA apt install; using PyPI CUDA runtime wheels from the cuda12 extra"
+    fi
 
     install_python_env "$venv_path"
-    write_cuda_env "$cuda_home" "$cuda_lib_dir"
+
+    if cuda_home="$(find_cuda_home 2>/dev/null)"; then
+        log "Using system CUDA home: $cuda_home"
+    else
+        cuda_home="$venv_path"
+        log "No system CUDA 12 toolkit detected; using CUDA libraries from Python wheels"
+    fi
+
+    mapfile -t cuda_lib_dirs < <(collect_cuda_lib_dirs "$venv_path")
+    if [[ "${#cuda_lib_dirs[@]}" -eq 0 ]]; then
+        die "No CUDA runtime library directories were found. Re-run with --cuda-apt or set MOSAIC_CUDA_HOME to an existing CUDA 12 install."
+    fi
+
+    log "Using CUDA library directories:"
+    printf '    %s\n' "${cuda_lib_dirs[@]}"
+
+    write_cuda_env "$cuda_home" "${cuda_lib_dirs[@]}"
     patch_venv_activate "$venv_path"
     write_wrappers "$venv_path"
     check_nvidia_smi

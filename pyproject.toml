@@ -40,7 +40,8 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda12 = [
-  "cupy-cuda12x",
+  "cupy-cuda12x[ctk]",
+  "cuda-toolkit>=12.4,<12.5",
   "cufinufft==2.5.1",
   "dask-cuda>=26.4",
   "cuda-bindings>=12,<13",
