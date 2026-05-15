@@ -607,7 +607,7 @@ def test_decoder_source_service_cache_mode_accepts_cache_directory(tmp_path):
     np.testing.assert_allclose(processor._decoder_M, np.eye(2))
 
 
-def test_decoder_source_service_current_mode_loads_existing_current_decoder(tmp_path):
+def test_decoder_source_service_current_mode_rejects_loose_decoder_cache(tmp_path):
     output_dir = tmp_path / "all" / "processed_point_data"
     output_dir.mkdir(parents=True)
     residual_marker = output_dir / "residual_chunk_0_amplitudes.hdf5"
@@ -636,25 +636,17 @@ def test_decoder_source_service_current_mode_loads_existing_current_decoder(tmp_
         decoder_source_provenance=None,
     )
 
-    provenance = service.prepare(
-        processor=processor,
-        workflow_parameters=SimpleNamespace(),
-        structure=SimpleNamespace(),
-        artifacts=SimpleNamespace(output_dir=str(output_dir)),
-        client=None,
-    )
-
-    assert provenance is not None
-    assert provenance.mode == "current"
-    assert provenance.semantics == "current-residual"
-    assert provenance.decoder_cache_path == cache_path
-    assert provenance.loaded_from_cache is True
-    assert provenance.computed is False
-    assert residual_marker.exists()
-    np.testing.assert_allclose(processor._decoder_M, np.eye(2))
+    with pytest.raises(RuntimeError, match="requires residual_run_digest"):
+        service.prepare(
+            processor=processor,
+            workflow_parameters=SimpleNamespace(),
+            structure=SimpleNamespace(),
+            artifacts=SimpleNamespace(output_dir=str(output_dir)),
+            client=None,
+        )
 
 
-def test_decoder_source_service_current_mode_fresh_start_rebuilds_only_decoder(
+def test_decoder_source_service_current_mode_fresh_start_rejects_missing_stage_identity(
     tmp_path,
     monkeypatch,
 ):
@@ -731,31 +723,21 @@ def test_decoder_source_service_current_mode_fresh_start_rebuilds_only_decoder(
         },
     )
 
-    provenance = service.prepare(
-        processor=processor,
-        workflow_parameters=SimpleNamespace(),
-        structure=SimpleNamespace(),
-        artifacts=SimpleNamespace(
-            output_dir=str(output_dir),
-            saver=SimpleNamespace(),
-            db_manager=SimpleNamespace(
-                get_pending_chunk_ids=lambda: [0],
-                get_point_data_for_chunk=lambda chunk_id: [point_row],
+    with pytest.raises(RuntimeError, match="requires residual_run_digest"):
+        service.prepare(
+            processor=processor,
+            workflow_parameters=SimpleNamespace(),
+            structure=SimpleNamespace(),
+            artifacts=SimpleNamespace(
+                output_dir=str(output_dir),
+                saver=SimpleNamespace(),
+                db_manager=SimpleNamespace(
+                    get_pending_chunk_ids=lambda: [0],
+                    get_point_data_for_chunk=lambda chunk_id: [point_row],
+                ),
             ),
-        ),
-        client=None,
-    )
-
-    recomputed_decoder, feature_dim = load_decoder_cache(cache_path, logger=_NoopLogger())
-    assert provenance is not None
-    assert provenance.mode == "current"
-    assert provenance.semantics == "current-residual"
-    assert provenance.loaded_from_cache is False
-    assert provenance.computed is True
-    assert feature_dim == 5
-    assert processor._feature_dim == 5
-    assert residual_marker.exists()
-    assert not np.allclose(recomputed_decoder, cached_decoder)
+            client=None,
+        )
 
 
 def test_decoder_source_service_compute_mode_reuses_valid_full_decoder(tmp_path, monkeypatch):

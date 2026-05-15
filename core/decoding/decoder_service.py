@@ -13,11 +13,15 @@ from core.decoding.contracts import (
     DisplacementDecoderSourcePolicy,
 )
 from core.decoding.decoder_cache import (
+    build_decoder_cache_identity,
     build_decoder_cache_path,
     load_decoder_cache,
+    resolve_current_residual_source_identity,
+    resolve_public_residual_source_identity,
     save_decoder_provenance,
     save_decoder_cache,
 )
+from core.decoding.commit import DecoderCommitManifest, decoder_commit_path, write_decoder_commit
 from core.decoding.payloads import build_decoding_payload
 from core.decoding.features import build_feature_vector_from_patch
 from core.decoding.grid import (
@@ -28,6 +32,9 @@ from core.decoding.grid import (
 from core.decoding.loader import resolve_output_dir
 from core.decoding.state import build_postprocessing_processor_state
 from core.patch_centers.contracts import PointSelectionRequest
+from core.storage.digests import digest_dict
+from core.storage.fingerprint import file_sha256
+from core.storage.manifest import read_manifest
 
 
 PATCH_SPEC_FEATURE_VERSION = 1
@@ -417,6 +424,152 @@ def _resolve_decoder_cache_path(cache_path: str, parameters: dict) -> str:
     if path.is_dir():
         return build_decoder_cache_path(parameters, str(path))
     return str(path)
+
+
+def _current_residual_run_digest(parameters: dict) -> str | None:
+    runtime_info = parameters.get("runtime_info", {}) or {}
+    for mapping in (parameters, runtime_info):
+        if not isinstance(mapping, dict):
+            continue
+        value = (
+            mapping.get("residual_run_digest")
+            or mapping.get("residual_field_run_digest")
+            or mapping.get("scattering_run_digest")
+        )
+        if value:
+            return str(value)
+    return None
+
+
+def _current_public_manifest_path(
+    parameters: dict,
+    policy: DisplacementDecoderSourcePolicy,
+) -> str | None:
+    if policy.public_manifest_path:
+        return str(policy.public_manifest_path)
+    runtime_info = parameters.get("runtime_info", {}) or {}
+    decoder_info = parameters.get("decoder", {}) or {}
+    for mapping in (decoder_info, parameters, runtime_info):
+        if not isinstance(mapping, dict):
+            continue
+        value = (
+            mapping.get("public_manifest_path")
+            or mapping.get("public_manifest")
+            or mapping.get("manifest_path")
+        )
+        if value:
+            return str(value)
+    return None
+
+
+def _digest_parameter_array(parameters: dict, key: str, *, domain: str) -> str:
+    value = parameters.get(key)
+    if value is None:
+        return digest_dict({"present": False, "key": key}, domain=domain)
+    return digest_dict(
+        {
+            "present": True,
+            "key": key,
+            "shape": list(np.asarray(value).shape),
+            "values": np.asarray(value).tolist(),
+        },
+        domain=domain,
+    )
+
+
+def _decoder_target_parameters(parameters: dict) -> dict[str, object]:
+    return {
+        "q_window_kind": parameters.get("q_window_kind", "cheb"),
+        "q_window_at_db": float(parameters.get("q_window_at_db", 100.0)),
+        "edge_guard_frac": float(parameters.get("edge_guard_frac", 0.10)),
+        "ls_weight_gamma": float(parameters.get("ls_weight_gamma", 0.35)),
+        "dog_lambda_reg": float(parameters.get("dog_lambda_reg", 1e-3)),
+        "linear_max_training_samples": parameters.get("linear_max_training_samples"),
+        "decoder": dict(parameters.get("decoder", {}) or {}),
+    }
+
+
+def _decoder_architecture_digest(parameters: dict, *, assignment: str) -> str:
+    return digest_dict(
+        {
+            "decoder_type": "linear_displacement",
+            "assignment": str(assignment),
+            "patch_feature_version": PATCH_SPEC_FEATURE_VERSION,
+            "target_parameters": _decoder_target_parameters(parameters),
+        },
+        domain="mosaic.decoder.architecture.v1",
+    )
+
+
+def _build_current_decoder_cache_identity(
+    *,
+    parameters: dict,
+    source_identity: dict,
+    assignment: str,
+) -> dict:
+    return build_decoder_cache_identity(
+        residual_source_identity=source_identity,
+        coordinate_digest=_digest_parameter_array(
+            parameters,
+            "original_coords",
+            domain="mosaic.decoder.original_coords.v1",
+        ),
+        average_coordinate_digest=_digest_parameter_array(
+            parameters,
+            "average_coords",
+            domain="mosaic.decoder.average_coords.v1",
+        ),
+        vector_digest=_digest_parameter_array(
+            parameters,
+            "vectors",
+            domain="mosaic.decoder.vectors.v1",
+        ),
+        refnumber_digest=(
+            None
+            if parameters.get("refnumbers") is None
+            else _digest_parameter_array(
+                parameters,
+                "refnumbers",
+                domain="mosaic.decoder.refnumbers.v1",
+            )
+        ),
+        feature_mode=str(parameters.get("postprocessing_mode", "displacement")),
+        target_parameters=_decoder_target_parameters(parameters),
+        decoder_architecture_digest=_decoder_architecture_digest(
+            parameters,
+            assignment=assignment,
+        ),
+        code_version=str(parameters.get("code_version", "current")),
+        schema_version=1,
+    )
+
+
+def _require_matching_decoder_commit(
+    *,
+    output_dir: str,
+    run_digest: str,
+    cache_path: str,
+    cache_identity: dict,
+) -> None:
+    manifest_path = decoder_commit_path(output_dir, run_digest)
+    if not manifest_path.exists():
+        raise RuntimeError(
+            "Current decoder cache exists without decoder_commit.json; refusing stale cache reuse."
+        )
+    commit = read_manifest(
+        manifest_path,
+        codec=DecoderCommitManifest,
+        output_dir=output_dir,
+    )
+    relative_cache_path = Path(cache_path).resolve().relative_to(Path(output_dir).resolve()).as_posix()
+    if commit.decoder_cache_path != relative_cache_path:
+        raise RuntimeError("decoder_commit.json points at a different decoder cache.")
+    if commit.decoder_cache_identity != cache_identity:
+        raise RuntimeError("decoder_commit.json identity does not match current decoder source.")
+    if commit.decoder_cache_file_sha256 != file_sha256(cache_path):
+        raise RuntimeError("decoder_commit.json file hash does not match current decoder cache.")
+    if int(commit.decoder_cache_nbytes) != int(Path(cache_path).stat().st_size):
+        raise RuntimeError("decoder_commit.json byte size does not match current decoder cache.")
 
 
 def _set_prepared_decoder_from_source(processor, *, decoder, feature_dim) -> None:
@@ -973,13 +1126,50 @@ class DisplacementDecoderSourceService:
         logger,
     ) -> DecoderSourceProvenance:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        cache_path = build_decoder_cache_path(processor.parameters, output_dir)
+        public_manifest_path = _current_public_manifest_path(processor.parameters, policy)
+        if public_manifest_path:
+            source_identity = resolve_public_residual_source_identity(
+                output_dir=output_dir,
+                public_manifest_path=public_manifest_path,
+            )
+            run_digest = str(source_identity["run_digest"])
+            single_semantics = "current-public-residual"
+            family_semantics = "current-public-residual-family"
+        else:
+            run_digest = _current_residual_run_digest(processor.parameters)
+            if run_digest is None:
+                raise RuntimeError(
+                    "processing.decoder.source='current' requires residual_run_digest "
+                    "or residual_field_run_digest before cache lookup."
+                )
+            source_identity = resolve_current_residual_source_identity(
+                output_dir=output_dir,
+                run_digest=run_digest,
+            )
+            single_semantics = "current-residual"
+            family_semantics = "current-residual-family"
+        cache_identity = _build_current_decoder_cache_identity(
+            parameters=processor.parameters,
+            source_identity=source_identity,
+            assignment=policy.assignment,
+        )
+        cache_path = build_decoder_cache_path(
+            processor.parameters,
+            output_dir,
+            source_identity=cache_identity,
+        )
         force_decoder_fresh = bool(policy.fresh_start)
         if (
             policy.assignment == "single"
             and not force_decoder_fresh
             and Path(cache_path).is_file()
         ):
+            _require_matching_decoder_commit(
+                output_dir=output_dir,
+                run_digest=run_digest,
+                cache_path=cache_path,
+                cache_identity=cache_identity,
+            )
             decoder, feature_dim = load_required_decoder(cache_path, logger)
             _set_prepared_decoder_from_source(
                 processor,
@@ -988,7 +1178,7 @@ class DisplacementDecoderSourceService:
             )
             provenance = DecoderSourceProvenance(
                 mode="current",
-                semantics="current-residual",
+                semantics=single_semantics,
                 decoder_cache_path=str(cache_path),
                 source_output_directory=str(Path(output_dir).resolve()),
                 feature_dim=feature_dim,
@@ -1014,12 +1204,19 @@ class DisplacementDecoderSourceService:
             output_dir=output_dir,
             cache_path=cache_path,
             mode="current",
-            single_semantics="current-residual",
-            family_semantics="current-residual-family",
+            single_semantics=single_semantics,
+            family_semantics=family_semantics,
             compute_output_directory=None,
             logger=logger,
             label="current residual decoder-source run",
         )
+        if cache_path is not None and policy.assignment == "single":
+            write_decoder_commit(
+                output_dir=output_dir,
+                run_digest=run_digest,
+                decoder_cache_path=cache_path,
+                decoder_cache_identity=cache_identity,
+            )
         processor.decoder_source_provenance = provenance
         return provenance
 

@@ -31,6 +31,7 @@ class DisplacementDecoderSourcePolicy:
     assignment: str = "single"
     cache_path: str | None = None
     compute_output_directory: str | None = None
+    public_manifest_path: str | None = None
     fresh_start: bool | None = None
 
     @classmethod
@@ -63,6 +64,11 @@ class DisplacementDecoderSourcePolicy:
             or mapping.get("output_directory")
             or mapping.get("working_directory")
         )
+        public_manifest_path = (
+            mapping.get("public_manifest_path")
+            or mapping.get("public_manifest")
+            or mapping.get("manifest_path")
+        )
         fresh_start = _optional_bool(
             mapping.get("fresh_start", mapping.get("freshStart", None))
         )
@@ -81,6 +87,7 @@ class DisplacementDecoderSourcePolicy:
             compute_output_directory=(
                 str(compute_output_directory) if compute_output_directory else None
             ),
+            public_manifest_path=str(public_manifest_path) if public_manifest_path else None,
             fresh_start=fresh_start,
         )
 
@@ -90,6 +97,8 @@ class DisplacementDecoderSourcePolicy:
             payload["cache_path"] = self.cache_path
         if self.compute_output_directory is not None:
             payload["compute_output_directory"] = self.compute_output_directory
+        if self.public_manifest_path is not None:
+            payload["public_manifest_path"] = self.public_manifest_path
         if self.fresh_start is not None:
             payload["fresh_start"] = bool(self.fresh_start)
         return payload
