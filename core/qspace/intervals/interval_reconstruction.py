@@ -13,9 +13,14 @@ class PendingIntervalWork:
 
 class IntervalReconstructionService:
     def load_pending_work(self, artifacts, dimension: int) -> PendingIntervalWork:
-        unsaved = artifacts.db_manager.get_unsaved_interval_chunks()
-        chunk_ids = sorted({chunk_id for _, chunk_id in unsaved})
-        interval_ids = sorted({interval_id for interval_id, _ in unsaved})
+        get_all_pairs = getattr(artifacts.db_manager, "get_interval_chunks", None)
+        interval_chunks = (
+            get_all_pairs()
+            if callable(get_all_pairs)
+            else artifacts.db_manager.get_unsaved_interval_chunks()
+        )
+        chunk_ids = sorted({chunk_id for _, chunk_id in interval_chunks})
+        interval_ids = sorted({interval_id for interval_id, _ in interval_chunks})
 
         point_rows: list[dict] = []
         for chunk_id in chunk_ids:

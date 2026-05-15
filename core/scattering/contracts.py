@@ -167,6 +167,13 @@ class ScatteringWorkUnit:
     chunk_artifact_prefix: str | None
     artifact_key: str
     retry: RetryIdempotencySemantics
+    stage: str = "scattering"
+    scientific_digest: str | None = None
+    execution_digest: str | None = None
+    run_digest: str | None = None
+    qspace_plan_digest: str | None = None
+    backend_policy_digest: str | None = None
+    source_structure_digest: str | None = None
     schema_version: int = SCATTERING_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -176,6 +183,12 @@ class ScatteringWorkUnit:
         interval_id: int,
         dimension: int,
         output_dir: str,
+        scientific_digest: str | None = None,
+        execution_digest: str | None = None,
+        run_digest: str | None = None,
+        qspace_plan_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        source_structure_digest: str | None = None,
     ) -> "ScatteringWorkUnit":
         return cls(
             interval_id=interval_id,
@@ -197,6 +210,12 @@ class ScatteringWorkUnit:
                     "exists and SQLite marks the interval as precomputed"
                 ),
             ),
+            scientific_digest=scientific_digest,
+            execution_digest=execution_digest,
+            run_digest=run_digest,
+            qspace_plan_digest=qspace_plan_digest,
+            backend_policy_digest=backend_policy_digest,
+            source_structure_digest=source_structure_digest,
         )
 
     @classmethod
@@ -207,6 +226,12 @@ class ScatteringWorkUnit:
         chunk_id: int,
         dimension: int,
         output_dir: str,
+        scientific_digest: str | None = None,
+        execution_digest: str | None = None,
+        run_digest: str | None = None,
+        qspace_plan_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        source_structure_digest: str | None = None,
     ) -> "ScatteringWorkUnit":
         return cls(
             interval_id=interval_id,
@@ -230,6 +255,12 @@ class ScatteringWorkUnit:
                     "the interval id"
                 ),
             ),
+            scientific_digest=scientific_digest,
+            execution_digest=execution_digest,
+            run_digest=run_digest,
+            qspace_plan_digest=qspace_plan_digest,
+            backend_policy_digest=backend_policy_digest,
+            source_structure_digest=source_structure_digest,
         )
 
     @property
@@ -320,6 +351,8 @@ def validate_scattering_partial_result(result: ScatteringPartialResult) -> None:
 
 
 def validate_scattering_work_unit(work_unit: ScatteringWorkUnit) -> None:
+    if work_unit.stage != "scattering":
+        raise ValueError("Scattering work units must have stage='scattering'.")
     if work_unit.interval_id < 0:
         raise ValueError("interval_id must be non-negative.")
     if work_unit.chunk_id is not None and work_unit.chunk_id < 0:
@@ -340,6 +373,21 @@ def validate_scattering_work_unit(work_unit: ScatteringWorkUnit) -> None:
             )
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
         raise ValueError("Scattering Phase 6 assumes NO_OP replay semantics.")
+    identity_fields = (
+        work_unit.scientific_digest,
+        work_unit.execution_digest,
+        work_unit.run_digest,
+        work_unit.qspace_plan_digest,
+        work_unit.backend_policy_digest,
+        work_unit.source_structure_digest,
+    )
+    if any(value is not None for value in identity_fields) and not all(
+        isinstance(value, str) and value for value in identity_fields
+    ):
+        raise ValueError(
+            "Scattering work-unit identity must include scientific, execution, "
+            "run, qspace-plan, backend-policy, and source-structure digests together."
+        )
 
 
 def scattering_partial_result_identity(

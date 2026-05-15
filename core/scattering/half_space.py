@@ -8,20 +8,18 @@ import numpy as np
 HALF_SPACE_ROLE_FULL = "full"
 HALF_SPACE_ROLE_ZERO_PLANE = "zero_plane"
 HALF_SPACE_ROLE_POSITIVE_HALF = "positive_half"
-HALF_SPACE_ROLE_LEGACY = "legacy"
 
 _VALID_HALF_SPACE_ROLES = {
     HALF_SPACE_ROLE_FULL,
     HALF_SPACE_ROLE_ZERO_PLANE,
     HALF_SPACE_ROLE_POSITIVE_HALF,
-    HALF_SPACE_ROLE_LEGACY,
 }
 _L_INDEX_ATOL = 1e-7
 
 
 def normalize_half_space_role(role: object | None) -> str:
     if role is None:
-        return HALF_SPACE_ROLE_LEGACY
+        raise ValueError("Current-run artifacts must include half_space_role metadata.")
     if isinstance(role, np.ndarray):
         if role.shape == ():
             role = role.item()
@@ -35,10 +33,8 @@ def normalize_half_space_role(role: object | None) -> str:
     return normalized
 
 
-def half_space_role_multiplicity(role: object | None) -> int | None:
+def half_space_role_multiplicity(role: object | None) -> int:
     normalized = normalize_half_space_role(role)
-    if normalized == HALF_SPACE_ROLE_LEGACY:
-        return None
     if normalized == HALF_SPACE_ROLE_POSITIVE_HALF:
         return 2
     return 1
@@ -101,25 +97,7 @@ def half_space_conjugate_reconstruction_required(
         return True
     if role in {HALF_SPACE_ROLE_FULL, HALF_SPACE_ROLE_ZERO_PLANE}:
         return False
-
-    q_arr = np.asarray(q_grid)
-    if q_arr.ndim != 2 or q_arr.shape[1] <= 2 or q_arr.shape[0] == 0:
-        return False
-    l_values = q_arr[:, 2]
-    nonzero_l = np.abs(l_values) > _L_INDEX_ATOL
-    if not bool(np.any(nonzero_l)):
-        return False
-    if not bool(np.all(nonzero_l)):
-        raise ValueError(
-            "Cannot apply half-space conjugate reconstruction to a legacy interval "
-            "that mixes L=0 and nonzero-L points."
-        )
-    if bool(np.any(l_values > _L_INDEX_ATOL)) and bool(np.any(l_values < -_L_INDEX_ATOL)):
-        raise ValueError(
-            "Cannot apply half-space conjugate reconstruction to a legacy interval "
-            "that contains both positive- and negative-L points."
-        )
-    return True
+    raise ValueError(f"Unknown reciprocal half-space role: {role!r}")
 
 
 def apply_half_space_conjugate_reconstruction(
@@ -135,7 +113,6 @@ def apply_half_space_conjugate_reconstruction(
 
 __all__ = [
     "HALF_SPACE_ROLE_FULL",
-    "HALF_SPACE_ROLE_LEGACY",
     "HALF_SPACE_ROLE_POSITIVE_HALF",
     "HALF_SPACE_ROLE_ZERO_PLANE",
     "apply_half_space_conjugate_reconstruction",
