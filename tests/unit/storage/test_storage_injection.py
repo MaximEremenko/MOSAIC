@@ -70,7 +70,7 @@ def test_residual_field_artifact_store_reuses_injected_saver():
     assert nrec == 3
 
 
-def test_residual_field_artifact_store_reads_legacy_chunk_artifacts():
+def test_residual_field_artifact_store_ignores_old_chunk_artifacts():
     saver = FakeSaver()
     saver.save_data({"shapeNd": np.array([[1]])}, "point_data_chunk_8_shapeNd.hdf5")
     saver.save_data(
@@ -94,8 +94,8 @@ def test_residual_field_artifact_store_reads_legacy_chunk_artifacts():
     current, current_av, nrec, shape_nd = store.load_chunk_payloads(8)
     applied = store.load_applied_interval_ids(8)
 
-    np.testing.assert_allclose(shape_nd, np.array([[1]]))
-    np.testing.assert_allclose(current[:, 1], np.array([2 + 0j]))
-    np.testing.assert_allclose(current_av[:, 1], np.array([1 + 0j]))
-    assert nrec == 3
-    assert applied == {4, 5}
+    assert shape_nd is None
+    assert current is None
+    assert current_av is None
+    assert nrec == 0
+    assert applied == set()
