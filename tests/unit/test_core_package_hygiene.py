@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 
@@ -33,6 +34,7 @@ EXPECTED_UNIT_STAGE_DIRS = {
 }
 ALLOWED_CROSS_CUTTING_UNIT_TESTS = {
     "test_application_services.py",
+    "test_ci_ast_check.py",
     "test_core_package_hygiene.py",
     "test_core_package_smoke.py",
     "test_entrypoints.py",
@@ -90,3 +92,13 @@ def test_unit_tests_are_grouped_by_stage_or_kept_cross_cutting():
         if path.is_file() and path.name.startswith("test_") and path.suffix == ".py"
     }
     assert flat_tests == ALLOWED_CROSS_CUTTING_UNIT_TESTS
+
+
+def test_public_package_extras_match_documented_surface():
+    with ROOT.joinpath("pyproject.toml").open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    extras = pyproject["project"]["optional-dependencies"]
+
+    assert set(extras) == {"hpc", "test", "cuda12"}
+    assert set(extras["hpc"]) == {"dask-jobqueue", "dask-mpi"}
+    assert set(extras["test"]) == {"build", "pytest", "pytest-timeout", "twine"}
