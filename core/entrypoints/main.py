@@ -24,7 +24,12 @@ from core.runtime import (
 )
 
 
-def main(run_file: str = "run_parameters.json") -> None:
+def main(
+    run_file: str = "run_parameters.json",
+    *,
+    db_path: str | None = None,
+    no_db_cache: bool = False,
+) -> None:
     parameter_loading_service = ParameterLoadingService()
     run_settings, workflow_parameters = parameter_loading_service.load(run_file)
     parameter_loading_service.apply_runtime_settings(run_settings.runtime)
@@ -89,6 +94,8 @@ def main(run_file: str = "run_parameters.json") -> None:
             run_settings=run_settings,
             workflow_parameters=workflow_parameters,
             client=client,
+            db_path=db_path,
+            no_db_cache=no_db_cache,
         )
     finally:
         shutdown_dask()
@@ -110,13 +117,67 @@ def build_parser() -> argparse.ArgumentParser:
         action="version",
         version=f"%(prog)s {__version__}",
     )
+    parser.add_argument(
+        "--db-path",
+        default=None,
+        help="SQLite cache path, 'local', or ':memory:'. Defaults to output_dir cache DB.",
+    )
+    parser.add_argument(
+        "--no-db-cache",
+        action="store_true",
+        help="Use manifest-only in-memory cache state and do not open SQLite.",
+    )
     return parser
 
 
+def build_publish_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mosaic publish",
+        description="Publish a completed private MOSAIC run to compatibility files.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Processed output directory containing the private .mosaic run namespace.",
+    )
+    parser.add_argument(
+        "--run-digest",
+        required=True,
+        help="Run digest to publish.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace an existing valid public manifest from a different run.",
+    )
+    return parser
+
+
+def publish_main(
+    *,
+    output_dir: str,
+    run_digest: str,
+    replace: bool = False,
+) -> None:
+    from core.storage.publisher import publish_run
+
+    publish_run(output_dir=output_dir, run_digest=run_digest, replace=replace)
+
+
 def cli(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "publish":
+        args = build_publish_parser().parse_args(argv[1:])
+        publish_main(
+            output_dir=args.output_dir,
+            run_digest=args.run_digest,
+            replace=args.replace,
+        )
+        return 0
     args = build_parser().parse_args(argv)
     freeze_support()
-    main(args.run_file)
+    main(args.run_file, db_path=args.db_path, no_db_cache=args.no_db_cache)
     return 0
 
 

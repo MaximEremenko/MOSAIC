@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import inspect
 import os
 import shutil
 from pathlib import Path
@@ -16,9 +17,41 @@ from core.structure.service import StructureLoadingService
 from core.models import RunSettings, WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
 from core.runtime import resolve_worker_scratch_root, short_path
+from core.storage.db_cache import resolve_db_cache_config
 
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_reciprocal_space_with_compatible_signature(
+    reciprocal_space_service: ReciprocalSpacePreparationService,
+    *,
+    workflow_parameters: WorkflowParameters,
+    point_data,
+    supercell,
+    output_dir: str,
+    db_cache_config,
+):
+    prepare = reciprocal_space_service.prepare
+    kwargs = {
+        "workflow_parameters": workflow_parameters,
+        "point_data": point_data,
+        "supercell": supercell,
+        "output_dir": output_dir,
+    }
+    try:
+        signature = inspect.signature(prepare)
+    except (TypeError, ValueError):
+        kwargs["db_cache_config"] = db_cache_config
+        return prepare(**kwargs)
+
+    accepts_db_cache_config = "db_cache_config" in signature.parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    if accepts_db_cache_config:
+        kwargs["db_cache_config"] = db_cache_config
+    return prepare(**kwargs)
 
 
 def recover_local_residual_state_before_scattering(
@@ -111,6 +144,9 @@ class WorkflowService:
         run_settings: RunSettings,
         workflow_parameters: WorkflowParameters,
         client,
+        *,
+        db_path: str | None = None,
+        no_db_cache: bool = False,
     ) -> None:
         artifacts = None
         structure = self.structure_loading_service.load(
@@ -122,6 +158,19 @@ class WorkflowService:
             / "processed_point_data"
         )
         self._prepare_output_dir(output_dir, workflow_parameters)
+        runtime_info = workflow_parameters.runtime_info.to_mapping()
+        db_cache_config = resolve_db_cache_config(
+            run_settings=run_settings,
+            workflow_parameters=workflow_parameters,
+            run_digest=(
+                runtime_info.get("scattering_run_digest")
+                or runtime_info.get("residual_run_digest")
+                or runtime_info.get("residual_field_run_digest")
+            ),
+            output_dir=output_dir,
+            db_path=db_path,
+            no_db_cache=no_db_cache,
+        )
         point_data = self.point_selection_service.select(
             PointSelectionRequest(
                 method=workflow_parameters.rspace_info.method,
@@ -130,11 +179,13 @@ class WorkflowService:
                 hdf5_file_path=str(output_dir / "point_data.hdf5"),
             )
         )
-        artifacts = self.reciprocal_space_service.prepare(
+        artifacts = _prepare_reciprocal_space_with_compatible_signature(
+            self.reciprocal_space_service,
             workflow_parameters=workflow_parameters,
             point_data=point_data,
             supercell=structure.supercell,
             output_dir=str(output_dir),
+            db_cache_config=db_cache_config,
         )
         try:
             recover_local_residual_state_before_scattering(
