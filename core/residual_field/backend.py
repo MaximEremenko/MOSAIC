@@ -1584,8 +1584,8 @@ class ManifestDrivenResidualFieldReducerBackend:
                 output_dir=output_dir,
                 scratch_root=scratch_root,
             ),
-            # T6: uniformly uncompressed. Legacy compressed artifacts remain
-            # readable (np.load auto-detects DEFLATE vs STORE zip members).
+            # Current checkpoint payloads are uniformly uncompressed; old-codebase
+            # checkpoint formats are not a supported compatibility input.
             compress=False,
             quiet_logs=quiet_logs,
         )
@@ -1781,10 +1781,10 @@ class ManifestDrivenResidualFieldReducerBackend:
                         snapshot_point_ids,
                         expected_point_ids,
                     ):
-                        # Legacy partition checkpoints wrote local 0..N-1 IDs
-                        # for every partition. The final public chunk artifact
-                        # must use absolute chunk-row IDs.
-                        snapshot_point_ids = expected_point_ids
+                        raise RuntimeError(
+                            "Residual-field checkpoint point IDs do not match the expected "
+                            "absolute chunk-row IDs for the current artifact contract."
+                        )
                     final_point_ids[point_offset:point_offset + n_points] = snapshot_point_ids
                     final_delta[point_offset:point_offset + n_points] = np.asarray(
                         snapshot["amplitudes_delta"], dtype=np.complex128

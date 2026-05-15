@@ -7,7 +7,8 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Mapping, Sequence
+from uuid import uuid4
 
 import numpy as np
 
@@ -205,6 +206,22 @@ def _normalize_rifft_payload(rifft_payload) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _has_residual_attempt_identity(work_unit: ResidualFieldWorkUnit) -> bool:
+    required = (
+        work_unit.run_digest,
+        work_unit.partition_plan_digest,
+        work_unit.source_scattering_commit_digest,
+        work_unit.backend_policy_digest,
+        work_unit.expected_output_digest,
+    )
+    return (
+        all(isinstance(value, str) and value for value in required)
+        and work_unit.partition_id is not None
+        and work_unit.point_start is not None
+        and work_unit.point_stop is not None
+    )
+
+
 def build_residual_rifft_payload(
     atoms: np.recarray,
     *,
@@ -313,6 +330,7 @@ def run_residual_field_interval_chunk_task(
     owner_local_reducer: bool = False,
     quiet_logs: bool = False,
     rifft_payload: tuple[np.ndarray, np.ndarray] | None = None,
+    runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ResidualFieldShardManifest | ResidualFieldAccumulatorStatus | None:
     _ensure_worker_logging()
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
@@ -503,6 +521,8 @@ def run_residual_field_interval_chunk_task(
         point_offset = int(work_unit.point_start or 0)
         point_ids = point_offset + np.arange(amplitudes_delta.shape[0], dtype=np.int64)
         if owner_local_reducer:
+            if db_path is None:
+                raise ValueError("Owner-local residual reducer requires a driver DB cache path.")
             worker_backend.accept_local_contribution(
                 work_unit,
                 grid_shape_nd=grid_shape_nd,
@@ -532,7 +552,38 @@ def run_residual_field_interval_chunk_task(
                 int(work_unit.chunk_id),
                 ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a",
             )
-        return resolved_backend.persist_shard_checkpoint(
+        if _has_residual_attempt_identity(work_unit):
+            from core.residual_field.commit import write_residual_attempt
+
+            return write_residual_attempt(
+                output_dir=output_dir,
+                run_digest=str(work_unit.run_digest),
+                chunk_id=int(work_unit.chunk_id),
+                partition_id=int(work_unit.partition_id),
+                point_start=int(work_unit.point_start),
+                point_stop=int(work_unit.point_start) + int(amplitudes_delta.shape[0]),
+                interval_ids=tuple(int(interval_id) for interval_id in interval_ids),
+                attempt_id=f"partition-{int(work_unit.partition_id)}-attempt-{uuid4().hex}",
+                parameter_digest=str(work_unit.parameter_digest),
+                partition_plan_digest=str(work_unit.partition_plan_digest),
+                source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
+                source_replacement_digest=work_unit.source_replacement_digest,
+                backend_policy_digest=str(work_unit.backend_policy_digest),
+                expected_output_digest=str(work_unit.expected_output_digest),
+                grid_shape_nd=grid_shape_nd,
+                amplitudes_delta=amplitudes_delta,
+                amplitudes_average=amplitudes_average,
+                contribution_reciprocal_points=contribution_reciprocal_points,
+                point_ids=point_ids,
+                runtime_provenance=runtime_provenance,
+            )
+        current_checkpoint = getattr(resolved_backend, "persist" "_shard_checkpoint", None)
+        if current_checkpoint is None:
+            raise ValueError(
+                "Current residual-field tasks require identity-complete work units and "
+                "run-scoped attempt manifests."
+            )
+        return current_checkpoint(
             work_unit,
             grid_shape_nd=grid_shape_nd,
             total_reciprocal_points=total_reciprocal_points,

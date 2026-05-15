@@ -31,7 +31,6 @@ from core.residual_field.contracts import (
     ResidualFieldReducerProgressManifest,
     ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
-    build_legacy_residual_field_output_artifacts,
     build_residual_field_output_artifacts,
     build_residual_field_shard_artifacts,
     make_residual_field_artifact_key,
@@ -109,13 +108,10 @@ class _ResidualFieldChunkStatusUpdater:
 
 
 class ResidualFieldArtifactStore(ScatteringArtifactStore):
-    """Residual-field chunk artifacts use their own namespace with legacy fallback."""
+    """Residual-field chunk artifacts use their own namespace."""
 
     def build_chunk_artifact_refs(self, chunk_id: int):
         return build_residual_field_output_artifacts(self.output_dir, chunk_id)
-
-    def build_legacy_chunk_artifact_refs(self, chunk_id: int):
-        return build_legacy_residual_field_output_artifacts(self.output_dir, chunk_id)
 
     def chunk_amplitudes_kind(self) -> str:
         return "chunk-residual-values"
@@ -210,7 +206,7 @@ def build_residual_field_reducer_progress_artifact(
     chunk_id: int,
     parameter_digest: str,
 ) -> ArtifactRef:
-    shard_dir = Path(output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = Path(output_dir) / "residual_checkpoints" / f"chunk_{chunk_id}"
     return ArtifactRef(
         stage="residual_field",
         kind="residual-reducer-progress-manifest",
@@ -254,7 +250,7 @@ def stage2_replacement_expected_digest(
         for chunk_id, interval_ids in normalized.items()
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha1(encoded).hexdigest()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_stage2_replacement_expected_artifact(
@@ -264,7 +260,7 @@ def build_stage2_replacement_expected_artifact(
 ) -> ArtifactRef:
     path = (
         Path(output_dir)
-        / "residual_shards"
+        / "residual_checkpoints"
         / f"stage2_replacement_expected_params_{parameter_digest}.manifest.json"
     )
     return ArtifactRef(
@@ -399,7 +395,7 @@ def build_residual_field_generation_artifacts(
     shard_storage_root: str | None = None,
 ) -> tuple[ArtifactRef, ...]:
     shard_root = Path(shard_storage_root or output_dir)
-    shard_dir = shard_root / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = shard_root / "residual_checkpoints" / f"chunk_{chunk_id}"
     partition_token = "owner" if partition_id is None else str(int(partition_id))
     base_name = (
         f"generation_partition_{partition_token}_seq_{int(generation_seq)}"
@@ -471,14 +467,7 @@ def _missing_artifact_paths(artifacts: tuple[ArtifactRef, ...]) -> tuple[str, ..
         path = Path(artifact.path)
         if path.exists():
             continue
-        if (
-            path.suffix == ".hdf5"
-            and artifact.kind in {"residual-shard-data", "interval-precompute"}
-            and path.with_suffix(".npz").exists()
-        ):
-            continue
-        else:
-            missing.append(artifact.key)
+        missing.append(artifact.key)
     return tuple(sorted(missing))
 
 
@@ -638,10 +627,6 @@ def _write_hdf5_payload_atomic(
 
 def _load_array_payload(path: str | Path) -> dict[str, np.ndarray]:
     payload_path = Path(path)
-    if not payload_path.exists() and payload_path.suffix == ".hdf5":
-        legacy_path = payload_path.with_suffix(".npz")
-        if legacy_path.exists():
-            payload_path = legacy_path
     if payload_path.suffix in {".h5", ".hdf5"}:
         with h5py.File(payload_path, "r") as h5file:
             return {name: np.asarray(h5file[name]) for name in h5file.keys()}
@@ -1296,7 +1281,7 @@ def discover_residual_field_shard_manifests(
     shard_storage_root: str | None = None,
     include_stale_generations: bool = False,
 ) -> list[ResidualFieldShardManifest]:
-    shard_dir = Path(shard_storage_root or output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = Path(shard_storage_root or output_dir) / "residual_checkpoints" / f"chunk_{chunk_id}"
     if not shard_dir.exists():
         return []
     manifests: list[ResidualFieldShardManifest] = []
@@ -1551,7 +1536,7 @@ def delete_reclaimable_residual_field_shards(
                 continue
             Path(artifact.path).unlink(missing_ok=True)
         deleted.append(manifest.artifact_key)
-    shard_dir = Path(shard_storage_root or output_dir) / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = Path(shard_storage_root or output_dir) / "residual_checkpoints" / f"chunk_{chunk_id}"
     if shard_dir.exists() and not any(shard_dir.iterdir()):
         shard_dir.rmdir()
     return tuple(sorted(deleted))
@@ -1623,7 +1608,7 @@ def persist_residual_field_shard_checkpoint(
     shard_path.parent.mkdir(parents=True, exist_ok=True)
     scratch_dir = (
         Path(manifest.scratch_root).expanduser()
-        / "residual_shards"
+        / "residual_checkpoints"
         / f"chunk_{work_unit.chunk_id}"
         if manifest.scratch_root
         else shard_path.parent
@@ -1798,7 +1783,7 @@ def persist_residual_field_generation_checkpoint(
     shard_path.parent.mkdir(parents=True, exist_ok=True)
     scratch_dir = (
         Path(manifest.scratch_root).expanduser()
-        / "residual_shards"
+        / "residual_checkpoints"
         / f"chunk_{chunk_id}"
         if manifest.scratch_root
         else shard_path.parent
@@ -2392,34 +2377,17 @@ __all__ = [
     "build_residual_field_output_artifact_refs",
     "build_residual_field_reducer_progress_artifact",
     "build_residual_field_shard_manifest",
-    "build_stage2_replacement_expected_artifact",
     "can_resume_residual_field_work_unit",
-    "delete_reclaimable_residual_field_shards",
     "discover_residual_field_reducer_progress_manifest",
-    "discover_residual_field_shard_manifests",
     "discover_stale_residual_field_generation_manifests",
     "is_residual_field_manifest_complete",
     "is_residual_field_replacement_complete",
-    "is_residual_field_shard_reclaimable",
-    "list_reclaimable_residual_field_shards",
-    "load_existing_residual_field_partial_result",
-    "load_existing_materialized_state",
     "load_residual_field_generation_metadata",
     "load_residual_field_generation_payload",
     "load_residual_field_reducer_progress_manifest",
-    "load_residual_field_shard_manifest",
-    "load_residual_field_shard_payload",
-    "load_stage2_replacement_expected_manifest",
-    "normalize_stage2_replacement_expected_by_chunk",
     "parse_residual_field_generation_ref",
     "persist_residual_field_generation_checkpoint",
-    "persist_residual_field_shard_checkpoint",
-    "persist_residual_field_chunk_result",
-    "persist_residual_field_interval_chunk_result",
     "reconcile_residual_field_reducer_progress",
-    "reduce_residual_field_shards_for_chunk",
-    "stage2_replacement_expected_digest",
     "summarize_residual_field_generation_metrics",
-    "write_stage2_replacement_expected_manifest",
     "write_residual_field_reducer_progress_manifest",
 ]

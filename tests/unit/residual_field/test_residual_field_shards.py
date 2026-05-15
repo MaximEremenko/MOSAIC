@@ -156,7 +156,7 @@ def test_residual_field_batch_shard_checkpoint_uses_single_durable_manifest(tmp_
     assert manifest.scratch_root == str(scratch_root)
     assert Path(manifest.artifacts[0].path).exists()
     assert Path(manifest.artifacts[1].path).exists()
-    scratch_shard_dir = scratch_root / "residual_shards" / "chunk_3"
+    scratch_shard_dir = scratch_root / "residual_checkpoints" / "chunk_3"
     assert list(scratch_shard_dir.glob("*.npz")) == []
     assert list(scratch_shard_dir.glob("*.hdf5")) == []
 
@@ -301,7 +301,7 @@ def test_residual_field_backend_round_trip_preserves_reducer_progress(tmp_path):
         assert progress.completion_status is CompletionStatus.COMMITTED
         assert progress.incorporated_interval_ids == (interval_id_1, interval_id_2)
         assert deleted == ()
-        durable_shard_dir = tmp_path / "residual_shards" / "chunk_3"
+        durable_shard_dir = tmp_path / "residual_checkpoints" / "chunk_3"
         assert durable_shard_dir.exists()
     finally:
         db.close()
@@ -1094,7 +1094,7 @@ def test_local_backend_repairs_db_from_committed_progress_without_snapshots(tmp_
         db.update_interval_chunk_status(interval_id_1, 3, saved=0)
         db.update_interval_chunk_status(interval_id_2, 3, saved=0)
         assert db.get_unsaved_interval_chunks() == [(interval_id_1, 3), (interval_id_2, 3)]
-        assert list((tmp_path / "residual_shards" / "chunk_3").glob("local_accumulator*.npz")) == []
+        assert list((tmp_path / "residual_checkpoints" / "chunk_3").glob("local_accumulator*.npz")) == []
 
         repaired_manifest = backend.finalize_chunk(
             chunk_id=3,

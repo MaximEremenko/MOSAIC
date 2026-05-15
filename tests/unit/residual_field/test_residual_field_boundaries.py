@@ -2,6 +2,7 @@ import logging
 import pickle
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 import pytest
 
@@ -42,7 +43,7 @@ from core.residual_field.tasks import (
     build_residual_rifft_payload,
     run_residual_field_interval_chunk_task,
 )
-from core.scattering.accumulation import HALF_SPACE_ROLE_POSITIVE_HALF
+from core.scattering.accumulation import HALF_SPACE_ROLE_FULL, HALF_SPACE_ROLE_POSITIVE_HALF
 from core.scattering.kernels import IntervalTask
 from core.storage.database_manager import DatabaseManager
 
@@ -65,6 +66,30 @@ class _CapturingReducerBackend:
 
 class _StopAfterIntervalPayloadScatter(RuntimeError):
     pass
+
+
+def _write_interval_hdf5(
+    path,
+    *,
+    irecip_id,
+    q_grid,
+    q_amp,
+    q_amp_av,
+    element="All",
+    half_space_role=HALF_SPACE_ROLE_FULL,
+    reciprocal_multiplicity=1,
+):
+    with h5py.File(path, "w") as h5file:
+        h5file.create_dataset("irecip_id", data=np.array([irecip_id], dtype=np.int64))
+        h5file.create_dataset("element", data=np.bytes_(element))
+        h5file.create_dataset("q_grid", data=np.asarray(q_grid))
+        h5file.create_dataset("q_amp", data=np.asarray(q_amp))
+        h5file.create_dataset("q_amp_av", data=np.asarray(q_amp_av))
+        h5file.create_dataset("half_space_role", data=np.bytes_(half_space_role))
+        h5file.create_dataset(
+            "reciprocal_multiplicity",
+            data=np.array([reciprocal_multiplicity], dtype=np.int64),
+        )
 
 
 class _FakeLocalReducerBackend:
@@ -949,13 +974,7 @@ def test_residual_field_loader_reconstructs_grid_and_normalizes_values(tmp_path)
         amplitudes_average_payload=payload.copy(),
         reciprocal_point_count=2,
     )
-    store.saver.save_data(
-        {
-            "ntotal_reciprocal_space_points": np.array([2], dtype=np.int64),
-            "ntotal_reciprocal_points": np.array([2], dtype=np.int64),
-        },
-        store.saver.generate_filename(3, suffix="_amplitudes_ntotal_reciprocal_space_points"),
-    )
+    store.ensure_total_reciprocal_points(3, 2)
 
     class FakePointDataProcessor:
         def generate_grid(
@@ -3233,11 +3252,10 @@ def test_residual_field_sync_stage_uses_worker_owned_local_reducer_boundary(
 
 
 def test_residual_field_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_path):
-    interval_path = tmp_path / "interval_1.npz"
-    np.savez(
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_interval_hdf5(
         interval_path,
-        irecip_id=np.array([1], dtype=np.int64),
-        element=np.array(["All"]),
+        irecip_id=1,
         q_grid=np.array([[0.0]], dtype=np.float64),
         q_amp=np.array([2.0 + 0.0j]),
         q_amp_av=np.array([1.0 + 0.0j]),
@@ -3289,16 +3307,15 @@ def test_residual_field_interval_chunk_task_reconstructs_positive_half_space(
     monkeypatch,
     tmp_path,
 ):
-    interval_path = tmp_path / "interval_1.npz"
-    np.savez(
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_interval_hdf5(
         interval_path,
-        irecip_id=np.array([1], dtype=np.int64),
-        element=np.array(["All"]),
+        irecip_id=1,
         q_grid=np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
         q_amp=np.array([2.0 + 0.0j]),
         q_amp_av=np.array([1.0 + 0.0j]),
-        half_space_role=np.array(HALF_SPACE_ROLE_POSITIVE_HALF),
-        reciprocal_multiplicity=np.array([2], dtype=np.int64),
+        half_space_role=HALF_SPACE_ROLE_POSITIVE_HALF,
+        reciprocal_multiplicity=2,
     )
     atoms = np.array(
         [([0.0], [0.1], [0.05])],
@@ -3841,16 +3858,15 @@ def test_residual_field_interval_chunk_task_slices_partition_atoms_for_owner_loc
 
 def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(monkeypatch, tmp_path):
     monkeypatch.delenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", raising=False)
-    interval_path_1 = tmp_path / "interval_1.npz"
-    interval_path_2 = tmp_path / "interval_2.npz"
+    interval_path_1 = tmp_path / "interval_1.hdf5"
+    interval_path_2 = tmp_path / "interval_2.hdf5"
     for path, interval_id, q_amp in (
         (interval_path_1, 1, 2.0 + 0.0j),
         (interval_path_2, 2, 4.0 + 0.0j),
     ):
-        np.savez(
+        _write_interval_hdf5(
             path,
-            irecip_id=np.array([interval_id], dtype=np.int64),
-            element=np.array(["All"]),
+            irecip_id=interval_id,
             q_grid=np.array([[0.0]], dtype=np.float64),
             q_amp=np.array([q_amp]),
             q_amp_av=np.array([1.0 + 0.0j]),
@@ -3985,20 +4001,18 @@ def test_residual_field_interval_chunk_task_can_disable_same_q_grid_presum(monke
 
 
 def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypatch, tmp_path):
-    interval_path_1 = tmp_path / "interval_1.npz"
-    interval_path_2 = tmp_path / "interval_2.npz"
-    np.savez(
+    interval_path_1 = tmp_path / "interval_1.hdf5"
+    interval_path_2 = tmp_path / "interval_2.hdf5"
+    _write_interval_hdf5(
         interval_path_1,
-        irecip_id=np.array([1], dtype=np.int64),
-        element=np.array(["All"]),
+        irecip_id=1,
         q_grid=np.array([[0.0]], dtype=np.float64),
         q_amp=np.array([2.0 + 0.0j]),
         q_amp_av=np.array([1.0 + 0.0j]),
     )
-    np.savez(
+    _write_interval_hdf5(
         interval_path_2,
-        irecip_id=np.array([2], dtype=np.int64),
-        element=np.array(["All"]),
+        irecip_id=2,
         q_grid=np.array([[1.0]], dtype=np.float64),
         q_amp=np.array([4.0 + 0.0j]),
         q_amp_av=np.array([1.0 + 0.0j]),

@@ -124,7 +124,7 @@ def build_local_accumulator_snapshot_path(
     )
     return (
         Path(output_dir)
-        / "residual_shards"
+        / "residual_checkpoints"
         / f"chunk_{chunk_id}"
         / f"local_accumulator{partition_suffix}_seq_{int(snapshot_seq)}_params_{parameter_digest}.npz"
     )

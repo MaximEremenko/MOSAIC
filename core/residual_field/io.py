@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 
 from core.residual_field.contracts import (
-    build_legacy_residual_field_output_artifacts,
     build_residual_field_output_artifacts,
 )
 
@@ -34,14 +33,6 @@ def resolve_residual_chunk_artifact_filename(output_dir: str, chunk_id: int, kin
     primary = Path(primary_refs[kind].path).name
     if (Path(output_dir) / primary).exists():
         return primary
-
-    legacy_refs = {
-        artifact.kind: artifact
-        for artifact in build_legacy_residual_field_output_artifacts(output_dir, chunk_id)
-    }
-    legacy = Path(legacy_refs[kind].path).name
-    if (Path(output_dir) / legacy).exists():
-        return legacy
     return primary
 
 

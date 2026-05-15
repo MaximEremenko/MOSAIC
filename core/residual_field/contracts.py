@@ -167,14 +167,8 @@ def build_residual_field_interval_source_artifacts(
 def build_residual_field_output_artifacts(
     output_dir: str,
     chunk_id: int,
-    *,
-    legacy_layout: bool = False,
 ) -> tuple[ArtifactRef, ...]:
-    chunk_prefix = Path(output_dir) / (
-        f"point_data_chunk_{chunk_id}"
-        if legacy_layout
-        else f"residual_chunk_{chunk_id}"
-    )
+    chunk_prefix = Path(output_dir) / f"residual_chunk_{chunk_id}"
     return (
         ArtifactRef(
             stage="residual_field",
@@ -230,18 +224,6 @@ def build_residual_field_output_artifacts(
         ),
     )
 
-
-def build_legacy_residual_field_output_artifacts(
-    output_dir: str,
-    chunk_id: int,
-) -> tuple[ArtifactRef, ...]:
-    return build_residual_field_output_artifacts(
-        output_dir,
-        chunk_id,
-        legacy_layout=True,
-    )
-
-
 def build_residual_field_shard_artifacts(
     output_dir: str,
     *,
@@ -251,7 +233,7 @@ def build_residual_field_shard_artifacts(
     shard_storage_root: str | None = None,
 ) -> tuple[ArtifactRef, ...]:
     shard_root = Path(shard_storage_root or output_dir)
-    shard_dir = shard_root / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = shard_root / "residual_checkpoints" / f"chunk_{chunk_id}"
     batch_token = make_residual_field_batch_token(interval_ids)
     base_name = f"batch_{batch_token}_params_{parameter_digest}"
     return (
@@ -300,6 +282,12 @@ class ResidualFieldWorkUnit:
     partition_id: int | None = None
     point_start: int | None = None
     point_stop: int | None = None
+    run_digest: str | None = None
+    partition_plan_digest: str | None = None
+    source_scattering_commit_digest: str | None = None
+    source_replacement_digest: str | None = None
+    backend_policy_digest: str | None = None
+    expected_output_digest: str | None = None
     schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -311,6 +299,12 @@ class ResidualFieldWorkUnit:
         output_dir: str,
         patch_scope: str | None = None,
         window_spec: str | None = None,
+        run_digest: str | None = None,
+        partition_plan_digest: str | None = None,
+        source_scattering_commit_digest: str | None = None,
+        source_replacement_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        expected_output_digest: str | None = None,
     ) -> "ResidualFieldWorkUnit":
         return cls(
             chunk_id=chunk_id,
@@ -320,6 +314,12 @@ class ResidualFieldWorkUnit:
             source_artifacts=build_residual_field_source_artifacts(output_dir, chunk_id),
             patch_scope=patch_scope,
             window_spec=window_spec,
+            run_digest=run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=source_replacement_digest,
+            backend_policy_digest=backend_policy_digest,
+            expected_output_digest=expected_output_digest,
             artifact_key=make_residual_field_artifact_key(
                 "chunk-scope",
                 chunk_id=chunk_id,
@@ -347,6 +347,12 @@ class ResidualFieldWorkUnit:
         output_dir: str,
         patch_scope: str | None = None,
         window_spec: str | None = None,
+        run_digest: str | None = None,
+        partition_plan_digest: str | None = None,
+        source_scattering_commit_digest: str | None = None,
+        source_replacement_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        expected_output_digest: str | None = None,
     ) -> "ResidualFieldWorkUnit":
         return cls(
             chunk_id=chunk_id,
@@ -359,6 +365,12 @@ class ResidualFieldWorkUnit:
             ),
             patch_scope=patch_scope,
             window_spec=window_spec,
+            run_digest=run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=source_replacement_digest,
+            backend_policy_digest=backend_policy_digest,
+            expected_output_digest=expected_output_digest,
             artifact_key=make_residual_field_artifact_key(
                 "interval-chunk",
                 chunk_id=chunk_id,
@@ -390,6 +402,12 @@ class ResidualFieldWorkUnit:
         output_dir: str,
         patch_scope: str | None = None,
         window_spec: str | None = None,
+        run_digest: str | None = None,
+        partition_plan_digest: str | None = None,
+        source_scattering_commit_digest: str | None = None,
+        source_replacement_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        expected_output_digest: str | None = None,
     ) -> "ResidualFieldWorkUnit":
         normalized = tuple(sorted(int(interval_id) for interval_id in interval_ids))
         if not normalized:
@@ -410,6 +428,12 @@ class ResidualFieldWorkUnit:
             ),
             patch_scope=patch_scope,
             window_spec=window_spec,
+            run_digest=run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=source_replacement_digest,
+            backend_policy_digest=backend_policy_digest,
+            expected_output_digest=expected_output_digest,
             artifact_key=make_residual_field_artifact_key(
                 "interval-batch",
                 chunk_id=chunk_id,
@@ -639,6 +663,27 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
         raise ValueError("Residual-field work units must not contain duplicate source artifact keys.")
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
         raise ValueError("Residual-field Phase 6 assumes NO_OP replay semantics.")
+    identity_values = (
+        work_unit.run_digest,
+        work_unit.partition_plan_digest,
+        work_unit.source_scattering_commit_digest,
+        work_unit.source_replacement_digest,
+        work_unit.backend_policy_digest,
+        work_unit.expected_output_digest,
+    )
+    if any(value is not None for value in identity_values):
+        required_current_identity = (
+            work_unit.run_digest,
+            work_unit.partition_plan_digest,
+            work_unit.source_scattering_commit_digest,
+            work_unit.backend_policy_digest,
+            work_unit.expected_output_digest,
+        )
+        if not all(isinstance(value, str) and value for value in required_current_identity):
+            raise ValueError(
+                "Current-run residual-field work units must include run, partition-plan, "
+                "source scattering commit, backend-policy, and expected-output identity."
+            )
     if work_unit.partition_id is None:
         if work_unit.point_start is not None or work_unit.point_stop is not None:
             raise ValueError(
@@ -964,7 +1009,6 @@ __all__ = [
     "ResidualFieldReducerProgressManifest",
     "ResidualFieldShardManifest",
     "ResidualFieldWorkUnit",
-    "build_legacy_residual_field_output_artifacts",
     "build_residual_field_interval_source_artifacts",
     "build_residual_field_output_artifacts",
     "build_residual_field_shard_artifacts",

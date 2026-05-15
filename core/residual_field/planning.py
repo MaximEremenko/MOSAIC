@@ -122,7 +122,7 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
         },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
 
 
 def _batch_interval_chunks(
