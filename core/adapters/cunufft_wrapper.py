@@ -47,7 +47,7 @@ def _coord_sig(arr) -> bytes:
             host = np.ascontiguousarray(np.asarray(arr))
     else:
         host = np.ascontiguousarray(np.asarray(arr))
-    return hashlib.sha1(host.view(np.uint8).tobytes()).digest()[:8]
+    return hashlib.sha256(host.view(np.uint8).tobytes()).digest()[:8]
 
 
 def _coords_sig(cols) -> bytes:

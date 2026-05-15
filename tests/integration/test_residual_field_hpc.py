@@ -192,7 +192,7 @@ def test_distributed_durable_residual_field_owner_local_generations_restart_and_
         )
         assert generation_manifests
         assert all(parse_residual_field_generation_ref(manifest) is not None for manifest in generation_manifests)
-        shard_dir = tmp_path / "residual_shards" / "chunk_3"
+        shard_dir = tmp_path / "residual_checkpoints" / "chunk_3"
         assert sorted(path.name for path in shard_dir.glob("batch_*")) == []
         generation_paths_before = sorted(path.name for path in shard_dir.glob("generation_*"))
         assert generation_paths_before
