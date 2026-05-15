@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import h5py
 import numpy as np
 
 from core.scattering.accumulation import (
@@ -31,6 +32,28 @@ from core.scattering.tasks import (
 )
 from core.contracts import CompletionStatus
 from core.storage.database_manager import DatabaseManager
+
+
+def _write_current_interval_payload(
+    path,
+    *,
+    q_grid,
+    q_amp,
+    q_amp_av,
+    half_space_role="full",
+    reciprocal_multiplicity=1,
+):
+    with h5py.File(path, "w") as h5file:
+        h5file.create_dataset("irecip_id", data=np.array([1], dtype=np.int64))
+        h5file.create_dataset("element", data=np.bytes_("All"))
+        h5file.create_dataset("q_grid", data=np.asarray(q_grid))
+        h5file.create_dataset("q_amp", data=np.asarray(q_amp))
+        h5file.create_dataset("q_amp_av", data=np.asarray(q_amp_av))
+        h5file.create_dataset("half_space_role", data=np.bytes_(half_space_role))
+        h5file.create_dataset(
+            "reciprocal_multiplicity",
+            data=np.array([int(reciprocal_multiplicity)], dtype=np.int64),
+        )
 
 
 def test_planning_builds_deterministic_scattering_work_units(tmp_path):
@@ -722,11 +745,9 @@ def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path)
 
 
 def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_path):
-    interval_path = tmp_path / "interval_1.npz"
-    np.savez(
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_current_interval_payload(
         interval_path,
-        irecip_id=np.array([1], dtype=np.int64),
-        element=np.array(["All"]),
         q_grid=np.array([[0.0]], dtype=np.float64),
         q_amp=np.array([2.0 + 0.0j]),
         q_amp_av=np.array([1.0 + 0.0j]),
@@ -776,20 +797,73 @@ def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_pa
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))
 
 
+def test_scattering_interval_chunk_task_accepts_transient_interval_payload(
+    monkeypatch,
+    tmp_path,
+):
+    interval_payload = IntervalTask(
+        1,
+        "All",
+        np.array([[0.0]], dtype=np.float64),
+        np.array([2.0 + 0.0j]),
+        np.array([1.0 + 0.0j]),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "core.scattering.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
+        lambda **kwargs: np.array([[3.0 + 0.0j], [4.0 + 0.0j]]),
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
+        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
+    )
+
+    result = run_scattering_interval_chunk_task(
+        ScatteringWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            dimension=1,
+            output_dir=str(tmp_path),
+        ),
+        interval_payload,
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        db_path=str(tmp_path / "state.db"),
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    assert captured["contribution_reciprocal_points"] == 1
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([3.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))
+
+
 def test_scattering_interval_chunk_task_reconstructs_positive_half_space(
     monkeypatch,
     tmp_path,
 ):
-    interval_path = tmp_path / "interval_1.npz"
-    np.savez(
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_current_interval_payload(
         interval_path,
-        irecip_id=np.array([1], dtype=np.int64),
-        element=np.array(["All"]),
         q_grid=np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
         q_amp=np.array([2.0 + 0.0j]),
         q_amp_av=np.array([1.0 + 0.0j]),
-        half_space_role=np.array(HALF_SPACE_ROLE_POSITIVE_HALF),
-        reciprocal_multiplicity=np.array([2], dtype=np.int64),
+        half_space_role=HALF_SPACE_ROLE_POSITIVE_HALF,
+        reciprocal_multiplicity=2,
     )
     atoms = np.array(
         [([0.0], [0.1], [0.05])],

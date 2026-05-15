@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from core.scattering.artifacts import persist_scattering_interval_chunk_result
 from core.scattering.contracts import ScatteringWorkUnit
+from core.scattering.half_space import (
+    half_space_role_multiplicity,
+)
 from core.scattering.kernels import IntervalTask
 
 
@@ -18,6 +21,7 @@ def save_amplitudes_and_meta(
     quiet_logs: bool = False,
 ) -> None:
     output_dir = point_data_processor.data_saver.output_dir
+    reciprocal_multiplicity = half_space_role_multiplicity(task.half_space_role) or 1
     work_unit = ScatteringWorkUnit.interval_chunk(
         interval_id=int(task.irecip_id),
         chunk_id=int(chunk_id),
@@ -28,11 +32,7 @@ def save_amplitudes_and_meta(
         work_unit,
         grid_shape_nd=grid_shape_nd,
         total_reciprocal_points=total_reciprocal_points,
-        contribution_reciprocal_points=(
-            int(task.q_grid.shape[0]) * 2
-            if task.q_grid.shape[1] > 2 and abs(task.q_grid[:, 2]).max() > 1e-7
-            else int(task.q_grid.shape[0])
-        ),
+        contribution_reciprocal_points=int(task.q_grid.shape[0]) * int(reciprocal_multiplicity),
         amplitudes_delta=amplitudes_delta,
         amplitudes_average=amplitudes_average,
         output_dir=output_dir,

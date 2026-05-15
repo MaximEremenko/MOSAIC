@@ -4,6 +4,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pytest
 
 from core.scattering.artifacts import persist_precomputed_interval_artifact
 from core.scattering.contracts import ScatteringWorkUnit
@@ -18,17 +19,6 @@ def _sample_task(seed: int = 0) -> IntervalTask:
     q_amp = rng.standard_normal((17,)).astype(np.complex128)
     q_amp_av = rng.standard_normal((17,)).astype(np.complex128)
     return IntervalTask(1, "Si", q_grid, q_amp, q_amp_av)
-
-
-def _write_legacy_npz(path: Path, task: IntervalTask) -> None:
-    np.savez(
-        path,
-        irecip_id=task.irecip_id,
-        element=task.element,
-        q_grid=task.q_grid,
-        q_amp=task.q_amp,
-        q_amp_av=task.q_amp_av,
-    )
 
 
 def test_interval_artifact_hdf5_roundtrip_and_digest(tmp_path):
@@ -66,14 +56,17 @@ def test_interval_artifact_hdf5_roundtrip_and_digest(tmp_path):
         db.close()
 
 
-def test_interval_loader_preserves_legacy_npz_read(tmp_path):
+def test_interval_loader_rejects_npz_intermediate_payloads(tmp_path):
     task = _sample_task()
     path = tmp_path / "interval_1.npz"
-    _write_legacy_npz(path, task)
+    np.savez(
+        path,
+        irecip_id=task.irecip_id,
+        element=task.element,
+        q_grid=task.q_grid,
+        q_amp=task.q_amp,
+        q_amp_av=task.q_amp_av,
+    )
 
-    loaded = load_interval_task_payload(path)
-
-    assert loaded.irecip_id == task.irecip_id
-    assert loaded.element == task.element
-    np.testing.assert_array_equal(loaded.q_grid, task.q_grid)
-    assert loaded.q_grid_digest is None
+    with pytest.raises(ValueError, match="must be HDF5"):
+        load_interval_task_payload(path)

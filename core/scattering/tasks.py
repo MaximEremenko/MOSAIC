@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any, Mapping
 
 import h5py
 import numpy as np
 
-from core.scattering.accumulation import (
-    apply_half_space_conjugate_reconstruction,
-    half_space_conjugate_reconstruction_required,
-)
+from core.scattering.accumulation import apply_half_space_conjugate_reconstruction
 from core.scattering.half_space import (
     classify_interval_half_space_role,
     half_space_role_multiplicity,
@@ -57,14 +55,19 @@ def _lower_worker_log_levels() -> None:
             pass
 
 
-def load_interval_task_payload(interval_path: Path) -> IntervalTask:
+def load_interval_task_payload(interval_path: Path | str | IntervalTask) -> IntervalTask:
+    if isinstance(interval_path, IntervalTask):
+        return interval_path
     path = Path(interval_path)
-    if not path.exists() and path.suffix == ".hdf5":
-        legacy_path = path.with_suffix(".npz")
-        if legacy_path.exists():
-            path = legacy_path
+    if path.suffix not in {".h5", ".hdf5"}:
+        raise ValueError("Current-run interval payloads must be HDF5 artifacts.")
     if path.suffix in {".h5", ".hdf5"}:
         with h5py.File(path, "r") as data:
+            if "half_space_role" not in data or "reciprocal_multiplicity" not in data:
+                raise ValueError(
+                    "Current-run interval payloads must include half_space_role "
+                    "and reciprocal_multiplicity metadata."
+                )
             element = data["element"][()]
             if isinstance(element, bytes):
                 element = element.decode("utf-8")
@@ -75,16 +78,8 @@ def load_interval_task_payload(interval_path: Path) -> IntervalTask:
                     q_grid_digest = q_grid_digest.decode("ascii")
                 else:
                     q_grid_digest = str(q_grid_digest)
-            half_space_role = (
-                normalize_half_space_role(data["half_space_role"][()])
-                if "half_space_role" in data
-                else "legacy"
-            )
-            reciprocal_multiplicity = (
-                int(np.asarray(data["reciprocal_multiplicity"]).reshape(-1)[0])
-                if "reciprocal_multiplicity" in data
-                else 0
-            )
+            half_space_role = normalize_half_space_role(data["half_space_role"][()])
+            reciprocal_multiplicity = int(np.asarray(data["reciprocal_multiplicity"]).reshape(-1)[0])
             return IntervalTask(
                 int(np.asarray(data["irecip_id"]).reshape(-1)[0]),
                 str(element),
@@ -95,44 +90,13 @@ def load_interval_task_payload(interval_path: Path) -> IntervalTask:
                 half_space_role=half_space_role,
                 reciprocal_multiplicity=reciprocal_multiplicity,
             )
-    with np.load(path, mmap_mode="r") as data:
-        half_space_role = (
-            normalize_half_space_role(data["half_space_role"])
-            if "half_space_role" in data.files
-            else "legacy"
-        )
-        reciprocal_multiplicity = (
-            int(np.asarray(data["reciprocal_multiplicity"]).ravel()[0])
-            if "reciprocal_multiplicity" in data.files
-            else 0
-        )
-        q_grid_digest = None
-        if "q_grid_digest" in data.files:
-            q_grid_digest = data["q_grid_digest"].item()
-            if isinstance(q_grid_digest, bytes):
-                q_grid_digest = q_grid_digest.decode("ascii")
-            else:
-                q_grid_digest = str(q_grid_digest)
-        return IntervalTask(
-            int(data["irecip_id"].item()),
-            str(data["element"].item()),
-            data["q_grid"],
-            data["q_amp"],
-            data["q_amp_av"],
-            q_grid_digest=q_grid_digest,
-            half_space_role=half_space_role,
-            reciprocal_multiplicity=reciprocal_multiplicity,
-        )
+    raise ValueError(f"Unsupported interval payload format: {path.suffix}")
 
 
 def scattering_contribution_point_count(interval_task: IntervalTask) -> int:
     q_grid = interval_task.q_grid
     multiplicity = half_space_role_multiplicity(interval_task.half_space_role)
-    if multiplicity is not None:
-        return int(q_grid.shape[0]) * int(multiplicity)
-    if half_space_conjugate_reconstruction_required(q_grid, interval_task.half_space_role):
-        return int(q_grid.shape[0]) * 2
-    return int(q_grid.shape[0])
+    return int(q_grid.shape[0]) * int(multiplicity)
 
 
 def compute_scattering_interval_payload(
@@ -210,9 +174,9 @@ def run_scattering_interval_task(
     unique_elements: list[str],
     ff_factory,
     output_dir: str,
-    db_path: str,
+    db_path: str | None = None,
 ) -> ScatteringArtifactManifest | None:
-    if is_interval_artifact_committed(work_unit, db_path=db_path):
+    if db_path is not None and is_interval_artifact_committed(work_unit, db_path=db_path):
         return build_scattering_interval_manifest(
             work_unit,
             completion_status=CompletionStatus.COMMITTED,
@@ -236,23 +200,25 @@ def run_scattering_interval_task(
     if interval_task is None:
         # Mask eliminated all Q-points in this interval.  Mark it as
         # precomputed so that downstream stages (Stage-2 and
-        # residual-field) do not attempt to load a non-existent .npz.
-        mark_empty_interval_precomputed(
-            work_unit.interval_id, db_path=db_path
-        )
+        # residual-field) do not attempt to load a non-existent interval artifact.
+        if db_path is not None:
+            mark_empty_interval_precomputed(
+                work_unit.interval_id, db_path=db_path
+            )
         return None
     return persist_precomputed_interval_artifact(work_unit, interval_task, db_path=db_path)
 
 
 def run_scattering_interval_chunk_task(
     work_unit: ScatteringWorkUnit,
-    interval_path: Path,
+    interval_path: Path | str | IntervalTask,
     atoms: np.recarray,
     *,
     total_reciprocal_points: int,
     output_dir: str,
-    db_path: str,
+    db_path: str | None = None,
     quiet_logs: bool = False,
+    runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ScatteringArtifactManifest | None:
     if quiet_logs:
         _lower_worker_log_levels()
@@ -300,6 +266,7 @@ def run_scattering_interval_chunk_task(
             amplitudes_average=amplitudes_average,
             output_dir=output_dir,
             quiet_logs=quiet_logs,
+            runtime_provenance=runtime_provenance,
         )
     except Exception as err:
         logger.error(

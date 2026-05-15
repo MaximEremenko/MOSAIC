@@ -4,17 +4,25 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from core.residual_field.artifacts import (
-    ResidualFieldArtifactStore,
-    load_stage2_replacement_expected_manifest,
-    persist_residual_field_shard_checkpoint,
-    write_stage2_replacement_expected_manifest,
-)
+from core.residual_field.commit import write_residual_attempt
 from core.scattering.execution import (
     _resolve_scattering_interval_artifact_policy,
     run_stage2_replacement_execution,
 )
+from core.scattering.planning import ScatteringWorkIdentity
+from core.storage.attempt_store import stage_commit_path
 from core.storage.database_manager import DatabaseManager
+
+
+def _work_identity():
+    return ScatteringWorkIdentity(
+        scientific_digest="1" * 64,
+        execution_digest="2" * 64,
+        run_digest="stage2run",
+        qspace_plan_digest="3" * 64,
+        backend_policy_digest="4" * 64,
+        source_structure_digest="5" * 64,
+    )
 
 
 def _db_with_replacement_work(tmp_path):
@@ -76,20 +84,30 @@ def test_stage2_replacement_execution_reduces_to_residual_outputs(
             owner_local_reducer,
             quiet_logs,
             **kwargs,
-        ):
-            del interval_inputs, atoms, db_path, scratch_root
-            del reducer_backend, owner_local_reducer, quiet_logs, kwargs
-            return persist_residual_field_shard_checkpoint(
-                work_unit,
-                grid_shape_nd=np.array([[1]], dtype=np.int64),
-                total_reciprocal_points=int(total_reciprocal_points),
-                contribution_reciprocal_points=5,
-                amplitudes_delta=np.array([5 + 0j]),
-                amplitudes_average=np.array([7 + 0j]),
-                point_ids=np.array([10]),
-                output_dir=output_dir,
-                quiet_logs=True,
-            )
+            ):
+                del interval_inputs, atoms, db_path, scratch_root
+                del reducer_backend, owner_local_reducer, quiet_logs, kwargs
+                return write_residual_attempt(
+                    output_dir=output_dir,
+                    run_digest=str(work_unit.run_digest),
+                    chunk_id=int(work_unit.chunk_id),
+                    partition_id=int(work_unit.partition_id),
+                    point_start=int(work_unit.point_start),
+                    point_stop=int(work_unit.point_stop),
+                    interval_ids=tuple(int(item) for item in work_unit.interval_ids),
+                    attempt_id="try1",
+                    parameter_digest=str(work_unit.parameter_digest),
+                    partition_plan_digest=str(work_unit.partition_plan_digest),
+                    source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
+                    source_replacement_digest=work_unit.source_replacement_digest,
+                    backend_policy_digest=str(work_unit.backend_policy_digest),
+                    expected_output_digest=str(work_unit.expected_output_digest),
+                    grid_shape_nd=np.array([[1]], dtype=np.int64),
+                    contribution_reciprocal_points=5,
+                    amplitudes_delta=np.array([5 + 0j]),
+                    amplitudes_average=np.array([7 + 0j]),
+                    point_ids=np.array([10]),
+                )
 
         monkeypatch.setattr(
             "core.residual_field.tasks.run_residual_field_interval_chunk_task",
@@ -104,22 +122,15 @@ def test_stage2_replacement_execution_reduces_to_residual_outputs(
             client=None,
             output_dir=str(tmp_path),
             parameter_digest="abc123",
+            work_identity=_work_identity(),
             max_intervals_per_shard=2,
             max_inflight=4,
         )
 
-        store = ResidualFieldArtifactStore(str(tmp_path))
-        amplitudes, amplitudes_av, nrec, _ = store.load_chunk_payloads(3)
-        manifest_expected = load_stage2_replacement_expected_manifest(
-            output_dir=str(tmp_path),
-            parameter_digest="abc123",
-        )
         assert expected == {3: interval_ids}
-        assert manifest_expected == {3: interval_ids}
         assert db.get_unsaved_interval_chunks() == []
-        assert nrec == 5
-        np.testing.assert_allclose(amplitudes[:, 1], np.array([5 + 0j]))
-        np.testing.assert_allclose(amplitudes_av[:, 1], np.array([7 + 0j]))
+        assert stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
+        assert not (tmp_path / "residual_chunk_3_amplitudes.hdf5").exists()
     finally:
         db.close()
 
@@ -145,32 +156,42 @@ def test_stage2_replacement_writes_expected_manifest_before_reduce_failure(
             owner_local_reducer,
             quiet_logs,
             **kwargs,
-        ):
-            del interval_inputs, atoms, db_path, scratch_root
-            del reducer_backend, owner_local_reducer, quiet_logs, kwargs
-            return persist_residual_field_shard_checkpoint(
-                work_unit,
-                grid_shape_nd=np.array([[1]], dtype=np.int64),
-                total_reciprocal_points=int(total_reciprocal_points),
-                contribution_reciprocal_points=5,
-                amplitudes_delta=np.array([5 + 0j]),
-                amplitudes_average=np.array([7 + 0j]),
-                point_ids=np.array([10]),
-                output_dir=output_dir,
-                quiet_logs=True,
-            )
+            ):
+                del interval_inputs, atoms, db_path, scratch_root
+                del reducer_backend, owner_local_reducer, quiet_logs, kwargs
+                return write_residual_attempt(
+                    output_dir=output_dir,
+                    run_digest=str(work_unit.run_digest),
+                    chunk_id=int(work_unit.chunk_id),
+                    partition_id=int(work_unit.partition_id),
+                    point_start=int(work_unit.point_start),
+                    point_stop=int(work_unit.point_stop),
+                    interval_ids=tuple(int(item) for item in work_unit.interval_ids),
+                    attempt_id="try1",
+                    parameter_digest=str(work_unit.parameter_digest),
+                    partition_plan_digest=str(work_unit.partition_plan_digest),
+                    source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
+                    source_replacement_digest=work_unit.source_replacement_digest,
+                    backend_policy_digest=str(work_unit.backend_policy_digest),
+                    expected_output_digest=str(work_unit.expected_output_digest),
+                    grid_shape_nd=np.array([[1]], dtype=np.int64),
+                    contribution_reciprocal_points=5,
+                    amplitudes_delta=np.array([5 + 0j]),
+                    amplitudes_average=np.array([7 + 0j]),
+                    point_ids=np.array([10]),
+                )
 
-        def fail_reduce(**kwargs):
+        def fail_commit(**kwargs):
             del kwargs
-            raise RuntimeError("reduce failed")
+            raise RuntimeError("commit failed")
 
         monkeypatch.setattr(
             "core.residual_field.tasks.run_residual_field_interval_chunk_task",
             fake_residual_batch_task,
         )
         monkeypatch.setattr(
-            "core.scattering.execution.reduce_residual_field_shards_for_chunk",
-            fail_reduce,
+            "core.scattering.execution._commit_stage2_replacement_attempts",
+            fail_commit,
         )
 
         try:
@@ -182,18 +203,14 @@ def test_stage2_replacement_writes_expected_manifest_before_reduce_failure(
                 client=None,
                 output_dir=str(tmp_path),
                 parameter_digest="abc123",
+                work_identity=_work_identity(),
                 max_intervals_per_shard=2,
                 max_inflight=4,
             )
         except RuntimeError as exc:
-            assert "reduce failed" in str(exc)
+            assert "commit failed" in str(exc)
         else:
-            raise AssertionError("Stage-2 replacement reduce should fail")
-
-        assert load_stage2_replacement_expected_manifest(
-            output_dir=str(tmp_path),
-            parameter_digest="abc123",
-        ) == {3: interval_ids}
+            raise AssertionError("Stage-2 replacement commit should fail")
     finally:
         db.close()
 
@@ -201,12 +218,6 @@ def test_stage2_replacement_writes_expected_manifest_before_reduce_failure(
 def test_stage2_replacement_no_work_keeps_existing_expected_manifest(tmp_path):
     db, interval_ids = _db_with_replacement_work(tmp_path)
     try:
-        write_stage2_replacement_expected_manifest(
-            output_dir=str(tmp_path),
-            parameter_digest="abc123",
-            expected_by_chunk={3: interval_ids},
-        )
-
         expected = run_stage2_replacement_execution(
             unsaved_interval_chunks=[],
             total_reciprocal_points=11,
@@ -215,15 +226,13 @@ def test_stage2_replacement_no_work_keeps_existing_expected_manifest(tmp_path):
             client=None,
             output_dir=str(tmp_path),
             parameter_digest="abc123",
+            work_identity=_work_identity(),
             max_intervals_per_shard=2,
             max_inflight=4,
         )
 
-        assert expected == {3: interval_ids}
-        assert load_stage2_replacement_expected_manifest(
-            output_dir=str(tmp_path),
-            parameter_digest="abc123",
-        ) == {3: interval_ids}
+        assert expected == {}
+        assert not stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
     finally:
         db.close()
 
@@ -239,15 +248,13 @@ def test_stage2_replacement_no_work_writes_empty_expected_manifest(tmp_path):
             client=None,
             output_dir=str(tmp_path),
             parameter_digest="abc123",
+            work_identity=_work_identity(),
             max_intervals_per_shard=2,
             max_inflight=4,
         )
 
         assert expected == {}
-        assert load_stage2_replacement_expected_manifest(
-            output_dir=str(tmp_path),
-            parameter_digest="abc123",
-        ) == {}
+        assert not stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
     finally:
         db.close()
 
@@ -302,6 +309,7 @@ def test_stage2_replacement_uses_strict_chunk_owner_affinity(
             client=FakeClient(),
             output_dir=str(tmp_path),
             parameter_digest="abc123",
+            work_identity=_work_identity(),
             max_intervals_per_shard=2,
             max_inflight=4,
         )
@@ -314,7 +322,7 @@ def test_stage2_replacement_uses_strict_chunk_owner_affinity(
         reducer_submits = [
             kwargs
             for _func, kwargs in submitted
-            if kwargs.get("chunk_id") == 3
+            if kwargs.get("run_digest") == "stage2run"
         ]
         assert task_submits
         assert reducer_submits

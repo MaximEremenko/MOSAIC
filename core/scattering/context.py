@@ -40,7 +40,12 @@ def build_scattering_execution_context(
     dimension = workflow_parameters.struct_info.dimension
     rspace = workflow_parameters.rspace_info
     post_mode = normalize_processing_mode(rspace.mode or "displacement")
-    unsaved = artifacts.db_manager.get_unsaved_interval_chunks()
+    get_all_pairs = getattr(artifacts.db_manager, "get_interval_chunks", None)
+    unsaved = (
+        get_all_pairs()
+        if callable(get_all_pairs)
+        else artifacts.db_manager.get_unsaved_interval_chunks()
+    )
     pending_work = interval_reconstruction_service.load_pending_work(
         artifacts,
         dimension,

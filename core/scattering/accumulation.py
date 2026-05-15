@@ -4,7 +4,6 @@ import numpy as np
 
 from core.scattering.half_space import (
     HALF_SPACE_ROLE_FULL,
-    HALF_SPACE_ROLE_LEGACY,
     HALF_SPACE_ROLE_POSITIVE_HALF,
     HALF_SPACE_ROLE_ZERO_PLANE,
     apply_half_space_conjugate_reconstruction,
@@ -140,7 +139,6 @@ def apply_scattering_partial_result(
 
 __all__ = [
     "HALF_SPACE_ROLE_FULL",
-    "HALF_SPACE_ROLE_LEGACY",
     "HALF_SPACE_ROLE_POSITIVE_HALF",
     "HALF_SPACE_ROLE_ZERO_PLANE",
     "ScatteringPartialResult",

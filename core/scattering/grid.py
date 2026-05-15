@@ -12,7 +12,7 @@ import numpy as np
 from core.qspace.masking.mask_strategies import EqBasedStrategy, get_last_eq_mask_telemetry
 from core.runtime.progress import timed
 from core.scattering.half_space import (
-    HALF_SPACE_ROLE_LEGACY,
+    HALF_SPACE_ROLE_FULL,
     classify_interval_half_space_role,
     half_space_role_multiplicity,
 )
@@ -31,8 +31,8 @@ class IntervalTask(NamedTuple):
     q_amp: np.ndarray
     q_amp_av: np.ndarray
     q_grid_digest: str | None = None
-    half_space_role: str = HALF_SPACE_ROLE_LEGACY
-    reciprocal_multiplicity: int = 0
+    half_space_role: str = HALF_SPACE_ROLE_FULL
+    reciprocal_multiplicity: int = 1
 
 
 def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:

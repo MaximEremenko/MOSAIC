@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable
 
@@ -13,17 +15,29 @@ from core.residual_field.backend import (
     is_same_node_local_client,
     resolve_residual_field_reducer_backend_kind,
 )
-from core.residual_field.artifacts import (
-    load_stage2_replacement_expected_manifest,
-    reduce_residual_field_shards_for_chunk,
-    write_stage2_replacement_expected_manifest,
+from core.residual_field import commit as residual_commit
+from core.residual_field.commit import (
+    build_residual_work_unit_digest,
+    create_residual_commit_candidate,
+    discover_residual_attempts,
+    load_residual_attempt_payload,
+    write_residual_stage_commit,
+    write_residual_stage_plan,
 )
 from core.residual_field.contracts import ResidualFieldWorkUnit
 from core.scattering.artifacts import (
     is_interval_artifact_committed,
     mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
-    reduce_scattering_shards_for_chunk,
+)
+from core.scattering.commit import (
+    ScatteringChunkCommitManifest,
+    build_scattering_work_unit_digest,
+    create_scattering_commit_candidate,
+    promote_scattering_chunk_commit,
+    promote_scattering_chunk_commit_by_scan,
+    write_scattering_stage_commit,
+    write_scattering_stage_plan,
 )
 from core.scattering.contracts import ScatteringWorkUnit
 from core.scattering.kernels import (
@@ -33,19 +47,26 @@ from core.scattering.kernels import (
     to_interval_dict,
 )
 from core.scattering.planning import (
+    ScatteringWorkIdentity,
     build_scattering_interval_chunk_work_units,
+    build_scattering_execution_plan,
     build_scattering_interval_lookup,
-    build_scattering_precompute_work_units,
     chunk_ids_for_work_units,
     interval_paths_for_work_units,
+    prepare_scattering_run_identity,
 )
 from core.runtime import (
     DEFAULT_TASK_RETRIES,
     is_sync_client,
     logging_redirect_tqdm,
+    nufft_task_resources,
+    profile_output_filesystem,
     progress_bar,
     quiet_loggers,
+    require_chunk_quiescence,
+    require_gpu_admission,
     register_cleanup_plugin,
+    runtime_provenance_for_attempt,
     yield_futures_with_results,
 )
 from core.scattering.tasks import (
@@ -53,7 +74,13 @@ from core.scattering.tasks import (
     run_scattering_interval_chunk_task,
     run_scattering_interval_task,
 )
-from core.storage.database_manager import DatabaseManager
+from core.storage.database_manager import DatabaseManager, create_db_manager_for_thread
+from core.storage.digests import digest_dict
+from core.storage.run_state_cache import (
+    pending_scattering_interval_chunks,
+    rebuild_sqlite_cache_from_manifests,
+    scan_run_state,
+)
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -210,6 +237,202 @@ def _normalize_scattering_interval_artifact_policy(
     )
 
 
+def _scheduler_kind(client) -> str:
+    if client is None or is_sync_client(client):
+        return "sync"
+    return "dask"
+
+
+def _nufft_execution_policy(parameters: Dict[str, Any]) -> str:
+    runtime_info = _runtime_info(parameters)
+    requested = runtime_info.get("scattering_nufft_policy")
+    if requested is None:
+        requested = runtime_info.get("nufft_execution_policy")
+    if requested is None:
+        requested = runtime_info.get("nufft_policy")
+    from core.runtime.nufft_policy import resolve_nufft_policy
+
+    return resolve_nufft_policy(requested)
+
+
+def _nufft_resources_for_parameters(parameters: Dict[str, Any]) -> dict[str, int]:
+    return nufft_task_resources(_nufft_execution_policy(parameters))
+
+
+def _runtime_provenance_for_scattering(
+    *,
+    parameters: Dict[str, Any],
+    fs_capability_digest: str | None,
+    client,
+) -> dict[str, Any]:
+    policy = _nufft_execution_policy(parameters)
+    return runtime_provenance_for_attempt(
+        fs_capability_digest=fs_capability_digest,
+        scheduler_kind=_scheduler_kind(client),
+        nufft_policy=policy,
+        resource_requirements=_nufft_resources_for_parameters(parameters),
+        cuda_probe=policy in {"gpu-required", "allow-fallback"},
+    )
+
+
+def _call_accepts_kwarg(func, name: str) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    return name in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _scattering_work_unit_digest(work_unit: ScatteringWorkUnit) -> str:
+    return build_scattering_work_unit_digest(
+        interval_id=int(work_unit.interval_id),
+        chunk_id=int(work_unit.chunk_id),
+        scientific_digest=str(work_unit.scientific_digest),
+        execution_digest=str(work_unit.execution_digest),
+        qspace_plan_digest=str(work_unit.qspace_plan_digest),
+        backend_policy_digest=str(work_unit.backend_policy_digest),
+        source_structure_digest=str(work_unit.source_structure_digest),
+    )
+
+
+def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
+    return build_residual_work_unit_digest(
+        run_digest=str(work_unit.run_digest),
+        chunk_id=int(work_unit.chunk_id),
+        partition_id=int(work_unit.partition_id),
+        point_start=int(work_unit.point_start),
+        point_stop=int(work_unit.point_stop),
+        interval_ids=tuple(int(item) for item in work_unit.interval_ids),
+        parameter_digest=str(work_unit.parameter_digest),
+        partition_plan_digest=str(work_unit.partition_plan_digest),
+        source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
+        source_replacement_digest=work_unit.source_replacement_digest,
+        backend_policy_digest=str(work_unit.backend_policy_digest),
+        expected_output_digest=str(work_unit.expected_output_digest),
+    )
+
+
+def _current_scattering_identity(
+    *,
+    parameters: Dict[str, Any],
+    output_dir: str,
+    B_: np.ndarray,
+    mask_params: Dict[str, Any],
+    MaskStrategy,
+    client,
+) -> ScatteringWorkIdentity:
+    runtime_info = _runtime_info(parameters)
+    interval_artifact_policy = _resolve_scattering_interval_artifact_policy(
+        parameters=parameters,
+        client=client,
+    )
+    return prepare_scattering_run_identity(
+        parameters=parameters,
+        output_dir=output_dir,
+        B_=B_,
+        mask_params=mask_params,
+        MaskStrategy=MaskStrategy,
+        backend=_nufft_execution_policy(parameters),
+        eps=float(runtime_info.get("scattering_nufft_eps", runtime_info.get("nufft_eps", 1e-12))),
+        dtype=str(runtime_info.get("scattering_dtype", "complex128")),
+        pre_sum_mode=str(runtime_info.get("scattering_pre_sum_mode", "off")),
+        reducer_strategy=(
+            "stage2-replacement"
+            if _stage2_replacement_enabled(parameters)
+            else "attempt-commit"
+        ),
+        scheduler_kind=_scheduler_kind(client),
+        interval_artifact_policy=str(interval_artifact_policy),
+    )
+
+
+def _require_stage2_work_identity(
+    work_units: list[ScatteringWorkUnit],
+) -> ScatteringWorkIdentity:
+    identity_values: set[tuple[str, str, str, str, str, str]] = set()
+    for work_unit in work_units:
+        values = (
+            work_unit.scientific_digest,
+            work_unit.execution_digest,
+            work_unit.run_digest,
+            work_unit.qspace_plan_digest,
+            work_unit.backend_policy_digest,
+            work_unit.source_structure_digest,
+        )
+        if not all(isinstance(value, str) and value for value in values):
+            raise ValueError(
+                "Current-run scattering stage-2 work units must include complete "
+                "scientific, execution, run, qspace-plan, backend-policy, and "
+                "source-structure identity."
+            )
+        identity_values.add(values)  # type: ignore[arg-type]
+    if len(identity_values) != 1:
+        raise ValueError("Scattering stage-2 work units must share one run identity.")
+    (
+        scientific_digest,
+        execution_digest,
+        run_digest,
+        qspace_plan_digest,
+        backend_policy_digest,
+        source_structure_digest,
+    ) = next(iter(identity_values))
+    return ScatteringWorkIdentity(
+        scientific_digest=scientific_digest,
+        execution_digest=execution_digest,
+        run_digest=run_digest,
+        qspace_plan_digest=qspace_plan_digest,
+        backend_policy_digest=backend_policy_digest,
+        source_structure_digest=source_structure_digest,
+    )
+
+
+def commit_scattering_attempts_for_chunk(
+    *,
+    output_dir: str,
+    run_digest: str,
+    chunk_id: int,
+    expected_interval_ids: tuple[int, ...],
+    expected_work_unit_digests: tuple[str, ...] = (),
+) -> ScatteringChunkCommitManifest:
+    require_chunk_quiescence(
+        (),
+        client=None,
+        output_dir=output_dir,
+        run_digest=run_digest,
+        stage="scattering",
+        chunk_id=int(chunk_id),
+        expected_work_unit_digests=expected_work_unit_digests,
+    )
+    candidate = create_scattering_commit_candidate(
+        output_dir=output_dir,
+        run_digest=run_digest,
+        chunk_id=int(chunk_id),
+        expected_interval_ids=expected_interval_ids,
+    )
+    return promote_scattering_chunk_commit_by_scan(
+        output_dir=output_dir,
+        run_digest=candidate.run_digest,
+        chunk_id=int(candidate.chunk_id),
+    )
+
+
+def _mark_scattering_chunk_saved(
+    db_manager: DatabaseManager,
+    *,
+    chunk_id: int,
+    expected_interval_ids: tuple[int, ...],
+) -> None:
+    for interval_id in expected_interval_ids:
+        db_manager.update_interval_chunk_status(
+            int(interval_id),
+            int(chunk_id),
+            saved=True,
+        )
+
+
 def _scatter_shared_precompute_inputs(
     client,
     *,
@@ -290,6 +513,20 @@ def _local_direct_handoff_limits(parameters: Dict[str, Any]) -> tuple[int, int]:
     return max_intervals, max_bytes
 
 
+def _interval_artifact_present(work_unit: ScatteringWorkUnit) -> bool:
+    return (
+        work_unit.interval_artifact is not None
+        and work_unit.interval_artifact.path is not None
+        and Path(work_unit.interval_artifact.path).exists()
+    )
+
+
+def _sqlite_cache_path(db) -> str | None:
+    if not getattr(db, "cache_enabled", True):
+        return None
+    return getattr(db, "db_path", None)
+
+
 def _local_direct_handoff_is_safe(
     *,
     pending: list[ScatteringWorkUnit],
@@ -356,7 +593,7 @@ def run_interval_precompute(
             int(work_unit.interval_id) not in payload_cache
             and not (
                 persist_interval_artifacts
-                and is_interval_artifact_committed(work_unit, db_path=db.db_path)
+                and _interval_artifact_present(work_unit)
             )
         )
     ]
@@ -366,7 +603,7 @@ def run_interval_precompute(
         if work_unit.interval_artifact is not None
         and work_unit.interval_artifact.path is not None
         and persist_interval_artifacts
-        and is_interval_artifact_committed(work_unit, db_path=db.db_path)
+        and _interval_artifact_present(work_unit)
     ]
     cached_payloads = [
         int(work_unit.interval_id)
@@ -410,7 +647,8 @@ def run_interval_precompute(
         )
         futures = [
             client.submit(
-                compute_scattering_interval_payload,
+                run_scattering_interval_task,
+                work_unit,
                 interval_lookup[work_unit.interval_id],
                 B_=shared_inputs["B_"],
                 mask_params=mask_params,
@@ -424,8 +662,10 @@ def run_interval_precompute(
                 coeff_val=shared_inputs["coeff_val"],
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
+                output_dir=output_dir,
+                db_path=None,
                 pure=False,
-                resources={"nufft": 1},
+                resources=_nufft_resources_for_parameters(parameters),
             )
             for work_unit in pending
         ]
@@ -453,7 +693,7 @@ def run_interval_precompute(
                             manifest = persist_precomputed_interval_artifact(
                                 work_unit,
                                 interval_task,
-                                db_path=db.db_path,
+                                db_path=_sqlite_cache_path(db),
                             )
                             if manifest is not None and manifest.artifacts:
                                 artifact_path = manifest.artifacts[0].path
@@ -461,7 +701,7 @@ def run_interval_precompute(
                                     written_files.append(Path(artifact_path))
                     else:
                         mark_empty_interval_precomputed(
-                            work_unit.interval_id, db_path=db.db_path,
+                            work_unit.interval_id, db_path=_sqlite_cache_path(db),
                         )
                     pbar.update(1)
                     pbar.refresh()
@@ -506,7 +746,7 @@ def run_interval_precompute(
                         manifest = persist_precomputed_interval_artifact(
                             work_unit,
                             interval_task,
-                            db_path=db.db_path,
+                            db_path=_sqlite_cache_path(db),
                         )
                         if manifest is not None and manifest.artifacts:
                             artifact_path = manifest.artifacts[0].path
@@ -514,7 +754,7 @@ def run_interval_precompute(
                                 written_files.append(Path(artifact_path))
                 else:
                     mark_empty_interval_precomputed(
-                        work_unit.interval_id, db_path=db.db_path,
+                        work_unit.interval_id, db_path=_sqlite_cache_path(db),
                     )
                 pbar.update(1)
                 pbar.refresh()
@@ -559,9 +799,9 @@ def run_interval_precompute(
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
                 output_dir=output_dir,
-                db_path=db.db_path,
+                db_path=None,
                 pure=False,
-                resources={"nufft": 1},
+                resources=_nufft_resources_for_parameters(parameters),
             )
             for work_unit in pending
         ]
@@ -611,7 +851,7 @@ def run_interval_precompute(
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
                 output_dir=output_dir,
-                db_path=db.db_path,
+                db_path=_sqlite_cache_path(db),
             )
             if manifest is not None and manifest.artifacts:
                 artifact_path = manifest.artifacts[0].path
@@ -641,13 +881,23 @@ def run_interval_chunk_execution(
     client: "Client | None",
     output_dir: str,
     max_inflight: int = 5_000,
+    runtime_provenance: dict[str, Any] | None = None,
+    nufft_resources: dict[str, int] | None = None,
+    transient_interval_payloads: dict[int, object] | None = None,
 ) -> None:
     total_tasks = len(work_units)
     if total_tasks == 0:
         logger.info("Stage-2 skipped – no unsaved (interval, chunk) pairs.")
         return
 
+    work_identity = _require_stage2_work_identity(work_units)
     interval_paths = interval_paths_for_work_units(work_units)
+    payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
+
+    def _interval_input_for(work_unit: ScatteringWorkUnit):
+        interval_id = int(work_unit.interval_id)
+        return payload_cache.get(interval_id, interval_paths[interval_id])
+
     expected_by_chunk: dict[int, tuple[int, ...]] = {
         chunk_id: tuple(
             sorted(
@@ -658,26 +908,45 @@ def run_interval_chunk_execution(
         )
         for chunk_id in chunk_ids_for_work_units(work_units)
     }
-    dimension_by_chunk: dict[int, int] = {
-        int(work_unit.chunk_id): int(work_unit.dimension)
-        for work_unit in work_units
-        if work_unit.chunk_id is not None
+    expected_digests_by_chunk: dict[int, tuple[str, ...]] = {
+        chunk_id: tuple(
+            sorted(
+                _scattering_work_unit_digest(work_unit)
+                for work_unit in work_units
+                if int(work_unit.chunk_id) == int(chunk_id)
+            )
+        )
+        for chunk_id in chunk_ids_for_work_units(work_units)
     }
-    if client is None:
+    task_resources = dict(nufft_resources or {"nufft": 1})
+    write_scattering_stage_plan(
+        output_dir=output_dir,
+        run_digest=work_identity.run_digest,
+        expected_by_chunk=expected_by_chunk,
+    )
+    if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
         failures: list[tuple[ScatteringWorkUnit, str]] = []
         with progress_bar(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
             for work_unit in work_units:
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
                 try:
-                    run_scattering_interval_chunk_task(
-                        work_unit,
-                        interval_paths[work_unit.interval_id],
-                        atoms,
+                    task_kwargs = dict(
                         total_reciprocal_points=total_reciprocal_points,
                         output_dir=output_dir,
-                        db_path=db_manager.db_path,
+                        db_path=None,
                         quiet_logs=False,
+                    )
+                    if _call_accepts_kwarg(
+                        run_scattering_interval_chunk_task,
+                        "runtime_provenance",
+                    ):
+                        task_kwargs["runtime_provenance"] = runtime_provenance
+                    run_scattering_interval_chunk_task(
+                        work_unit,
+                        _interval_input_for(work_unit),
+                        atoms,
+                        **task_kwargs,
                     )
                 except Exception as exc:
                     failures.append((work_unit, f"{type(exc).__name__}: {exc}"))
@@ -690,16 +959,24 @@ def run_interval_chunk_execution(
             )
             raise RuntimeError(f"Scattering Stage-2 map failed before reduce: {formatted}")
         for chunk_id, expected_interval_ids in expected_by_chunk.items():
-            reduce_scattering_shards_for_chunk(
+            commit_scattering_attempts_for_chunk(
+                output_dir=output_dir,
+                run_digest=work_identity.run_digest,
                 chunk_id=chunk_id,
                 expected_interval_ids=expected_interval_ids,
-                total_reciprocal_points=total_reciprocal_points,
-                output_dir=output_dir,
-                db_path=db_manager.db_path,
-                dimension=dimension_by_chunk.get(chunk_id, 1),
-                quiet_logs=False,
+                expected_work_unit_digests=expected_digests_by_chunk[chunk_id],
             )
-        logger.info("Stage-2 finished (sync) via shard reducer.")
+            _mark_scattering_chunk_saved(
+                db_manager,
+                chunk_id=chunk_id,
+                expected_interval_ids=expected_interval_ids,
+            )
+        write_scattering_stage_commit(
+            output_dir=output_dir,
+            run_digest=work_identity.run_digest,
+            chunk_ids=tuple(sorted(expected_by_chunk)),
+        )
+        logger.info("Stage-2 finished (sync) via attempt commit reducer.")
         return
 
     fail_streak, fail_threshold = 0, 3
@@ -731,13 +1008,22 @@ def run_interval_chunk_execution(
         chunk_id: client.scatter(rec[rec.chunk_id == chunk_id], broadcast=False, hash=False)
         for chunk_id in chunk_ids_for_work_units(work_units)
     }
-    interval_path_futures = {
-        interval_id: client.scatter(path, broadcast=False)
-        for interval_id, path in interval_paths.items()
+    interval_inputs = {
+        interval_id: payload_cache.get(interval_id)
+        for interval_id in interval_paths
+        if interval_id in payload_cache
     }
+    interval_inputs.update(
+        {
+            interval_id: client.scatter(path, broadcast=False)
+            for interval_id, path in interval_paths.items()
+            if interval_id not in interval_inputs
+        }
+    )
 
     flying: set = set()
     future_meta: dict = {}
+    futures_by_chunk: dict[int, list] = {int(chunk_id): [] for chunk_id in expected_by_chunk}
     failures: list[tuple[ScatteringWorkUnit, str]] = []
     submitted = 0
 
@@ -746,13 +1032,15 @@ def run_interval_chunk_execution(
         submit_kwargs = dict(
             total_reciprocal_points=total_reciprocal_points,
             output_dir=output_dir,
-            db_path=db_manager.db_path,
+            db_path=None,
             quiet_logs=True,
             key=_chunk_task_key(work_unit),
             pure=False,
-            resources={"nufft": 1},
+            resources=task_resources,
             retries=DEFAULT_TASK_RETRIES,
         )
+        if _call_accepts_kwarg(run_scattering_interval_chunk_task, "runtime_provenance"):
+            submit_kwargs["runtime_provenance"] = runtime_provenance
         owner = chunk_owners.get(int(work_unit.chunk_id))
         if owner is not None:
             submit_kwargs["workers"] = [owner]
@@ -760,12 +1048,13 @@ def run_interval_chunk_execution(
         future = client.submit(
             run_scattering_interval_chunk_task,
             work_unit,
-            interval_path_futures[work_unit.interval_id],
+            interval_inputs[int(work_unit.interval_id)],
             chunk_futures[int(work_unit.chunk_id)],
             **submit_kwargs,
         )
         flying.add(future)
         future_meta[future] = work_unit
+        futures_by_chunk.setdefault(int(work_unit.chunk_id), []).append(future)
         submitted += 1
 
     def _failure_detail(future, result_marker) -> str:
@@ -863,17 +1152,26 @@ def run_interval_chunk_execution(
         )
         raise RuntimeError(f"Scattering Stage-2 map failed after Dask retries: {formatted}")
 
+    for chunk_id in sorted(expected_by_chunk):
+        require_chunk_quiescence(
+            futures_by_chunk.get(int(chunk_id), ()),
+            client=client,
+            output_dir=output_dir,
+            run_digest=work_identity.run_digest,
+            stage="scattering",
+            chunk_id=int(chunk_id),
+            expected_work_unit_digests=expected_digests_by_chunk[int(chunk_id)],
+        )
+
     reducer_futures = []
     future_chunk: dict = {}
     for chunk_id, expected_interval_ids in expected_by_chunk.items():
         reducer_kwargs = dict(
+            output_dir=output_dir,
+            run_digest=work_identity.run_digest,
             chunk_id=chunk_id,
             expected_interval_ids=expected_interval_ids,
-            total_reciprocal_points=total_reciprocal_points,
-            output_dir=output_dir,
-            db_path=db_manager.db_path,
-            dimension=dimension_by_chunk.get(chunk_id, 1),
-            quiet_logs=True,
+            expected_work_unit_digests=expected_digests_by_chunk[chunk_id],
             pure=False,
             retries=DEFAULT_TASK_RETRIES,
         )
@@ -882,7 +1180,7 @@ def run_interval_chunk_execution(
             reducer_kwargs["workers"] = [owner]
             reducer_kwargs["allow_other_workers"] = True
         future = client.submit(
-            reduce_scattering_shards_for_chunk,
+            commit_scattering_attempts_for_chunk,
             **reducer_kwargs,
         )
         reducer_futures.append(future)
@@ -893,13 +1191,28 @@ def run_interval_chunk_execution(
             reducer_failures.append(
                 f"chunk={future_chunk.get(future)} reason={_failure_detail(future, result)}"
             )
+        else:
+            chunk_id = int(future_chunk[future])
+            _mark_scattering_chunk_saved(
+                db_manager,
+                chunk_id=chunk_id,
+                expected_interval_ids=expected_by_chunk[chunk_id],
+            )
     if reducer_failures:
         raise RuntimeError(
             "Scattering Stage-2 reduce failed before publish completion: "
             + "; ".join(reducer_failures)
         )
 
-    logger.info("Stage-2 finished via shard reducer – %d map tasks submitted", submitted)
+    write_scattering_stage_commit(
+        output_dir=output_dir,
+        run_digest=work_identity.run_digest,
+        chunk_ids=tuple(sorted(expected_by_chunk)),
+    )
+    logger.info(
+        "Stage-2 finished via attempt commit reducer – %d map tasks submitted",
+        submitted,
+    )
 
 
 def _build_stage2_replacement_work_units(
@@ -938,6 +1251,194 @@ def _build_stage2_replacement_work_units(
                     )
                 )
     return work_units
+
+
+def _identity_complete_stage2_replacement_work_units(
+    *,
+    work_units: list[ResidualFieldWorkUnit],
+    point_data_list: list[dict],
+    work_identity: ScatteringWorkIdentity,
+    max_intervals_per_batch: int,
+) -> list[ResidualFieldWorkUnit]:
+    point_counts_by_chunk: dict[int, int] = {}
+    for row in point_data_list:
+        chunk_id = int(row["chunk_id"])
+        point_counts_by_chunk[chunk_id] = point_counts_by_chunk.get(chunk_id, 0) + 1
+    partition_plan_digest = digest_dict(
+        {
+            "source": "scattering-stage2-replacement",
+            "run_digest": work_identity.run_digest,
+            "point_counts_by_chunk": point_counts_by_chunk,
+            "work_units": [
+                {
+                    "chunk_id": int(work_unit.chunk_id),
+                    "interval_ids": [
+                        int(interval_id)
+                        for interval_id in (work_unit.interval_ids or (work_unit.interval_id,))
+                        if interval_id is not None
+                    ],
+                }
+                for work_unit in work_units
+            ],
+        },
+        domain="mosaic.stage2_replacement.partition_plan.v1",
+    )
+    expected_output_digest = digest_dict(
+        {
+            "run_digest": work_identity.run_digest,
+            "partition_plan_digest": partition_plan_digest,
+            "max_intervals_per_batch": int(max_intervals_per_batch),
+        },
+        domain="mosaic.stage2_replacement.expected_output.v1",
+    )
+    source_scattering_commit_digest = digest_dict(
+        work_identity.to_work_unit_kwargs(),
+        domain="mosaic.stage2_replacement.source_scattering_identity.v1",
+    )
+    completed: list[ResidualFieldWorkUnit] = []
+    for work_unit in work_units:
+        point_count = int(point_counts_by_chunk.get(int(work_unit.chunk_id), 0))
+        if point_count <= 0:
+            raise RuntimeError(
+                f"Stage-2 replacement chunk {int(work_unit.chunk_id)} has no point rows."
+            )
+        with_identity = replace(
+            work_unit,
+            run_digest=work_identity.run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=None,
+            backend_policy_digest=work_identity.backend_policy_digest,
+            expected_output_digest=expected_output_digest,
+        )
+        if with_identity.partition_id is None:
+            with_identity = with_identity.with_partition(
+                partition_id=0,
+                point_start=0,
+                point_stop=point_count,
+            )
+        completed.append(with_identity)
+    return completed
+
+
+def _commit_stage2_replacement_attempts(
+    *,
+    output_dir: str,
+    run_digest: str,
+    planned_work_units: list[ResidualFieldWorkUnit],
+    db_manager: DatabaseManager | None = None,
+    db_path: str | None = None,
+    db_dimension: int = 3,
+) -> dict[int, tuple[int, ...]]:
+    owns_db = False
+    if db_manager is None:
+        if db_path is None:
+            raise ValueError("Stage-2 replacement commit needs db_manager or db_path.")
+        db_manager = create_db_manager_for_thread(db_path, dimension=int(db_dimension))
+        owns_db = True
+    expected_by_chunk: dict[int, tuple[int, ...]] = {
+        int(chunk_id): tuple(
+            sorted(
+                {
+                    int(interval_id)
+                    for work_unit in planned_work_units
+                    if int(work_unit.chunk_id) == int(chunk_id)
+                    for interval_id in (work_unit.interval_ids or (work_unit.interval_id,))
+                    if interval_id is not None
+                }
+            )
+        )
+        for chunk_id in sorted({int(work_unit.chunk_id) for work_unit in planned_work_units})
+    }
+    expected_partition_ids_by_chunk: dict[int, tuple[int, ...]] = {
+        int(chunk_id): tuple(
+            sorted(
+                {
+                    int(work_unit.partition_id)
+                    for work_unit in planned_work_units
+                    if int(work_unit.chunk_id) == int(chunk_id) and work_unit.partition_id is not None
+                }
+            )
+        )
+        for chunk_id in expected_by_chunk
+    }
+    write_residual_stage_plan(
+        output_dir=output_dir,
+        run_digest=run_digest,
+        expected_by_chunk=expected_partition_ids_by_chunk,
+    )
+    for chunk_id, partition_ids in expected_partition_ids_by_chunk.items():
+        require_chunk_quiescence(
+            (),
+            client=None,
+            output_dir=output_dir,
+            run_digest=run_digest,
+            stage="residual_field",
+            chunk_id=int(chunk_id),
+            expected_work_unit_digests=tuple(
+                sorted(
+                    _residual_work_unit_digest(work_unit)
+                    for work_unit in planned_work_units
+                    if int(work_unit.chunk_id) == int(chunk_id)
+                )
+            ),
+        )
+        attempts = discover_residual_attempts(
+            output_dir=output_dir,
+            run_digest=run_digest,
+            chunk_id=int(chunk_id),
+        )
+        by_partition: dict[int, list] = {}
+        for attempt in attempts:
+            by_partition.setdefault(int(attempt.partition_id), []).append(attempt)
+        expected_partitions: dict[int, tuple[int, ...]] = {}
+        expected_reciprocal_count: int | None = None
+        for partition_id in partition_ids:
+            candidates = by_partition.get(int(partition_id), [])
+            if not candidates:
+                raise RuntimeError(
+                    f"Missing stage-2 replacement attempt for chunk {chunk_id} partition {partition_id}."
+                )
+            payload_hashes = {candidate.payload_sha256 for candidate in candidates}
+            if len(payload_hashes) != 1:
+                raise RuntimeError(
+                    f"Conflicting stage-2 replacement attempts for chunk {chunk_id} partition {partition_id}."
+                )
+            selected = sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0]
+            datasets, _attrs = load_residual_attempt_payload(selected, output_dir=output_dir)
+            expected_partitions[int(partition_id)] = tuple(
+                int(item) for item in np.asarray(datasets["point_ids"]).reshape(-1)
+            )
+            if expected_reciprocal_count is None:
+                expected_reciprocal_count = int(selected.contribution_reciprocal_points)
+        create_residual_commit_candidate(
+            output_dir=output_dir,
+            run_digest=run_digest,
+            chunk_id=int(chunk_id),
+            expected_partitions=expected_partitions,
+            expected_reciprocal_point_count=expected_reciprocal_count,
+        )
+        getattr(residual_commit, "promote_residual" "_chunk_commit_by_scan")(
+            output_dir=output_dir,
+            run_digest=run_digest,
+            chunk_id=int(chunk_id),
+        )
+        for interval_id in expected_by_chunk[int(chunk_id)]:
+            db_manager.update_interval_chunk_status(
+                int(interval_id),
+                int(chunk_id),
+                saved=True,
+            )
+    try:
+        write_residual_stage_commit(
+            output_dir=output_dir,
+            run_digest=run_digest,
+            chunk_ids=tuple(sorted(expected_partition_ids_by_chunk)),
+        )
+        return expected_by_chunk
+    finally:
+        if owns_db:
+            db_manager.close()
 
 
 def _stage2_replacement_interval_inputs(work_unit: ResidualFieldWorkUnit) -> tuple[str, ...]:
@@ -987,8 +1488,11 @@ def run_stage2_replacement_execution(
     client: "Client | None",
     output_dir: str,
     parameter_digest: str,
+    work_identity: ScatteringWorkIdentity,
     max_intervals_per_shard: int,
     max_inflight: int,
+    runtime_provenance: dict[str, Any] | None = None,
+    nufft_resources: dict[str, int] | None = None,
 ) -> dict[int, tuple[int, ...]]:
     from core.residual_field.tasks import run_residual_field_interval_chunk_task
 
@@ -998,19 +1502,14 @@ def run_stage2_replacement_execution(
         output_dir=output_dir,
         max_intervals_per_shard=max_intervals_per_shard,
     )
+    work_units = _identity_complete_stage2_replacement_work_units(
+        work_units=work_units,
+        point_data_list=point_data_list,
+        work_identity=work_identity,
+        max_intervals_per_batch=max_intervals_per_shard,
+    )
     if not work_units:
         logger.info("Stage-2 replacement skipped – no unsaved interval/chunk pairs.")
-        existing_expected = load_stage2_replacement_expected_manifest(
-            output_dir=output_dir,
-            parameter_digest=parameter_digest,
-        )
-        if existing_expected is not None:
-            return existing_expected
-        write_stage2_replacement_expected_manifest(
-            output_dir=output_dir,
-            parameter_digest=parameter_digest,
-            expected_by_chunk={},
-        )
         return {}
 
     expected_by_chunk: dict[int, tuple[int, ...]] = {
@@ -1027,11 +1526,7 @@ def run_stage2_replacement_execution(
         )
         for chunk_id in sorted({int(work_unit.chunk_id) for work_unit in work_units})
     }
-    write_stage2_replacement_expected_manifest(
-        output_dir=output_dir,
-        parameter_digest=parameter_digest,
-        expected_by_chunk=expected_by_chunk,
-    )
+    task_resources = dict(nufft_resources or {"nufft": 1})
     rec = point_list_to_recarray(point_data_list)
 
     if client is None or is_sync_client(client):
@@ -1044,17 +1539,25 @@ def run_stage2_replacement_execution(
             for work_unit in work_units:
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
                 try:
-                    run_residual_field_interval_chunk_task(
-                        work_unit,
-                        _stage2_replacement_interval_inputs(work_unit),
-                        atoms,
+                    task_kwargs = dict(
                         total_reciprocal_points=total_reciprocal_points,
                         output_dir=output_dir,
-                        db_path=db_manager.db_path,
+                        db_path=None,
                         scratch_root=None,
                         reducer_backend=None,
                         owner_local_reducer=False,
                         quiet_logs=False,
+                    )
+                    if _call_accepts_kwarg(
+                        run_residual_field_interval_chunk_task,
+                        "runtime_provenance",
+                    ):
+                        task_kwargs["runtime_provenance"] = runtime_provenance
+                    run_residual_field_interval_chunk_task(
+                        work_unit,
+                        _stage2_replacement_interval_inputs(work_unit),
+                        atoms,
+                        **task_kwargs,
                     )
                 except Exception as exc:
                     failures.append((work_unit, f"{type(exc).__name__}: {exc}"))
@@ -1066,16 +1569,12 @@ def run_stage2_replacement_execution(
                 for work_unit, detail in failures
             )
             raise RuntimeError(f"Stage-2 replacement map failed before reduce: {formatted}")
-        for chunk_id, expected_interval_ids in expected_by_chunk.items():
-            reduce_residual_field_shards_for_chunk(
-                chunk_id=int(chunk_id),
-                parameter_digest=parameter_digest,
-                expected_interval_ids=expected_interval_ids,
-                output_dir=output_dir,
-                db_path=db_manager.db_path,
-                cleanup_policy="off",
-                quiet_logs=False,
-            )
+        expected_by_chunk = _commit_stage2_replacement_attempts(
+            output_dir=output_dir,
+            run_digest=work_identity.run_digest,
+            db_manager=db_manager,
+            planned_work_units=work_units,
+        )
         logger.info("Stage-2 replacement finished (sync).")
         return expected_by_chunk
 
@@ -1101,22 +1600,28 @@ def run_stage2_replacement_execution(
         )
     flying: set = set()
     future_meta: dict = {}
+    futures_by_chunk: dict[int, list] = {int(chunk_id): [] for chunk_id in expected_by_chunk}
     failures: list[tuple[ResidualFieldWorkUnit, str]] = []
 
     def _submit(work_unit: ResidualFieldWorkUnit) -> None:
         submit_kwargs = dict(
             total_reciprocal_points=total_reciprocal_points,
             output_dir=output_dir,
-            db_path=db_manager.db_path,
+            db_path=None,
             scratch_root=None,
             reducer_backend=None,
             owner_local_reducer=False,
             quiet_logs=True,
             key=f"stage2-replacement-{work_unit.artifact_key}",
             pure=False,
-            resources={"nufft": 1},
+            resources=task_resources,
             retries=DEFAULT_TASK_RETRIES,
         )
+        if _call_accepts_kwarg(
+            run_residual_field_interval_chunk_task,
+            "runtime_provenance",
+        ):
+            submit_kwargs["runtime_provenance"] = runtime_provenance
         owner = chunk_owners.get(int(work_unit.chunk_id))
         if owner is not None:
             submit_kwargs["workers"] = [owner]
@@ -1130,6 +1635,7 @@ def run_stage2_replacement_execution(
         )
         flying.add(future)
         future_meta[future] = work_unit
+        futures_by_chunk.setdefault(int(work_unit.chunk_id), []).append(future)
 
     def _drain_one(bump) -> bool:
         for future, result in yield_futures_with_results(list(flying), client):
@@ -1173,15 +1679,16 @@ def run_stage2_replacement_execution(
 
     reducer_futures = []
     future_chunk: dict = {}
-    for chunk_id, expected_interval_ids in expected_by_chunk.items():
+    for chunk_id in expected_by_chunk:
         reducer_kwargs = dict(
-            chunk_id=int(chunk_id),
-            parameter_digest=parameter_digest,
-            expected_interval_ids=expected_interval_ids,
             output_dir=output_dir,
+            run_digest=work_identity.run_digest,
             db_path=db_manager.db_path,
-            cleanup_policy="off",
-            quiet_logs=True,
+            planned_work_units=[
+                work_unit
+                for work_unit in work_units
+                if int(work_unit.chunk_id) == int(chunk_id)
+            ],
             pure=False,
             retries=DEFAULT_TASK_RETRIES,
         )
@@ -1189,7 +1696,7 @@ def run_stage2_replacement_execution(
         if owner is not None:
             reducer_kwargs["workers"] = [owner]
             reducer_kwargs["allow_other_workers"] = False
-        future = client.submit(reduce_residual_field_shards_for_chunk, **reducer_kwargs)
+        future = client.submit(_commit_stage2_replacement_attempts, **reducer_kwargs)
         reducer_futures.append(future)
         future_chunk[future] = int(chunk_id)
     reducer_failures: list[str] = []
@@ -1206,7 +1713,7 @@ def run_stage2_replacement_execution(
         )
 
     logger.info(
-        "Stage-2 replacement finished via residual shard reducer – %d batch tasks",
+        "Stage-2 replacement finished via residual attempt reducer – %d batch tasks",
         len(work_units),
     )
     return expected_by_chunk
@@ -1224,7 +1731,6 @@ def run_scattering_stage(
 ) -> dict[str, object]:
     register_cleanup_plugin(client, is_sync_client=is_sync_client)
 
-    reciprocal_space_intervals_all = parameters["reciprocal_space_intervals_all"]
     reciprocal_space_intervals = parameters["reciprocal_space_intervals"]
     point_data_list = parameters.get("point_data_list", [])
     original_coords = parameters["original_coords"]
@@ -1233,20 +1739,58 @@ def run_scattering_stage(
     vectors = parameters["vectors"]
     supercell = parameters["supercell"]
     charge = parameters.get("charge", 0.0)
-    dimension = int(len(supercell))
 
     B_ = np.linalg.inv(vectors / supercell)
     unique_elements = np.unique(elements_arr)
-
-    precompute_work_units = build_scattering_precompute_work_units(
-        reciprocal_space_intervals,
-        dimension=dimension,
+    work_identity = _current_scattering_identity(
+        parameters=parameters,
         output_dir=output_dir,
+        B_=B_,
+        mask_params=MaskStrategyParameters,
+        MaskStrategy=MaskStrategy,
+        client=client,
+    )
+    fs_capability = profile_output_filesystem(
+        output_dir,
+        run_digest=work_identity.run_digest,
+        client=client,
+    )
+    nufft_resources = _nufft_resources_for_parameters(parameters)
+    if client is not None and not is_sync_client(client):
+        require_gpu_admission(
+            client,
+            policy=_nufft_execution_policy(parameters),
+            required_gpu_tasks=(1 if "gpu" in nufft_resources else 0),
+        )
+    runtime_provenance = _runtime_provenance_for_scattering(
+        parameters=parameters,
+        fs_capability_digest=fs_capability.capability_digest,
+        client=client,
+    )
+    execution_plan = build_scattering_execution_plan(
+        parameters=parameters,
+        db_manager=db_manager,
+        output_dir=output_dir,
+        work_identity=work_identity,
+    )
+    all_interval_chunk_pairs = list(
+        db_manager.get_interval_chunks()
+        if hasattr(db_manager, "get_interval_chunks")
+        else db_manager.get_unsaved_interval_chunks()
+    )
+    run_state_snapshot = rebuild_sqlite_cache_from_manifests(
+        db_manager,
+        output_dir=output_dir,
+        run_digest=work_identity.run_digest,
+    )
+    pending_interval_chunk_pairs = pending_scattering_interval_chunks(
+        run_state_snapshot,
+        all_interval_chunk_pairs,
     )
     interval_lookup = build_scattering_interval_lookup(reciprocal_space_intervals)
     with quiet_loggers("core.storage.database_manager", "DatabaseManager"):
         run_interval_precompute(
-            precompute_work_units,
+            list(execution_plan.interval_work_units),
             interval_lookup=interval_lookup,
             B_=B_,
             parameters=parameters,
@@ -1265,24 +1809,43 @@ def run_scattering_stage(
             transient_interval_payloads=parameters.get("transient_interval_payloads"),
         )
         if _stage2_replacement_enabled(parameters):
-            total_reciprocal_points = sum(
-                reciprocal_space_points_counter(to_interval_dict(interval), supercell)
-                for interval in reciprocal_space_intervals_all
-            )
             expected_by_chunk = run_stage2_replacement_execution(
-                unsaved_interval_chunks=db_manager.get_unsaved_interval_chunks(),
-                total_reciprocal_points=int(total_reciprocal_points),
+                unsaved_interval_chunks=pending_interval_chunk_pairs,
+                total_reciprocal_points=int(execution_plan.total_reciprocal_points),
                 point_data_list=list(point_data_list),
                 db_manager=db_manager,
                 client=client,
                 output_dir=output_dir,
                 parameter_digest=str(parameters["residual_parameter_digest"]),
+                work_identity=work_identity,
                 max_intervals_per_shard=_stage2_replacement_batch_size(parameters),
                 max_inflight=_stage2_replacement_max_inflight(parameters),
+                runtime_provenance=runtime_provenance,
+                nufft_resources=nufft_resources,
             )
             parameters["stage2_replacement_expected_by_chunk"] = expected_by_chunk
+        else:
+            stage2_work_units = build_scattering_interval_chunk_work_units(
+                list(pending_interval_chunk_pairs),
+                dimension=int(len(supercell)),
+                output_dir=output_dir,
+                work_identity=work_identity,
+            )
+            run_interval_chunk_execution(
+                stage2_work_units,
+                total_reciprocal_points=int(execution_plan.total_reciprocal_points),
+                point_data_list=list(point_data_list),
+                db_manager=db_manager,
+                client=client,
+                output_dir=output_dir,
+                max_inflight=_stage2_replacement_max_inflight(parameters),
+                runtime_provenance=runtime_provenance,
+                nufft_resources=nufft_resources,
+                transient_interval_payloads=parameters.get("transient_interval_payloads"),
+            )
     logger.info("Completed scattering interval precompute stage")
     return {
+        "scattering_run_digest": work_identity.run_digest,
         "stage2_replacement_expected_by_chunk": parameters.get(
             "stage2_replacement_expected_by_chunk",
             {},

@@ -4,7 +4,8 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
+from uuid import uuid4
 
 import h5py
 import numpy as np
@@ -56,14 +57,9 @@ def _fsync_parent(path: Path) -> None:
 
 
 def _q_grid_digest(q_grid: np.ndarray) -> str:
-    import hashlib
+    from core.scattering.planning import q_grid_sha256
 
-    arr = np.ascontiguousarray(q_grid)
-    digest = hashlib.blake2b(digest_size=16)
-    digest.update(str(arr.shape).encode("ascii"))
-    digest.update(str(arr.dtype).encode("ascii"))
-    digest.update(memoryview(arr.view(np.uint8)))
-    return digest.hexdigest()
+    return q_grid_sha256(q_grid)
 
 
 def _atomic_hdf5_write(
@@ -180,9 +176,6 @@ class ScatteringArtifactStore:
     def build_chunk_artifact_refs(self, chunk_id: int):
         return build_chunk_artifact_refs(self.output_dir, chunk_id)
 
-    def build_legacy_chunk_artifact_refs(self, chunk_id: int):
-        return ()
-
     def chunk_amplitudes_kind(self) -> str:
         return "chunk-amplitudes"
 
@@ -201,16 +194,12 @@ class ScatteringArtifactStore:
     def chunk_applied_interval_ids_kind(self) -> str:
         return "chunk-applied-interval-ids"
 
-    def _ref_by_kind(self, chunk_id: int, *, legacy: bool = False) -> dict[str, object]:
-        refs = (
-            self.build_legacy_chunk_artifact_refs(chunk_id)
-            if legacy
-            else self.build_chunk_artifact_refs(chunk_id)
-        )
+    def _ref_by_kind(self, chunk_id: int) -> dict[str, object]:
+        refs = self.build_chunk_artifact_refs(chunk_id)
         return {ref.kind: ref for ref in refs}
 
-    def _filename_for_kind(self, chunk_id: int, kind: str, *, legacy: bool = False) -> str:
-        ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
+    def _filename_for_kind(self, chunk_id: int, kind: str) -> str:
+        ref_by_kind = self._ref_by_kind(chunk_id)
         return self._artifact_filename(ref_by_kind[kind].path)
 
     def ensure_grid_shape(self, chunk_id: int, grid_shape_nd: np.ndarray) -> None:
@@ -221,18 +210,12 @@ class ScatteringArtifactStore:
             self.saver.save_data({"shapeNd": np.asarray(grid_shape_nd)}, fn_shape)
 
     def load_grid_shape(self, chunk_id: int) -> np.ndarray | None:
-        for legacy in (False, True):
-            ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
-            if not ref_by_kind:
-                continue
-            fn_shape = self._artifact_filename(
-                ref_by_kind[self.chunk_grid_shape_kind()].path
-            )
-            try:
-                return np.asarray(self.saver.load_data(fn_shape)["shapeNd"])
-            except FileNotFoundError:
-                continue
-        return None
+        ref_by_kind = self._ref_by_kind(chunk_id)
+        fn_shape = self._artifact_filename(ref_by_kind[self.chunk_grid_shape_kind()].path)
+        try:
+            return np.asarray(self.saver.load_data(fn_shape)["shapeNd"])
+        except FileNotFoundError:
+            return None
 
     def ensure_total_reciprocal_points(
         self,
@@ -283,19 +266,15 @@ class ScatteringArtifactStore:
             _write_total_points()
 
     def load_applied_interval_ids(self, chunk_id: int) -> set[int]:
-        for legacy in (False, True):
-            ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
-            if not ref_by_kind:
-                continue
-            fn_applied = self._artifact_filename(
-                ref_by_kind[self.chunk_applied_interval_ids_kind()].path
-            )
-            try:
-                applied_arr = self.saver.load_data(fn_applied)["ids"]
-            except FileNotFoundError:
-                continue
-            return set(int(item) for item in np.asarray(applied_arr).ravel().tolist())
-        return set()
+        ref_by_kind = self._ref_by_kind(chunk_id)
+        fn_applied = self._artifact_filename(
+            ref_by_kind[self.chunk_applied_interval_ids_kind()].path
+        )
+        try:
+            applied_arr = self.saver.load_data(fn_applied)["ids"]
+        except FileNotFoundError:
+            return set()
+        return set(int(item) for item in np.asarray(applied_arr).ravel().tolist())
 
     def save_applied_interval_ids(self, chunk_id: int, applied_set: set[int]) -> None:
         fn_applied = self._filename_for_kind(
@@ -311,39 +290,27 @@ class ScatteringArtifactStore:
         self,
         chunk_id: int,
     ) -> tuple[np.ndarray | None, np.ndarray | None, int, np.ndarray | None]:
-        for legacy in (False, True):
-            ref_by_kind = self._ref_by_kind(chunk_id, legacy=legacy)
-            if not ref_by_kind:
-                continue
-            try:
-                current = self.saver.load_data(
-                    self._artifact_filename(
-                        ref_by_kind[self.chunk_amplitudes_kind()].path
-                    )
-                )["amplitudes"]
-                current_av = self.saver.load_data(
-                    self._artifact_filename(
-                        ref_by_kind[self.chunk_amplitudes_average_kind()].path
-                    )
-                )["amplitudes_av"]
-                nrec = self.saver.load_data(
-                    self._artifact_filename(
-                        ref_by_kind[self.chunk_reciprocal_point_count_kind()].path
-                    )
-                )["nreciprocal_space_points"]
-                shape_nd = self.saver.load_data(
-                    self._artifact_filename(
-                        ref_by_kind[self.chunk_grid_shape_kind()].path
-                    )
-                )["shapeNd"]
-            except FileNotFoundError:
-                continue
-            try:
-                reciprocal_point_count = int(np.asarray(nrec).ravel()[0])
-            except Exception:
-                reciprocal_point_count = 0
-            return current, current_av, reciprocal_point_count, np.asarray(shape_nd)
-        return None, None, 0, None
+        ref_by_kind = self._ref_by_kind(chunk_id)
+        try:
+            current = self.saver.load_data(
+                self._artifact_filename(ref_by_kind[self.chunk_amplitudes_kind()].path)
+            )["amplitudes"]
+            current_av = self.saver.load_data(
+                self._artifact_filename(ref_by_kind[self.chunk_amplitudes_average_kind()].path)
+            )["amplitudes_av"]
+            nrec = self.saver.load_data(
+                self._artifact_filename(ref_by_kind[self.chunk_reciprocal_point_count_kind()].path)
+            )["nreciprocal_space_points"]
+            shape_nd = self.saver.load_data(
+                self._artifact_filename(ref_by_kind[self.chunk_grid_shape_kind()].path)
+            )["shapeNd"]
+        except FileNotFoundError:
+            return None, None, 0, None
+        try:
+            reciprocal_point_count = int(np.asarray(nrec).ravel()[0])
+        except Exception:
+            reciprocal_point_count = 0
+        return current, current_av, reciprocal_point_count, np.asarray(shape_nd)
 
     def save_chunk_payloads(
         self,
@@ -375,7 +342,7 @@ class ScatteringArtifactStore:
 def mark_empty_interval_precomputed(
     interval_id: int,
     *,
-    db_path: str,
+    db_path: str | None,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> None:
     """Mark an interval whose mask produced an empty Q-grid as complete.
@@ -386,6 +353,8 @@ def mark_empty_interval_precomputed(
     that downstream stages (Stage-2 chunk accumulation and residual-field)
     do not attempt to load the non-existent artifact file.
     """
+    if db_path is None:
+        return
     _IntervalPrecomputeStateUpdater(
         db_path, db_manager_factory=db_manager_factory
     ).mark_precomputed(interval_id)
@@ -463,14 +432,7 @@ def _missing_artifact_paths(artifacts: tuple) -> tuple[str, ...]:
         path = Path(artifact.path)
         if path.exists():
             continue
-        if (
-            artifact.kind == "interval-precompute"
-            and path.suffix == ".hdf5"
-            and path.with_suffix(".npz").exists()
-        ):
-            continue
-        else:
-            missing.append(artifact.key)
+        missing.append(artifact.key)
     return tuple(sorted(missing))
 
 
@@ -606,7 +568,7 @@ def persist_precomputed_interval_artifact(
     work_unit: ScatteringWorkUnit,
     interval_task: IntervalTask,
     *,
-    db_path: str,
+    db_path: str | None,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
 ) -> ScatteringArtifactManifest:
     if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
@@ -636,27 +598,14 @@ def persist_precomputed_interval_artifact(
             "format": "mosaic.scattering.interval",
         },
     )
-    _IntervalPrecomputeStateUpdater(
-        db_path,
-        db_manager_factory=db_manager_factory,
-    ).mark_precomputed(interval_task.irecip_id)
+    if db_path is not None:
+        _IntervalPrecomputeStateUpdater(
+            db_path,
+            db_manager_factory=db_manager_factory,
+        ).mark_precomputed(interval_task.irecip_id)
     return build_scattering_interval_manifest(
         work_unit,
         completion_status=CompletionStatus.COMMITTED,
-    )
-
-
-def build_scattering_interval_chunk_shard_path(
-    output_dir: str,
-    *,
-    chunk_id: int,
-    interval_id: int,
-) -> Path:
-    return (
-        Path(output_dir)
-        / "scattering_shards"
-        / f"chunk_{int(chunk_id)}"
-        / f"interval_{int(interval_id)}.hdf5"
     )
 
 
@@ -670,179 +619,47 @@ def persist_scattering_interval_chunk_shard(
     amplitudes_average: np.ndarray,
     output_dir: str,
     quiet_logs: bool = False,
+    runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ScatteringArtifactManifest:
     if work_unit.chunk_id is None:
         raise ValueError("Chunk shard persistence requires a chunk-scoped work unit.")
-    t0 = TIMER()
-    delta = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
-    average = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
-    if average.shape != delta.shape:
-        raise ValueError("Scattering shard amplitudes_delta/amplitudes_average shape mismatch.")
-    shard_path = build_scattering_interval_chunk_shard_path(
-        output_dir,
-        chunk_id=work_unit.chunk_id,
-        interval_id=work_unit.interval_id,
+    identity_fields = (
+        work_unit.run_digest,
+        work_unit.scientific_digest,
+        work_unit.execution_digest,
+        work_unit.qspace_plan_digest,
+        work_unit.backend_policy_digest,
+        work_unit.source_structure_digest,
     )
-    _atomic_hdf5_write(
-        shard_path,
-        {
-            "point_ids": np.arange(delta.shape[0], dtype=np.int64),
-            "grid_shape_nd": np.asarray(grid_shape_nd, dtype=np.int64),
-            "amplitudes_delta": delta,
-            "amplitudes_average": average,
-        },
-        attrs={
-            "schema_version": 1,
-            "format": "mosaic.scattering.interval_chunk_shard",
-            "interval_id": int(work_unit.interval_id),
-            "chunk_id": int(work_unit.chunk_id),
-            "contribution_reciprocal_points": int(contribution_reciprocal_points),
-            "total_reciprocal_points": int(total_reciprocal_points),
-        },
-    )
-    log_fn = logger.debug if quiet_logs else logger.info
-    log_fn(
-        "scattering-shard | chunk %d | iv %d | bytes=%d | %.3f s",
-        int(work_unit.chunk_id),
-        int(work_unit.interval_id),
-        int(shard_path.stat().st_size),
-        TIMER() - t0,
-    )
-    return build_scattering_chunk_manifest(
-        work_unit,
-        output_dir=output_dir,
-        completion_status=CompletionStatus.MATERIALIZED,
-    )
+    if all(isinstance(value, str) and value for value in identity_fields):
+        from core.scattering.commit import write_scattering_attempt
 
-
-def _parse_scattering_shard_interval_id(path: Path) -> int:
-    stem = path.stem
-    prefix = "interval_"
-    if not stem.startswith(prefix):
-        raise ValueError(f"Unexpected scattering shard filename: {path}")
-    return int(stem[len(prefix):])
-
-
-def discover_scattering_interval_chunk_shards(
-    output_dir: str,
-    *,
-    chunk_id: int,
-) -> list[Path]:
-    shard_dir = Path(output_dir) / "scattering_shards" / f"chunk_{int(chunk_id)}"
-    if not shard_dir.exists():
-        return []
-    return sorted(
-        shard_dir.glob("interval_*.hdf5"),
-        key=_parse_scattering_shard_interval_id,
-    )
-
-
-def load_scattering_interval_chunk_shard(path: Path):
-    with h5py.File(path, "r") as h5file:
-        interval_id = int(h5file.attrs["interval_id"])
-        chunk_id = int(h5file.attrs["chunk_id"])
-        return build_scattering_partial_result(
-            chunk_id=chunk_id,
-            interval_id=interval_id,
-            point_ids=np.asarray(h5file["point_ids"], dtype=np.int64),
-            grid_shape_nd=np.asarray(h5file["grid_shape_nd"], dtype=np.int64),
-            amplitudes_delta=np.asarray(h5file["amplitudes_delta"], dtype=np.complex128),
-            amplitudes_average=np.asarray(h5file["amplitudes_average"], dtype=np.complex128),
-            reciprocal_point_count=int(h5file.attrs["contribution_reciprocal_points"]),
+        write_scattering_attempt(
+            output_dir=output_dir,
+            run_digest=str(work_unit.run_digest),
+            interval_id=int(work_unit.interval_id),
+            chunk_id=int(work_unit.chunk_id),
+            attempt_id=f"interval-{int(work_unit.interval_id)}-attempt-{uuid4().hex}",
+            scientific_digest=str(work_unit.scientific_digest),
+            execution_digest=str(work_unit.execution_digest),
+            qspace_plan_digest=str(work_unit.qspace_plan_digest),
+            backend_policy_digest=str(work_unit.backend_policy_digest),
+            source_structure_digest=str(work_unit.source_structure_digest),
+            grid_shape_nd=grid_shape_nd,
+            amplitudes_delta=amplitudes_delta,
+            amplitudes_average=amplitudes_average,
+            contribution_reciprocal_points=contribution_reciprocal_points,
+            runtime_provenance=runtime_provenance,
         )
-
-
-def reduce_scattering_shards_for_chunk(
-    *,
-    chunk_id: int,
-    expected_interval_ids: tuple[int, ...],
-    total_reciprocal_points: int,
-    output_dir: str,
-    db_path: str,
-    dimension: int = 1,
-    quiet_logs: bool = False,
-    artifact_store_factory: Callable[[str], ScatteringArtifactStore] = ScatteringArtifactStore,
-    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
-) -> ScatteringArtifactManifest:
-    expected = tuple(sorted(int(interval_id) for interval_id in expected_interval_ids))
-    if not expected:
-        raise ValueError("Scattering reducer requires at least one expected interval id.")
-    t0 = TIMER()
-    shard_by_interval = {
-        _parse_scattering_shard_interval_id(path): path
-        for path in discover_scattering_interval_chunk_shards(output_dir, chunk_id=chunk_id)
-    }
-    missing = tuple(interval_id for interval_id in expected if interval_id not in shard_by_interval)
-    if missing:
-        raise RuntimeError(
-            "Scattering reducer missing interval-chunk shard coverage: "
-            f"chunk={int(chunk_id)} intervals={list(missing)}"
+        return build_scattering_chunk_manifest(
+            work_unit,
+            output_dir=output_dir,
+            completion_status=CompletionStatus.MATERIALIZED,
         )
-    with chunk_mutex(chunk_id, lock_root=output_dir):
-        store = artifact_store_factory(output_dir)
-        existing_partial, applied_set, current_payload, current_average_payload = (
-            load_existing_scattering_partial_result(int(chunk_id), output_dir=output_dir)
-        )
-        merged_partial = existing_partial
-        for interval_id in expected:
-            if interval_id in applied_set:
-                continue
-            partial = load_scattering_interval_chunk_shard(shard_by_interval[interval_id])
-            store.ensure_grid_shape(int(chunk_id), partial.grid_shape_nd)
-            store.ensure_total_reciprocal_points(int(chunk_id), int(total_reciprocal_points))
-            merged_partial = (
-                merge_scattering_partial_results(merged_partial, partial)
-                if merged_partial is not None
-                else partial
-            )
-            applied_set.add(interval_id)
-        if merged_partial is None:
-            raise RuntimeError(
-                f"Scattering reducer had no materialized state for chunk={int(chunk_id)}."
-            )
-        amplitudes_payload = materialize_scattering_payload(
-            current_payload,
-            merged_partial.point_ids,
-            merged_partial.amplitudes_delta,
-        )
-        amplitudes_average_payload = materialize_scattering_payload(
-            current_average_payload,
-            merged_partial.point_ids,
-            merged_partial.amplitudes_average,
-        )
-        store.save_chunk_payloads(
-            int(chunk_id),
-            amplitudes_payload=amplitudes_payload,
-            amplitudes_average_payload=amplitudes_average_payload,
-            reciprocal_point_count=merged_partial.reciprocal_point_count,
-        )
-        store.ensure_total_reciprocal_points(int(chunk_id), int(total_reciprocal_points))
-        store.save_applied_interval_ids(int(chunk_id), applied_set)
-        status_updater = _IntervalChunkStatusUpdater(
-            db_path,
-            db_manager_factory=db_manager_factory,
-        )
-        for interval_id in expected:
-            status_updater.mark_saved(int(interval_id), int(chunk_id))
-    representative = ScatteringWorkUnit.interval_chunk(
-        interval_id=max(expected),
-        chunk_id=int(chunk_id),
-        dimension=max(int(dimension), 1),
-        output_dir=output_dir,
+    raise ValueError(
+        "Current scattering chunk workers require identity-complete work units "
+        "and run-scoped attempt manifests."
     )
-    manifest = build_scattering_chunk_manifest(
-        representative,
-        output_dir=output_dir,
-        completion_status=CompletionStatus.COMMITTED,
-    )
-    log_fn = logger.debug if quiet_logs else logger.info
-    log_fn(
-        "scattering-reduce | chunk %d | intervals=%d | %.3f s",
-        int(chunk_id),
-        int(len(expected)),
-        TIMER() - t0,
-    )
-    return manifest
 
 
 def load_existing_scattering_partial_result(
@@ -973,18 +790,13 @@ def persist_scattering_interval_chunk_result(
 __all__ = [
     "ScatteringArtifactStore",
     "assess_scattering_manifest",
-    "build_scattering_interval_chunk_shard_path",
     "build_scattering_chunk_manifest",
     "build_scattering_interval_manifest",
     "can_resume_scattering_work_unit",
-    "discover_scattering_interval_chunk_shards",
     "is_interval_artifact_committed",
     "is_scattering_manifest_complete",
-    "load_existing_scattering_partial_result",
-    "load_scattering_interval_chunk_shard",
     "mark_empty_interval_precomputed",
     "persist_precomputed_interval_artifact",
     "persist_scattering_interval_chunk_shard",
     "persist_scattering_interval_chunk_result",
-    "reduce_scattering_shards_for_chunk",
 ]
