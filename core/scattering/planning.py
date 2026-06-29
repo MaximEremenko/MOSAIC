@@ -17,6 +17,7 @@ from core.storage.attempt_store import qspace_plan_path, run_manifest_path
 from core.storage.digests import (
     build_execution_digest as _build_execution_digest,
     build_run_digest as _build_run_digest,
+    build_run_identity_digest as _build_run_identity_digest,
     digest_dict,
     normalize_digest_input,
     require_sha256_hex,
@@ -293,10 +294,24 @@ def build_run_identity(
         reducer_strategy=reducer_strategy,
         backend_policy_digest=backend_policy_digest,
     )
+    # P11 C-2: the run/checkpoint tree is addressed by the DEVICE-INDEPENDENT run
+    # identity (science + numerical contract: eps/dtype/pre-sum/reducer), NOT by the
+    # device-bound execution_digest. A CPU run and a GPU run of the same science thus
+    # share one `.mosaic/runs/<run_digest>/` tree; the device-bound execution_digest
+    # is retained on the identity as metadata (and in the run manifest's execution
+    # contract), never as the path address.
+    run_digest = _build_run_identity_digest(
+        scientific_digest=scientific_digest,
+        eps=eps,
+        dtype=dtype,
+        pre_sum_mode=pre_sum_mode,
+        reducer_strategy=reducer_strategy,
+        schema_version=SCATTERING_IDENTITY_SCHEMA_VERSION,
+    )
     return ScatteringRunIdentity(
         scientific_digest=scientific_digest,
         execution_digest=execution_digest,
-        run_digest=build_run_digest(execution_digest),
+        run_digest=run_digest,
     )
 
 

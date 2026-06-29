@@ -88,7 +88,14 @@ def build_run_digest(
     domain: str = "mosaic.run.v1",
     length: int = 32,
 ) -> str:
-    """Derive the path-layout run digest from an ``execution_digest``."""
+    """Derive the path-layout run digest from an ``execution_digest``.
+
+    NOTE (P11): ``execution_digest`` is device-bound (it includes ``backend``),
+    so this run digest separates CPU and GPU runs into different trees. P11
+    re-anchors the run/checkpoint identity onto the device-independent
+    :func:`build_run_identity_digest`; this function is retained for callers and
+    tests that still address the device-bound layout during the migration.
+    """
     require_sha256_hex(execution_digest, field_name="execution_digest")
     return digest_dict(
         {"schema_version": schema_version, "execution_digest": execution_digest},
@@ -96,9 +103,49 @@ def build_run_digest(
     )[:length]
 
 
+def build_run_identity_digest(
+    *,
+    scientific_digest: str,
+    eps: float,
+    dtype: str,
+    pre_sum_mode: str,
+    reducer_strategy: str,
+    schema_version: int,
+    domain: str = "mosaic.run_identity.v1",
+    length: int = 32,
+) -> str:
+    """Device-INDEPENDENT run / checkpoint identity (P11).
+
+    Unlike :func:`build_execution_digest`, this deliberately EXCLUDES the
+    ``backend`` (cpu/cuda) and any device-bound policy. Under P11 a durable
+    checkpoint is addressed by the *science* plus the *numerical contract*
+    (eps/dtype/pre-sum/reducer) — never by the device that computed it — so a CPU
+    run and a GPU run of the same science share the same run tree and the same
+    checkpoint addresses. Cross-device promotion is then decided by
+    scientific-invariant validation, not by output-byte equality (which is
+    impossible across CPU/GPU and even across GPU launches). The realized backend
+    is recorded as *attempt metadata* (see ``NufftExecutionSettings.backend``),
+    never as identity.
+
+    eps/dtype/pre-sum/reducer ARE part of the identity: two runs that disagree on
+    the numerical contract are different checkpoints (and need not agree).
+    """
+    require_sha256_hex(scientific_digest, field_name="scientific_digest")
+    payload = {
+        "schema_version": schema_version,
+        "scientific_digest": scientific_digest,
+        "eps": float(eps),
+        "dtype": str(dtype),
+        "pre_sum_mode": str(pre_sum_mode),
+        "reducer_strategy": str(reducer_strategy),
+    }
+    return digest_dict(payload, domain=domain)[:length]
+
+
 __all__ = [
     "build_execution_digest",
     "build_run_digest",
+    "build_run_identity_digest",
     "canonical_json",
     "digest_dict",
     "normalize_digest_input",
