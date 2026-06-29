@@ -253,6 +253,29 @@ def stage2_replacement_expected_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def normalize_stage2_replacement_expected_metadata(
+    raw: Mapping[str, object],
+) -> dict[str, object]:
+    expected = normalize_stage2_replacement_expected_by_chunk(
+        raw.get("expected_by_chunk", {})
+    )
+    expected_digest = raw.get("expected_digest")
+    if (
+        expected_digest is not None
+        and str(expected_digest) != stage2_replacement_expected_digest(expected)
+    ):
+        raise ValueError("Stage-2 replacement expected manifest digest mismatch.")
+    return {
+        "expected_by_chunk": expected,
+        "run_digest": None if raw.get("run_digest") is None else str(raw["run_digest"]),
+        "source_scattering_commit_digest": (
+            None
+            if raw.get("source_scattering_commit_digest") is None
+            else str(raw["source_scattering_commit_digest"])
+        ),
+    }
+
+
 def build_stage2_replacement_expected_artifact(
     output_dir: str,
     *,
@@ -277,6 +300,8 @@ def write_stage2_replacement_expected_manifest(
     output_dir: str,
     parameter_digest: str,
     expected_by_chunk: Mapping[object, Iterable[object]] | None,
+    run_digest: str | None = None,
+    source_scattering_commit_digest: str | None = None,
 ) -> ArtifactRef:
     artifact = build_stage2_replacement_expected_artifact(
         output_dir,
@@ -297,6 +322,12 @@ def write_stage2_replacement_expected_manifest(
             "schema_version": artifact.schema_version,
         },
         "parameter_digest": str(parameter_digest),
+        "run_digest": None if run_digest is None else str(run_digest),
+        "source_scattering_commit_digest": (
+            None
+            if source_scattering_commit_digest is None
+            else str(source_scattering_commit_digest)
+        ),
         "expected_digest": stage2_replacement_expected_digest(normalized),
         "expected_by_chunk": {
             str(chunk_id): list(interval_ids)
@@ -307,11 +338,11 @@ def write_stage2_replacement_expected_manifest(
     return artifact
 
 
-def load_stage2_replacement_expected_manifest(
+def load_stage2_replacement_expected_metadata(
     *,
     output_dir: str,
     parameter_digest: str,
-) -> dict[int, tuple[int, ...]] | None:
+) -> dict[str, object] | None:
     artifact = build_stage2_replacement_expected_artifact(
         output_dir,
         parameter_digest=parameter_digest,
@@ -328,16 +359,21 @@ def load_stage2_replacement_expected_manifest(
         raise ValueError(
             "Stage-2 replacement expected manifest parameter digest mismatch."
         )
-    expected = normalize_stage2_replacement_expected_by_chunk(
-        payload.get("expected_by_chunk", {})
+    return normalize_stage2_replacement_expected_metadata(payload)
+
+
+def load_stage2_replacement_expected_manifest(
+    *,
+    output_dir: str,
+    parameter_digest: str,
+) -> dict[int, tuple[int, ...]] | None:
+    metadata = load_stage2_replacement_expected_metadata(
+        output_dir=output_dir,
+        parameter_digest=parameter_digest,
     )
-    expected_digest = payload.get("expected_digest")
-    if (
-        expected_digest is not None
-        and str(expected_digest) != stage2_replacement_expected_digest(expected)
-    ):
-        raise ValueError("Stage-2 replacement expected manifest digest mismatch.")
-    return expected
+    if metadata is None:
+        return None
+    return dict(metadata["expected_by_chunk"])
 
 
 def build_residual_field_chunk_manifest(
@@ -2382,12 +2418,16 @@ __all__ = [
     "discover_stale_residual_field_generation_manifests",
     "is_residual_field_manifest_complete",
     "is_residual_field_replacement_complete",
+    "load_stage2_replacement_expected_manifest",
+    "load_stage2_replacement_expected_metadata",
     "load_residual_field_generation_metadata",
     "load_residual_field_generation_payload",
+    "normalize_stage2_replacement_expected_metadata",
     "load_residual_field_reducer_progress_manifest",
     "parse_residual_field_generation_ref",
     "persist_residual_field_generation_checkpoint",
     "reconcile_residual_field_reducer_progress",
     "summarize_residual_field_generation_metrics",
     "write_residual_field_reducer_progress_manifest",
+    "write_stage2_replacement_expected_manifest",
 ]

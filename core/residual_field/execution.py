@@ -26,6 +26,7 @@ from core.runtime import (
     require_chunk_quiescence,
     require_gpu_admission,
     register_cleanup_plugin,
+    resolve_nufft_execution_settings,
     resolve_worker_scratch_root,
     runtime_provenance_for_attempt,
     short_path,
@@ -78,6 +79,7 @@ from core.storage.run_state_cache import (
     rebuild_sqlite_cache_from_manifests,
     scan_run_state,
 )
+from core.runtime.nufft_policy import nufft_task_retries
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -829,6 +831,10 @@ def _call_accepts_kwarg(func, name: str) -> bool:
 
 
 def _residual_nufft_policy(workflow_parameters) -> str:
+    return _residual_nufft_settings(workflow_parameters).execution_policy
+
+
+def _residual_nufft_settings(workflow_parameters):
     runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
     if not hasattr(runtime_info, "get"):
         runtime_info = {}
@@ -837,9 +843,9 @@ def _residual_nufft_policy(workflow_parameters) -> str:
         requested = runtime_info.get("nufft_execution_policy")
     if requested is None:
         requested = runtime_info.get("nufft_policy")
-    from core.runtime.nufft_policy import resolve_nufft_policy
-
-    return resolve_nufft_policy(requested)
+    eps = runtime_info.get("residual_nufft_eps", runtime_info.get("nufft_eps", 1e-12))
+    dtype = runtime_info.get("residual_dtype", runtime_info.get("nufft_dtype", "complex128"))
+    return resolve_nufft_execution_settings(requested, eps=eps, dtype=dtype)
 
 
 def _residual_nufft_resources(workflow_parameters) -> dict[str, int]:
@@ -858,14 +864,16 @@ def _runtime_provenance_for_residual(
     fs_capability_digest: str | None,
     client,
 ) -> dict[str, object]:
-    policy = _residual_nufft_policy(workflow_parameters)
-    return runtime_provenance_for_attempt(
+    settings = _residual_nufft_settings(workflow_parameters)
+    provenance = runtime_provenance_for_attempt(
         fs_capability_digest=fs_capability_digest,
         scheduler_kind=_scheduler_kind(client),
-        nufft_policy=policy,
+        nufft_policy=settings.execution_policy,
         resource_requirements=_residual_nufft_resources(workflow_parameters),
-        cuda_probe=policy in {"gpu-required", "allow-fallback"},
+        cuda_probe=settings.gpu_only,
     )
+    provenance["nufft_execution_settings"] = settings.identity_payload()
+    return provenance
 
 
 def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
@@ -1658,6 +1666,7 @@ def run_residual_field_stage(
     fs_capability_digest: str | None = None
     runtime_provenance: dict[str, object] | None = None
     nufft_resources = _residual_nufft_resources(workflow_parameters)
+    nufft_settings = _residual_nufft_settings(workflow_parameters)
     if planned_work_units:
         fs_capability = profile_output_filesystem(
             artifacts.output_dir,
@@ -1757,6 +1766,9 @@ def run_residual_field_stage(
                     quiet_logs=False,
                     rifft_payload=current_rifft_payload if reuse_rifft_payload else None,
                     runtime_provenance=runtime_provenance,
+                    nufft_eps=nufft_settings.eps,
+                    nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                    nufft_gpu_only=nufft_settings.gpu_only,
                 )
                 pbar.update(1)
                 if manifest is None:
@@ -1990,8 +2002,11 @@ def run_residual_field_stage(
             key=f"residual-{work_unit.artifact_key}",
             pure=False,
             resources=nufft_resources,
-            retries=DEFAULT_TASK_RETRIES,
+            retries=nufft_task_retries(nufft_settings.execution_policy, DEFAULT_TASK_RETRIES),
             runtime_provenance=runtime_provenance,
+            nufft_eps=nufft_settings.eps,
+            nufft_prefer_cpu=nufft_settings.prefer_cpu,
+            nufft_gpu_only=nufft_settings.gpu_only,
         )
         if reuse_rifft_payload:
             submit_kwargs["rifft_payload"] = _target_rifft_payload_future(

@@ -9,6 +9,7 @@ from core.residual_field.artifacts import (
     reduce_residual_field_shards_for_chunk,
     write_stage2_replacement_expected_manifest,
 )
+from core.residual_field.commit import require_residual_no_output_manifest
 from core.residual_field.contracts import ResidualFieldWorkUnit
 from core.residual_field.planning import build_residual_field_parameter_digest
 from core.residual_field.stage import ResidualFieldStage
@@ -193,6 +194,8 @@ def test_residual_stage_treats_empty_fresh_expected_as_complete_noop(
             artifacts=SimpleNamespace(output_dir=str(tmp_path), db_manager=db),
             client=None,
             scattering_parameters={
+                "scattering_run_digest": "stage2run",
+                "source_scattering_commit_digest": "b" * 64,
                 "residual_parameter_digest": "abc123",
                 "stage2_replacement_expected_by_chunk": {},
             },
@@ -200,7 +203,47 @@ def test_residual_stage_treats_empty_fresh_expected_as_complete_noop(
 
         assert called == []
         assert result["stage2_replacement_expected_by_chunk"] == {}
+        no_output = require_residual_no_output_manifest(
+            output_dir=tmp_path,
+            run_digest="stage2run",
+        )
+        assert no_output.source_scattering_commit_digest == "b" * 64
         assert db.get_unsaved_interval_chunks() == []
+    finally:
+        db.close()
+
+
+def test_residual_stage_rejects_empty_expected_without_source_identity(
+    tmp_path,
+    monkeypatch,
+):
+    db, interval_ids = _seed_db_for_replacement(tmp_path)
+    try:
+        for interval_id in interval_ids:
+            db.update_interval_chunk_status(interval_id, 3, saved=True)
+
+        monkeypatch.setattr(
+            "core.residual_field.stage.run_residual_field_stage",
+            lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("residual fallback should not run")
+            ),
+        )
+
+        try:
+            ResidualFieldStage().execute(
+                workflow_parameters=_workflow_parameters(),
+                structure=SimpleNamespace(),
+                artifacts=SimpleNamespace(output_dir=str(tmp_path), db_manager=db),
+                client=None,
+                scattering_parameters={
+                    "residual_parameter_digest": "abc123",
+                    "stage2_replacement_expected_by_chunk": {},
+                },
+            )
+        except RuntimeError as exc:
+            assert "source_scattering_commit_digest" in str(exc)
+        else:
+            raise AssertionError("empty replacement without identity should fail closed")
     finally:
         db.close()
 
@@ -256,6 +299,8 @@ def test_residual_stage_loads_expected_manifest_when_scattering_returns_no_param
             output_dir=str(tmp_path),
             parameter_digest=parameter_digest,
             expected_by_chunk={3: interval_ids},
+            run_digest="stage2run",
+            source_scattering_commit_digest="b" * 64,
         )
         work_unit = ResidualFieldWorkUnit.interval_chunk_batch(
             interval_ids=interval_ids,
@@ -303,6 +348,49 @@ def test_residual_stage_loads_expected_manifest_when_scattering_returns_no_param
         )
 
         assert called == []
+        assert db.get_unsaved_interval_chunks() == []
+    finally:
+        db.close()
+
+
+def test_residual_stage_writes_no_output_from_empty_expected_manifest(
+    tmp_path,
+    monkeypatch,
+):
+    db, interval_ids = _seed_db_for_replacement(tmp_path)
+    try:
+        for interval_id in interval_ids:
+            db.update_interval_chunk_status(interval_id, 3, saved=True)
+        workflow_parameters = _workflow_parameters()
+        parameter_digest = build_residual_field_parameter_digest(workflow_parameters)
+        write_stage2_replacement_expected_manifest(
+            output_dir=str(tmp_path),
+            parameter_digest=parameter_digest,
+            expected_by_chunk={},
+            run_digest="stage2run",
+            source_scattering_commit_digest="c" * 64,
+        )
+
+        monkeypatch.setattr(
+            "core.residual_field.stage.run_residual_field_stage",
+            lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("residual fallback should not run")
+            ),
+        )
+
+        ResidualFieldStage().execute(
+            workflow_parameters=workflow_parameters,
+            structure=SimpleNamespace(),
+            artifacts=SimpleNamespace(output_dir=str(tmp_path), db_manager=db),
+            client=None,
+            scattering_parameters={},
+        )
+
+        no_output = require_residual_no_output_manifest(
+            output_dir=tmp_path,
+            run_digest="stage2run",
+        )
+        assert no_output.source_scattering_commit_digest == "c" * 64
         assert db.get_unsaved_interval_chunks() == []
     finally:
         db.close()

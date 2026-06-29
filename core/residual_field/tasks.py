@@ -6,6 +6,8 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -20,7 +22,11 @@ from core.residual_field.backend import (
 from core.scattering.accumulation import apply_half_space_conjugate_reconstruction
 from core.scattering.kernels import build_rifft_grid_for_chunk
 from core.scattering.kernels import IntervalTask
-from core.scattering.tasks import load_interval_task_payload, scattering_contribution_point_count
+from core.scattering.tasks import (
+    IntervalPayloadRef,
+    load_interval_task_payload,
+    scattering_contribution_point_count,
+)
 from core.residual_field.contracts import (
     ResidualFieldAccumulatorStatus,
     ResidualFieldShardManifest,
@@ -39,6 +45,15 @@ _RIFFT_PAYLOAD_CACHE: "OrderedDict[tuple, tuple[tuple[np.ndarray, np.ndarray], i
 _RIFFT_PAYLOAD_CACHE_BYTES = 0
 _RIFFT_PAYLOAD_CACHE_LOCK = threading.Lock()
 _RIFFT_PAYLOAD_CACHE_MAX_BYTES_DEFAULT = 4 * 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ResidualChunkComputeResult:
+    grid_shape_nd: np.ndarray
+    contribution_reciprocal_points: int
+    amplitudes_delta: np.ndarray
+    amplitudes_average: np.ndarray
+    point_ids: np.ndarray
 
 
 def _ensure_worker_logging() -> None:
@@ -147,15 +162,19 @@ def _store_rifft_payload_cache(
 
 
 def _normalize_interval_inputs(
-    interval_inputs: Path | str | IntervalTask | Sequence[Path | str | IntervalTask],
-) -> tuple[Path | IntervalTask, ...]:
+    interval_inputs: Path | str | IntervalTask | IntervalPayloadRef | Sequence[Path | str | IntervalTask | IntervalPayloadRef],
+) -> tuple[Path | IntervalTask | IntervalPayloadRef, ...]:
     if isinstance(interval_inputs, IntervalTask):
+        return (interval_inputs,)
+    if isinstance(interval_inputs, IntervalPayloadRef):
         return (interval_inputs,)
     if isinstance(interval_inputs, (str, Path)):
         return (Path(interval_inputs),)
-    normalized: list[Path | IntervalTask] = []
+    normalized: list[Path | IntervalTask | IntervalPayloadRef] = []
     for item in interval_inputs:
         if isinstance(item, IntervalTask):
+            normalized.append(item)
+        elif isinstance(item, IntervalPayloadRef):
             normalized.append(item)
         else:
             normalized.append(Path(item))
@@ -167,6 +186,14 @@ def _q_grid_signature(q_grid: np.ndarray, q_grid_digest: str | None = None) -> t
     if q_grid_digest:
         return (tuple(arr.shape), str(arr.dtype), str(q_grid_digest))
     return (tuple(arr.shape), str(arr.dtype), arr.tobytes())
+
+
+def _interval_task_sort_key(interval_task: IntervalTask) -> tuple:
+    return (
+        int(interval_task.irecip_id),
+        str(interval_task.half_space_role),
+        int(interval_task.reciprocal_multiplicity),
+    )
 
 
 def _atoms_to_chunk_data(atoms: np.recarray) -> list[dict]:
@@ -316,9 +343,153 @@ def _validate_same_q_grid_weight_shapes(
             )
 
 
+def _call_inverse_super_batch(
+    *,
+    q_coords: np.ndarray,
+    weights: np.ndarray,
+    real_coords: np.ndarray,
+    eps: float,
+    prefer_cpu: bool,
+    gpu_only: bool,
+) -> np.ndarray:
+    kwargs = {
+        "q_coords": q_coords,
+        "weights": weights,
+        "real_coords": real_coords,
+        "eps": eps,
+    }
+    try:
+        signature = inspect.signature(execute_inverse_cunufft_super_batch)
+    except (TypeError, ValueError):
+        kwargs.update({"prefer_cpu": prefer_cpu, "gpu_only": gpu_only})
+    else:
+        accepts_var_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        if accepts_var_kwargs or "prefer_cpu" in signature.parameters:
+            kwargs["prefer_cpu"] = prefer_cpu
+        if accepts_var_kwargs or "gpu_only" in signature.parameters:
+            kwargs["gpu_only"] = gpu_only
+    return execute_inverse_cunufft_super_batch(**kwargs)
+
+
+def compute_residual_field_interval_chunk_arrays(
+    interval_tasks: Sequence[IntervalTask],
+    *,
+    rifft_grid: np.ndarray,
+    grid_shape_nd: np.ndarray,
+    point_start: int = 0,
+    nufft_eps: float = 1e-12,
+    nufft_prefer_cpu: bool = False,
+    nufft_gpu_only: bool = False,
+) -> ResidualChunkComputeResult:
+    ordered_interval_tasks = sorted(interval_tasks, key=_interval_task_sort_key)
+    grouped_interval_tasks: dict[tuple, list[IntervalTask]] = {}
+    contribution_reciprocal_points = 0
+    for interval_task in ordered_interval_tasks:
+        grouped_interval_tasks.setdefault(
+            (
+                _q_grid_signature(
+                    interval_task.q_grid,
+                    getattr(interval_task, "q_grid_digest", None),
+                ),
+                interval_task.half_space_role,
+            ),
+            [],
+        ).append(interval_task)
+        contribution_reciprocal_points += scattering_contribution_point_count(interval_task)
+    if not grouped_interval_tasks:
+        raise ValueError("Residual-field batch task produced no interval contributions.")
+
+    amplitudes_delta = None
+    amplitudes_average = None
+    use_presum = _same_q_grid_presum_enabled()
+    ordered_groups = [
+        grouped_interval_tasks[key]
+        for key in sorted(grouped_interval_tasks, key=lambda item: (str(item[1]), item[0]))
+    ]
+    for grouped_tasks in ordered_groups:
+        grouped_tasks = sorted(grouped_tasks, key=_interval_task_sort_key)
+        reference_q_grid = grouped_tasks[0].q_grid
+        if use_presum:
+            inverse_weights = _pre_sum_same_q_grid_weights(
+                grouped_tasks,
+                reference_q_grid=reference_q_grid,
+            )
+        else:
+            _validate_same_q_grid_weight_shapes(
+                grouped_tasks,
+                reference_q_grid=reference_q_grid,
+            )
+            stacked_weights = []
+            for interval_task in grouped_tasks:
+                stacked_weights.extend(
+                    [
+                        interval_task.q_amp - interval_task.q_amp_av,
+                        interval_task.q_amp_av,
+                    ]
+                )
+            inverse_weights = np.stack(stacked_weights, axis=0)
+            del stacked_weights
+        inverse_outputs = _call_inverse_super_batch(
+            q_coords=reference_q_grid,
+            weights=inverse_weights,
+            real_coords=rifft_grid,
+            eps=nufft_eps,
+            prefer_cpu=nufft_prefer_cpu,
+            gpu_only=nufft_gpu_only,
+        )
+        del inverse_weights
+        inverse_outputs = np.asarray(inverse_outputs, dtype=np.complex128)
+        if use_presum:
+            if inverse_outputs.shape[0] != 2:
+                raise ValueError(
+                    "Residual-field same-q-grid inverse expected two output transforms; "
+                    f"got {inverse_outputs.shape[0]}"
+                )
+            grouped_delta = inverse_outputs[0]
+            grouped_average = inverse_outputs[1]
+        else:
+            grouped_delta = np.sum(inverse_outputs[0::2], axis=0, dtype=np.complex128)
+            grouped_average = np.sum(inverse_outputs[1::2], axis=0, dtype=np.complex128)
+        grouped_delta = apply_half_space_conjugate_reconstruction(
+            grouped_delta,
+            reference_q_grid,
+            grouped_tasks[0].half_space_role,
+        )
+        grouped_average = apply_half_space_conjugate_reconstruction(
+            grouped_average,
+            reference_q_grid,
+            grouped_tasks[0].half_space_role,
+        )
+        del inverse_outputs
+        if amplitudes_delta is None:
+            amplitudes_delta = grouped_delta
+        else:
+            amplitudes_delta += grouped_delta
+            del grouped_delta
+        if amplitudes_average is None:
+            amplitudes_average = grouped_average
+        else:
+            amplitudes_average += grouped_average
+            del grouped_average
+    if amplitudes_delta is None or amplitudes_average is None:
+        raise ValueError("Residual-field batch task produced no inverse outputs.")
+    point_offset = int(point_start or 0)
+    point_ids = point_offset + np.arange(amplitudes_delta.shape[0], dtype=np.int64)
+    return ResidualChunkComputeResult(
+        grid_shape_nd=np.asarray(grid_shape_nd, dtype=np.int64),
+        contribution_reciprocal_points=int(contribution_reciprocal_points),
+        amplitudes_delta=np.asarray(amplitudes_delta, dtype=np.complex128),
+        amplitudes_average=np.asarray(amplitudes_average, dtype=np.complex128),
+        point_ids=point_ids,
+    )
+
+
 def run_residual_field_interval_chunk_task(
     work_unit: ResidualFieldWorkUnit,
-    interval_paths: Path | str | IntervalTask | Sequence[Path | str | IntervalTask],
+    interval_paths: Path | str | IntervalTask | IntervalPayloadRef | Sequence[Path | str | IntervalTask | IntervalPayloadRef],
     atoms: np.recarray | None,
     *,
     total_reciprocal_points: int,
@@ -331,6 +502,9 @@ def run_residual_field_interval_chunk_task(
     quiet_logs: bool = False,
     rifft_payload: tuple[np.ndarray, np.ndarray] | None = None,
     runtime_provenance: Mapping[str, Any] | None = None,
+    nufft_eps: float = 1e-12,
+    nufft_prefer_cpu: bool = False,
+    nufft_gpu_only: bool = False,
 ) -> ResidualFieldShardManifest | ResidualFieldAccumulatorStatus | None:
     _ensure_worker_logging()
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
@@ -396,130 +570,29 @@ def run_residual_field_interval_chunk_task(
                 ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a",
                 int(rifft_grid.shape[0]),
             )
-        contribution_reciprocal_points = 0
-        interval_tasks = [
-            interval_input
-            if isinstance(interval_input, IntervalTask)
-            else load_interval_task_payload(interval_input)
-            for interval_input in loaded_interval_inputs
-        ]
-        grouped_interval_tasks: dict[tuple, list] = {}
-        for interval_task in interval_tasks:
-            grouped_interval_tasks.setdefault(
-                (
-                    _q_grid_signature(
-                        interval_task.q_grid,
-                        getattr(interval_task, "q_grid_digest", None),
-                    ),
-                    interval_task.half_space_role,
-                ),
-                [],
-            ).append(interval_task)
-            contribution_reciprocal_points += scattering_contribution_point_count(interval_task)
-        if not grouped_interval_tasks:
-            raise ValueError("Residual-field batch task produced no interval contributions.")
-        amplitudes_delta = None
-        amplitudes_average = None
-        use_presum = _same_q_grid_presum_enabled()
-        total_groups = len(grouped_interval_tasks)
-        for group_index, grouped_tasks in enumerate(grouped_interval_tasks.values(), start=1):
-            reference_q_grid = grouped_tasks[0].q_grid
-            if show_progress:
-                logger.debug(
-                    "Residual batch group | chunk=%d | partition=%s | group=%d/%d | intervals=%d | q_points=%d",
-                    int(work_unit.chunk_id),
-                    work_unit.partition_id,
-                    int(group_index),
-                    int(total_groups),
-                    int(len(grouped_tasks)),
-                    int(reference_q_grid.shape[0]),
-                )
-            if use_presum:
-                inverse_weights = _pre_sum_same_q_grid_weights(
-                    grouped_tasks,
-                    reference_q_grid=reference_q_grid,
-                )
-                if show_progress:
-                    previous_transforms = 2 * int(len(grouped_tasks))
-                    logger.debug(
-                        "Residual batch same-q-grid pre-sum | chunk=%d | partition=%s | "
-                        "intervals=%d | q_points=%d | transforms_before=%d | transforms_after=2 | saved=%d",
-                        int(work_unit.chunk_id),
-                        work_unit.partition_id,
-                        int(len(grouped_tasks)),
-                        int(reference_q_grid.shape[0]),
-                        int(previous_transforms),
-                        max(0, int(previous_transforms) - 2),
-                    )
-            else:
-                _validate_same_q_grid_weight_shapes(
-                    grouped_tasks,
-                    reference_q_grid=reference_q_grid,
-                )
-                stacked_weights = []
-                for interval_task in grouped_tasks:
-                    stacked_weights.extend(
-                        [
-                            interval_task.q_amp - interval_task.q_amp_av,
-                            interval_task.q_amp_av,
-                        ]
-                    )
-                inverse_weights = np.stack(stacked_weights, axis=0)
-                del stacked_weights
-            inverse_start = time.perf_counter()
-            inverse_outputs = execute_inverse_cunufft_super_batch(
-                q_coords=reference_q_grid,
-                weights=inverse_weights,
-                real_coords=rifft_grid,
-                eps=1e-12,
-            )
-            if show_progress:
-                logger.debug(
-                    "Residual batch inverse NUFFT | chunk=%d | partition=%s | group=%d/%d | intervals=%d | transforms=%d | duration=%.3fs",
-                    int(work_unit.chunk_id),
-                    work_unit.partition_id,
-                    int(group_index),
-                    int(total_groups),
-                    int(len(grouped_tasks)),
-                    int(np.asarray(inverse_weights).shape[0]),
-                    time.perf_counter() - inverse_start,
-                )
-            del inverse_weights
-            inverse_outputs = np.asarray(inverse_outputs, dtype=np.complex128)
-            if use_presum:
-                if inverse_outputs.shape[0] != 2:
-                    raise ValueError(
-                        "Residual-field same-q-grid inverse expected two output transforms; "
-                        f"got {inverse_outputs.shape[0]}"
-                    )
-                grouped_delta = inverse_outputs[0]
-                grouped_average = inverse_outputs[1]
-            else:
-                grouped_delta = np.sum(inverse_outputs[0::2], axis=0, dtype=np.complex128)
-                grouped_average = np.sum(inverse_outputs[1::2], axis=0, dtype=np.complex128)
-            grouped_delta = apply_half_space_conjugate_reconstruction(
-                grouped_delta,
-                reference_q_grid,
-                grouped_tasks[0].half_space_role,
-            )
-            grouped_average = apply_half_space_conjugate_reconstruction(
-                grouped_average,
-                reference_q_grid,
-                grouped_tasks[0].half_space_role,
-            )
-            del inverse_outputs
-            if amplitudes_delta is None:
-                amplitudes_delta = grouped_delta
-            else:
-                amplitudes_delta += grouped_delta
-                del grouped_delta
-            if amplitudes_average is None:
-                amplitudes_average = grouped_average
-            else:
-                amplitudes_average += grouped_average
-                del grouped_average
-        point_offset = int(work_unit.point_start or 0)
-        point_ids = point_offset + np.arange(amplitudes_delta.shape[0], dtype=np.int64)
+        interval_tasks = sorted(
+            [
+                interval_input
+                if isinstance(interval_input, IntervalTask)
+                else load_interval_task_payload(interval_input)
+                for interval_input in loaded_interval_inputs
+            ],
+            key=_interval_task_sort_key,
+        )
+        compute_result = compute_residual_field_interval_chunk_arrays(
+            interval_tasks,
+            rifft_grid=rifft_grid,
+            grid_shape_nd=grid_shape_nd,
+            point_start=int(work_unit.point_start or 0),
+            nufft_eps=nufft_eps,
+            nufft_prefer_cpu=nufft_prefer_cpu,
+            nufft_gpu_only=nufft_gpu_only,
+        )
+        grid_shape_nd = compute_result.grid_shape_nd
+        contribution_reciprocal_points = compute_result.contribution_reciprocal_points
+        amplitudes_delta = compute_result.amplitudes_delta
+        amplitudes_average = compute_result.amplitudes_average
+        point_ids = compute_result.point_ids
         if owner_local_reducer:
             if db_path is None:
                 raise ValueError("Owner-local residual reducer requires a driver DB cache path.")
@@ -608,7 +681,9 @@ def run_residual_field_interval_chunk_task(
 
 
 __all__ = [
+    "ResidualChunkComputeResult",
     "build_residual_rifft_payload",
     "clear_residual_rifft_payload_cache",
+    "compute_residual_field_interval_chunk_arrays",
     "run_residual_field_interval_chunk_task",
 ]

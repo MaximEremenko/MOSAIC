@@ -4000,6 +4000,94 @@ def test_residual_field_interval_chunk_task_can_disable_same_q_grid_presum(monke
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
 
 
+def test_residual_field_interval_chunk_task_sorts_intervals_and_threads_nufft_settings(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", "0")
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+
+    def fake_super_batch(**kwargs):
+        captured.update(kwargs)
+        return np.array(
+            [
+                [1.0 + 0.0j],
+                [2.0 + 0.0j],
+                [3.0 + 0.0j],
+                [4.0 + 0.0j],
+            ],
+            dtype=np.complex128,
+        )
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        fake_super_batch,
+    )
+    reducer_backend = _CapturingReducerBackend("manifest")
+
+    run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(2, 1),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (
+            IntervalTask(
+                2,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([20.0 + 0.0j]),
+                np.array([2.0 + 0.0j]),
+            ),
+            IntervalTask(
+                1,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([10.0 + 0.0j]),
+                np.array([1.0 + 0.0j]),
+            ),
+        ),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=reducer_backend,
+        quiet_logs=True,
+        nufft_eps=1e-7,
+        nufft_prefer_cpu=True,
+        nufft_gpu_only=False,
+    )
+
+    np.testing.assert_allclose(
+        captured["weights"],
+        np.array(
+            [
+                [9.0 + 0.0j],
+                [1.0 + 0.0j],
+                [18.0 + 0.0j],
+                [2.0 + 0.0j],
+            ],
+            dtype=np.complex128,
+        ),
+    )
+    assert captured["eps"] == 1e-7
+    assert captured["prefer_cpu"] is True
+    assert captured["gpu_only"] is False
+
+
 def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypatch, tmp_path):
     interval_path_1 = tmp_path / "interval_1.hdf5"
     interval_path_2 = tmp_path / "interval_2.hdf5"

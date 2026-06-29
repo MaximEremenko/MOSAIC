@@ -4,9 +4,10 @@ import logging
 
 from core.residual_field.artifacts import (
     is_residual_field_replacement_complete,
-    load_stage2_replacement_expected_manifest,
+    load_stage2_replacement_expected_metadata,
     normalize_stage2_replacement_expected_by_chunk,
 )
+from core.residual_field.commit import write_residual_no_output_manifest
 from core.residual_field.execution import run_residual_field_stage
 from core.residual_field.planning import build_residual_field_parameter_digest
 from core.models import StructureData, WorkflowParameters
@@ -30,29 +31,61 @@ def _stage2_replacement_enabled(workflow_parameters: WorkflowParameters) -> bool
     return bool(enabled)
 
 
-def _replacement_expected_by_chunk(
+def _replacement_expected_metadata(
     scattering_parameters: dict[str, object],
-) -> dict[int, tuple[int, ...]]:
+) -> dict[str, object]:
     raw = scattering_parameters.get(_STAGE2_REPLACEMENT_EXPECTED_KEY, {})
-    return normalize_stage2_replacement_expected_by_chunk(raw)
+    return {
+        "expected_by_chunk": normalize_stage2_replacement_expected_by_chunk(raw),
+        "run_digest": scattering_parameters.get("scattering_run_digest")
+        or scattering_parameters.get("run_digest"),
+        "source_scattering_commit_digest": scattering_parameters.get(
+            "source_scattering_commit_digest"
+        ),
+    }
 
 
-def _resolve_replacement_expected_by_chunk(
+def _resolve_replacement_expected_metadata(
     *,
     scattering_parameters: dict[str, object],
     artifacts,
     parameter_digest: str,
-) -> tuple[dict[int, tuple[int, ...]], str]:
+) -> tuple[dict[str, object], str]:
     if _STAGE2_REPLACEMENT_EXPECTED_KEY in scattering_parameters:
-        return _replacement_expected_by_chunk(scattering_parameters), "scattering"
+        return _replacement_expected_metadata(scattering_parameters), "scattering"
 
-    expected_from_manifest = load_stage2_replacement_expected_manifest(
+    expected_from_manifest = load_stage2_replacement_expected_metadata(
         output_dir=artifacts.output_dir,
         parameter_digest=parameter_digest,
     )
     if expected_from_manifest is not None:
         return expected_from_manifest, "manifest"
-    return {}, "absent"
+    return {
+        "expected_by_chunk": {},
+        "run_digest": None,
+        "source_scattering_commit_digest": None,
+    }, "absent"
+
+
+def _write_empty_replacement_no_output_manifest(
+    *,
+    artifacts,
+    metadata: dict[str, object],
+    expected_source: str,
+) -> None:
+    run_digest = metadata.get("run_digest")
+    source_scattering_commit_digest = metadata.get("source_scattering_commit_digest")
+    if not run_digest or not source_scattering_commit_digest:
+        raise RuntimeError(
+            "Stage-2 empty replacement evidence must include run_digest and "
+            "source_scattering_commit_digest before residual no_output.json can be written."
+        )
+    write_residual_no_output_manifest(
+        output_dir=artifacts.output_dir,
+        run_digest=str(run_digest),
+        source_scattering_commit_digest=str(source_scattering_commit_digest),
+        reason=f"empty replacement coverage from {expected_source}",
+    )
 
 
 def _reset_expected_interval_chunks(artifacts, expected_by_chunk: dict[int, tuple[int, ...]]) -> None:
@@ -82,11 +115,12 @@ class ResidualFieldStage:
                 scattering_parameters.get("residual_parameter_digest")
                 or build_residual_field_parameter_digest(workflow_parameters)
             )
-            expected_by_chunk, expected_source = _resolve_replacement_expected_by_chunk(
+            expected_metadata, expected_source = _resolve_replacement_expected_metadata(
                 scattering_parameters=scattering_parameters,
                 artifacts=artifacts,
                 parameter_digest=parameter_digest,
             )
+            expected_by_chunk = dict(expected_metadata["expected_by_chunk"])
             if expected_by_chunk:
                 complete_by_chunk = {
                     chunk_id: is_residual_field_replacement_complete(
@@ -110,6 +144,11 @@ class ResidualFieldStage:
                 )
                 _reset_expected_interval_chunks(artifacts, expected_by_chunk)
             elif expected_source in {"scattering", "manifest"}:
+                _write_empty_replacement_no_output_manifest(
+                    artifacts=artifacts,
+                    metadata=expected_metadata,
+                    expected_source=expected_source,
+                )
                 logger.info(
                     "Residual-field skipped: Stage-2 replacement expected no residual chunks."
                 )
