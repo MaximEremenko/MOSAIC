@@ -18,8 +18,15 @@ def main() -> int:
 
     env = dict(os.environ)
     env["MOSAIC_NUFFT_CPU_ONLY"] = "1"
+    if env.get("MOSAIC_SMOKE_USE_INSTALLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        mosaic_executable = shutil.which("mosaic")
+        if mosaic_executable is None:
+            raise SystemExit("MOSAIC_SMOKE_USE_INSTALLED=1 requires a mosaic executable on PATH.")
+        command = [mosaic_executable, str(RUN_FILE)]
+    else:
+        command = [sys.executable, "-m", "core.main", str(RUN_FILE)]
     subprocess.run(
-        [sys.executable, "-m", "core.main", str(RUN_FILE)],
+        command,
         cwd=ROOT,
         env=env,
         check=True,

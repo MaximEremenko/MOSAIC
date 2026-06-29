@@ -16,11 +16,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install package
+      - name: Build package
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install pytest
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Install built wheel
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, wheels
+          Path("wheel_path.txt").write_text(str(wheels[0]))
+          PY
+          python -m pip install "mosaic[test] @ file://$PWD/$(cat wheel_path.txt)"
+          python -m pip check
 
       - name: Import/version smoke
         run: |
@@ -31,13 +44,33 @@ jobs:
 
       - name: CLI help/version
         run: |
-          python -m core.main --help
-          python -m core.main --version
+          mosaic --help
+          mosaic --version
 
       - name: Canonical example smoke
         run: |
-          python scripts/smoke_example.py
+          MOSAIC_SMOKE_USE_INSTALLED=1 python scripts/smoke_example.py
+
+      - name: Guard rails
+        run: |
+          python scripts/ci_ast_check.py
 
       - name: Unit tests
         run: |
           pytest -q tests/unit
+
+      - name: Workflow integration tests
+        run: |
+          pytest -q tests/integration/test_workflow_services.py
+
+      - name: Distributed residual integration tests
+        env:
+          MOSAIC_ENABLE_DISTRIBUTED_TESTS: "1"
+          MOSAIC_DASK_RESOURCE_WAIT_TIMEOUT: "10"
+        run: |
+          pytest --timeout=180 -q tests/integration/test_residual_field_hpc.py
+
+      - name: CUDA extra resolution and admission gate
+        run: |
+          python -m pip install "mosaic[test,cuda12] @ file://$PWD/$(cat wheel_path.txt)"
+          pytest -q tests/unit/runtime/test_gpu_admission.py
