@@ -1,9 +1,13 @@
-from .dask_client import default_log_dir, get_client, set_log_dir_for_run
+from .dask_client import (
+    default_log_dir,
+    get_client,
+    set_log_dir_for_run,
+    shutdown_dask,
+)
 from .dask_helpers import (
     DEFAULT_TASK_RETRIES,
     ensure_dask_client,
     is_sync_client,
-    shutdown_dask,
     yield_futures_with_results,
 )
 from .fs_capability import (
@@ -16,6 +20,10 @@ from .gpu_admission import (
     nufft_task_resources,
     require_gpu_admission,
     runtime_provenance_for_attempt,
+)
+from .nufft_policy import (
+    NufftExecutionSettings,
+    resolve_nufft_execution_settings,
 )
 from .log_utils import short_path
 from .logger_config import setup_logging
@@ -41,6 +49,7 @@ __all__ = [
     "DEFAULT_TASK_RETRIES",
     "FilesystemCapabilityError",
     "GPUAdmissionError",
+    "NufftExecutionSettings",
     "QuiescenceReport",
     "TIMER",
     "chunk_mutex",
@@ -61,6 +70,7 @@ __all__ = [
     "require_chunk_quiescence",
     "require_gpu_admission",
     "resolve_worker_scratch_root",
+    "resolve_nufft_execution_settings",
     "runtime_provenance_for_attempt",
     "set_log_dir_for_run",
     "short_path",

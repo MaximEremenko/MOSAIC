@@ -604,35 +604,3 @@ def _register_heap_trim_plugin(client) -> None:
         client.register_worker_plugin(_PerTaskHeapTrim(), name="mosaic-heap-trim")
     except Exception:
         return
-
-
-# --------------------------------------------------------------------------- #
-#  Convenience for interactive sessions                                      #
-# --------------------------------------------------------------------------- #
-
-def shutdown_dask() -> None:
-    client = None
-    try:
-        try:
-            import core.runtime.dask_client as _dask_client
-            client = _dask_client._CLIENT
-        except Exception:
-            _dask_client = None
-        if client is None:
-            client = get_client()
-        cluster = getattr(client, "cluster", None)
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
-        cluster_close = getattr(cluster, "close", None)
-        if callable(cluster_close):
-            cluster_close()
-        logger.info("Dask client closed.")
-    except ValueError:
-        logger.info("No active Dask client.")
-    finally:
-        try:
-            import core.runtime.dask_client as _dask_client
-            _dask_client._CLIENT = None
-        except Exception:
-            pass

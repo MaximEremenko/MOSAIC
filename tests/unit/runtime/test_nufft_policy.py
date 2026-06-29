@@ -8,6 +8,7 @@ from core.runtime.nufft_policy import (
     normalize_nufft_policy,
     nufft_execute_kwargs,
     nufft_task_retries,
+    resolve_nufft_execution_settings,
     resolve_nufft_policy,
     should_resubmit_cpu_fallback,
 )
@@ -98,3 +99,37 @@ def test_nufft_gpu_failure_classifier_and_invalid_policy():
     assert not is_nufft_gpu_resource_failure("plain validation failure")
     with pytest.raises(ValueError):
         normalize_nufft_policy("sometimes-gpu")
+
+
+def test_resolved_execution_settings_make_auto_concrete_cpu():
+    settings = resolve_nufft_execution_settings(
+        "auto",
+        eps=1e-9,
+        dtype="complex128",
+        env={},
+    )
+
+    assert settings.requested_policy == "auto"
+    assert settings.execution_policy == "cpu-only"
+    assert settings.backend == "cpu"
+    assert settings.execute_kwargs == {"prefer_cpu": True, "gpu_only": False}
+    assert settings.identity_payload()["eps"] == 1e-9
+
+
+def test_resolved_execution_settings_make_gpu_required_fail_fast_contract():
+    settings = resolve_nufft_execution_settings(
+        "allow-fallback",
+        eps=1e-12,
+        dtype="complex128",
+        env={},
+    )
+
+    assert settings.requested_policy == "allow-fallback"
+    assert settings.execution_policy == "gpu-required"
+    assert settings.backend == "cuda"
+    assert settings.execute_kwargs == {"prefer_cpu": False, "gpu_only": True}
+
+
+def test_resolved_execution_settings_reject_non_complex128_dtype():
+    with pytest.raises(ValueError, match="complex128"):
+        resolve_nufft_execution_settings("cpu-only", dtype="complex64")

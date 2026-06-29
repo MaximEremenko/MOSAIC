@@ -75,7 +75,7 @@ def test_shutdown_dask_clears_singleton(monkeypatch):
     import core.runtime.dask_client as _dc
 
     _dc._CLIENT = object()  # simulate a live client singleton
-    from core.runtime.dask_helpers import shutdown_dask
+    from core.runtime.dask_client import shutdown_dask
 
     shutdown_dask()
     assert _dc._CLIENT is None

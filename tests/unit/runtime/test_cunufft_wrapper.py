@@ -603,6 +603,36 @@ def test_execute_inverse_cunufft_prefer_cpu_uses_cpu_fallback(monkeypatch: pytes
     np.testing.assert_allclose(result, np.array([9.0 + 0.0j]))
 
 
+def test_execute_cunufft_gpu_only_rejects_cpu_fallback_when_gpu_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(cunufft_wrapper, "_CPU_ONLY", False)
+    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", False)
+
+    with pytest.raises(RuntimeError, match="GPU execution forced"):
+        cunufft_wrapper.execute_cunufft(
+            np.array([[0.0]], dtype=np.float64),
+            np.array([1.0 + 0.0j]),
+            np.array([[1.0]], dtype=np.float64),
+            gpu_only=True,
+        )
+
+
+def test_execute_inverse_cunufft_gpu_only_rejects_cpu_only_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(cunufft_wrapper, "_CPU_ONLY", True)
+    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", True)
+
+    with pytest.raises(RuntimeError, match="GPU execution forced"):
+        cunufft_wrapper.execute_inverse_cunufft_batch(
+            q_coords=np.array([[1.0]], dtype=np.float64),
+            weights=np.array([[1.0 + 0.0j]], dtype=np.complex128),
+            real_coords=np.array([[0.0]], dtype=np.float64),
+            gpu_only=True,
+        )
+
+
 def test_batched_type3_calls_cleanup_before_cpu_fallback(monkeypatch: pytest.MonkeyPatch):
     fake_cp = SimpleNamespace(
         cuda=SimpleNamespace(

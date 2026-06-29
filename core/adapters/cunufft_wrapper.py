@@ -1044,6 +1044,11 @@ def _execute_inverse_cunufft_batch(
             "Experimental overlap requested for inverse batch, but the current path remains serialized with timing diagnostics only."
         )
 
+    if gpu_only and (_CPU_ONLY or prefer_cpu):
+        raise RuntimeError("GPU execution forced but CPU execution was requested.")
+    if gpu_only and not _GPU_AVAILABLE:
+        raise RuntimeError("GPU execution forced but no CUDA/cuFINUFFT backend is available.")
+
     if _CPU_ONLY or prefer_cpu or not _GPU_AVAILABLE:
         host = np.stack(
             [
@@ -1381,6 +1386,11 @@ def _batched_type3(
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):
         raise ValueError("Only 1-, 2-, and 3-D inputs supported")
+
+    if gpu_only and (_CPU_ONLY or prefer_cpu):
+        raise RuntimeError("GPU execution forced but CPU execution was requested.")
+    if gpu_only and not _GPU_AVAILABLE:
+        raise RuntimeError("GPU execution forced but no CUDA/cuFINUFFT backend is available.")
 
     if _CPU_ONLY or prefer_cpu or not _GPU_AVAILABLE:
         return _cpu_fallback(real_coords, weights, q_coords, eps, inverse)

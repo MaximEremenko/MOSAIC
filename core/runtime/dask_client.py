@@ -17,16 +17,19 @@ environment variables instead of digging through source files.
 """
 
 
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Optional
-from dask.distributed import Client
+from dask.distributed import Client, get_client as _dd_get_client
 
 from core.runtime.dask_helpers import ensure_dask_client
 
 # Public symbols re‑exported for convenience
-__all__ = ["get_client", "default_log_dir", "set_log_dir_for_run"]
+__all__ = ["get_client", "default_log_dir", "set_log_dir_for_run", "shutdown_dask"]
+
+logger = logging.getLogger(__name__)
 
 # Singleton cache so repeated calls return the same Client
 _CLIENT: Optional[Client] = None
@@ -134,3 +137,34 @@ def get_client() -> Client:
         **extra,                         # ← only present for job‑queue back‑ends
     )
     return _CLIENT
+
+
+# --------------------------------------------------------------------------- #
+#  Convenience for interactive sessions                                        #
+# --------------------------------------------------------------------------- #
+
+def shutdown_dask() -> None:
+    """Close the cached project client (and its cluster) and clear the singleton.
+
+    The ``_CLIENT`` singleton lives in this module, so its lifecycle
+    (``get_client`` / ``shutdown_dask``) is owned here. ``dask_helpers`` holds
+    only the lower-level cluster builders and never references this singleton,
+    keeping the runtime import graph acyclic.
+    """
+    global _CLIENT
+    client = _CLIENT
+    try:
+        if client is None:
+            client = _dd_get_client()
+        cluster = getattr(client, "cluster", None)
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+        cluster_close = getattr(cluster, "close", None)
+        if callable(cluster_close):
+            cluster_close()
+        logger.info("Dask client closed.")
+    except ValueError:
+        logger.info("No active Dask client.")
+    finally:
+        _CLIENT = None
