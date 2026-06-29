@@ -120,13 +120,13 @@ def test_prepare_displacement_decoder_inputs_fails_before_late_feature_mismatch(
     )
 
     monkeypatch.setattr(
-        "core.decoding.displacement_service.load_chunk_residual_field_and_grid",
+        "core.decoding.displacement_inputs.load_chunk_residual_field_and_grid",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("residual-field reload should not happen before patch-spec validation")
         ),
     )
     monkeypatch.setattr(
-        "core.decoding.displacement_service.build_feature_sets",
+        "core.decoding.displacement_inputs.build_feature_sets",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("feature building should not happen before patch-spec validation")
         ),
@@ -330,7 +330,7 @@ def test_prepare_displacement_decoder_inputs_allows_mixed_patch_specs_in_family_
     )
 
     monkeypatch.setattr(
-        "core.decoding.displacement_service.load_chunk_residual_field_and_grid",
+        "core.decoding.displacement_inputs.load_chunk_residual_field_and_grid",
         lambda *args, **kwargs: (
             {},
             np.array([[0.0, 1.0], [1.0, 2.0]], dtype=np.float64),
@@ -338,7 +338,7 @@ def test_prepare_displacement_decoder_inputs_allows_mixed_patch_specs_in_family_
         ),
     )
     monkeypatch.setattr(
-        "core.decoding.displacement_service.build_feature_sets",
+        "core.decoding.displacement_inputs.build_feature_sets",
         lambda *args, **kwargs: (
             [np.array([1.0]), np.array([1.0, 0.0])],
             [0, 1],
