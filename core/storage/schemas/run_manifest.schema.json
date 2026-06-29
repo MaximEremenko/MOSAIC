@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.run_manifest"},
+    "schema_version": {"const": 1},
+    "scientific_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "run_digest": {"type": "string"},
+    "execution_contract": {"type": "object"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "scientific_digest",
+    "execution_digest",
+    "run_digest",
+    "execution_contract"
+  ],
+  "type": "object"
+}

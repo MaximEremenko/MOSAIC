@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.performance_metrics"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "generated_at_utc": {"type": "string"},
+    "run_file_count": {"type": "integer"},
+    "stage_file_counts": {"type": "object"},
+    "chunk_file_counts": {"type": "object"},
+    "attempt_leaf_fanout": {
+      "type": "array",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "stage": {"type": "string"},
+          "chunk_id": {"type": "integer"},
+          "shard": {"type": "string"},
+          "work_unit_digest": {"type": "string"},
+          "attempt_count": {"type": "integer"}
+        },
+        "required": [
+          "stage",
+          "chunk_id",
+          "shard",
+          "work_unit_digest",
+          "attempt_count"
+        ],
+        "type": "object"
+      }
+    },
+    "max_attempt_leaf_entries": {"type": "integer"},
+    "commit_scan_seconds": {"type": "object"},
+    "recovery_scan_seconds": {
+      "anyOf": [
+        {"type": "number"},
+        {"type": "null"}
+      ]
+    },
+    "performance_metrics_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "generated_at_utc",
+    "run_file_count",
+    "stage_file_counts",
+    "chunk_file_counts",
+    "attempt_leaf_fanout",
+    "max_attempt_leaf_entries",
+    "commit_scan_seconds",
+    "recovery_scan_seconds",
+    "performance_metrics_digest"
+  ],
+  "type": "object"
+}

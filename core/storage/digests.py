@@ -48,7 +48,57 @@ def require_sha256_hex(value: str, *, field_name: str = "digest") -> str:
     return text
 
 
+def build_execution_digest(
+    *,
+    scientific_digest: str,
+    backend: str,
+    eps: float,
+    dtype: str,
+    pre_sum_mode: str,
+    reducer_strategy: str,
+    backend_policy_digest: str | None = None,
+    schema_version: int,
+    domain: str,
+) -> str:
+    """Generic execution-identity algebra shared by every Map-Reduce stage.
+
+    ``execution_digest`` is ``scientific_digest`` plus the numerical execution
+    contract (backend, epsilon, dtype, pre-sum/reducer strategy, backend
+    policy). The scientific-identity *content* stays domain-specific in each
+    stage's planning module; only this stage-agnostic combination lives here.
+    """
+    require_sha256_hex(scientific_digest, field_name="scientific_digest")
+    payload = {
+        "schema_version": schema_version,
+        "scientific_digest": scientific_digest,
+        "backend": str(backend),
+        "eps": float(eps),
+        "dtype": str(dtype),
+        "pre_sum_mode": str(pre_sum_mode),
+        "reducer_strategy": str(reducer_strategy),
+        "backend_policy_digest": backend_policy_digest,
+    }
+    return digest_dict(payload, domain=domain)
+
+
+def build_run_digest(
+    execution_digest: str,
+    *,
+    schema_version: int,
+    domain: str = "mosaic.run.v1",
+    length: int = 32,
+) -> str:
+    """Derive the path-layout run digest from an ``execution_digest``."""
+    require_sha256_hex(execution_digest, field_name="execution_digest")
+    return digest_dict(
+        {"schema_version": schema_version, "execution_digest": execution_digest},
+        domain=domain,
+    )[:length]
+
+
 __all__ = [
+    "build_execution_digest",
+    "build_run_digest",
     "canonical_json",
     "digest_dict",
     "normalize_digest_input",

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.public_manifest"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "source_stage": {"type": "string"},
+    "source_identity": {"type": "object"},
+    "published_files": {"type": "array", "items": {"type": "string"}},
+    "published_file_records": {
+      "type": "array",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "stage": {"type": "string"},
+          "kind": {"type": "string"},
+          "chunk_id": {
+            "anyOf": [
+              {"type": "integer"},
+              {"type": "null"}
+            ]
+          },
+          "file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "payload_nbytes": {"type": "integer"}
+        },
+        "required": [
+          "path",
+          "stage",
+          "kind",
+          "chunk_id",
+          "file_sha256",
+          "payload_nbytes"
+        ],
+        "type": "object"
+      }
+    },
+    "public_manifest_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "previous_run_digest": {
+      "anyOf": [
+        {"type": "string"},
+        {"type": "null"}
+      ]
+    },
+    "previous_public_manifest_sha256": {
+      "anyOf": [
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        {"type": "null"}
+      ]
+    },
+    "previous_public_manifest_path": {
+      "anyOf": [
+        {"type": "string"},
+        {"type": "null"}
+      ]
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "source_stage",
+    "source_identity",
+    "published_files",
+    "published_file_records",
+    "public_manifest_digest",
+    "previous_run_digest",
+    "previous_public_manifest_sha256",
+    "previous_public_manifest_path"
+  ],
+  "type": "object"
+}

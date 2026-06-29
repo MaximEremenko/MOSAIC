@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.scattering.chunk_commit"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "stage": {"const": "scattering"},
+    "chunk_id": {"type": "integer"},
+    "selected_candidate_id": {"type": "string"},
+    "candidate_manifest_path": {"type": "string"},
+    "candidate_payload_path": {"type": "string"},
+    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload_nbytes": {"type": "integer"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "stage",
+    "chunk_id",
+    "selected_candidate_id",
+    "candidate_manifest_path",
+    "candidate_payload_path",
+    "payload_sha256",
+    "file_sha256",
+    "payload_nbytes"
+  ],
+  "type": "object"
+}

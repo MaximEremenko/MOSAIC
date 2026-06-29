@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.qspace_plan"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "scientific_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "mask_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "q_grid_set_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "intervals": {
+      "type": "array",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "interval_id": {"type": "integer"},
+          "h_bounds": {"type": "array", "items": {"type": "number"}},
+          "k_bounds": {"type": "array", "items": {"type": "number"}},
+          "l_bounds": {"type": "array", "items": {"type": "number"}},
+          "half_space_role": {"type": "string"},
+          "reciprocal_multiplicity": {"type": "integer"},
+          "reciprocal_point_count": {"type": "integer"},
+          "q_grid_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "mask_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "l_coverage": {"type": "string"}
+        },
+        "required": [
+          "interval_id",
+          "h_bounds",
+          "k_bounds",
+          "l_bounds",
+          "half_space_role",
+          "reciprocal_multiplicity",
+          "reciprocal_point_count",
+          "q_grid_digest",
+          "mask_digest",
+          "l_coverage"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "scientific_digest",
+    "execution_digest",
+    "mask_digest",
+    "q_grid_set_digest",
+    "intervals"
+  ],
+  "type": "object"
+}

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.scattering.commit_candidate"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "stage": {"const": "scattering"},
+    "candidate_id": {"type": "string"},
+    "chunk_id": {"type": "integer"},
+    "contributing_interval_ids": {"type": "array", "items": {"type": "integer"}},
+    "selected_attempts": {"type": "array", "items": {"type": "object"}},
+    "payload_path": {"type": "string"},
+    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload_nbytes": {"type": "integer"},
+    "reciprocal_point_count": {"type": "integer"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "stage",
+    "candidate_id",
+    "chunk_id",
+    "contributing_interval_ids",
+    "selected_attempts",
+    "payload_path",
+    "payload_sha256",
+    "file_sha256",
+    "payload_nbytes",
+    "reciprocal_point_count"
+  ],
+  "type": "object"
+}

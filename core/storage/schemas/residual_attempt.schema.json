@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.residual_field.attempt"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "stage": {"const": "residual_field"},
+    "work_unit_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "attempt_id": {"type": "string"},
+    "chunk_id": {"type": "integer"},
+    "partition_id": {"type": "integer"},
+    "point_start": {"type": "integer"},
+    "point_stop": {"type": "integer"},
+    "interval_ids": {"type": "array", "items": {"type": "integer"}},
+    "parameter_digest": {"type": "string"},
+    "partition_plan_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_scattering_commit_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_replacement_digest": {
+      "anyOf": [
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        {"type": "null"}
+      ]
+    },
+    "backend_policy_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "expected_output_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "contribution_reciprocal_points": {"type": "integer"},
+    "runtime_provenance": {"type": "object"},
+    "payload_path": {"type": "string"},
+    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload_nbytes": {"type": "integer"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "stage",
+    "work_unit_digest",
+    "attempt_id",
+    "chunk_id",
+    "partition_id",
+    "point_start",
+    "point_stop",
+    "interval_ids",
+    "parameter_digest",
+    "partition_plan_digest",
+    "source_scattering_commit_digest",
+    "source_replacement_digest",
+    "backend_policy_digest",
+    "expected_output_digest",
+    "contribution_reciprocal_points",
+    "runtime_provenance",
+    "payload_path",
+    "payload_sha256",
+    "file_sha256",
+    "payload_nbytes"
+  ],
+  "type": "object"
+}

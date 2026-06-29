@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.fs_capability"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "capabilities": {"type": "object"},
+    "capability_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "capabilities",
+    "capability_digest"
+  ],
+  "type": "object"
+}
