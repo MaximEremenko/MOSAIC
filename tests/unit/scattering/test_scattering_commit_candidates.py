@@ -57,17 +57,67 @@ def test_commit_candidate_dedupes_retry_attempts_with_same_payload(tmp_path):
     )
 
 
-def test_commit_candidate_rejects_conflicting_retry_attempts(tmp_path):
+def test_commit_candidate_rejects_divergent_retry_attempts(tmp_path):
+    # P11: two attempts for the same interval that DISAGREE numerically (a real
+    # divergence, not float noise) still fail closed -- bitwise equality was
+    # REPLACED by a numerical agreement gate, not removed.
     _attempt(tmp_path, interval_id=1, attempt_id="try1", delta=2.0 + 0.0j)
     _attempt(tmp_path, interval_id=1, attempt_id="try2", delta=3.0 + 0.0j)
 
-    with pytest.raises(RuntimeError, match="Conflicting scattering attempts"):
+    with pytest.raises(RuntimeError, match="Divergent scattering results"):
         create_scattering_commit_candidate(
             output_dir=tmp_path,
             run_digest="run123",
             chunk_id=3,
             expected_interval_ids=(1,),
         )
+
+
+def test_commit_candidate_accepts_agreeing_retry_attempts_and_picks_winner(tmp_path):
+    # A non-deterministic relaunch differs in BYTES but AGREES within tolerance:
+    # accepted, with a deterministic winner (sorted attempt_id) -- not byte-equal.
+    _attempt(tmp_path, interval_id=1, attempt_id="try1", delta=2.0 + 0.0j)
+    _attempt(tmp_path, interval_id=1, attempt_id="try2", delta=2.0 + 1e-12j)
+
+    candidate = create_scattering_commit_candidate(
+        output_dir=tmp_path,
+        run_digest="run123",
+        chunk_id=3,
+        expected_interval_ids=(1,),
+    )
+
+    by_interval = {item["interval_id"]: item for item in candidate.selected_attempts}
+    assert by_interval[1]["attempt_id"] == "try1"  # deterministic winner
+    assert candidate.contributing_interval_ids == (1,)
+
+
+def test_commit_candidate_treats_cpu_and_gpu_attempts_as_shared_checkpoint(tmp_path):
+    # P11 C-2: a CPU attempt and a GPU attempt for the same (interval, chunk) science
+    # differ ONLY in device-bound metadata (execution_digest / backend_policy_digest).
+    # They must map to ONE checkpoint identity -- NOT be rejected as "conflicting" --
+    # and, agreeing within tolerance (GPU non-determinism vs CPU is ~1e-13 rel-L2),
+    # promote to a single deterministically-chosen attempt. This is the cross-device
+    # sharing exit criterion of the P11 design.
+    cpu_identity = dict(IDENTITY)
+    gpu_identity = dict(IDENTITY)
+    gpu_identity["execution_digest"] = "f" * 64
+    gpu_identity["backend_policy_digest"] = "9" * 64
+
+    _attempt(tmp_path, interval_id=1, attempt_id="cpu", delta=2.0 + 0.0j, identity=cpu_identity)
+    _attempt(
+        tmp_path, interval_id=1, attempt_id="gpu", delta=2.0 + 1e-12j, identity=gpu_identity
+    )
+
+    candidate = create_scattering_commit_candidate(
+        output_dir=tmp_path,
+        run_digest="run123",
+        chunk_id=3,
+        expected_interval_ids=(1,),
+    )
+
+    by_interval = {item["interval_id"]: item for item in candidate.selected_attempts}
+    assert by_interval[1]["attempt_id"] == "cpu"  # deterministic winner (sorted attempt_id)
+    assert candidate.contributing_interval_ids == (1,)
 
 
 def test_commit_candidate_rejects_missing_expected_interval(tmp_path):

@@ -17,9 +17,9 @@ from core.storage.performance import (
 
 IDENTITY = {
     "run_digest": "run123",
-    "scientific_digest": "s" * 64,
+    "scientific_digest": "a" * 64,
     "execution_digest": "e" * 64,
-    "qspace_plan_digest": "q" * 64,
+    "qspace_plan_digest": "c" * 64,
     "backend_policy_digest": "b" * 64,
     "source_structure_digest": "a" * 64,
 }

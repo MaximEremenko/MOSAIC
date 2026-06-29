@@ -21,6 +21,12 @@ from core.storage.attempt_store import (
     stage_plan_path,
     stage_root,
 )
+from core.storage.agreement import (
+    DEFAULT_NUFFT_EPS,
+    cancellation_kappa,
+    predict_agreement_rtol,
+    relative_l2,
+)
 from core.storage.digests import digest_dict
 from core.storage.fingerprint import file_sha256, payload_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
@@ -51,9 +57,21 @@ def build_residual_work_unit_digest(
     partition_plan_digest: str,
     source_scattering_commit_digest: str,
     source_replacement_digest: str | None,
-    backend_policy_digest: str,
     expected_output_digest: str,
 ) -> str:
+    """Device-INDEPENDENT residual checkpoint/work address (P11 C-4).
+
+    Mirrors the scattering C-2 change: the address is the run + structural partition
+    keys (chunk, partition, point range, interval ids), the parameter / partition-
+    plan digests, the upstream source-commit identities, and the *structural*
+    ``expected_output_digest`` (the planned output SHAPE -- counts/intervals/params --
+    NOT output bytes). It deliberately EXCLUDES the device-bound
+    ``backend_policy_digest`` (which carries ``backend_kind``) so a CPU- and a
+    GPU-computed partition for the same science map to the SAME address and promote
+    to one checkpoint. The realized backend policy stays on the attempt manifest as
+    METADATA. ``run_digest`` is already device-independent (it propagates the
+    scattering run identity). Domain bumped to ``v2`` (no released data to migrate).
+    """
     return digest_dict(
         {
             "schema_version": RESIDUAL_FIELD_COMMIT_SCHEMA_VERSION,
@@ -70,10 +88,9 @@ def build_residual_work_unit_digest(
             "source_replacement_digest": (
                 None if source_replacement_digest is None else str(source_replacement_digest)
             ),
-            "backend_policy_digest": str(backend_policy_digest),
             "expected_output_digest": str(expected_output_digest),
         },
-        domain="mosaic.residual_field.work_unit.v1",
+        domain="mosaic.residual_field.work_unit.v2",
     )
 
 
@@ -480,6 +497,9 @@ def write_residual_attempt(
     runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ResidualAttemptManifest:
     normalized_interval_ids = tuple(sorted(int(item) for item in interval_ids))
+    # P11 C-4: device-INDEPENDENT checkpoint address. backend_policy_digest is still
+    # received and recorded on the manifest as metadata, but NOT folded into the
+    # address (so CPU and GPU partitions share one checkpoint).
     work_unit_digest = build_residual_work_unit_digest(
         run_digest=run_digest,
         chunk_id=chunk_id,
@@ -491,7 +511,6 @@ def write_residual_attempt(
         partition_plan_digest=partition_plan_digest,
         source_scattering_commit_digest=source_scattering_commit_digest,
         source_replacement_digest=source_replacement_digest,
-        backend_policy_digest=backend_policy_digest,
         expected_output_digest=expected_output_digest,
     )
     datasets = _payload_datasets(
@@ -606,13 +625,16 @@ def load_residual_attempt_payload(
 
 
 def _identity_tuple(manifest: ResidualAttemptManifest) -> tuple[Any, ...]:
+    # P11 C-4: DEVICE-INDEPENDENT identity. backend_policy_digest (which carries the
+    # backend kind) is deliberately EXCLUDED so a CPU attempt and a GPU attempt for
+    # the same partition share one identity and are reconciled by the numerical
+    # agreement gate, not rejected as "conflicting".
     return (
         manifest.run_digest,
         manifest.parameter_digest,
         manifest.partition_plan_digest,
         manifest.source_scattering_commit_digest,
         manifest.source_replacement_digest,
-        manifest.backend_policy_digest,
         manifest.expected_output_digest,
     )
 
@@ -629,15 +651,69 @@ def _expected_work_unit_digest(manifest: ResidualAttemptManifest) -> str:
         partition_plan_digest=manifest.partition_plan_digest,
         source_scattering_commit_digest=manifest.source_scattering_commit_digest,
         source_replacement_digest=manifest.source_replacement_digest,
-        backend_policy_digest=manifest.backend_policy_digest,
         expected_output_digest=manifest.expected_output_digest,
     )
+
+
+class ResidualDivergenceError(RuntimeError):
+    """Same-work residual results disagree beyond the numerical tolerance."""
+
+
+# P11 (mirror of the scattering gate): same-work residual retries -- a
+# non-deterministic GPU relaunch, or a CPU vs GPU attempt for the same partition --
+# need not be bit-identical but MUST agree NUMERICALLY. The tolerance is the PREDICTED
+# forward-error bound rtol = S*(eps + M*u)*kappa (core/storage/agreement.py), tied to
+# the NUFFT eps, the reciprocal-point summation depth M, and the per-channel
+# cancellation factor kappa. A genuine divergence fails closed.
+
+
+def _assert_residual_partials_agree(
+    payloads: Sequence[Mapping[str, np.ndarray]],
+    *,
+    eps: float,
+    summation_terms: int,
+    context: str,
+) -> None:
+    """Fail closed unless every same-work residual payload agrees within the PREDICTED
+    forward-error tolerance, evaluated PER FIELD.
+
+    Replaces (does NOT remove) the old exact-``payload_sha256`` equality: bytes may
+    differ across non-deterministic launches / devices, but a real numerical
+    divergence must not be silently reconciled by deterministic winner selection. The
+    tolerance is ``predict_agreement_rtol(eps, M, kappa)`` with ``M`` the
+    reciprocal-point summation depth and ``kappa`` = 1 for the average channel and the
+    cancellation amplification ``||avg||/||delta||`` for the delta channel.
+    """
+    reference = payloads[0]
+    rtol_by_field = {
+        "amplitudes_average": predict_agreement_rtol(
+            eps=eps, summation_terms=summation_terms, kappa=1.0
+        ),
+        "amplitudes_delta": predict_agreement_rtol(
+            eps=eps,
+            summation_terms=summation_terms,
+            kappa=cancellation_kappa(
+                reference["amplitudes_average"], reference["amplitudes_delta"]
+            ),
+        ),
+    }
+    for other in payloads[1:]:
+        for field, rtol in rtol_by_field.items():
+            rel = relative_l2(reference[field], other[field])
+            if not (rel <= rtol):
+                raise ResidualDivergenceError(
+                    f"Divergent residual results for {context}: {field} rel-L2 "
+                    f"{rel:.3e} exceeds predicted agreement tolerance {rtol:.3e} "
+                    f"(eps={eps:.1e}, M={int(summation_terms)})."
+                )
 
 
 def _select_attempts_by_partition(
     attempts: tuple[ResidualAttemptManifest, ...],
     *,
     expected_partitions: Mapping[int, Sequence[int]],
+    output_dir: str | Path,
+    eps: float = DEFAULT_NUFFT_EPS,
 ) -> tuple[ResidualAttemptManifest, ...]:
     by_partition: dict[int, list[ResidualAttemptManifest]] = {}
     for attempt in attempts:
@@ -649,10 +725,20 @@ def _select_attempts_by_partition(
             raise RuntimeError(
                 f"Residual commit candidate missing attempts for partition {partition_id}."
             )
-        payload_hashes = {candidate.payload_sha256 for candidate in candidates}
-        if len(payload_hashes) != 1:
-            raise RuntimeError(
-                f"Conflicting residual attempts for partition {partition_id}."
+        # P11: bitwise payload equality is REPLACED (not removed) by the PREDICTED
+        # numerical agreement gate. Same-work retries (non-deterministic GPU
+        # relaunches, or a CPU vs GPU attempt) may differ in bytes but MUST agree
+        # within the predicted tolerance; a genuine divergence fails closed.
+        if len(candidates) > 1:
+            payloads = [
+                load_residual_attempt_payload(candidate, output_dir=output_dir)[0]
+                for candidate in candidates
+            ]
+            _assert_residual_partials_agree(
+                payloads,
+                eps=eps,
+                summation_terms=int(candidates[0].contribution_reciprocal_points),
+                context=f"partition {partition_id}",
             )
         selected.append(sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0])
     return tuple(selected)
@@ -687,6 +773,7 @@ def create_residual_commit_candidate(
     chunk_id: int,
     expected_partitions: Mapping[int, Sequence[int]],
     expected_reciprocal_point_count: int | None = None,
+    eps: float = DEFAULT_NUFFT_EPS,
 ) -> ResidualCommitCandidateManifest:
     normalized_expected = {
         int(partition_id): tuple(int(point_id) for point_id in point_ids)
@@ -729,6 +816,8 @@ def create_residual_commit_candidate(
     selected = _select_attempts_by_partition(
         attempts,
         expected_partitions=normalized_expected,
+        output_dir=output_dir,
+        eps=eps,
     )
     datasets_by_partition: list[tuple[ResidualAttemptManifest, dict[str, np.ndarray]]] = []
     reciprocal_counts: set[int] = set()
@@ -972,16 +1061,11 @@ def promote_residual_chunk_commit_by_scan(
         raise RuntimeError(
             f"No valid residual commit candidates for chunk {int(chunk_id)}: {detail}"
         )
-    payload_hashes = {candidate.payload_sha256 for candidate in valid}
-    if len(payload_hashes) != 1:
-        raise RuntimeError(
-            "Conflicting valid residual commit candidates for chunk "
-            f"{int(chunk_id)}: "
-            + ", ".join(
-                f"{candidate.candidate_id}:{candidate.payload_sha256}"
-                for candidate in sorted(valid, key=lambda item: item.candidate_id)
-            )
-        )
+    # P11: the old cross-candidate bitwise payload_sha256 equality is REMOVED.
+    # Attempt-level numerical agreement (_select_attempts_by_partition) already
+    # guarantees that the candidates for this chunk are numerically consistent, so a
+    # deterministic winner (lowest candidate_id) is canonical; bytes need not match
+    # across non-deterministic launches / devices.
     candidate = sorted(valid, key=lambda item: item.candidate_id)[0]
     candidate_manifest = commit_candidate_manifest_path(
         output_dir,

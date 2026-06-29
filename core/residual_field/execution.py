@@ -877,6 +877,8 @@ def _runtime_provenance_for_residual(
 
 
 def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
+    # P11 C-4: device-independent checkpoint address (backend policy is metadata,
+    # not identity) so CPU and GPU residual work units share one address.
     return build_residual_work_unit_digest(
         run_digest=str(work_unit.run_digest),
         chunk_id=int(work_unit.chunk_id),
@@ -888,7 +890,6 @@ def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
         partition_plan_digest=str(work_unit.partition_plan_digest),
         source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
         source_replacement_digest=work_unit.source_replacement_digest,
-        backend_policy_digest=str(work_unit.backend_policy_digest),
         expected_output_digest=str(work_unit.expected_output_digest),
     )
 
@@ -972,11 +973,10 @@ def _commit_residual_attempt_outputs(
                 raise RuntimeError(
                     f"Missing residual attempt for chunk {chunk_id} partition {partition_id}."
                 )
-            payload_hashes = {candidate.payload_sha256 for candidate in candidates}
-            if len(payload_hashes) != 1:
-                raise RuntimeError(
-                    f"Conflicting residual attempts for chunk {chunk_id} partition {partition_id}."
-                )
+            # P11: do NOT bitwise-compare cross-device payloads here. We only read the
+            # structural, device-independent point_ids to build expected_partitions;
+            # numerical agreement is enforced by create_residual_commit_candidate's
+            # predicted-tolerance gate. Pick a deterministic attempt to read ids from.
             chosen = sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0]
             datasets, _attrs = load_residual_attempt_payload(chosen, output_dir=output_dir)
             expected_partitions[int(partition_id)] = tuple(

@@ -12,6 +12,7 @@ from core.scattering.accumulation import (
     build_scattering_partial_result,
     merge_scattering_partial_results,
 )
+from core.scattering.invariants import validate_scattering_result
 from core.storage.attempt_store import (
     attempt_manifest_path,
     attempt_payload_path,
@@ -24,6 +25,12 @@ from core.storage.attempt_store import (
     stage_commit_path,
     stage_plan_path,
     stage_root,
+)
+from core.storage.agreement import (
+    DEFAULT_NUFFT_EPS,
+    cancellation_kappa,
+    predict_agreement_rtol,
+    relative_l2,
 )
 from core.storage.digests import digest_dict, normalize_digest_input
 from core.storage.fingerprint import file_sha256, payload_sha256
@@ -47,11 +54,23 @@ def build_scattering_work_unit_digest(
     interval_id: int,
     chunk_id: int,
     scientific_digest: str,
-    execution_digest: str,
     qspace_plan_digest: str,
-    backend_policy_digest: str,
     source_structure_digest: str,
 ) -> str:
+    """Device-INDEPENDENT checkpoint/work address for one (interval, chunk) (P11 C-2).
+
+    The address is the science + structural partition keys: ``scientific_digest`` +
+    ``qspace_plan_digest`` + ``source_structure_digest`` + (interval, chunk). It
+    deliberately EXCLUDES the device-bound ``execution_digest`` and
+    ``backend_policy_digest`` (which include the backend) so a CPU-computed chunk
+    and a GPU-computed chunk for the same science map to the SAME address and can be
+    promoted to the same checkpoint. The realized backend / execution contract is
+    retained on the attempt manifest as METADATA, never as identity. The numerical
+    contract (eps/dtype/pre-sum/reducer) is already pinned by the device-independent
+    ``run_digest`` (:func:`core.scattering.planning.build_run_identity`) that scopes
+    the run tree this address lives under. Domain bumped to ``v2`` to mark the model
+    change (no released data to migrate).
+    """
     return digest_dict(
         {
             "schema_version": SCATTERING_COMMIT_SCHEMA_VERSION,
@@ -59,12 +78,10 @@ def build_scattering_work_unit_digest(
             "interval_id": int(interval_id),
             "chunk_id": int(chunk_id),
             "scientific_digest": str(scientific_digest),
-            "execution_digest": str(execution_digest),
             "qspace_plan_digest": str(qspace_plan_digest),
-            "backend_policy_digest": str(backend_policy_digest),
             "source_structure_digest": str(source_structure_digest),
         },
-        domain="mosaic.scattering.work_unit.v1",
+        domain="mosaic.scattering.work_unit.v2",
     )
 
 
@@ -405,6 +422,91 @@ class ScatteringStageCommitManifest:
         )
 
 
+class ScatteringInvariantError(RuntimeError):
+    """A scattering attempt failed P11 mechanical validation at write time."""
+
+
+class ScatteringDivergenceError(RuntimeError):
+    """Same-work scattering results disagree beyond the numerical tolerance."""
+
+
+# P11 numerical agreement: two attempts/candidates for the SAME work need not be
+# bit-identical (CPU/GPU and GPU relaunches are non-deterministic), but they MUST
+# agree NUMERICALLY -- a genuine divergence (a real bug, not float noise) fails
+# closed. The tolerance is NOT a magic constant: it is the PREDICTED forward-error
+# bound of the computation, rtol = S*(eps + M*u)*kappa (see core/storage/agreement.py),
+# tied to the NUFFT eps, the reciprocal-point summation depth M, and the per-channel
+# cancellation factor kappa (the delta channel is a subtraction and needs the looser
+# bound). The model's safety factor / kappa cap are DOCUMENTED engineering values
+# flagged for the scientist; this is not a claim of scientific equivalence.
+
+
+def _assert_scattering_partials_agree(partials, *, eps: float, context: str) -> None:
+    """Fail closed unless every same-work partial agrees within the PREDICTED
+    forward-error tolerance, evaluated PER FIELD.
+
+    Replaces (does NOT remove) the old exact-``payload_sha256`` equality: bytes may
+    differ across non-deterministic launches/devices, but a real numerical divergence
+    is a bug and must not be silently reconciled by deterministic winner selection.
+    The tolerance is ``predict_agreement_rtol(eps, M, kappa)`` with ``M`` the
+    reciprocal-point summation depth and ``kappa`` = 1 for the average channel and the
+    cancellation amplification ``||avg||/||delta||`` for the delta channel.
+    """
+    reference = partials[0]
+    summation_terms = int(reference.reciprocal_point_count)
+    rtol_by_field = {
+        "amplitudes_average": predict_agreement_rtol(
+            eps=eps, summation_terms=summation_terms, kappa=1.0
+        ),
+        "amplitudes_delta": predict_agreement_rtol(
+            eps=eps,
+            summation_terms=summation_terms,
+            kappa=cancellation_kappa(
+                reference.amplitudes_average, reference.amplitudes_delta
+            ),
+        ),
+    }
+    for other in partials[1:]:
+        for field, rtol in rtol_by_field.items():
+            rel = relative_l2(getattr(reference, field), getattr(other, field))
+            if not (rel <= rtol):
+                raise ScatteringDivergenceError(
+                    f"Divergent scattering results for {context}: {field} rel-L2 "
+                    f"{rel:.3e} exceeds predicted agreement tolerance {rtol:.3e} "
+                    f"(eps={eps:.1e}, M={summation_terms})."
+                )
+
+
+def _expected_point_count_from_grid_shape(grid_shape_nd: np.ndarray) -> int | None:
+    """Authoritative real-space sample count implied by the DECLARED grid geometry.
+
+    ``grid_shape_nd`` is the per-source-point sub-grid geometry produced by the
+    rifft grid builder (``core/scattering/grid.py::_process_chunk`` -> the
+    ``np.vstack(shapes)`` return), shape ``(num_points, dim)``. Each row is one
+    source point's N-D sub-grid shape, and ``_generate_grid`` guarantees that point
+    contributes exactly ``prod(row)`` real-space samples, so the chunk's total
+    sample count is ``sum_i prod(grid_shape_nd[i])``. The inverse NUFFT emits one
+    amplitude per real-space sample and the element-wise half-space conjugate
+    reconstruction (``delta + conj(delta)``) preserves length, so this equals the
+    REQUIRED length of ``amplitudes_delta``.
+
+    Crucially this is derived from the geometry that downstream accumulation
+    reshapes into -- NOT from ``len(amplitudes)`` -- so coverage validated against it
+    is an AUTHORITATIVE partition-coverage check, not a self-generated tautology.
+
+    Returns ``None`` when the geometry is absent/unusable (e.g. an empty array);
+    callers then fall back to self-consistency only, which is documented at the
+    call site and reserved for non-production fixtures.
+    """
+    arr = np.asarray(grid_shape_nd)
+    if arr.size == 0:
+        return None
+    arr2d = np.atleast_2d(arr)
+    if arr2d.ndim != 2:
+        return None
+    return int(np.prod(arr2d, axis=1).sum())
+
+
 def write_scattering_attempt(
     *,
     output_dir: str | Path,
@@ -422,17 +524,69 @@ def write_scattering_attempt(
     amplitudes_average: np.ndarray,
     contribution_reciprocal_points: int,
     point_ids: np.ndarray | None = None,
+    expected_point_count: int | None = None,
     runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ScatteringAttemptManifest:
+    amplitude_len = int(np.asarray(amplitudes_delta).reshape(-1).shape[0])
+    point_ids_explicit = point_ids is not None
     if point_ids is None:
-        point_ids = np.arange(np.asarray(amplitudes_delta).reshape(-1).shape[0], dtype=np.int64)
+        # Stored point_ids are POSITIONAL: the contract aligns amplitudes to
+        # point_ids by index. They are NOT the coverage authority -- coverage is
+        # validated against the partition's expected set resolved just below.
+        point_ids = np.arange(amplitude_len, dtype=np.int64)
+    # P11 C-3b: resolve the AUTHORITATIVE expected coverage set, in precedence order:
+    #   1. an explicit ``expected_point_count`` (e.g. a future partition-plan count);
+    #   2. caller-declared ``point_ids`` -- when a caller passes real ids it is
+    #      asserting that exact coverage set, so we validate against it directly;
+    #   3. otherwise (the PRODUCTION path, which omits point_ids) the count DECLARED
+    #      by the grid geometry: sum_i prod(grid_shape_nd[i]) -- the same geometry
+    #      downstream accumulation reshapes into. This closes the self-validation
+    #      loop the review flagged: a worker that omits ids and truncates/over-
+    #      produces amplitudes relative to its declared grid now fails closed here
+    #      instead of self-validating against arange(len(amplitudes)).
+    if expected_point_count is None and not point_ids_explicit:
+        expected_point_count = _expected_point_count_from_grid_shape(grid_shape_nd)
+    expected_point_ids = (
+        np.arange(int(expected_point_count), dtype=np.int64)
+        if expected_point_count is not None
+        else np.asarray(point_ids)
+    )
+    # MECHANICAL gate at attempt-WRITE time -- reject NaN/Inf, wrong shape/dtype,
+    # and coverage that disagrees with the declared partition geometry before a
+    # result is ever persisted. This is NOT a full scientific-validity check:
+    # half-space and scientific agreement gates are the scientist's to author
+    # (advisory for now). Same-work numerical AGREEMENT is enforced separately at
+    # selection time (_select_attempts_by_interval).
+    _attempt_partial = build_scattering_partial_result(
+        chunk_id=int(chunk_id),
+        interval_id=int(interval_id),
+        amplitudes_delta=np.asarray(amplitudes_delta),
+        amplitudes_average=np.asarray(amplitudes_average),
+        grid_shape_nd=np.asarray(grid_shape_nd),
+        reciprocal_point_count=int(contribution_reciprocal_points),
+        point_ids=np.asarray(point_ids),
+    )
+    _invalid = [
+        finding
+        for finding in validate_scattering_result(
+            _attempt_partial, expected_point_ids=expected_point_ids
+        )
+        if not finding.ok
+    ]
+    if _invalid:
+        raise ScatteringInvariantError(
+            f"Scattering attempt (interval {int(interval_id)}, chunk {int(chunk_id)}) "
+            "failed invariant validation: "
+            + "; ".join(f"{finding.name}: {finding.detail}" for finding in _invalid)
+        )
+    # P11 C-2: the work-unit (checkpoint) address is device-INDEPENDENT.
+    # execution_digest/backend_policy_digest are still received and recorded on the
+    # attempt manifest as metadata, but NOT folded into the address.
     work_unit_digest = build_scattering_work_unit_digest(
         interval_id=interval_id,
         chunk_id=chunk_id,
         scientific_digest=scientific_digest,
-        execution_digest=execution_digest,
         qspace_plan_digest=qspace_plan_digest,
-        backend_policy_digest=backend_policy_digest,
         source_structure_digest=source_structure_digest,
     )
     datasets = _payload_datasets(
@@ -544,12 +698,15 @@ def load_scattering_attempt_partial(
 
 
 def _attempt_identity_tuple(manifest: ScatteringAttemptManifest) -> tuple[str, ...]:
+    # P11 C-2: identity is DEVICE-INDEPENDENT. execution_digest /
+    # backend_policy_digest (which encode the backend) are deliberately EXCLUDED so a
+    # CPU attempt and a GPU attempt for the same science/partition share one identity
+    # and are treated as the same work -- their (non-bit-identical) results are then
+    # reconciled by the numerical agreement gate, not rejected as "conflicting".
     return (
         manifest.run_digest,
         manifest.scientific_digest,
-        manifest.execution_digest,
         manifest.qspace_plan_digest,
-        manifest.backend_policy_digest,
         manifest.source_structure_digest,
     )
 
@@ -559,9 +716,7 @@ def _expected_work_unit_digest(manifest: ScatteringAttemptManifest) -> str:
         interval_id=manifest.interval_id,
         chunk_id=manifest.chunk_id,
         scientific_digest=manifest.scientific_digest,
-        execution_digest=manifest.execution_digest,
         qspace_plan_digest=manifest.qspace_plan_digest,
-        backend_policy_digest=manifest.backend_policy_digest,
         source_structure_digest=manifest.source_structure_digest,
     )
 
@@ -604,6 +759,8 @@ def _select_attempts_by_interval(
     attempts: tuple[ScatteringAttemptManifest, ...],
     *,
     expected_interval_ids: tuple[int, ...],
+    output_dir: str | Path,
+    eps: float = DEFAULT_NUFFT_EPS,
 ) -> tuple[ScatteringAttemptManifest, ...]:
     selected: list[ScatteringAttemptManifest] = []
     by_interval: dict[int, list[ScatteringAttemptManifest]] = {}
@@ -615,17 +772,26 @@ def _select_attempts_by_interval(
             raise RuntimeError(
                 f"Scattering commit candidate missing attempts for interval {int(interval_id)}."
             )
-        payload_hashes = {candidate.payload_sha256 for candidate in candidates}
-        if len(payload_hashes) != 1:
-            raise RuntimeError(
-                f"Conflicting scattering attempts for interval {int(interval_id)}."
-            )
         identities = {_attempt_identity_tuple(candidate) for candidate in candidates}
         if len(identities) != 1:
             raise RuntimeError(
                 f"Conflicting scattering attempt identity for interval {int(interval_id)}."
             )
-        selected.append(sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0])
+        # P11: bitwise equality is REPLACED (not removed) by a numerical agreement
+        # gate. Same-work retries (e.g. non-deterministic GPU relaunches) may
+        # differ in bytes but MUST agree within tolerance; a genuine divergence
+        # fails closed rather than being silently reconciled by winner selection.
+        if len(candidates) > 1:
+            partials = [
+                load_scattering_attempt_partial(candidate, output_dir=output_dir)
+                for candidate in candidates
+            ]
+            _assert_scattering_partials_agree(
+                partials, eps=eps, context=f"interval {int(interval_id)}"
+            )
+        selected.append(
+            sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0]
+        )
     return tuple(selected)
 
 
@@ -657,6 +823,7 @@ def create_scattering_commit_candidate(
     run_digest: str,
     chunk_id: int,
     expected_interval_ids: tuple[int, ...],
+    eps: float = DEFAULT_NUFFT_EPS,
 ) -> ScatteringCommitCandidateManifest:
     expected = tuple(sorted(int(item) for item in expected_interval_ids))
     if not expected:
@@ -671,7 +838,9 @@ def create_scattering_commit_candidate(
         expected_interval_ids=expected,
         output_dir=output_dir,
     )
-    selected = _select_attempts_by_interval(attempts, expected_interval_ids=expected)
+    selected = _select_attempts_by_interval(
+        attempts, expected_interval_ids=expected, output_dir=output_dir, eps=eps
+    )
     merged = None
     for attempt in selected:
         partial = load_scattering_attempt_partial(attempt, output_dir=output_dir)
@@ -870,16 +1039,11 @@ def promote_scattering_chunk_commit_by_scan(
         raise RuntimeError(
             f"No valid scattering commit candidates for chunk {int(chunk_id)}: {detail}"
         )
-    payload_hashes = {candidate.payload_sha256 for candidate in valid}
-    if len(payload_hashes) != 1:
-        raise RuntimeError(
-            "Conflicting valid scattering commit candidates for chunk "
-            f"{int(chunk_id)}: "
-            + ", ".join(
-                f"{candidate.candidate_id}:{candidate.payload_sha256}"
-                for candidate in sorted(valid, key=lambda item: item.candidate_id)
-            )
-        )
+    # P11: valid candidates need NOT share output bytes. Each was built by
+    # _select_attempts_by_interval, which already fails closed unless every
+    # same-work attempt AGREES numerically within tolerance and then picks a
+    # deterministic winner -- so any two valid candidates here are built from
+    # within-tolerance-agreeing attempts. Promote the deterministic winner by id.
     candidate = sorted(valid, key=lambda item: item.candidate_id)[0]
     candidate_manifest = commit_candidate_manifest_path(
         output_dir,

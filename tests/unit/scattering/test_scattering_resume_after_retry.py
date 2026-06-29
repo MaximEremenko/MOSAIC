@@ -46,14 +46,34 @@ def test_retry_with_matching_payload_dedupes_to_one_selected_attempt(tmp_path):
     assert candidate.selected_attempts[0]["attempt_id"] == "attempt-a"
 
 
-def test_retry_with_different_payload_fails_closed(tmp_path):
+def test_retry_with_divergent_payload_fails_closed(tmp_path):
+    # P11: a retry that produces a numerically DIVERGENT payload (real bug, not
+    # float noise) still fails closed -- the numerical agreement gate replaced the
+    # old exact-hash check, it did not remove the safety.
     _attempt(tmp_path, attempt_id="attempt-a", delta=2.0 + 0.0j)
     _attempt(tmp_path, attempt_id="attempt-b", delta=3.0 + 0.0j)
 
-    with pytest.raises(RuntimeError, match="Conflicting scattering attempts"):
+    with pytest.raises(RuntimeError, match="Divergent scattering results"):
         create_scattering_commit_candidate(
             output_dir=tmp_path,
             run_digest="run123",
             chunk_id=3,
             expected_interval_ids=(1,),
         )
+
+
+def test_retry_with_agreeing_nondeterministic_payload_promotes_winner(tmp_path):
+    # A non-deterministic relaunch differs in BYTES but AGREES within tolerance:
+    # accepted, deterministic winner chosen (sorted attempt_id).
+    _attempt(tmp_path, attempt_id="attempt-a", delta=2.0 + 0.0j)
+    _attempt(tmp_path, attempt_id="attempt-b", delta=2.0 + 1e-12j)
+
+    candidate = create_scattering_commit_candidate(
+        output_dir=tmp_path,
+        run_digest="run123",
+        chunk_id=3,
+        expected_interval_ids=(1,),
+    )
+
+    assert len(candidate.selected_attempts) == 1
+    assert candidate.selected_attempts[0]["attempt_id"] == "attempt-a"

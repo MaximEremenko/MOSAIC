@@ -40,6 +40,7 @@ from core.scattering.commit import (
     write_scattering_stage_commit,
     write_scattering_stage_plan,
 )
+from core.storage.agreement import DEFAULT_NUFFT_EPS
 from core.scattering.contracts import ScatteringWorkUnit
 from core.scattering.kernels import (
     IntervalTask,
@@ -308,18 +309,22 @@ def _add_nufft_task_kwargs(func, kwargs: dict[str, Any], nufft_settings) -> None
 
 
 def _scattering_work_unit_digest(work_unit: ScatteringWorkUnit) -> str:
+    # P11 C-2: device-independent checkpoint address (execution/backend policy are
+    # metadata, not identity) so CPU and GPU work units share one address.
     return build_scattering_work_unit_digest(
         interval_id=int(work_unit.interval_id),
         chunk_id=int(work_unit.chunk_id),
         scientific_digest=str(work_unit.scientific_digest),
-        execution_digest=str(work_unit.execution_digest),
         qspace_plan_digest=str(work_unit.qspace_plan_digest),
-        backend_policy_digest=str(work_unit.backend_policy_digest),
         source_structure_digest=str(work_unit.source_structure_digest),
     )
 
 
 def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
+    # P11 C-4: device-independent residual checkpoint address (backend policy is
+    # metadata, not identity). Mirrors residual_field/execution.py's builder; the
+    # stage2-replacement bridge persists residual outputs and must use the same
+    # device-independent address so CPU/GPU bridged results share one checkpoint.
     return build_residual_work_unit_digest(
         run_digest=str(work_unit.run_digest),
         chunk_id=int(work_unit.chunk_id),
@@ -331,7 +336,6 @@ def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
         partition_plan_digest=str(work_unit.partition_plan_digest),
         source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
         source_replacement_digest=work_unit.source_replacement_digest,
-        backend_policy_digest=str(work_unit.backend_policy_digest),
         expected_output_digest=str(work_unit.expected_output_digest),
     )
 
@@ -436,6 +440,7 @@ def commit_scattering_attempts_for_chunk(
     chunk_id: int,
     expected_interval_ids: tuple[int, ...],
     expected_work_unit_digests: tuple[str, ...] = (),
+    eps: float = DEFAULT_NUFFT_EPS,
 ) -> ScatteringChunkCommitManifest:
     require_chunk_quiescence(
         (),
@@ -446,11 +451,13 @@ def commit_scattering_attempts_for_chunk(
         chunk_id=int(chunk_id),
         expected_work_unit_digests=expected_work_unit_digests,
     )
+    # eps drives the PREDICTED same-work agreement tolerance (core/storage/agreement.py).
     candidate = create_scattering_commit_candidate(
         output_dir=output_dir,
         run_digest=run_digest,
         chunk_id=int(chunk_id),
         expected_interval_ids=expected_interval_ids,
+        eps=eps,
     )
     return promote_scattering_chunk_commit_by_scan(
         output_dir=output_dir,
@@ -1032,6 +1039,7 @@ def run_interval_chunk_execution(
                 chunk_id=chunk_id,
                 expected_interval_ids=expected_interval_ids,
                 expected_work_unit_digests=expected_digests_by_chunk[chunk_id],
+                eps=float(nufft_settings.eps),
             )
             _mark_scattering_chunk_saved(
                 db_manager,
