@@ -24,6 +24,7 @@ from core.residual_field.commit import (
     write_residual_stage_commit,
     write_residual_stage_plan,
 )
+from core.residual_field.artifacts import write_stage2_replacement_expected_manifest
 from core.residual_field.contracts import ResidualFieldWorkUnit
 from core.scattering.artifacts import (
     is_interval_artifact_committed,
@@ -67,20 +68,24 @@ from core.runtime import (
     require_gpu_admission,
     register_cleanup_plugin,
     runtime_provenance_for_attempt,
+    resolve_nufft_execution_settings,
     yield_futures_with_results,
 )
 from core.scattering.tasks import (
+    IntervalPayloadRef,
     compute_scattering_interval_payload,
     run_scattering_interval_chunk_task,
     run_scattering_interval_task,
 )
 from core.storage.database_manager import DatabaseManager, create_db_manager_for_thread
 from core.storage.digests import digest_dict
+from core.storage.fingerprint import file_sha256
 from core.storage.run_state_cache import (
     pending_scattering_interval_chunks,
     rebuild_sqlite_cache_from_manifests,
     scan_run_state,
 )
+from core.runtime.nufft_policy import nufft_task_retries
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -244,15 +249,19 @@ def _scheduler_kind(client) -> str:
 
 
 def _nufft_execution_policy(parameters: Dict[str, Any]) -> str:
+    return _nufft_execution_settings(parameters).execution_policy
+
+
+def _nufft_execution_settings(parameters: Dict[str, Any]):
     runtime_info = _runtime_info(parameters)
     requested = runtime_info.get("scattering_nufft_policy")
     if requested is None:
         requested = runtime_info.get("nufft_execution_policy")
     if requested is None:
         requested = runtime_info.get("nufft_policy")
-    from core.runtime.nufft_policy import resolve_nufft_policy
-
-    return resolve_nufft_policy(requested)
+    eps = runtime_info.get("scattering_nufft_eps", runtime_info.get("nufft_eps", 1e-12))
+    dtype = runtime_info.get("scattering_dtype", runtime_info.get("nufft_dtype", "complex128"))
+    return resolve_nufft_execution_settings(requested, eps=eps, dtype=dtype)
 
 
 def _nufft_resources_for_parameters(parameters: Dict[str, Any]) -> dict[str, int]:
@@ -265,14 +274,16 @@ def _runtime_provenance_for_scattering(
     fs_capability_digest: str | None,
     client,
 ) -> dict[str, Any]:
-    policy = _nufft_execution_policy(parameters)
-    return runtime_provenance_for_attempt(
+    settings = _nufft_execution_settings(parameters)
+    provenance = runtime_provenance_for_attempt(
         fs_capability_digest=fs_capability_digest,
         scheduler_kind=_scheduler_kind(client),
-        nufft_policy=policy,
+        nufft_policy=settings.execution_policy,
         resource_requirements=_nufft_resources_for_parameters(parameters),
-        cuda_probe=policy in {"gpu-required", "allow-fallback"},
+        cuda_probe=settings.gpu_only,
     )
+    provenance["nufft_execution_settings"] = settings.identity_payload()
+    return provenance
 
 
 def _call_accepts_kwarg(func, name: str) -> bool:
@@ -284,6 +295,16 @@ def _call_accepts_kwarg(func, name: str) -> bool:
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
+
+
+def _add_nufft_task_kwargs(func, kwargs: dict[str, Any], nufft_settings) -> None:
+    for name, value in (
+        ("nufft_eps", nufft_settings.eps),
+        ("nufft_prefer_cpu", nufft_settings.prefer_cpu),
+        ("nufft_gpu_only", nufft_settings.gpu_only),
+    ):
+        if _call_accepts_kwarg(func, name):
+            kwargs[name] = value
 
 
 def _scattering_work_unit_digest(work_unit: ScatteringWorkUnit) -> str:
@@ -325,6 +346,7 @@ def _current_scattering_identity(
     client,
 ) -> ScatteringWorkIdentity:
     runtime_info = _runtime_info(parameters)
+    nufft_settings = _nufft_execution_settings(parameters)
     interval_artifact_policy = _resolve_scattering_interval_artifact_policy(
         parameters=parameters,
         client=client,
@@ -335,9 +357,9 @@ def _current_scattering_identity(
         B_=B_,
         mask_params=mask_params,
         MaskStrategy=MaskStrategy,
-        backend=_nufft_execution_policy(parameters),
-        eps=float(runtime_info.get("scattering_nufft_eps", runtime_info.get("nufft_eps", 1e-12))),
-        dtype=str(runtime_info.get("scattering_dtype", "complex128")),
+        backend=nufft_settings.backend,
+        eps=nufft_settings.eps,
+        dtype=nufft_settings.dtype,
         pre_sum_mode=str(runtime_info.get("scattering_pre_sum_mode", "off")),
         reducer_strategy=(
             "stage2-replacement"
@@ -346,6 +368,10 @@ def _current_scattering_identity(
         ),
         scheduler_kind=_scheduler_kind(client),
         interval_artifact_policy=str(interval_artifact_policy),
+        deterministic_mode=nufft_settings.deterministic_mode,
+        thread_count=nufft_settings.thread_count,
+        requested_nufft_policy=nufft_settings.requested_policy,
+        execution_nufft_policy=nufft_settings.execution_policy,
     )
 
 
@@ -386,6 +412,20 @@ def _require_stage2_work_identity(
         qspace_plan_digest=qspace_plan_digest,
         backend_policy_digest=backend_policy_digest,
         source_structure_digest=source_structure_digest,
+    )
+
+
+def _interval_payload_input(
+    interval_id: int | None,
+    path: Path | str,
+) -> IntervalPayloadRef | Path:
+    payload_path = Path(path)
+    if not payload_path.exists():
+        return payload_path
+    return IntervalPayloadRef(
+        path=str(payload_path),
+        file_sha256=file_sha256(payload_path),
+        interval_id=None if interval_id is None else int(interval_id),
     )
 
 
@@ -580,6 +620,7 @@ def run_interval_precompute(
     transient_interval_payloads: dict[int, IntervalTask] | None = None,
 ) -> list[Path]:
     payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
+    nufft_settings = _nufft_execution_settings(parameters)
     local_fast_handoff = _local_fast_handoff_enabled(parameters=parameters, client=client)
     interval_artifact_policy = _resolve_scattering_interval_artifact_policy(
         parameters=parameters,
@@ -664,6 +705,9 @@ def run_interval_precompute(
                 ff_factory=ff_factory,
                 output_dir=output_dir,
                 db_path=None,
+                nufft_eps=nufft_settings.eps,
+                nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                nufft_gpu_only=nufft_settings.gpu_only,
                 pure=False,
                 resources=_nufft_resources_for_parameters(parameters),
             )
@@ -733,6 +777,9 @@ def run_interval_precompute(
                     coeff_val=parameters.get("coeff"),
                     unique_elements=list(unique_elements),
                     ff_factory=ff_factory,
+                    nufft_eps=nufft_settings.eps,
+                    nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                    nufft_gpu_only=nufft_settings.gpu_only,
                 )
                 if interval_task is not None:
                     _store_transient_interval_payload(
@@ -800,6 +847,9 @@ def run_interval_precompute(
                 ff_factory=ff_factory,
                 output_dir=output_dir,
                 db_path=None,
+                nufft_eps=nufft_settings.eps,
+                nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                nufft_gpu_only=nufft_settings.gpu_only,
                 pure=False,
                 resources=_nufft_resources_for_parameters(parameters),
             )
@@ -852,6 +902,9 @@ def run_interval_precompute(
                 ff_factory=ff_factory,
                 output_dir=output_dir,
                 db_path=_sqlite_cache_path(db),
+                nufft_eps=nufft_settings.eps,
+                nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                nufft_gpu_only=nufft_settings.gpu_only,
             )
             if manifest is not None and manifest.artifacts:
                 artifact_path = manifest.artifacts[0].path
@@ -883,6 +936,7 @@ def run_interval_chunk_execution(
     max_inflight: int = 5_000,
     runtime_provenance: dict[str, Any] | None = None,
     nufft_resources: dict[str, int] | None = None,
+    nufft_settings=None,
     transient_interval_payloads: dict[int, object] | None = None,
 ) -> None:
     total_tasks = len(work_units)
@@ -892,11 +946,19 @@ def run_interval_chunk_execution(
 
     work_identity = _require_stage2_work_identity(work_units)
     interval_paths = interval_paths_for_work_units(work_units)
+    if nufft_settings is None:
+        nufft_settings = _nufft_execution_settings(
+            {"runtime_info": {"nufft_policy": "cpu-only"}}
+        )
+    interval_refs = {
+        int(interval_id): _interval_payload_input(int(interval_id), path)
+        for interval_id, path in interval_paths.items()
+    }
     payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
 
     def _interval_input_for(work_unit: ScatteringWorkUnit):
         interval_id = int(work_unit.interval_id)
-        return payload_cache.get(interval_id, interval_paths[interval_id])
+        return payload_cache.get(interval_id, interval_refs[interval_id])
 
     expected_by_chunk: dict[int, tuple[int, ...]] = {
         chunk_id: tuple(
@@ -942,6 +1004,11 @@ def run_interval_chunk_execution(
                         "runtime_provenance",
                     ):
                         task_kwargs["runtime_provenance"] = runtime_provenance
+                    _add_nufft_task_kwargs(
+                        run_scattering_interval_chunk_task,
+                        task_kwargs,
+                        nufft_settings,
+                    )
                     run_scattering_interval_chunk_task(
                         work_unit,
                         _interval_input_for(work_unit),
@@ -1015,8 +1082,8 @@ def run_interval_chunk_execution(
     }
     interval_inputs.update(
         {
-            interval_id: client.scatter(path, broadcast=False)
-            for interval_id, path in interval_paths.items()
+            interval_id: client.scatter(interval_refs[interval_id], broadcast=False)
+            for interval_id in interval_paths
             if interval_id not in interval_inputs
         }
     )
@@ -1037,10 +1104,15 @@ def run_interval_chunk_execution(
             key=_chunk_task_key(work_unit),
             pure=False,
             resources=task_resources,
-            retries=DEFAULT_TASK_RETRIES,
+            retries=nufft_task_retries(nufft_settings.execution_policy, DEFAULT_TASK_RETRIES),
         )
         if _call_accepts_kwarg(run_scattering_interval_chunk_task, "runtime_provenance"):
             submit_kwargs["runtime_provenance"] = runtime_provenance
+        _add_nufft_task_kwargs(
+            run_scattering_interval_chunk_task,
+            submit_kwargs,
+            nufft_settings,
+        )
         owner = chunk_owners.get(int(work_unit.chunk_id))
         if owner is not None:
             submit_kwargs["workers"] = [owner]
@@ -1291,9 +1363,8 @@ def _identity_complete_stage2_replacement_work_units(
         },
         domain="mosaic.stage2_replacement.expected_output.v1",
     )
-    source_scattering_commit_digest = digest_dict(
-        work_identity.to_work_unit_kwargs(),
-        domain="mosaic.stage2_replacement.source_scattering_identity.v1",
+    source_scattering_commit_digest = _stage2_replacement_source_scattering_commit_digest(
+        work_identity
     )
     completed: list[ResidualFieldWorkUnit] = []
     for work_unit in work_units:
@@ -1319,6 +1390,15 @@ def _identity_complete_stage2_replacement_work_units(
             )
         completed.append(with_identity)
     return completed
+
+
+def _stage2_replacement_source_scattering_commit_digest(
+    work_identity: ScatteringWorkIdentity,
+) -> str:
+    return digest_dict(
+        work_identity.to_work_unit_kwargs(),
+        domain="mosaic.stage2_replacement.source_scattering_identity.v1",
+    )
 
 
 def _commit_stage2_replacement_attempts(
@@ -1441,15 +1521,15 @@ def _commit_stage2_replacement_attempts(
             db_manager.close()
 
 
-def _stage2_replacement_interval_inputs(work_unit: ResidualFieldWorkUnit) -> tuple[str, ...]:
-    interval_paths = tuple(
-        artifact.path
+def _stage2_replacement_interval_inputs(work_unit: ResidualFieldWorkUnit) -> tuple[IntervalPayloadRef | str, ...]:
+    interval_refs = tuple(
+        _interval_payload_input(None, artifact.path)
         for artifact in work_unit.source_artifacts
         if artifact.kind == "interval-precompute" and artifact.path is not None
     )
-    if not interval_paths:
+    if not interval_refs:
         raise ValueError("Stage-2 replacement work unit is missing interval artifacts.")
-    return interval_paths
+    return interval_refs
 
 
 def _residual_future_ok(future, result_marker) -> bool:
@@ -1493,6 +1573,7 @@ def run_stage2_replacement_execution(
     max_inflight: int,
     runtime_provenance: dict[str, Any] | None = None,
     nufft_resources: dict[str, int] | None = None,
+    nufft_settings=None,
 ) -> dict[int, tuple[int, ...]]:
     from core.residual_field.tasks import run_residual_field_interval_chunk_task
 
@@ -1508,7 +1589,21 @@ def run_stage2_replacement_execution(
         work_identity=work_identity,
         max_intervals_per_batch=max_intervals_per_shard,
     )
+    source_scattering_commit_digest = _stage2_replacement_source_scattering_commit_digest(
+        work_identity
+    )
+    if nufft_settings is None:
+        nufft_settings = _nufft_execution_settings(
+            {"runtime_info": {"nufft_policy": "cpu-only"}}
+        )
     if not work_units:
+        write_stage2_replacement_expected_manifest(
+            output_dir=output_dir,
+            parameter_digest=parameter_digest,
+            expected_by_chunk={},
+            run_digest=work_identity.run_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+        )
         logger.info("Stage-2 replacement skipped – no unsaved interval/chunk pairs.")
         return {}
 
@@ -1526,6 +1621,13 @@ def run_stage2_replacement_execution(
         )
         for chunk_id in sorted({int(work_unit.chunk_id) for work_unit in work_units})
     }
+    write_stage2_replacement_expected_manifest(
+        output_dir=output_dir,
+        parameter_digest=parameter_digest,
+        expected_by_chunk=expected_by_chunk,
+        run_digest=work_identity.run_digest,
+        source_scattering_commit_digest=source_scattering_commit_digest,
+    )
     task_resources = dict(nufft_resources or {"nufft": 1})
     rec = point_list_to_recarray(point_data_list)
 
@@ -1553,6 +1655,11 @@ def run_stage2_replacement_execution(
                         "runtime_provenance",
                     ):
                         task_kwargs["runtime_provenance"] = runtime_provenance
+                    _add_nufft_task_kwargs(
+                        run_residual_field_interval_chunk_task,
+                        task_kwargs,
+                        nufft_settings,
+                    )
                     run_residual_field_interval_chunk_task(
                         work_unit,
                         _stage2_replacement_interval_inputs(work_unit),
@@ -1615,13 +1722,18 @@ def run_stage2_replacement_execution(
             key=f"stage2-replacement-{work_unit.artifact_key}",
             pure=False,
             resources=task_resources,
-            retries=DEFAULT_TASK_RETRIES,
+            retries=nufft_task_retries(nufft_settings.execution_policy, DEFAULT_TASK_RETRIES),
         )
         if _call_accepts_kwarg(
             run_residual_field_interval_chunk_task,
             "runtime_provenance",
         ):
             submit_kwargs["runtime_provenance"] = runtime_provenance
+        _add_nufft_task_kwargs(
+            run_residual_field_interval_chunk_task,
+            submit_kwargs,
+            nufft_settings,
+        )
         owner = chunk_owners.get(int(work_unit.chunk_id))
         if owner is not None:
             submit_kwargs["workers"] = [owner]
@@ -1822,6 +1934,7 @@ def run_scattering_stage(
                 max_inflight=_stage2_replacement_max_inflight(parameters),
                 runtime_provenance=runtime_provenance,
                 nufft_resources=nufft_resources,
+                nufft_settings=_nufft_execution_settings(parameters),
             )
             parameters["stage2_replacement_expected_by_chunk"] = expected_by_chunk
         else:
@@ -1841,11 +1954,15 @@ def run_scattering_stage(
                 max_inflight=_stage2_replacement_max_inflight(parameters),
                 runtime_provenance=runtime_provenance,
                 nufft_resources=nufft_resources,
+                nufft_settings=_nufft_execution_settings(parameters),
                 transient_interval_payloads=parameters.get("transient_interval_payloads"),
             )
     logger.info("Completed scattering interval precompute stage")
     return {
         "scattering_run_digest": work_identity.run_digest,
+        "source_scattering_commit_digest": _stage2_replacement_source_scattering_commit_digest(
+            work_identity
+        ),
         "stage2_replacement_expected_by_chunk": parameters.get(
             "stage2_replacement_expected_by_chunk",
             {},

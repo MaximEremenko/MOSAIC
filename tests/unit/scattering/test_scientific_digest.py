@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from core.scattering.planning import build_scientific_digest
+from core.scattering.half_space import (
+    HALF_SPACE_ROLE_POSITIVE_HALF,
+    HALF_SPACE_ROLE_ZERO_PLANE,
+)
+from core.scattering.planning import (
+    build_scientific_digest,
+    build_scientific_identity_payload,
+)
 
 
 def _parameters(**overrides):
@@ -55,3 +62,20 @@ def test_scientific_digest_changes_when_science_changes():
 
     assert charge_changed != baseline
     assert interval_changed != baseline
+
+
+def test_scientific_identity_payload_includes_derived_half_space_metadata():
+    payload = build_scientific_identity_payload(_parameters())
+
+    assert payload["half_space_metadata"] == [
+        {
+            "half_space_role": HALF_SPACE_ROLE_ZERO_PLANE,
+            "interval_id": 1,
+            "reciprocal_multiplicity": 1,
+        },
+        {
+            "half_space_role": HALF_SPACE_ROLE_POSITIVE_HALF,
+            "interval_id": 2,
+            "reciprocal_multiplicity": 2,
+        },
+    ]

@@ -14,7 +14,13 @@ from core.scattering.half_space import (
 from core.scattering.kernels import reciprocal_space_points_counter, to_interval_dict
 from core.scattering.grid import generate_q_space_grid_sync
 from core.storage.attempt_store import qspace_plan_path, run_manifest_path
-from core.storage.digests import digest_dict, normalize_digest_input, require_sha256_hex
+from core.storage.digests import (
+    build_execution_digest as _build_execution_digest,
+    build_run_digest as _build_run_digest,
+    digest_dict,
+    normalize_digest_input,
+    require_sha256_hex,
+)
 from core.storage.fingerprint import file_sha256, payload_sha256
 from core.storage.manifest import write_manifest
 
@@ -187,6 +193,23 @@ def _normalize_intervals_for_identity(intervals: list[dict]) -> list[dict[str, A
     )
 
 
+def _half_space_metadata_for_identity(
+    intervals: list[dict],
+    supercell: Any,
+) -> list[dict[str, Any]]:
+    metadata: list[dict[str, Any]] = []
+    for index, interval in enumerate(_normalize_intervals_for_identity(intervals)):
+        role = classify_interval_half_space_role(interval, np.asarray(supercell))
+        metadata.append(
+            {
+                "interval_id": int(interval.get("id", index)),
+                "half_space_role": role,
+                "reciprocal_multiplicity": int(half_space_role_multiplicity(role)),
+            }
+        )
+    return metadata
+
+
 def build_scientific_identity_payload(parameters: Mapping[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {"schema_version": SCATTERING_IDENTITY_SCHEMA_VERSION}
     for key in _SCIENTIFIC_KEYS:
@@ -198,6 +221,16 @@ def build_scientific_identity_payload(parameters: Mapping[str, Any]) -> dict[str
         elif key == "mask_strategy":
             value = _mask_strategy_name(value)
         payload[key] = normalize_digest_input(value)
+    identity_intervals = parameters.get("reciprocal_space_intervals_all")
+    if identity_intervals is None:
+        identity_intervals = parameters.get("reciprocal_space_intervals")
+    if identity_intervals is not None and parameters.get("supercell") is not None:
+        payload["half_space_metadata"] = normalize_digest_input(
+            _half_space_metadata_for_identity(
+                list(identity_intervals),
+                parameters["supercell"],
+            )
+        )
     return payload
 
 
@@ -218,29 +251,26 @@ def build_execution_digest(
     reducer_strategy: str,
     backend_policy_digest: str | None = None,
 ) -> str:
-    require_sha256_hex(scientific_digest, field_name="scientific_digest")
-    payload = {
-        "schema_version": SCATTERING_IDENTITY_SCHEMA_VERSION,
-        "scientific_digest": scientific_digest,
-        "backend": str(backend),
-        "eps": float(eps),
-        "dtype": str(dtype),
-        "pre_sum_mode": str(pre_sum_mode),
-        "reducer_strategy": str(reducer_strategy),
-        "backend_policy_digest": backend_policy_digest,
-    }
-    return digest_dict(payload, domain="mosaic.scattering.execution.v1")
+    return _build_execution_digest(
+        scientific_digest=scientific_digest,
+        backend=backend,
+        eps=eps,
+        dtype=dtype,
+        pre_sum_mode=pre_sum_mode,
+        reducer_strategy=reducer_strategy,
+        backend_policy_digest=backend_policy_digest,
+        schema_version=SCATTERING_IDENTITY_SCHEMA_VERSION,
+        domain="mosaic.scattering.execution.v1",
+    )
 
 
 def build_run_digest(execution_digest: str) -> str:
-    require_sha256_hex(execution_digest, field_name="execution_digest")
-    return digest_dict(
-        {
-            "schema_version": SCATTERING_IDENTITY_SCHEMA_VERSION,
-            "execution_digest": execution_digest,
-        },
+    return _build_run_digest(
+        execution_digest,
+        schema_version=SCATTERING_IDENTITY_SCHEMA_VERSION,
         domain="mosaic.run.v1",
-    )[:32]
+        length=32,
+    )
 
 
 def build_run_identity(
@@ -306,6 +336,10 @@ def build_scattering_backend_policy_digest(
     reducer_strategy: str,
     scheduler_kind: str,
     interval_artifact_policy: str,
+    deterministic_mode: str = "stable-v1",
+    thread_count: int | None = None,
+    requested_nufft_policy: str | None = None,
+    execution_nufft_policy: str | None = None,
 ) -> str:
     return digest_dict(
         {
@@ -317,6 +351,14 @@ def build_scattering_backend_policy_digest(
             "reducer_strategy": str(reducer_strategy),
             "scheduler_kind": str(scheduler_kind),
             "interval_artifact_policy": str(interval_artifact_policy),
+            "deterministic_mode": str(deterministic_mode),
+            "thread_count": None if thread_count is None else int(thread_count),
+            "requested_nufft_policy": (
+                None if requested_nufft_policy is None else str(requested_nufft_policy)
+            ),
+            "execution_nufft_policy": (
+                None if execution_nufft_policy is None else str(execution_nufft_policy)
+            ),
         },
         domain="mosaic.scattering.backend_policy.v1",
     )
@@ -336,6 +378,10 @@ def prepare_scattering_run_identity(
     reducer_strategy: str,
     scheduler_kind: str,
     interval_artifact_policy: str,
+    deterministic_mode: str = "stable-v1",
+    thread_count: int | None = None,
+    requested_nufft_policy: str | None = None,
+    execution_nufft_policy: str | None = None,
 ) -> ScatteringWorkIdentity:
     backend_policy_digest = build_scattering_backend_policy_digest(
         backend=backend,
@@ -345,6 +391,10 @@ def prepare_scattering_run_identity(
         reducer_strategy=reducer_strategy,
         scheduler_kind=scheduler_kind,
         interval_artifact_policy=interval_artifact_policy,
+        deterministic_mode=deterministic_mode,
+        thread_count=thread_count,
+        requested_nufft_policy=requested_nufft_policy,
+        execution_nufft_policy=execution_nufft_policy,
     )
     identity_parameters = dict(parameters)
     identity_parameters.setdefault("mask_parameters", dict(mask_params or {}))
@@ -370,6 +420,14 @@ def prepare_scattering_run_identity(
             "reducer_strategy": str(reducer_strategy),
             "scheduler_kind": str(scheduler_kind),
             "interval_artifact_policy": str(interval_artifact_policy),
+            "deterministic_mode": str(deterministic_mode),
+            "thread_count": None if thread_count is None else int(thread_count),
+            "requested_nufft_policy": (
+                None if requested_nufft_policy is None else str(requested_nufft_policy)
+            ),
+            "execution_nufft_policy": (
+                None if execution_nufft_policy is None else str(execution_nufft_policy)
+            ),
             "backend_policy_digest": backend_policy_digest,
             "source_structure_digest": build_source_structure_digest(parameters),
         },

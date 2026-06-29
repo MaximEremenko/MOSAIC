@@ -12,7 +12,6 @@ from core.scattering.accumulation import (
     build_scattering_partial_result,
     merge_scattering_partial_results,
 )
-from core.scattering.artifacts import _atomic_hdf5_write
 from core.storage.attempt_store import (
     attempt_manifest_path,
     attempt_payload_path,
@@ -28,6 +27,7 @@ from core.storage.attempt_store import (
 )
 from core.storage.digests import digest_dict, normalize_digest_input
 from core.storage.fingerprint import file_sha256, payload_sha256
+from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.manifest import read_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
 from core.runtime.gpu_admission import runtime_provenance_for_attempt
@@ -457,7 +457,7 @@ def write_scattering_attempt(
         work_unit_digest,
         attempt_id,
     )
-    _atomic_hdf5_write(payload_path, datasets, attrs=attrs)
+    atomic_hdf5_write(payload_path, datasets, attrs=attrs)
     manifest = ScatteringAttemptManifest(
         run_digest=str(run_digest),
         work_unit_digest=work_unit_digest,
@@ -698,7 +698,7 @@ def create_scattering_commit_candidate(
         int(chunk_id),
         candidate_id,
     )
-    _atomic_hdf5_write(payload_path, datasets, attrs=attrs)
+    atomic_hdf5_write(payload_path, datasets, attrs=attrs)
     manifest = ScatteringCommitCandidateManifest(
         run_digest=str(run_digest),
         candidate_id=candidate_id,

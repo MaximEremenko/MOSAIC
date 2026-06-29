@@ -5,17 +5,34 @@ import inspect
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, NamedTuple, Tuple
 
 import numpy as np
 
 from core.qspace.masking.mask_strategies import EqBasedStrategy, get_last_eq_mask_telemetry
-from core.runtime.progress import timed
 from core.scattering.half_space import (
     HALF_SPACE_ROLE_FULL,
     classify_interval_half_space_role,
     half_space_role_multiplicity,
 )
+
+
+@contextmanager
+def _timed(label: str):
+    """Local timing instrumentation.
+
+    Kept in this compute leaf instead of importing the runtime/progress
+    layer, so q-space grid construction does not depend on orchestration.
+    Behaviour matches ``core.runtime.progress.timed``.
+    """
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logging.getLogger(__name__).info(
+            "%s took %.3f s", label, time.perf_counter() - t0
+        )
 
 
 logger = logging.getLogger(__name__)
@@ -515,7 +532,7 @@ def generate_rifft_grid(chunk_data: List[dict]):
 
 
 def _build_rifft_grid_locally(chunk_data: List[dict]):
-    with timed("RIFFT grid build"):
+    with _timed("RIFFT grid build"):
         return _process_chunk(chunk_data)
 
 

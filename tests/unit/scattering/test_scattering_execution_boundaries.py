@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
+import pytest
 
 from core.scattering.accumulation import (
     HALF_SPACE_ROLE_POSITIVE_HALF,
@@ -26,12 +27,15 @@ from core.scattering.planning import (
     build_scattering_precompute_work_units,
 )
 from core.scattering.tasks import (
+    IntervalPayloadRef,
+    clear_scattering_interval_payload_cache,
     compute_scattering_interval_payload,
     load_interval_task_payload,
     run_scattering_interval_chunk_task,
 )
 from core.contracts import CompletionStatus
 from core.storage.database_manager import DatabaseManager
+from core.storage.fingerprint import file_sha256
 
 
 def _write_current_interval_payload(
@@ -795,6 +799,112 @@ def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_pa
     assert calls["count"] == 1
     np.testing.assert_allclose(captured["amplitudes_delta"], np.array([3.0 + 0.0j]))
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))
+
+
+def test_scattering_interval_chunk_task_threads_nufft_settings(monkeypatch, tmp_path):
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_current_interval_payload(
+        interval_path,
+        q_grid=np.array([[0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    captured_inverse = {}
+
+    monkeypatch.setattr(
+        "core.scattering.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
+    )
+
+    def fake_inverse(**kwargs):
+        captured_inverse.update(kwargs)
+        return np.array([[3.0 + 0.0j], [4.0 + 0.0j]])
+
+    monkeypatch.setattr(
+        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
+        fake_inverse,
+    )
+    monkeypatch.setattr(
+        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
+        lambda work_unit, **kwargs: "manifest",
+    )
+
+    run_scattering_interval_chunk_task(
+        ScatteringWorkUnit.interval_chunk(
+            interval_id=1,
+            chunk_id=3,
+            dimension=1,
+            output_dir=str(tmp_path),
+        ),
+        interval_path,
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        nufft_eps=1e-7,
+        nufft_prefer_cpu=True,
+        nufft_gpu_only=False,
+    )
+
+    assert captured_inverse["eps"] == 1e-7
+    assert captured_inverse["prefer_cpu"] is True
+    assert captured_inverse["gpu_only"] is False
+
+
+def test_interval_payload_ref_uses_digest_backed_cache(monkeypatch, tmp_path):
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_current_interval_payload(
+        interval_path,
+        q_grid=np.array([[0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+    clear_scattering_interval_payload_cache()
+    ref = IntervalPayloadRef(
+        path=str(interval_path),
+        file_sha256=file_sha256(interval_path),
+        interval_id=1,
+    )
+    open_count = {"count": 0}
+    real_file = h5py.File
+
+    def counted_file(*args, **kwargs):
+        open_count["count"] += 1
+        return real_file(*args, **kwargs)
+
+    monkeypatch.setattr("core.scattering.tasks.h5py.File", counted_file)
+
+    first = load_interval_task_payload(ref)
+    second = load_interval_task_payload(ref)
+
+    assert first is second
+    assert open_count["count"] == 1
+
+
+def test_interval_payload_ref_rejects_digest_mismatch(tmp_path):
+    interval_path = tmp_path / "interval_1.hdf5"
+    _write_current_interval_payload(
+        interval_path,
+        q_grid=np.array([[0.0]], dtype=np.float64),
+        q_amp=np.array([2.0 + 0.0j]),
+        q_amp_av=np.array([1.0 + 0.0j]),
+    )
+
+    ref = IntervalPayloadRef(
+        path=str(interval_path),
+        file_sha256="0" * 64,
+        interval_id=1,
+    )
+
+    with pytest.raises(ValueError, match="file_sha256 mismatch"):
+        load_interval_task_payload(ref)
 
 
 def test_scattering_interval_chunk_task_accepts_transient_interval_payload(

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from core.residual_field.artifacts import load_stage2_replacement_expected_metadata
 from core.residual_field.commit import write_residual_attempt
 from core.scattering.execution import (
     _resolve_scattering_interval_artifact_policy,
@@ -232,6 +233,14 @@ def test_stage2_replacement_no_work_keeps_existing_expected_manifest(tmp_path):
         )
 
         assert expected == {}
+        metadata = load_stage2_replacement_expected_metadata(
+            output_dir=str(tmp_path),
+            parameter_digest="abc123",
+        )
+        assert metadata is not None
+        assert metadata["expected_by_chunk"] == {}
+        assert metadata["run_digest"] == "stage2run"
+        assert len(str(metadata["source_scattering_commit_digest"])) == 64
         assert not stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
     finally:
         db.close()
@@ -254,6 +263,14 @@ def test_stage2_replacement_no_work_writes_empty_expected_manifest(tmp_path):
         )
 
         assert expected == {}
+        metadata = load_stage2_replacement_expected_metadata(
+            output_dir=str(tmp_path),
+            parameter_digest="abc123",
+        )
+        assert metadata is not None
+        assert metadata["expected_by_chunk"] == {}
+        assert metadata["run_digest"] == "stage2run"
+        assert len(str(metadata["source_scattering_commit_digest"])) == 64
         assert not stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
     finally:
         db.close()

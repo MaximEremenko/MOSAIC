@@ -10,10 +10,11 @@ from core.scattering.planning import (
     build_scattering_interval_lookup,
     build_scattering_precompute_work_units,
 )
-from core.storage.database_manager import DatabaseManager
 
 if TYPE_CHECKING:
     from dask.distributed import Client
+
+    from core.storage.database_manager import DatabaseManager
 
 
 def precompute_intervals(

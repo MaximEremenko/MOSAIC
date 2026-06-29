@@ -37,6 +37,10 @@ def compute_interval_element_contribution(
     elements_arr: np.ndarray,
     charge: float,
     ff_factory,
+    *,
+    nufft_eps: float = 1e-12,
+    nufft_prefer_cpu: bool = False,
+    nufft_gpu_only: bool = False,
 ) -> Tuple | None:
     ff = ff_factory.calculate(q_grid, element, charge=charge)
     mask = elements_arr == element
@@ -46,19 +50,25 @@ def compute_interval_element_contribution(
         original_coords[mask],
         np.ones(mask.sum()),
         q_grid,
-        eps=1e-12,
+        eps=nufft_eps,
+        prefer_cpu=nufft_prefer_cpu,
+        gpu_only=nufft_gpu_only,
     )
     q_av = execute_cunufft(
         cells_origin,
         np.ones(original_coords.shape[0]),
         q_grid,
-        eps=1e-12,
+        eps=nufft_eps,
+        prefer_cpu=nufft_prefer_cpu,
+        gpu_only=nufft_gpu_only,
     )
     q_delta = execute_cunufft(
         original_coords[mask] - cells_origin[mask],
         np.ones(mask.sum()),
         q_grid,
-        eps=1e-12,
+        eps=nufft_eps,
+        prefer_cpu=nufft_prefer_cpu,
+        gpu_only=nufft_gpu_only,
     )
     q_av_final = ff * q_av * q_delta / original_coords.shape[0]
     return (interval["id"], element, q_grid, q_amp, q_av_final)
@@ -70,21 +80,36 @@ def compute_interval_coeff_contribution(
     coeff: np.ndarray,
     original_coords: np.ndarray,
     cells_origin: np.ndarray,
+    *,
+    nufft_eps: float = 1e-12,
+    nufft_prefer_cpu: bool = False,
+    nufft_gpu_only: bool = False,
 ) -> Tuple:
     n_points = original_coords.shape[0]
     coeff_arr = coeff * (np.ones(n_points) + 1j * np.zeros(n_points))
-    q_amplitudes = execute_cunufft(original_coords, coeff_arr, q_grid, eps=1e-12)
+    q_amplitudes = execute_cunufft(
+        original_coords,
+        coeff_arr,
+        q_grid,
+        eps=nufft_eps,
+        prefer_cpu=nufft_prefer_cpu,
+        gpu_only=nufft_gpu_only,
+    )
     q_amplitudes_av = execute_cunufft(
         cells_origin,
         coeff_arr * 0.0 + 1.0,
         q_grid,
-        eps=1e-12,
+        eps=nufft_eps,
+        prefer_cpu=nufft_prefer_cpu,
+        gpu_only=nufft_gpu_only,
     )
     q_amplitudes_delta = execute_cunufft(
         original_coords - cells_origin,
         coeff_arr,
         q_grid,
-        eps=1e-12,
+        eps=nufft_eps,
+        prefer_cpu=nufft_prefer_cpu,
+        gpu_only=nufft_gpu_only,
     )
     q_amplitudes_av_final = q_amplitudes_av * q_amplitudes_delta / n_points
     return (interval["id"], "All", q_grid, q_amplitudes, q_amplitudes_av_final)
@@ -99,10 +124,19 @@ def aggregate_interval_contributions(
         interval_id, element, q_grid, q_amp, q_amp_av = contributions[0]
         return IntervalTask(interval_id, element, q_grid, q_amp, q_amp_av)
 
-    interval_id = contributions[0][0]
-    q_grid = contributions[0][2]
-    q_amp = np.sum([contribution[3] for contribution in contributions], axis=0)
-    q_amp_av = np.sum([contribution[4] for contribution in contributions], axis=0)
+    ordered = sorted(contributions, key=lambda contribution: str(contribution[1]))
+    interval_id = ordered[0][0]
+    q_grid = ordered[0][2]
+    q_amp = np.sum(
+        np.stack([np.asarray(contribution[3], dtype=np.complex128) for contribution in ordered]),
+        axis=0,
+        dtype=np.complex128,
+    )
+    q_amp_av = np.sum(
+        np.stack([np.asarray(contribution[4], dtype=np.complex128) for contribution in ordered]),
+        axis=0,
+        dtype=np.complex128,
+    )
     return IntervalTask(interval_id, "All", q_grid, q_amp, q_amp_av)
 
 

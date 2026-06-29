@@ -13,6 +13,7 @@ from core.scattering.accumulation import (
 )
 from core.scattering.calculator import compute_amplitudes_delta
 from core.scattering.half_space import classify_interval_half_space_role
+from core.scattering.kernels import aggregate_interval_contributions
 from core.scattering.planning import (
     ScatteringWorkIdentity,
     build_scattering_execution_plan,
@@ -63,6 +64,21 @@ def test_build_scattering_execution_plan_uses_contract_work_units(tmp_path):
     assert all(unit.run_digest == "run123" for unit in plan.interval_work_units)
     assert all(unit.qspace_plan_digest == "3" * 64 for unit in plan.chunk_work_units)
     assert plan.total_reciprocal_points > 0
+
+
+def test_interval_contribution_aggregation_uses_stable_element_order():
+    q_grid = np.array([[0.0]], dtype=np.float64)
+    contributions = [
+        (1, "Zr", q_grid, np.array([1.0e16 + 0.0j]), np.array([1.0 + 0.0j])),
+        (1, "Al", q_grid, np.array([-1.0e16 + 0.0j]), np.array([2.0 + 0.0j])),
+        (1, "Na", q_grid, np.array([1.0 + 0.0j]), np.array([3.0 + 0.0j])),
+    ]
+
+    baseline = aggregate_interval_contributions(contributions, use_coeff=False)
+    permuted = aggregate_interval_contributions(list(reversed(contributions)), use_coeff=False)
+
+    np.testing.assert_array_equal(permuted.q_amp, baseline.q_amp)
+    np.testing.assert_array_equal(permuted.q_amp_av, baseline.q_amp_av)
 
 
 def test_scattering_accumulation_builds_and_applies_partial_results():

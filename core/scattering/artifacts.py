@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from uuid import uuid4
@@ -28,80 +26,17 @@ from core.scattering.kernels import IntervalTask
 from core.contracts import ArtifactManifestAssessment, CompletionStatus
 from core.runtime import TIMER, chunk_mutex
 from core.storage.database_manager import create_db_manager_for_thread
+from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 
 
 logger = logging.getLogger(__name__)
 
 
-def _fsync_path(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _fsync_parent(path: Path) -> None:
-    try:
-        fd = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 def _q_grid_digest(q_grid: np.ndarray) -> str:
     from core.scattering.planning import q_grid_sha256
 
     return q_grid_sha256(q_grid)
-
-
-def _atomic_hdf5_write(
-    out_path: Path,
-    datasets: dict[str, np.ndarray],
-    *,
-    attrs: dict[str, object] | None = None,
-) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        dir=out_path.parent,
-        prefix=f".{out_path.name}.",
-        suffix=".tmp",
-    )
-    os.close(fd)
-    temp_path = Path(temp_name)
-    try:
-        with h5py.File(temp_path, "w") as h5file:
-            for name, values in datasets.items():
-                data = np.asarray(values)
-                h5file.create_dataset(name, data=data)
-            if attrs:
-                for name, value in attrs.items():
-                    h5file.attrs[name] = value
-            h5file.flush()
-        _fsync_path(temp_path)
-        with h5py.File(temp_path, "r") as h5file:
-            for name, expected in datasets.items():
-                if name not in h5file:
-                    raise OSError(f"HDF5 validation failed: missing dataset {name!r}")
-                if h5file[name].shape != np.asarray(expected).shape:
-                    raise OSError(
-                        f"HDF5 validation failed for {name!r}: "
-                        f"{h5file[name].shape} != {np.asarray(expected).shape}"
-                    )
-        os.replace(temp_path, out_path)
-        _fsync_parent(out_path)
-    finally:
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
 
 
 class _IntervalPrecomputeStateUpdater:
@@ -574,7 +509,7 @@ def persist_precomputed_interval_artifact(
     if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
         raise ValueError("Precompute work unit must include an interval artifact path.")
     out_path = Path(work_unit.interval_artifact.path)
-    _atomic_hdf5_write(
+    atomic_hdf5_write(
         out_path,
         {
             "irecip_id": np.array([int(interval_task.irecip_id)], dtype=np.int64),
