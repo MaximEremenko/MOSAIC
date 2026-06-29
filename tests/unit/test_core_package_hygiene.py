@@ -40,6 +40,7 @@ ALLOWED_CROSS_CUTTING_UNIT_TESTS = {
     "test_entrypoints.py",
     "test_import_style_guard.py",
     "test_no_print_guard.py",
+    "test_release_evidence_layout.py",
     "test_stage_contracts.py",
     "test_stage_manifest_semantics.py",
 }

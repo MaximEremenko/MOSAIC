@@ -11,7 +11,46 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+# ---------------------------------------------------------------------------
+# Release evidence bundle layout
+# ---------------------------------------------------------------------------
+#
+# ``final_plan.md`` section 13 defines an explicit, auditable bundle layout::
+#
+#     release_evidence/<version>/
+#       commit.txt
+#       ci_urls.txt
+#       dist_sha256.txt
+#       pip_freeze.txt
+#       environment.json
+#       fs_capability.json
+#       public_manifest.json
+#       stage_commits/
+#       chunk_commits/
+#       decoder_commit.json
+#       restart_recovery.log
+#       cross_host_visibility.log
+#       gpu_validation_report.json
+#       hpc_runbook_signoff.txt
+#
+# This script emits that layout wherever inputs are available and keeps
+# ``release_evidence.json`` as the canonical *index*: it lists every expected
+# path with present/missing status, the hash where applicable, and whether the
+# item is required for the claimed release scope. The bundle is auditable
+# without opening ``release_evidence.json`` (each piece of evidence is a real
+# file on disk); the index exists so an auditor can verify completeness and so a
+# release gate can fail when required evidence is missing.
+
+# Scopes describe how much of the release is being claimed. An evidence item is
+# "required" when the claimed scope appears in its ``required_scopes`` set.
+#
+#   local   - packaging / source-tree evidence derivable on the build host.
+#   runtime - adds evidence produced by a real MOSAIC run (durable run state).
+#   hpc     - adds multi-node / GPU site evidence that cannot be derived locally.
+#   full    - every listed item is required (a complete release candidate).
+SCOPES = ("local", "runtime", "hpc", "full")
 
 
 def _utc_timestamp() -> str:
@@ -40,6 +79,7 @@ def _run_command(
             "returncode": completed.returncode,
             "started_at_utc": started_at.isoformat(),
             "ended_at_utc": ended_at.isoformat(),
+            "stdout": completed.stdout,
             "stdout_tail": completed.stdout[-8000:],
             "stderr_tail": completed.stderr[-8000:],
         }
@@ -50,17 +90,20 @@ def _run_command(
             "returncode": 127,
             "started_at_utc": started_at.isoformat(),
             "ended_at_utc": ended_at.isoformat(),
+            "stdout": "",
             "stdout_tail": "",
             "stderr_tail": str(exc),
         }
     except subprocess.TimeoutExpired as exc:
         ended_at = datetime.now(timezone.utc)
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         return {
             "command": command,
             "returncode": 124,
             "started_at_utc": started_at.isoformat(),
             "ended_at_utc": ended_at.isoformat(),
-            "stdout_tail": (exc.stdout or "")[-8000:] if isinstance(exc.stdout, str) else "",
+            "stdout": stdout,
+            "stdout_tail": stdout[-8000:],
             "stderr_tail": (exc.stderr or "")[-8000:] if isinstance(exc.stderr, str) else "",
         }
 
@@ -107,6 +150,7 @@ def _dist_hashes(dist_dir: Path) -> list[dict[str, Any]]:
             entries.append(
                 {
                     "path": path.as_posix(),
+                    "name": path.name,
                     "size_bytes": path.stat().st_size,
                     "sha256": _sha256(path),
                 }
@@ -119,105 +163,333 @@ def _load_json_file(path: Path) -> Any:
         return json.load(handle)
 
 
-def _copy_evidence_file(
-    source: Path,
-    target: Path,
-    *,
-    repo_root: Path,
-) -> dict[str, Any]:
-    if not source.exists():
-        return {
-            "source": source.as_posix(),
-            "copied_to": None,
-            "present": False,
-        }
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, target)
-    try:
-        copied_to = target.relative_to(repo_root).as_posix()
-    except ValueError:
-        copied_to = target.as_posix()
+def _pip_freeze(repo_root: Path, *, timeout_seconds: int) -> dict[str, Any]:
+    result = _run_command(
+        [sys.executable, "-m", "pip", "freeze", "--all"],
+        cwd=repo_root,
+        timeout_seconds=timeout_seconds,
+    )
+    return result
+
+
+def _environment_payload(repo_root: Path) -> dict[str, Any]:
     return {
-        "source": source.as_posix(),
-        "copied_to": copied_to,
-        "present": True,
-        "sha256": _sha256(target),
-        "size_bytes": target.stat().st_size,
+        "schema": "mosaic.release_evidence.environment",
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "repository_root": repo_root.as_posix(),
+        "python": {
+            "executable": sys.executable,
+            "version": sys.version,
+            "version_info": list(sys.version_info),
+            "implementation": platform.python_implementation(),
+        },
+        "platform": {
+            "platform": platform.platform(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "node": platform.node(),
+        },
+        "installed_packages": _installed_packages(),
     }
 
 
-def _copy_optional_input(
-    raw_path: str | None,
-    *,
-    repo_root: Path,
-    evidence_dir: Path,
-    target_name: str,
-) -> dict[str, Any] | None:
+class BundleWriter:
+    """Materialise the explicit bundle layout and build the index entries.
+
+    Every expected layout item is registered through one of the ``record_*``
+    helpers. Each call appends one entry to :attr:`index` describing where the
+    file lives, whether it is present, its hash, and whether it is required for
+    the claimed scope. Items that cannot be produced (no input supplied, or an
+    input path that does not exist) are recorded as explicitly missing rather
+    than silently omitted.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        evidence_dir: Path,
+        scope: str,
+    ) -> None:
+        self.repo_root = repo_root
+        self.evidence_dir = evidence_dir
+        self.scope = scope
+        self.index: list[dict[str, Any]] = []
+
+    # -- low level ---------------------------------------------------------
+    def _relpath(self, target: Path) -> str:
+        try:
+            return target.relative_to(self.evidence_dir).as_posix()
+        except ValueError:
+            return target.as_posix()
+
+    def _is_required(self, required_scopes: Iterable[str]) -> bool:
+        required = set(required_scopes)
+        return self.scope == "full" or self.scope in required
+
+    def _base_entry(
+        self,
+        rel_path: str,
+        *,
+        kind: str,
+        required_scopes: Iterable[str],
+    ) -> dict[str, Any]:
+        return {
+            "path": rel_path,
+            "kind": kind,
+            "required": self._is_required(required_scopes),
+            "required_scopes": sorted(set(required_scopes)),
+        }
+
+    def _present_entry(
+        self,
+        target: Path,
+        *,
+        kind: str,
+        required_scopes: Iterable[str],
+        source: str | None,
+    ) -> dict[str, Any]:
+        entry = self._base_entry(
+            self._relpath(target),
+            kind=kind,
+            required_scopes=required_scopes,
+        )
+        entry.update(
+            {
+                "present": True,
+                "missing_reason": None,
+                "sha256": _sha256(target),
+                "size_bytes": target.stat().st_size,
+                "source": source,
+            }
+        )
+        return entry
+
+    def _missing_entry(
+        self,
+        rel_path: str,
+        *,
+        kind: str,
+        required_scopes: Iterable[str],
+        missing_reason: str,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        entry = self._base_entry(rel_path, kind=kind, required_scopes=required_scopes)
+        entry.update(
+            {
+                "present": False,
+                "missing_reason": missing_reason,
+                "sha256": None,
+                "size_bytes": None,
+                "source": source,
+            }
+        )
+        return entry
+
+    # -- recorders ---------------------------------------------------------
+    def write_text(
+        self,
+        rel_path: str,
+        content: str | None,
+        *,
+        required_scopes: Iterable[str],
+        missing_reason: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Write locally-derived text evidence, or record it as missing."""
+        if content is None:
+            entry = self._missing_entry(
+                rel_path,
+                kind="text",
+                required_scopes=required_scopes,
+                missing_reason=missing_reason or "not available",
+                source=source,
+            )
+            self.index.append(entry)
+            return entry
+        target = self.evidence_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = content if content.endswith("\n") else content + "\n"
+        target.write_text(text, encoding="utf-8")
+        entry = self._present_entry(
+            target,
+            kind="text",
+            required_scopes=required_scopes,
+            source=source,
+        )
+        self.index.append(entry)
+        return entry
+
+    def write_json(
+        self,
+        rel_path: str,
+        payload: Any,
+        *,
+        required_scopes: Iterable[str],
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        target = self.evidence_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        entry = self._present_entry(
+            target,
+            kind="json",
+            required_scopes=required_scopes,
+            source=source,
+        )
+        self.index.append(entry)
+        return entry
+
+    def copy_input(
+        self,
+        rel_path: str,
+        source_path: Path | None,
+        *,
+        kind: str,
+        required_scopes: Iterable[str],
+        missing_reason: str,
+    ) -> dict[str, Any]:
+        """Copy an externally-supplied input into the bundle, or mark missing.
+
+        ``source_path is None`` means the input was never supplied on the CLI
+        (e.g. an HPC artifact that requires a real site run). A supplied path
+        that does not exist is also recorded as missing, with the source noted
+        so the auditor can see what was attempted.
+        """
+        if source_path is None:
+            entry = self._missing_entry(
+                rel_path,
+                kind=kind,
+                required_scopes=required_scopes,
+                missing_reason=missing_reason,
+            )
+            self.index.append(entry)
+            return entry
+        if not source_path.exists():
+            entry = self._missing_entry(
+                rel_path,
+                kind=kind,
+                required_scopes=required_scopes,
+                missing_reason="supplied path does not exist",
+                source=source_path.as_posix(),
+            )
+            self.index.append(entry)
+            return entry
+        target = self.evidence_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target)
+        entry = self._present_entry(
+            target,
+            kind=kind,
+            required_scopes=required_scopes,
+            source=source_path.as_posix(),
+        )
+        self.index.append(entry)
+        return entry
+
+    def record_directory(
+        self,
+        rel_path: str,
+        members: list[dict[str, Any]],
+        *,
+        required_scopes: Iterable[str],
+        missing_reason: str,
+    ) -> dict[str, Any]:
+        """Record a directory of copied artifacts (stage/chunk commits).
+
+        The directory is created even when empty so the layout is stable. It is
+        considered present only when at least one member was copied in.
+        """
+        target = self.evidence_dir / rel_path
+        target.mkdir(parents=True, exist_ok=True)
+        entry = self._base_entry(
+            rel_path.rstrip("/") + "/",
+            kind="directory",
+            required_scopes=required_scopes,
+        )
+        present = bool(members)
+        entry.update(
+            {
+                "present": present,
+                "missing_reason": None if present else missing_reason,
+                "member_count": len(members),
+                "members": members,
+            }
+        )
+        self.index.append(entry)
+        return entry
+
+
+def _resolve_input(raw_path: str | None, repo_root: Path) -> Path | None:
     if raw_path is None:
         return None
     path = Path(raw_path)
     if not path.is_absolute():
         path = repo_root / path
-    return _copy_evidence_file(
-        path,
-        evidence_dir / target_name,
-        repo_root=repo_root,
-    )
+    return path
 
 
-def _copy_run_artifacts(
+def _read_ci_urls(args_urls: list[str], ci_urls_file: Path | None) -> str | None:
+    urls: list[str] = []
+    if ci_urls_file is not None and ci_urls_file.exists():
+        for line in ci_urls_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped:
+                urls.append(stripped)
+    for raw in args_urls:
+        stripped = raw.strip()
+        if stripped:
+            urls.append(stripped)
+    if not urls:
+        return None
+    return "\n".join(urls)
+
+
+def _stage_chunk_members(
+    writer: BundleWriter,
+    run_root: Path,
     *,
-    repo_root: Path,
-    evidence_dir: Path,
-    output_dir: Path,
-    run_digest: str,
-) -> dict[str, Any]:
-    output_root = output_dir.resolve()
-    run_root = output_root / ".mosaic" / "runs" / str(run_digest)
-    copied: dict[str, Any] = {
-        "output_dir": output_root.as_posix(),
-        "run_digest": str(run_digest),
-        "run_root": run_root.as_posix(),
-        "run_root_present": run_root.exists(),
-        "files": {},
-        "stage_commits": [],
-        "chunk_commits": [],
-    }
-    copied["files"]["fs_capability"] = _copy_evidence_file(
-        run_root / "fs_capability.json",
-        evidence_dir / "fs_capability.json",
-        repo_root=repo_root,
-    )
-    copied["files"]["public_manifest"] = _copy_evidence_file(
-        output_root / "public_manifest.json",
-        evidence_dir / "public_manifest.json",
-        repo_root=repo_root,
-    )
-    copied["files"]["decoder_commit"] = _copy_evidence_file(
-        run_root / "decoding" / "decoder_commit.json",
-        evidence_dir / "decoder_commit.json",
-        repo_root=repo_root,
-    )
+    required_scopes: Iterable[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    stage_members: list[dict[str, Any]] = []
+    chunk_members: list[dict[str, Any]] = []
+    if not run_root.exists():
+        return stage_members, chunk_members
     for path in sorted(run_root.glob("*/stage_commit.json")):
         stage = path.parent.name
-        copied["stage_commits"].append(
-            _copy_evidence_file(
-                path,
-                evidence_dir / "stage_commits" / f"{stage}_stage_commit.json",
-                repo_root=repo_root,
-            )
+        rel = f"stage_commits/{stage}_stage_commit.json"
+        target = writer.evidence_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        stage_members.append(
+            {
+                "path": rel,
+                "source": path.as_posix(),
+                "sha256": _sha256(target),
+                "size_bytes": target.stat().st_size,
+            }
         )
     for path in sorted(run_root.glob("*/chunks/chunk_*/chunk_commit.json")):
         stage = path.parents[2].name
         chunk = path.parent.name
-        copied["chunk_commits"].append(
-            _copy_evidence_file(
-                path,
-                evidence_dir / "chunk_commits" / f"{stage}_{chunk}_chunk_commit.json",
-                repo_root=repo_root,
-            )
+        rel = f"chunk_commits/{stage}_{chunk}_chunk_commit.json"
+        target = writer.evidence_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        chunk_members.append(
+            {
+                "path": rel,
+                "source": path.as_posix(),
+                "sha256": _sha256(target),
+                "size_bytes": target.stat().st_size,
+            }
         )
-    return copied
+    return stage_members, chunk_members
 
 
 def _standard_commands(repo_root: Path) -> list[tuple[str, list[str]]]:
@@ -236,13 +508,242 @@ def _standard_commands(repo_root: Path) -> list[tuple[str, list[str]]]:
     return commands
 
 
+def build_bundle(args: argparse.Namespace, repo_root: Path) -> dict[str, Any]:
+    """Materialise the bundle layout and return the canonical index payload."""
+    label = args.label or _utc_timestamp()
+    evidence_dir = (repo_root / args.output_dir / label).resolve()
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    dist_dir = (repo_root / args.dist_dir).resolve()
+    timeout = max(1, int(args.command_timeout_seconds))
+
+    writer = BundleWriter(repo_root=repo_root, evidence_dir=evidence_dir, scope=args.scope)
+
+    # -- Locally derivable, always-required-for-local evidence -------------
+    git = _git_evidence(repo_root)
+    commit_sha = git["sha"]
+    commit_text = None
+    if commit_sha:
+        dirty_suffix = " (dirty)" if git["dirty"] else ""
+        commit_text = f"{commit_sha}{dirty_suffix}"
+    writer.write_text(
+        "commit.txt",
+        commit_text,
+        required_scopes={"local", "runtime", "hpc"},
+        missing_reason="git rev-parse HEAD failed",
+        source="git rev-parse HEAD",
+    )
+
+    ci_urls_file = _resolve_input(args.ci_urls_file, repo_root)
+    ci_urls = _read_ci_urls(args.ci_url, ci_urls_file)
+    writer.write_text(
+        "ci_urls.txt",
+        ci_urls,
+        required_scopes={"local", "runtime", "hpc"},
+        missing_reason="no CI run URLs supplied (--ci-url / --ci-urls-file)",
+        source="--ci-url / --ci-urls-file",
+    )
+
+    dist_files = _dist_hashes(dist_dir)
+    dist_text = None
+    if dist_files:
+        dist_text = "\n".join(f"{entry['sha256']}  {entry['name']}" for entry in dist_files)
+    writer.write_text(
+        "dist_sha256.txt",
+        dist_text,
+        required_scopes={"local"},
+        missing_reason=f"no distribution artifacts under {dist_dir.as_posix()}",
+        source=f"sha256({dist_dir.as_posix()}/*)",
+    )
+
+    freeze = _pip_freeze(repo_root, timeout_seconds=timeout)
+    freeze_text = freeze["stdout"] if freeze["returncode"] == 0 else None
+    writer.write_text(
+        "pip_freeze.txt",
+        freeze_text,
+        required_scopes={"local"},
+        missing_reason="pip freeze failed",
+        source="python -m pip freeze --all",
+    )
+
+    writer.write_json(
+        "environment.json",
+        _environment_payload(repo_root),
+        required_scopes={"local"},
+        source="platform/python introspection",
+    )
+
+    # -- Run evidence (requires a real run output dir) ---------------------
+    run_root: Path | None = None
+    run_output_dir: Path | None = None
+    if args.run_output_dir is not None or args.run_digest is not None:
+        if args.run_output_dir is None or args.run_digest is None:
+            raise SystemExit("--run-output-dir and --run-digest must be provided together.")
+        run_output_dir = _resolve_input(args.run_output_dir, repo_root)
+        assert run_output_dir is not None
+        run_output_dir = run_output_dir.resolve()
+        run_root = run_output_dir / ".mosaic" / "runs" / str(args.run_digest)
+
+    run_missing = "no run output dir supplied (--run-output-dir / --run-digest)"
+
+    writer.copy_input(
+        "fs_capability.json",
+        (run_root / "fs_capability.json") if run_root is not None else None,
+        kind="json",
+        required_scopes={"runtime", "hpc"},
+        missing_reason=run_missing,
+    )
+    writer.copy_input(
+        "public_manifest.json",
+        (run_output_dir / "public_manifest.json") if run_output_dir is not None else None,
+        kind="json",
+        required_scopes={"runtime", "hpc"},
+        missing_reason=run_missing,
+    )
+    writer.copy_input(
+        "decoder_commit.json",
+        (run_root / "decoding" / "decoder_commit.json") if run_root is not None else None,
+        kind="json",
+        required_scopes={"runtime"},
+        missing_reason=run_missing,
+    )
+
+    stage_members, chunk_members = (
+        _stage_chunk_members(writer, run_root, required_scopes={"runtime"})
+        if run_root is not None
+        else ([], [])
+    )
+    writer.record_directory(
+        "stage_commits",
+        stage_members,
+        required_scopes={"runtime"},
+        missing_reason=run_missing if run_root is None else "no stage_commit.json files under run root",
+    )
+    writer.record_directory(
+        "chunk_commits",
+        chunk_members,
+        required_scopes={"runtime"},
+        missing_reason=run_missing if run_root is None else "no chunk_commit.json files under run root",
+    )
+
+    # -- HPC / GPU site evidence (cannot be derived locally) ---------------
+    writer.copy_input(
+        "restart_recovery.log",
+        _resolve_input(args.restart_recovery_log, repo_root),
+        kind="log",
+        required_scopes={"hpc"},
+        missing_reason="requires a real HPC restart/recovery run (--restart-recovery-log)",
+    )
+    writer.copy_input(
+        "cross_host_visibility.log",
+        _resolve_input(args.cross_host_visibility_log, repo_root),
+        kind="log",
+        required_scopes={"hpc"},
+        missing_reason="requires a multi-host run (--cross-host-visibility-log)",
+    )
+    writer.copy_input(
+        "gpu_validation_report.json",
+        _resolve_input(args.gpu_validation_report, repo_root),
+        kind="json",
+        required_scopes={"hpc"},
+        missing_reason="requires a GPU validation run (--gpu-validation-report)",
+    )
+    writer.copy_input(
+        "hpc_runbook_signoff.txt",
+        _resolve_input(args.hpc_runbook_signoff, repo_root),
+        kind="text",
+        required_scopes={"hpc"},
+        missing_reason="requires a human HPC runbook signoff (--hpc-runbook-signoff)",
+    )
+
+    # -- Optional standard commands + hpc smoke outputs --------------------
+    command_results: dict[str, Any] = {}
+    if args.run_standard_commands:
+        for name, command in _standard_commands(repo_root):
+            command_results[name] = _run_command(command, cwd=repo_root, timeout_seconds=timeout)
+
+    hpc_smoke_outputs = []
+    for raw_path in args.hpc_smoke_json:
+        path = _resolve_input(raw_path, repo_root)
+        assert path is not None
+        hpc_smoke_outputs.append(
+            {
+                "path": path.as_posix(),
+                "present": path.exists(),
+                "content": _load_json_file(path) if path.exists() else None,
+            }
+        )
+
+    missing_required = [
+        entry for entry in writer.index if entry["required"] and not entry["present"]
+    ]
+    failed_commands = {
+        name: result
+        for name, result in command_results.items()
+        if int(result.get("returncode", 1)) != 0
+    }
+
+    index = {
+        "schema": "mosaic.release_evidence",
+        "schema_version": 2,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "repository_root": repo_root.as_posix(),
+        "evidence_dir": evidence_dir.as_posix(),
+        "label": label,
+        "scope": args.scope,
+        "git": git,
+        "python": {
+            "executable": sys.executable,
+            "version": sys.version,
+            "platform": platform.platform(),
+        },
+        "dist_files": dist_files,
+        "bundle_index": writer.index,
+        "missing_required": [entry["path"] for entry in missing_required],
+        "complete_for_scope": not missing_required,
+        "command_results": command_results,
+        "hpc_smoke_outputs": hpc_smoke_outputs,
+    }
+
+    evidence_path = evidence_dir / "release_evidence.json"
+    with evidence_path.open("w", encoding="utf-8") as handle:
+        json.dump(index, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    return {
+        "index": index,
+        "evidence_path": evidence_path,
+        "missing_required": missing_required,
+        "failed_commands": failed_commands,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Write a MOSAIC release evidence JSON bundle."
+        description="Write the MOSAIC release evidence bundle (explicit layout + index)."
     )
     parser.add_argument("--output-dir", default="release_evidence")
     parser.add_argument("--label", default=None)
     parser.add_argument("--dist-dir", default="dist")
+    parser.add_argument(
+        "--scope",
+        choices=SCOPES,
+        default="local",
+        help=(
+            "Release scope being claimed. Items required for this scope that are "
+            "missing fail the gate (unless --no-fail-on-missing-required)."
+        ),
+    )
+    parser.add_argument(
+        "--ci-url",
+        action="append",
+        default=[],
+        help="A CI run URL to record in ci_urls.txt (repeatable).",
+    )
+    parser.add_argument(
+        "--ci-urls-file",
+        default=None,
+        help="Path to a newline-delimited file of CI run URLs.",
+    )
     parser.add_argument("--hpc-smoke-json", action="append", default=[])
     parser.add_argument("--run-output-dir", default=None)
     parser.add_argument("--run-digest", default=None)
@@ -252,106 +753,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hpc-runbook-signoff", default=None)
     parser.add_argument("--run-standard-commands", action="store_true")
     parser.add_argument("--fail-on-command-error", action="store_true")
+    parser.add_argument(
+        "--no-fail-on-missing-required",
+        dest="fail_on_missing_required",
+        action="store_false",
+        help="Do not fail the gate when required evidence is missing for the scope.",
+    )
+    parser.set_defaults(fail_on_missing_required=True)
     parser.add_argument("--command-timeout-seconds", type=int, default=300)
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parents[1]
-    label = args.label or _utc_timestamp()
-    evidence_dir = (repo_root / args.output_dir / label).resolve()
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    dist_dir = (repo_root / args.dist_dir).resolve()
+    result = build_bundle(args, repo_root)
 
-    command_results: dict[str, Any] = {}
-    if args.run_standard_commands:
-        for label_name, command in _standard_commands(repo_root):
-            command_results[label_name] = _run_command(
-                command,
-                cwd=repo_root,
-                timeout_seconds=max(1, int(args.command_timeout_seconds)),
-            )
-
-    hpc_smoke_outputs = []
-    for raw_path in args.hpc_smoke_json:
-        path = Path(raw_path)
-        if not path.is_absolute():
-            path = repo_root / path
-        hpc_smoke_outputs.append(
+    missing_required = result["missing_required"]
+    failed_commands = result["failed_commands"]
+    ok = not missing_required and not failed_commands
+    print(
+        json.dumps(
             {
-                "path": path.as_posix(),
-                "content": _load_json_file(path),
-            }
+                "ok": ok,
+                "scope": args.scope,
+                "path": result["evidence_path"].as_posix(),
+                "complete_for_scope": not missing_required,
+                "missing_required": [entry["path"] for entry in missing_required],
+                "failed_commands": sorted(failed_commands),
+            },
+            indent=2,
         )
+    )
 
-    run_artifacts = None
-    if args.run_output_dir is not None or args.run_digest is not None:
-        if args.run_output_dir is None or args.run_digest is None:
-            parser.error("--run-output-dir and --run-digest must be provided together.")
-        run_output_dir = Path(args.run_output_dir)
-        if not run_output_dir.is_absolute():
-            run_output_dir = repo_root / run_output_dir
-        run_artifacts = _copy_run_artifacts(
-            repo_root=repo_root,
-            evidence_dir=evidence_dir,
-            output_dir=run_output_dir,
-            run_digest=str(args.run_digest),
-        )
-
-    optional_evidence_files = {
-        "restart_recovery_log": _copy_optional_input(
-            args.restart_recovery_log,
-            repo_root=repo_root,
-            evidence_dir=evidence_dir,
-            target_name="restart_recovery.log",
-        ),
-        "cross_host_visibility_log": _copy_optional_input(
-            args.cross_host_visibility_log,
-            repo_root=repo_root,
-            evidence_dir=evidence_dir,
-            target_name="cross_host_visibility.log",
-        ),
-        "gpu_validation_report": _copy_optional_input(
-            args.gpu_validation_report,
-            repo_root=repo_root,
-            evidence_dir=evidence_dir,
-            target_name="gpu_validation_report.json",
-        ),
-        "hpc_runbook_signoff": _copy_optional_input(
-            args.hpc_runbook_signoff,
-            repo_root=repo_root,
-            evidence_dir=evidence_dir,
-            target_name="hpc_runbook_signoff.txt",
-        ),
-    }
-
-    evidence = {
-        "schema": "mosaic.release_evidence",
-        "schema_version": 1,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "repository_root": repo_root.as_posix(),
-        "git": _git_evidence(repo_root),
-        "python": {
-            "executable": sys.executable,
-            "version": sys.version,
-            "platform": platform.platform(),
-        },
-        "installed_packages": _installed_packages(),
-        "dist_files": _dist_hashes(dist_dir),
-        "command_results": command_results,
-        "hpc_smoke_outputs": hpc_smoke_outputs,
-        "run_artifacts": run_artifacts,
-        "optional_evidence_files": optional_evidence_files,
-    }
-    evidence_path = evidence_dir / "release_evidence.json"
-    with evidence_path.open("w", encoding="utf-8") as handle:
-        json.dump(evidence, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-    failed_commands = {
-        name: result
-        for name, result in command_results.items()
-        if int(result.get("returncode", 1)) != 0
-    }
-    print(json.dumps({"ok": not failed_commands, "path": evidence_path.as_posix()}, indent=2))
+    if missing_required and args.fail_on_missing_required:
+        return 2
     if failed_commands and args.fail_on_command_error:
         return 1
     return 0
