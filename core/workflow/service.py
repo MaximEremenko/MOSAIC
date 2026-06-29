@@ -1,13 +1,9 @@
 from __future__ import annotations
 
 import logging
-import inspect
-import os
 import shutil
 from pathlib import Path
 
-from core.residual_field.backend import resolve_residual_field_reducer_backend
-from core.residual_field.planning import build_residual_field_parameter_digest
 from core.scattering.stage import ScatteringStage
 from core.patch_centers.service import PointSelectionService
 from core.decoding.stage import DecodingStage
@@ -16,109 +12,10 @@ from core.residual_field.stage import ResidualFieldStage
 from core.structure.service import StructureLoadingService
 from core.models import RunSettings, WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
-from core.runtime import resolve_worker_scratch_root, short_path
 from core.storage.db_cache import resolve_db_cache_config
 
 
 logger = logging.getLogger(__name__)
-
-
-def _prepare_reciprocal_space_with_compatible_signature(
-    reciprocal_space_service: ReciprocalSpacePreparationService,
-    *,
-    workflow_parameters: WorkflowParameters,
-    point_data,
-    supercell,
-    output_dir: str,
-    db_cache_config,
-):
-    prepare = reciprocal_space_service.prepare
-    kwargs = {
-        "workflow_parameters": workflow_parameters,
-        "point_data": point_data,
-        "supercell": supercell,
-        "output_dir": output_dir,
-    }
-    try:
-        signature = inspect.signature(prepare)
-    except (TypeError, ValueError):
-        kwargs["db_cache_config"] = db_cache_config
-        return prepare(**kwargs)
-
-    accepts_db_cache_config = "db_cache_config" in signature.parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-    if accepts_db_cache_config:
-        kwargs["db_cache_config"] = db_cache_config
-    return prepare(**kwargs)
-
-
-def recover_local_residual_state_before_scattering(
-    *,
-    workflow_parameters: WorkflowParameters,
-    artifacts,
-    client,
-) -> list[int]:
-    db_manager = getattr(artifacts, "db_manager", None)
-    get_pending_chunk_ids = getattr(db_manager, "get_pending_chunk_ids", None)
-    if not callable(get_pending_chunk_ids):
-        return []
-
-    backend = resolve_residual_field_reducer_backend(
-        workflow_parameters=workflow_parameters,
-        client=client,
-    )
-    if getattr(getattr(backend, "layout", None), "kind", None) != "local_restartable":
-        return []
-
-    load_progress_manifest = getattr(backend, "load_progress_manifest", None)
-    finalize_chunk = getattr(backend, "finalize_chunk", None)
-    if not callable(load_progress_manifest) or not callable(finalize_chunk):
-        return []
-
-    explicit_scratch_root = workflow_parameters.runtime_info.get(
-        "residual_shard_scratch_root",
-        os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT"),
-    )
-    scratch_root = resolve_worker_scratch_root(
-        preferred=(
-            explicit_scratch_root
-            if explicit_scratch_root is not None
-            else str(Path(artifacts.output_dir) / ".local_restartable")
-        ),
-        stage="residual_field",
-    )
-    parameter_digest = build_residual_field_parameter_digest(workflow_parameters)
-    recovered_chunks: list[int] = []
-    for chunk_id in sorted(int(value) for value in get_pending_chunk_ids()):
-        progress = load_progress_manifest(
-            output_dir=artifacts.output_dir,
-            chunk_id=int(chunk_id),
-            parameter_digest=parameter_digest,
-        )
-        if progress is None:
-            continue
-        manifest = finalize_chunk(
-            chunk_id=int(chunk_id),
-            parameter_digest=parameter_digest,
-            output_dir=artifacts.output_dir,
-            db_path=db_manager.db_path,
-            cleanup_policy="off",
-            scratch_root=scratch_root,
-            quiet_logs=True,
-        )
-        if manifest is not None:
-            recovered_chunks.append(int(chunk_id))
-
-    if recovered_chunks:
-        logger.info(
-            "Recovered residual-field local restart state before scattering | chunks=%s | digest=%s | scratch=%s",
-            recovered_chunks,
-            parameter_digest,
-            short_path(scratch_root),
-        )
-    return recovered_chunks
 
 
 class WorkflowService:
@@ -179,8 +76,7 @@ class WorkflowService:
                 hdf5_file_path=str(output_dir / "point_data.hdf5"),
             )
         )
-        artifacts = _prepare_reciprocal_space_with_compatible_signature(
-            self.reciprocal_space_service,
+        artifacts = self.reciprocal_space_service.prepare(
             workflow_parameters=workflow_parameters,
             point_data=point_data,
             supercell=structure.supercell,
@@ -188,7 +84,7 @@ class WorkflowService:
             db_cache_config=db_cache_config,
         )
         try:
-            recover_local_residual_state_before_scattering(
+            self.residual_field_stage.recover_pending(
                 workflow_parameters=workflow_parameters,
                 artifacts=artifacts,
                 client=client,
