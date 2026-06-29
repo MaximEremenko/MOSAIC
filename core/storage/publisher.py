@@ -16,7 +16,9 @@ from core.residual_field.commit import (
     RESIDUAL_FIELD_STAGE,
     ResidualChunkCommitManifest,
     ResidualCommitCandidateManifest,
+    ResidualNoOutputManifest,
     ResidualStageCommitManifest,
+    require_residual_no_output_manifest,
     validate_residual_commit_candidate,
     write_residual_stage_commit,
 )
@@ -69,7 +71,8 @@ class _ChunkProjection:
 @dataclass(frozen=True)
 class _RunProjection:
     scattering_stage: ScatteringStageCommitManifest
-    residual_stage: ResidualStageCommitManifest
+    residual_stage: ResidualStageCommitManifest | None
+    residual_no_output: ResidualNoOutputManifest | None
     scattering_chunks: tuple[_ChunkProjection, ...]
     residual_chunks: tuple[_ChunkProjection, ...]
     decoder_commit: DecoderCommitManifest | None
@@ -172,16 +175,36 @@ def _require_residual_stage(
     *,
     output_dir: str | Path,
     run_digest: str,
-) -> ResidualStageCommitManifest:
+) -> ResidualStageCommitManifest | None:
     path = stage_commit_path(output_dir, run_digest, RESIDUAL_FIELD_STAGE)
     if not path.exists():
-        raise PublicPublishError("Cannot publish run without residual stage_commit.json.")
+        return None
     stage = read_manifest(path, codec=ResidualStageCommitManifest, output_dir=output_dir)
     return write_residual_stage_commit(
         output_dir=output_dir,
         run_digest=run_digest,
         chunk_ids=stage.chunk_ids,
     )
+
+
+def _require_residual_terminal(
+    *,
+    output_dir: str | Path,
+    run_digest: str,
+) -> tuple[ResidualStageCommitManifest | None, ResidualNoOutputManifest | None]:
+    residual_stage = _require_residual_stage(output_dir=output_dir, run_digest=run_digest)
+    if residual_stage is not None:
+        return residual_stage, None
+    try:
+        no_output = require_residual_no_output_manifest(
+            output_dir=output_dir,
+            run_digest=run_digest,
+        )
+    except RuntimeError as exc:
+        raise PublicPublishError(
+            "Cannot publish run without residual stage_commit.json or no_output.json."
+        ) from exc
+    return None, no_output
 
 
 def _scattering_chunk_projection(
@@ -294,7 +317,10 @@ def _build_run_projection(
     run_digest: str,
 ) -> _RunProjection:
     scattering_stage = _require_scattering_stage(output_dir=output_dir, run_digest=run_digest)
-    residual_stage = _require_residual_stage(output_dir=output_dir, run_digest=run_digest)
+    residual_stage, residual_no_output = _require_residual_terminal(
+        output_dir=output_dir,
+        run_digest=run_digest,
+    )
     scattering_chunks = tuple(
         sorted(
             (
@@ -308,22 +334,27 @@ def _build_run_projection(
             key=lambda item: item.chunk_id,
         )
     )
-    residual_chunks = tuple(
-        sorted(
-            (
-                _residual_chunk_projection(
-                    output_dir=output_dir,
-                    chunk_commit_relpath=path,
-                    run_digest=run_digest,
-                )
-                for path in residual_stage.chunk_commit_paths
-            ),
-            key=lambda item: item.chunk_id,
+    residual_chunks = (
+        ()
+        if residual_stage is None
+        else tuple(
+            sorted(
+                (
+                    _residual_chunk_projection(
+                        output_dir=output_dir,
+                        chunk_commit_relpath=path,
+                        run_digest=run_digest,
+                    )
+                    for path in residual_stage.chunk_commit_paths
+                ),
+                key=lambda item: item.chunk_id,
+            )
         )
     )
     return _RunProjection(
         scattering_stage=scattering_stage,
         residual_stage=residual_stage,
+        residual_no_output=residual_no_output,
         scattering_chunks=scattering_chunks,
         residual_chunks=residual_chunks,
         decoder_commit=_read_decoder_commit_if_present(
@@ -496,8 +527,14 @@ def _source_identity(projection: _RunProjection) -> dict[str, Any]:
             {"scattering_stage_digest": projection.scattering_stage.stage_digest}
         ]
     identity: dict[str, Any] = {
-        "residual_stage_digest": projection.residual_stage.stage_digest,
-        "residual_stage_plan_digest": projection.residual_stage.stage_plan_digest,
+        "residual_stage_digest": (
+            None if projection.residual_stage is None else projection.residual_stage.stage_digest
+        ),
+        "residual_stage_plan_digest": (
+            None
+            if projection.residual_stage is None
+            else projection.residual_stage.stage_plan_digest
+        ),
         "residual_payload_hashes": [
             chunk.payload_sha256 for chunk in projection.residual_chunks
         ],
@@ -507,6 +544,14 @@ def _source_identity(projection: _RunProjection) -> dict[str, Any]:
             chunk.payload_sha256 for chunk in projection.scattering_chunks
         ],
     }
+    if projection.residual_no_output is not None:
+        identity["residual_no_output"] = {
+            "no_output_digest": projection.residual_no_output.no_output_digest,
+            "source_scattering_commit_digest": (
+                projection.residual_no_output.source_scattering_commit_digest
+            ),
+            "reason": projection.residual_no_output.reason,
+        }
     if projection.decoder_commit is not None:
         identity["decoder_commit_digest"] = projection.decoder_commit.decoder_commit_digest
     return identity

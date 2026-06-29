@@ -11,6 +11,7 @@ from core.residual_field.commit import (
     create_residual_commit_candidate,
     promote_residual_chunk_commit,
     write_residual_attempt,
+    write_residual_no_output_manifest,
     write_residual_stage_commit,
     write_residual_stage_plan,
 )
@@ -126,6 +127,44 @@ def _complete_private_run(tmp_path, *, run_digest: str, decoder: bool = False):
         )
 
 
+def _complete_private_no_output_run(tmp_path, *, run_digest: str):
+    write_scattering_attempt(
+        output_dir=tmp_path,
+        run_digest=run_digest,
+        interval_id=1,
+        chunk_id=0,
+        attempt_id="try1",
+        grid_shape_nd=np.array([[2]], dtype=np.int64),
+        amplitudes_delta=np.array([2.0 + 1.0j, 3.0 + 0.0j], dtype=np.complex128),
+        amplitudes_average=np.array([1.0 + 0.0j, 1.5 + 0.0j], dtype=np.complex128),
+        contribution_reciprocal_points=2,
+        point_ids=np.array([0, 1], dtype=np.int64),
+        **SCATTERING_IDENTITY,
+    )
+    scattering_candidate = create_scattering_commit_candidate(
+        output_dir=tmp_path,
+        run_digest=run_digest,
+        chunk_id=0,
+        expected_interval_ids=(1,),
+    )
+    write_scattering_stage_plan(
+        output_dir=tmp_path,
+        run_digest=run_digest,
+        expected_by_chunk={0: (1,)},
+    )
+    promote_scattering_chunk_commit(output_dir=tmp_path, candidate=scattering_candidate)
+    scattering_stage = write_scattering_stage_commit(
+        output_dir=tmp_path,
+        run_digest=run_digest,
+        chunk_ids=(0,),
+    )
+    write_residual_no_output_manifest(
+        output_dir=tmp_path,
+        run_digest=run_digest,
+        source_scattering_commit_digest=scattering_stage.stage_digest,
+    )
+
+
 def test_public_manifest_authority_ignores_loose_files_and_fails_closed(tmp_path):
     (tmp_path / "residual_chunk_0_amplitudes.hdf5").write_text(
         "loose public artifact",
@@ -216,3 +255,18 @@ def test_public_publisher_payload_hashes_and_decoder_record(tmp_path):
         path = tmp_path / record["path"]
         assert file_sha256(path) == record["file_sha256"]
         assert path.stat().st_size == record["payload_nbytes"]
+
+
+def test_public_publish_accepts_residual_no_output_manifest(tmp_path):
+    _complete_private_no_output_run(tmp_path, run_digest="run123")
+
+    manifest = publish_run(tmp_path, "run123")
+
+    assert "point_data_chunk_0_amplitudes.hdf5" in manifest.published_files
+    assert "residual_chunk_0_amplitudes.hdf5" not in manifest.published_files
+    assert manifest.source_identity["residual_stage_digest"] is None
+    assert manifest.source_identity["residual_no_output"]["reason"] == (
+        "empty replacement coverage"
+    )
+    loaded = validate_public_manifest_files(tmp_path / "public_manifest.json", output_dir=tmp_path)
+    assert loaded == manifest
