@@ -191,24 +191,27 @@ def _apply_cupy_pool_cap() -> None:
 
 # Apply at import; safe even when CuPy is absent.
 _apply_cupy_pool_cap()
-_SUCCESSFUL_SUBPROB: "dict[tuple[int, int], int]" = {}
-_SUCCESSFUL_SUBPROB_LOCK = threading.Lock()
+# Fixed, deterministic OOM back-off ladder for ``gpu_maxsubprobsize``.
+# Selection is intentionally history-independent: every call starts at the
+# same largest subproblem size and, on out-of-memory, backs off through this
+# exact sequence.  We deliberately do NOT cache a last-known-good size across
+# calls — caching made the subprob path depend on prior-call history (process
+# state), so identical inputs could follow different ladders in different
+# processes.  With a fixed ladder, identical inputs always follow an identical
+# subprob path regardless of process history.  OOM recovery is unchanged: the
+# back-off ladder (and the one cache-flush retry per subprob) is preserved.
 _DEFAULT_SUBPROBS: tuple = (32, 16, 8, 4, 2, 1)
 
 
 def _subprob_order(dim: int, n_trans: int) -> tuple:
-    """Return the retry sequence with the last-known-good size first."""
-    with _SUCCESSFUL_SUBPROB_LOCK:
-        preferred = _SUCCESSFUL_SUBPROB.get((int(dim), int(n_trans)))
-    if preferred is None or preferred not in _DEFAULT_SUBPROBS:
-        return _DEFAULT_SUBPROBS
-    rest = tuple(s for s in _DEFAULT_SUBPROBS if s != preferred)
-    return (preferred,) + rest
+    """Return the deterministic OOM back-off ladder.
 
-
-def _record_successful_subprob(dim: int, n_trans: int, subprob: int) -> None:
-    with _SUCCESSFUL_SUBPROB_LOCK:
-        _SUCCESSFUL_SUBPROB[(int(dim), int(n_trans))] = int(subprob)
+    History-independent by design: always the same fixed sequence, so the
+    subprob path a given input follows does not depend on what earlier calls
+    in this process happened to succeed at.  ``dim``/``n_trans`` are accepted
+    for call-site stability but do not influence the order.
+    """
+    return _DEFAULT_SUBPROBS
 
 
 def _destroy_plan_quietly(plan) -> None:
@@ -1620,7 +1623,8 @@ def _batched_type3(
 ###############################################################################
 def _adaptive_gpu_launch(dim, resident_cols, d_w, target_cols, eps, inverse):
     isign = -1 if inverse else 1
-    subprobs = (32, 16, 8, 4, 2, 1)
+    # Single-source the deterministic, history-independent back-off ladder.
+    subprobs = _subprob_order(dim, 1)
 
     for s in subprobs:
         kw = _build_gpu_launch_kwargs(gpu_maxsubprobsize=s)
@@ -1757,7 +1761,6 @@ def _execute_inverse_batch_gpu(
 
         try:
             result = _do_call()
-            _record_successful_subprob(dim, n_trans, s)
             # Best-effort: return any pool blocks released by the call back
             # to the device. Live cuFINUFFT Plan internals (kept alive by
             # the cache) are NOT in the free list; only this task's
@@ -1782,7 +1785,6 @@ def _execute_inverse_batch_gpu(
                 oom_retry_done = True
                 try:
                     result = _do_call()
-                    _record_successful_subprob(dim, n_trans, s)
                     _free_cupy_pool_blocks()
                     return result
                 except Exception as e2:

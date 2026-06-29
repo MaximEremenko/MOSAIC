@@ -33,23 +33,100 @@ _COMPLEX128_ALIASES = {
 }
 
 
+# A device-bound identity may only be stamped when the device is *known* to
+# have run the work:
+#   * ``cpu``  — CPU was enforced (``cpu-only``/``auto``), so CPU bytes are
+#     definitively CPU bytes.
+#   * ``cuda`` — GPU was enforced with no fallback (``gpu-required``), so the
+#     bytes are definitively GPU bytes (the wrapper raises rather than fall
+#     back under ``gpu_only``).
+# ``allow-fallback`` is *not* device-bound at resolve time: the wrapper may
+# silently fall back to CPU, so the realized device is unknown until execution
+# completes.  We represent that as the sentinel ``"pending"`` backend, which
+# carries a conservative recorded identity of ``cpu`` (see ``backend``) so that
+# CPU bytes can never be mis-recorded under a ``cuda`` identity if Phase C has
+# not yet stamped the realized device.  Phase C MUST call
+# ``with_realized_backend(...)`` with the device that actually ran before the
+# identity is committed; only then may a ``cuda`` identity appear for a
+# fallback-eligible run.
+RealizedBackend = Literal["cpu", "cuda"]
+_BackendState = Literal["cpu", "cuda", "pending"]
+
+
 @dataclass(frozen=True)
 class NufftExecutionSettings:
     requested_policy: NufftExecutionPolicy
     execution_policy: NufftExecutionPolicy
-    backend: Literal["cpu", "cuda"]
+    # ``backend_state`` is the resolve-time intent: ``"pending"`` means the
+    # realized device is not yet known (fallback-eligible).  ``backend`` (a
+    # property) is what gets recorded into identity and is always a concrete,
+    # truthful device — never ``cuda`` unless GPU execution is guaranteed or
+    # has been confirmed via ``with_realized_backend``.
+    backend_state: _BackendState
     eps: float
     dtype: Literal["complex128"]
     deterministic_mode: str
     thread_count: int | None
+    # Whether the wrapper should *attempt* GPU first.  Decoupled from the
+    # recorded identity: ``allow-fallback`` attempts GPU (``True``) but may
+    # realize as CPU, so its recorded backend is not forced to ``cuda``.
+    attempt_gpu: bool = False
+
+    @property
+    def realized_backend_known(self) -> bool:
+        """True iff the recorded ``backend`` is a confirmed realized device."""
+        return self.backend_state != "pending"
+
+    @property
+    def backend(self) -> RealizedBackend:
+        """Device identity to record.
+
+        Device-bound when known (``cpu``/``cuda``).  For a still-``pending``
+        fallback-eligible run we record the conservative ``cpu`` so CPU bytes
+        are never recorded under ``cuda`` before Phase C confirms the realized
+        device via :meth:`with_realized_backend`.
+        """
+        if self.backend_state == "cuda":
+            return "cuda"
+        return "cpu"
+
+    def with_realized_backend(self, realized: RealizedBackend) -> "NufftExecutionSettings":
+        """Stamp the device that actually executed the work (Phase C seam).
+
+        Only meaningful for a ``pending`` (fallback-eligible) resolution.  For
+        an already device-bound resolution the realized device must match the
+        bound device, otherwise the policy was violated (e.g. ``gpu-required``
+        somehow ran on CPU) and we fail closed rather than mis-record identity.
+        """
+        if realized not in ("cpu", "cuda"):
+            raise ValueError("realized backend must be 'cpu' or 'cuda'.")
+        if self.backend_state != "pending" and self.backend_state != realized:
+            raise ValueError(
+                "realized backend "
+                f"{realized!r} contradicts device-bound policy backend "
+                f"{self.backend_state!r}; cannot record identity under a device "
+                "that did not run the work."
+            )
+        if self.backend_state == realized:
+            return self
+        return NufftExecutionSettings(
+            requested_policy=self.requested_policy,
+            execution_policy=self.execution_policy,
+            backend_state=realized,
+            eps=self.eps,
+            dtype=self.dtype,
+            deterministic_mode=self.deterministic_mode,
+            thread_count=self.thread_count,
+            attempt_gpu=self.attempt_gpu,
+        )
 
     @property
     def prefer_cpu(self) -> bool:
-        return self.backend == "cpu"
+        return not self.attempt_gpu
 
     @property
     def gpu_only(self) -> bool:
-        return self.backend == "cuda"
+        return self.attempt_gpu
 
     @property
     def execute_kwargs(self) -> dict[str, bool]:
@@ -63,6 +140,7 @@ class NufftExecutionSettings:
             "requested_policy": self.requested_policy,
             "execution_policy": self.execution_policy,
             "backend": self.backend,
+            "realized_backend_known": self.realized_backend_known,
             "eps": float(self.eps),
             "dtype": self.dtype,
             "deterministic_mode": self.deterministic_mode,
@@ -168,17 +246,35 @@ def resolve_nufft_execution_settings(
 ) -> NufftExecutionSettings:
     environment = _env(env)
     policy = resolve_nufft_policy(requested, env=environment)
+    # ``backend_state`` is the resolve-time device intent; ``attempt_gpu`` is
+    # whether the wrapper tries GPU first.  Only ``cpu-only``/``auto`` (CPU
+    # enforced) and ``gpu-required`` (GPU enforced, no fallback) may bind a
+    # device identity at resolve time.  ``allow-fallback`` resolves to
+    # ``pending`` because the wrapper may silently fall back to CPU; the
+    # realized device must be stamped post-execution via
+    # ``with_realized_backend`` (Phase C) before identity is committed.
     if policy == "auto":
-        backend: Literal["cpu", "cuda"] = "cpu"
+        backend_state: _BackendState = "cpu"
         execution_policy: NufftExecutionPolicy = "cpu-only"
+        attempt_gpu = False
     elif policy == "cpu-only":
-        backend = "cpu"
+        backend_state = "cpu"
         execution_policy = "cpu-only"
-    elif policy in {"gpu-required", "allow-fallback"}:
-        # Fallback is not allowed under the same durable identity.  A future
-        # CPU fallback orchestration must create a separate CPU execution digest.
-        backend = "cuda"
+        attempt_gpu = False
+    elif policy == "gpu-required":
+        # GPU enforced with no fallback: the wrapper raises rather than fall
+        # back under ``gpu_only``, so a ``cuda`` identity is definitively true.
+        backend_state = "cuda"
         execution_policy = "gpu-required"
+        attempt_gpu = True
+    elif policy == "allow-fallback":
+        # Fallback-eligible: attempt GPU but DO NOT bind a ``cuda`` identity.
+        # The wrapper may fall back to CPU; the realized device is unknown
+        # until execution completes.  Recorded backend stays the conservative
+        # ``cpu`` until Phase C confirms the realized device.
+        backend_state = "pending"
+        execution_policy = "allow-fallback"
+        attempt_gpu = True
     else:  # pragma: no cover - normalize_nufft_policy keeps this closed.
         raise ValueError(f"Unsupported NUFFT policy: {policy!r}")
     try:
@@ -190,11 +286,12 @@ def resolve_nufft_execution_settings(
     return NufftExecutionSettings(
         requested_policy=policy,
         execution_policy=execution_policy,
-        backend=backend,
+        backend_state=backend_state,
         eps=resolved_eps,
         dtype=normalize_nufft_dtype(dtype),
         deterministic_mode="stable-v1",
         thread_count=_env_thread_count(environment),
+        attempt_gpu=attempt_gpu,
     )
 
 
@@ -256,6 +353,7 @@ def should_resubmit_cpu_fallback(
 __all__ = [
     "NufftExecutionSettings",
     "NufftExecutionPolicy",
+    "RealizedBackend",
     "VALID_NUFFT_POLICIES",
     "gpu_launch_requested",
     "is_nufft_gpu_resource_failure",

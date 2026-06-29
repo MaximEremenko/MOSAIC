@@ -54,11 +54,9 @@ class _SpyPlan:
 @pytest.fixture(autouse=True)
 def _reset_module_state():
     wrapper._clear_plan_cache()
-    wrapper._SUCCESSFUL_SUBPROB.clear()
     _SpyPlan.reset()
     yield
     wrapper._clear_plan_cache()
-    wrapper._SUCCESSFUL_SUBPROB.clear()
 
 
 def test_cache_hit_reuses_plan_object():
@@ -132,12 +130,21 @@ def test_bound_honoured_evicts_oldest():
         wrapper._PLAN_CACHE_MAX = original_max
 
 
-def test_subprob_memoization():
+def test_subprob_order_is_deterministic_and_history_independent():
+    # Selection must be the same fixed ladder regardless of prior calls: no
+    # last-known-good caching across calls, so identical inputs always follow
+    # the same OOM back-off path independent of process history.
     assert wrapper._subprob_order(3, 4) == wrapper._DEFAULT_SUBPROBS
-    wrapper._record_successful_subprob(3, 4, 8)
-    order = wrapper._subprob_order(3, 4)
-    assert order[0] == 8
-    assert set(order) == set(wrapper._DEFAULT_SUBPROBS)
+    # Different (dim, n_trans) must not change the order, and repeated calls
+    # never drift away from the fixed default.
+    assert wrapper._subprob_order(1, 1) == wrapper._DEFAULT_SUBPROBS
+    assert wrapper._subprob_order(3, 4) == wrapper._DEFAULT_SUBPROBS
+    # The default ladder is a strictly decreasing back-off sequence ending at 1.
+    assert wrapper._DEFAULT_SUBPROBS[0] == 32
+    assert wrapper._DEFAULT_SUBPROBS[-1] == 1
+    assert list(wrapper._DEFAULT_SUBPROBS) == sorted(
+        wrapper._DEFAULT_SUBPROBS, reverse=True
+    )
 
 
 def test_destroy_plan_quietly_swallows_exceptions():

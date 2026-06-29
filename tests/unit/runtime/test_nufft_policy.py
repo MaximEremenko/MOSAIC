@@ -116,7 +116,23 @@ def test_resolved_execution_settings_make_auto_concrete_cpu():
     assert settings.identity_payload()["eps"] == 1e-9
 
 
-def test_resolved_execution_settings_make_gpu_required_fail_fast_contract():
+def test_resolved_execution_settings_gpu_required_binds_cuda_identity():
+    settings = resolve_nufft_execution_settings(
+        "gpu-required",
+        eps=1e-12,
+        dtype="complex128",
+        env={},
+    )
+
+    assert settings.requested_policy == "gpu-required"
+    assert settings.execution_policy == "gpu-required"
+    # GPU enforced with no fallback -> cuda identity is definitively true.
+    assert settings.backend == "cuda"
+    assert settings.realized_backend_known is True
+    assert settings.execute_kwargs == {"prefer_cpu": False, "gpu_only": True}
+
+
+def test_allow_fallback_does_not_bind_cuda_identity_until_realized():
     settings = resolve_nufft_execution_settings(
         "allow-fallback",
         eps=1e-12,
@@ -124,10 +140,55 @@ def test_resolved_execution_settings_make_gpu_required_fail_fast_contract():
         env={},
     )
 
+    # allow-fallback still *attempts* GPU first ...
     assert settings.requested_policy == "allow-fallback"
-    assert settings.execution_policy == "gpu-required"
-    assert settings.backend == "cuda"
+    assert settings.execution_policy == "allow-fallback"
     assert settings.execute_kwargs == {"prefer_cpu": False, "gpu_only": True}
+    # ... but it must NOT stamp a cuda identity, because the wrapper may
+    # silently fall back to CPU. Recorded backend is the conservative cpu and
+    # the realized device is explicitly not yet known.
+    assert settings.backend == "cpu"
+    assert settings.realized_backend_known is False
+    assert settings.identity_payload()["backend"] == "cpu"
+    assert settings.identity_payload()["realized_backend_known"] is False
+
+
+def test_allow_fallback_records_realized_backend():
+    settings = resolve_nufft_execution_settings(
+        "allow-fallback",
+        eps=1e-12,
+        dtype="complex128",
+        env={},
+    )
+
+    # Realized as CPU (the GPU did not run): identity must read cpu.
+    realized_cpu = settings.with_realized_backend("cpu")
+    assert realized_cpu.backend == "cpu"
+    assert realized_cpu.realized_backend_known is True
+    assert realized_cpu.identity_payload()["backend"] == "cpu"
+
+    # Realized as CUDA (the GPU actually ran): only now may identity read cuda.
+    realized_cuda = settings.with_realized_backend("cuda")
+    assert realized_cuda.backend == "cuda"
+    assert realized_cuda.realized_backend_known is True
+    assert realized_cuda.identity_payload()["backend"] == "cuda"
+
+
+def test_with_realized_backend_fails_closed_on_device_bound_contradiction():
+    gpu_required = resolve_nufft_execution_settings(
+        "gpu-required", eps=1e-12, dtype="complex128", env={}
+    )
+    # A device-bound gpu-required run must never be re-recorded as cpu.
+    with pytest.raises(ValueError, match="contradicts device-bound"):
+        gpu_required.with_realized_backend("cpu")
+    # Re-stamping the same device is a no-op (idempotent).
+    assert gpu_required.with_realized_backend("cuda") is gpu_required
+
+    cpu_only = resolve_nufft_execution_settings(
+        "cpu-only", eps=1e-12, dtype="complex128", env={}
+    )
+    with pytest.raises(ValueError, match="contradicts device-bound"):
+        cpu_only.with_realized_backend("cuda")
 
 
 def test_resolved_execution_settings_reject_non_complex128_dtype():

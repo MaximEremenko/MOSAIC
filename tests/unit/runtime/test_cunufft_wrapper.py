@@ -713,6 +713,21 @@ def test_batched_type3_does_not_flush_on_every_successful_chunk(monkeypatch: pyt
     assert cleanup_calls["count"] == 1
 
 
+def test_subprob_order_is_deterministic_and_history_independent():
+    # The OOM back-off ladder must always be the same fixed sequence,
+    # regardless of (dim, n_trans) or prior calls. No last-known-good is
+    # cached across calls, so identical inputs follow an identical subprob
+    # path independent of process history.
+    default = cunufft_wrapper._DEFAULT_SUBPROBS
+    assert cunufft_wrapper._subprob_order(3, 4) == default
+    assert cunufft_wrapper._subprob_order(1, 1) == default
+    # Re-querying after other (dim, n_trans) calls does not reorder anything.
+    assert cunufft_wrapper._subprob_order(3, 4) == default
+    # No cross-call cache state exists to leak history between runs.
+    assert not hasattr(cunufft_wrapper, "_SUCCESSFUL_SUBPROB")
+    assert not hasattr(cunufft_wrapper, "_record_successful_subprob")
+
+
 def test_build_gpu_launch_kwargs_uses_defaults(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("MOSAIC_NUFFT_GPU_METHOD", raising=False)
     monkeypatch.delenv("MOSAIC_NUFFT_GPU_KEREVALMETH", raising=False)
