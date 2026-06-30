@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 from pathlib import Path
 
 import numpy as np
 
+from core.qspace.normalization import (
+    QNormalizationContract,
+    write_q_normalization_sidecar,
+)
 from core.scattering.contracts import ScatteringWorkUnit
 from core.scattering.half_space import (
     classify_interval_half_space_role,
@@ -25,6 +30,8 @@ from core.storage.digests import (
 from core.storage.fingerprint import file_sha256, payload_sha256
 from core.storage.manifest import write_manifest
 
+
+logger = logging.getLogger(__name__)
 
 SCATTERING_IDENTITY_SCHEMA_VERSION = 1
 RUN_MANIFEST_SCHEMA = "mosaic.run_manifest"
@@ -159,8 +166,20 @@ class QSpacePlan:
     q_grid_set_digest: str
     schema: str = QSPACE_PLAN_SCHEMA
     schema_version: int = SCATTERING_IDENTITY_SCHEMA_VERSION
+    # NOT part of the persisted qspace_plan.json payload (see to_payload below) and so
+    # NOT part of qspace_plan_digest. These multiplicity-free planned/accepted contracts
+    # ride alongside the plan in memory and are written to the SEPARATE sidecar
+    # q_normalization.json by prepare_scattering_run_identity. Keeping them off
+    # to_payload is what guarantees the plan file's bytes -- hence its digest -- are
+    # unchanged by this feature.
+    q_normalization_contracts: tuple[QNormalizationContract, ...] = field(
+        default=(), compare=False
+    )
 
     def to_payload(self) -> dict[str, Any]:
+        # Deliberately EXCLUDES q_normalization_contracts: the q-normalization data is
+        # persisted to the q_normalization.json sidecar, never into this identity-bearing
+        # file. Adding a field here would change qspace_plan_digest.
         return {
             "schema": self.schema,
             "schema_version": self.schema_version,
@@ -455,6 +474,14 @@ def prepare_scattering_run_identity(
         MaskStrategy=MaskStrategy,
     )
     qspace_path = write_qspace_plan(output_dir, qspace_plan)
+    # A3: persist the per-interval q-normalization contracts to the SEPARATE sidecar
+    # (q_normalization.json) next to qspace_plan.json. This never touches the plan file,
+    # so qspace_plan_digest (file_sha256 of qspace_path) below is unchanged.
+    write_q_normalization_sidecar(
+        output_dir,
+        qspace_plan.run_digest,
+        qspace_plan.q_normalization_contracts,
+    )
     return ScatteringWorkIdentity(
         scientific_digest=run_identity.scientific_digest,
         execution_digest=run_identity.execution_digest,
@@ -520,6 +547,7 @@ def build_qspace_plan(
     intervals = list(parameters["reciprocal_space_intervals"])
     mask_digest = build_mask_digest(mask_params, MaskStrategy)
     interval_plans: list[QSpaceIntervalPlan] = []
+    normalization_contracts: list[QNormalizationContract] = []
     for interval in sorted(intervals, key=lambda item: int(item["id"])):
         if "id" not in interval:
             raise ValueError("qspace_plan intervals must include stable interval IDs.")
@@ -533,6 +561,37 @@ def build_qspace_plan(
             MaskStrategy,
             supercell,
         )
+        # A1: the masked q_grid is already in scope -- its row count is the
+        # multiplicity-FREE accepted (post-mask) count.
+        accepted_count = int(np.asarray(q_grid).shape[0])
+        # A2: multiplicity-FREE dense planned count (mask-blind). This is comparable to
+        # accepted_count; the multiplicity-FOLDED value still feeds the persisted
+        # QSpaceIntervalPlan.reciprocal_point_count below (byte-identical, unchanged).
+        planned_count = int(
+            reciprocal_space_points_counter(
+                interval_dict, supercell, include_multiplicity=False
+            )
+        )
+        q_digest = q_grid_sha256(q_grid)
+        contract = QNormalizationContract(
+            planned_count=planned_count,
+            accepted_count=accepted_count,
+            multiplicity=multiplicity,
+            half_space_role=role,
+            interval_id=int(interval["id"]),
+            q_digest=q_digest,
+        )
+        normalization_contracts.append(contract)
+        logger.info(
+            "qspace interval %d q-normalization: planned=%d accepted=%d "
+            "mask_rejected=%d multiplicity=%d (role=%s)",
+            int(interval["id"]),
+            planned_count,
+            accepted_count,
+            contract.mask_rejected,
+            multiplicity,
+            role,
+        )
         interval_plans.append(
             QSpaceIntervalPlan(
                 interval_id=int(interval["id"]),
@@ -542,7 +601,7 @@ def build_qspace_plan(
                 half_space_role=role,
                 reciprocal_multiplicity=multiplicity,
                 reciprocal_point_count=int(reciprocal_space_points_counter(interval_dict, supercell)),
-                q_grid_digest=q_grid_sha256(q_grid),
+                q_grid_digest=q_digest,
                 mask_digest=mask_digest,
                 l_coverage=_l_coverage_for_role(role),
             )
@@ -564,6 +623,7 @@ def build_qspace_plan(
         mask_digest=mask_digest,
         intervals=tuple(interval_plans),
         q_grid_set_digest=q_grid_set_digest,
+        q_normalization_contracts=tuple(normalization_contracts),
     )
 
 

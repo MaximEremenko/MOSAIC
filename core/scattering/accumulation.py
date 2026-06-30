@@ -118,9 +118,16 @@ def apply_scattering_partial_result(
     delta = partial_result.amplitudes_delta
     average_delta = partial_result.amplitudes_average
     if mirror_conjugate_symmetry:
+        # The conjugate reconstruction doubles the AMPLITUDE (delta + conj(delta)) for a
+        # positive-half interval. It must NOT also double reciprocal_point_count:
+        # partial_result.reciprocal_point_count is already the multiplicity-applied
+        # (accepted x multiplicity) count from the q-normalization contract, so the
+        # half-space weight is baked in. The previous ``* 2`` double-counted it -- apply
+        # the count exactly ONCE, matching the live merge_scattering_partial_results
+        # path (plain addition of reciprocal_point_count).
         delta = delta + np.conj(delta)
         average_delta = average_delta + np.conj(average_delta)
-        reciprocal_count = current_reciprocal_point_count + (partial_result.reciprocal_point_count * 2)
+        reciprocal_count = current_reciprocal_point_count + partial_result.reciprocal_point_count
     else:
         reciprocal_count = current_reciprocal_point_count + partial_result.reciprocal_point_count
 

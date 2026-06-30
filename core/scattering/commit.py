@@ -11,6 +11,7 @@ from core.scattering.accumulation import (
     build_scattering_partial_result,
     merge_scattering_partial_results,
 )
+from core.qspace.normalization import load_q_normalization_contract
 from core.scattering.invariants import validate_scattering_result
 from core.storage.attempt_store import (
     attempt_manifest_path,
@@ -40,7 +41,7 @@ from core.storage.commit_payloads import (
 from core.storage.digests import digest_dict
 from core.storage.fingerprint import file_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
-from core.storage.manifest import read_manifest, write_manifest
+from core.storage.manifest import read_manifest, try_commit_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
 from core.storage.work_identity import assert_device_independent
 
@@ -377,6 +378,10 @@ class ScatteringInvariantError(RuntimeError):
     """A scattering attempt failed P11 mechanical validation at write time."""
 
 
+class ScatteringNormalizationError(RuntimeError):
+    """An attempt's reciprocal-point count disagrees with the q-normalization contract."""
+
+
 class ScatteringDivergenceError(RuntimeError):
     """Same-work scattering results disagree beyond the numerical tolerance."""
 
@@ -448,6 +453,13 @@ def _expected_point_count_from_grid_shape(grid_shape_nd: np.ndarray) -> int | No
     Returns ``None`` when the geometry is absent/unusable (e.g. an empty array);
     callers then fall back to self-consistency only, which is documented at the
     call site and reserved for non-production fixtures.
+
+    AXIS NOTE (A6): this REAL-SPACE coverage count (``sum_i prod(grid_shape_nd[i])``)
+    is DELIBERATELY DISTINCT from reciprocal-space normalization
+    (``accepted x multiplicity`` == ``QNormalizationContract.reciprocal_point_count``,
+    enforced in write_scattering_attempt against the q_normalization.json sidecar).
+    One counts emitted real-space samples; the other weights reciprocal points by
+    half-space multiplicity. They are separate axes -- never conflate them.
     """
     arr = np.asarray(grid_shape_nd)
     if arr.size == 0:
@@ -479,6 +491,27 @@ def write_scattering_attempt(
     runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ScatteringAttemptManifest:
     amplitude_len = int(np.asarray(amplitudes_delta).reshape(-1).shape[0])
+    # A4: reconcile the attempt's reciprocal-point count against the interval's
+    # q-normalization contract (the SIDECAR authority, q_normalization.json). The
+    # contract's reciprocal_point_count is accepted x multiplicity -- exactly what
+    # contribution_reciprocal_points equals today -- so this passes on agreeing data and
+    # fails closed on a genuine mismatch. If the sidecar/contract is ABSENT (older runs
+    # predating the feature) we SKIP the assertion for back-compatibility. This is a
+    # reciprocal-space-normalization check, distinct from the real-space coverage gate
+    # (C-3b) below.
+    _norm_contract = load_q_normalization_contract(
+        output_dir, str(run_digest), int(interval_id)
+    )
+    if _norm_contract is not None:
+        if int(contribution_reciprocal_points) != int(_norm_contract.reciprocal_point_count):
+            raise ScatteringNormalizationError(
+                f"Scattering attempt (interval {int(interval_id)}, chunk {int(chunk_id)}) "
+                f"reciprocal-point count {int(contribution_reciprocal_points)} disagrees "
+                "with the q-normalization contract "
+                f"{int(_norm_contract.reciprocal_point_count)} "
+                f"(accepted={_norm_contract.accepted_count} x "
+                f"multiplicity={_norm_contract.multiplicity})."
+            )
     point_ids_explicit = point_ids is not None
     if point_ids is None:
         # Stored point_ids are POSITIONAL: the contract aligns amplitudes to
@@ -1024,27 +1057,22 @@ def promote_scattering_chunk_commit_by_scan(
         file_sha256=candidate.file_sha256,
         payload_nbytes=int(candidate.payload_nbytes),
     )
-    if target.exists():
-        existing = read_manifest(target, codec=ScatteringChunkCommitManifest, output_dir=output_dir)
-        if existing != manifest:
-            raise RuntimeError(
-                f"Chunk {candidate.chunk_id} already committed to a different candidate."
-            )
-        _record_scattering_commit_scan_seconds(
-            output_dir=output_dir,
-            run_digest=candidate.run_digest,
-            chunk_id=int(candidate.chunk_id),
-            scan_seconds=time.perf_counter() - scan_started,
-        )
-        return existing
-    write_manifest(target, manifest, output_dir=output_dir)
+    committed, _created = try_commit_manifest(
+        target,
+        manifest,
+        codec=ScatteringChunkCommitManifest,
+        output_dir=output_dir,
+        conflict_error=lambda _existing: RuntimeError(
+            f"Chunk {candidate.chunk_id} already committed to a different candidate."
+        ),
+    )
     _record_scattering_commit_scan_seconds(
         output_dir=output_dir,
         run_digest=candidate.run_digest,
         chunk_id=int(candidate.chunk_id),
         scan_seconds=time.perf_counter() - scan_started,
     )
-    return manifest
+    return committed
 
 
 def promote_scattering_chunk_commit(
@@ -1295,6 +1323,7 @@ __all__ = [
     "ScatteringAttemptManifest",
     "ScatteringChunkCommitManifest",
     "ScatteringCommitCandidateManifest",
+    "ScatteringNormalizationError",
     "ScatteringStageCommitManifest",
     "ScatteringStagePlanManifest",
     "build_scattering_work_unit_digest",

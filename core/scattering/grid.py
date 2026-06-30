@@ -64,7 +64,23 @@ def _to_interval_dict(iv: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 
-def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.ndarray) -> int:
+def reciprocal_space_points_counter(
+    interval: Dict[str, float],
+    supercell: np.ndarray,
+    *,
+    include_multiplicity: bool = True,
+) -> int:
+    """Dense (mask-blind) interval-bound reciprocal-point count.
+
+    With ``include_multiplicity=True`` (the default, and the behaviour the persisted
+    ``QSpaceIntervalPlan.reciprocal_point_count`` depends on) the half-space role
+    multiplicity is folded in, so a positive-half interval reports its full-space
+    equivalent count. Set ``include_multiplicity=False`` to obtain the
+    multiplicity-FREE dense count, which is the ``planned_count`` axis of the
+    q-normalization contract (directly comparable to the multiplicity-free accepted
+    masked count). Do NOT change the default: the persisted plan digest depends on the
+    multiplicity-folded value.
+    """
     supercell = np.asarray(supercell, dtype=float)
     interval = _to_interval_dict(interval)
     step = 1.0 / supercell
@@ -85,9 +101,12 @@ def reciprocal_space_points_counter(interval: Dict[str, float], supercell: np.nd
         else 1
     )
 
+    dense = int(h_n * k_n * l_n)
+    if not include_multiplicity:
+        return dense
     role = classify_interval_half_space_role(interval, supercell)
     multiplicity = half_space_role_multiplicity(role)
-    return int(h_n * k_n * l_n * int(multiplicity or 1))
+    return int(dense * int(multiplicity or 1))
 
 
 def _call_generate_mask(mask_strategy, hkl: np.ndarray, mask_params: Dict[str, Any]):

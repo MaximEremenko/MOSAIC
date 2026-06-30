@@ -126,6 +126,51 @@ def test_scattering_accumulation_builds_and_applies_partial_results():
         mirrored_average_rows[:, 1],
         np.array([1.0 + 0.0j, 0.5 + 0.0j]),
     )
+    # A5 double-count fix: the conjugate reconstruction doubles the AMPLITUDE but the
+    # reciprocal_point_count (already multiplicity-applied) is added exactly ONCE, not
+    # twice. Previously this asserted 10 (5 * 2); the corrected value is 5.
+    assert mirrored_count == 5
+
+
+def test_apply_scattering_partial_result_does_not_double_count_reciprocal_points():
+    """A5 regression: mirror_conjugate_symmetry must NOT multiply reciprocal_point_count.
+
+    The partial's reciprocal_point_count already encodes accepted x multiplicity (the
+    q-normalization contract). Doubling the amplitude via delta + conj(delta) is the
+    half-space reconstruction; the count is half-space-weighted already and must be
+    accumulated once. This pins parity with merge_scattering_partial_results, which adds
+    reciprocal_point_count by plain summation regardless of conjugate reconstruction.
+    """
+    current_rows = np.array([[1, 0.0 + 0.0j]], dtype=np.complex128)
+    current_average_rows = np.array([[1, 0.0 + 0.0j]], dtype=np.complex128)
+    partial = build_scattering_partial_result(
+        chunk_id=0,
+        interval_id=2,
+        grid_shape_nd=np.array([[1]]),
+        amplitudes_delta=np.array([1.0 + 1.0j]),
+        amplitudes_average=np.array([2.0 + 0.0j]),
+        reciprocal_point_count=7,
+        point_ids=np.array([1]),
+    )
+
+    _, _, plain_count = apply_scattering_partial_result(
+        current_rows,
+        current_average_rows,
+        3,
+        partial,
+        mirror_conjugate_symmetry=False,
+    )
+    _, _, mirrored_count = apply_scattering_partial_result(
+        current_rows,
+        current_average_rows,
+        3,
+        partial,
+        mirror_conjugate_symmetry=True,
+    )
+
+    # Both paths add reciprocal_point_count EXACTLY ONCE (3 + 7 = 10), regardless of the
+    # conjugate-symmetry reconstruction. No silent factor-of-two.
+    assert plain_count == 10
     assert mirrored_count == 10
 
 
