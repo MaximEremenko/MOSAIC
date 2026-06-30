@@ -107,6 +107,21 @@ def temp_sibling_path(path: str | Path, *, suffix: str = ".tmp") -> Path:
     return Path(temp_path)
 
 
+def serialize_json_payload(payload: Mapping) -> bytes:
+    """Serialize a manifest payload to the canonical on-disk byte form.
+
+    This is the single source of truth for the durable JSON encoding used by
+    ``atomic_write_json`` (and therefore ``write_manifest``). Any other code path
+    that needs to reproduce the exact committed bytes — e.g. a no-overwrite CAS
+    commit — MUST route through this helper so the two paths can never drift.
+
+    The encoding is ``json.dumps(..., sort_keys=True, separators=(",", ":"))``
+    followed by a single trailing newline, encoded as UTF-8.
+    """
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return (text + "\n").encode("utf-8")
+
+
 def atomic_write_json(
     path: str | Path,
     payload: Mapping,
@@ -117,11 +132,11 @@ def atomic_write_json(
     target = assert_path_contained(path, output_dir=output_dir)
     if validator is not None:
         validator(payload)
+    data = serialize_json_payload(payload)
     temp_path = temp_sibling_path(target, suffix=".tmp")
     try:
-        with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
-            handle.write("\n")
+        with temp_path.open("wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_path, target)
@@ -140,12 +155,65 @@ def atomic_write_json(
             pass
 
 
+def atomic_create_no_overwrite(target: str | Path, data: bytes) -> bool:
+    """Atomically create ``target`` with ``data`` only if it does not yet exist.
+
+    This is a true first-writer-wins compare-and-swap (CAS): the first caller to
+    create the file wins; every later caller is told the file already exists and
+    leaves the existing bytes untouched. Unlike ``atomic_write_json`` (which uses
+    ``os.replace`` = atomic OVERWRITE, with a check-then-write TOCTOU window when
+    callers gate it on ``exists()``), this primitive never overwrites and has no
+    TOCTOU window.
+
+    Mechanism: ``data`` is written to a unique temp file in the SAME directory as
+    ``target`` (so the temp and target share a filesystem, a hard requirement for
+    ``os.link``), flushed and ``os.fsync``-ed for durability. We then attempt
+    ``os.link(temp, target)``:
+
+    * success  -> this caller is the first writer; returns ``True`` and the parent
+      directory is fsync-ed so the new directory entry is durable.
+    * ``FileExistsError`` -> another writer already created ``target``; returns
+      ``False`` and the existing file is left exactly as-is.
+
+    The temp file is ALWAYS unlinked in a ``finally`` (the hard link keeps the
+    committed inode alive after the temp name is removed).
+
+    ``os.link`` is the classic POSIX atomic no-overwrite CAS and is the intended
+    path for the Linux cluster and WSL. WINDOWS CAVEAT: hard-link / replace
+    semantics differ on Windows (and ``os.link`` requires NTFS + privileges), so
+    this primitive is not the supported durable path there; the ``os.replace``
+    based writers above remain for non-CAS atomic overwrites.
+    """
+    target_path = Path(target)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_sibling_path(target_path, suffix=".cas.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, target_path)
+        except FileExistsError:
+            return False
+        fsync_parent(target_path)
+        return True
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
 __all__ = [
     "PathContainmentError",
     "assert_relative_path_contained",
     "assert_path_contained",
+    "atomic_create_no_overwrite",
     "atomic_write_json",
     "fsync_parent",
     "fsync_path",
+    "serialize_json_payload",
     "temp_sibling_path",
 ]

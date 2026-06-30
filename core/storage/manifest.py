@@ -6,9 +6,15 @@ import re
 from dataclasses import is_dataclass, fields
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, ClassVar, Mapping, Protocol, Sequence, TypeVar
+from typing import Any, Callable, ClassVar, Mapping, Protocol, Sequence, TypeVar
 
-from core.storage.atomic import assert_path_contained, assert_relative_path_contained, atomic_write_json
+from core.storage.atomic import (
+    assert_path_contained,
+    assert_relative_path_contained,
+    atomic_create_no_overwrite,
+    atomic_write_json,
+    serialize_json_payload,
+)
 
 
 class ManifestError(ValueError):
@@ -260,10 +266,61 @@ def write_manifest(path: str | Path, manifest: Any, *, output_dir: str | Path) -
     atomic_write_json(path, payload, output_dir=output_dir, validator=_validate_manifest)
 
 
+def try_commit_manifest(
+    path: str | Path,
+    manifest: Any,
+    *,
+    codec: type[T],
+    output_dir: str | Path,
+    conflict_error: Callable[[T], Exception] | None = None,
+) -> tuple[T, bool]:
+    """First-writer-wins commit of ``manifest`` to ``path`` (no overwrite, no TOCTOU).
+
+    Serializes ``manifest`` to EXACTLY the same bytes ``write_manifest`` would
+    write (both route through ``serialize_json_payload``) and validates the
+    payload identically, then commits via ``atomic_create_no_overwrite``:
+
+    * If this caller created the file, returns ``(manifest, True)``.
+    * Otherwise the file already exists; the committed manifest is read back via
+      ``read_manifest``. If it equals ``manifest`` (the idempotent / concurrent
+      identical-writer case), returns ``(existing, False)``. If it differs,
+      raises — by default a ``RuntimeError`` describing the conflict, or the
+      exception built by ``conflict_error(existing)`` when the caller supplies one
+      (so each promote path can preserve its existing error wording).
+
+    This replaces the ``if target.exists(): match-or-raise else write_manifest``
+    pattern, which had both an atomic-overwrite (last-writer-wins) write and a
+    check-then-write TOCTOU window.
+    """
+    payload = _payload_from_manifest(manifest)
+    expected_schema = getattr(manifest, "schema", None)
+    expected_version = getattr(manifest, "schema_version", None)
+    validate_manifest_payload(
+        payload,
+        expected_schema=expected_schema,
+        expected_version=expected_version,
+        output_dir=output_dir,
+    )
+    target = assert_path_contained(path, output_dir=output_dir)
+    data = serialize_json_payload(payload)
+    created = atomic_create_no_overwrite(target, data)
+    if created:
+        return manifest, True
+    existing = read_manifest(target, codec=codec, output_dir=output_dir)
+    if existing == manifest:
+        return existing, False
+    if conflict_error is not None:
+        raise conflict_error(existing)
+    raise RuntimeError(
+        f"Manifest at {target!s} already committed with different content."
+    )
+
+
 __all__ = [
     "ManifestCodec",
     "ManifestError",
     "read_manifest",
+    "try_commit_manifest",
     "validate_manifest_payload",
     "validate_relative_manifest_path",
     "write_manifest",
