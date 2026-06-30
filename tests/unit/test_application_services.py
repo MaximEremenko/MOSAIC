@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from core.contracts import ScatteringHandoff
 from core.scattering.context import build_scattering_execution_context
 from core.scattering.stage import ScatteringStage
 from core.scattering.coefficients import CoefficientCenteringService
@@ -303,7 +304,8 @@ def test_scattering_stage_uses_injected_compute_callable(tmp_path):
             artifacts=artifacts,
             client=None,
         )
-        assert result["postprocessing_mode"] == "displacement"
+        assert isinstance(result, ScatteringHandoff)
+        assert result.residual_parameter_digest is not None
         assert captured["db_manager"] is artifacts.db_manager
         assert captured["point_data_processor"] is artifacts.point_data_processor
     finally:

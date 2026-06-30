@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
+from core.contracts import ScatteringHandoff
 from core.residual_field.artifacts import (
     is_residual_field_replacement_complete,
     load_stage2_replacement_expected_metadata,
@@ -40,27 +41,25 @@ def _stage2_replacement_enabled(workflow_parameters: WorkflowParameters) -> bool
 
 
 def _replacement_expected_metadata(
-    scattering_parameters: dict[str, object],
+    handoff: ScatteringHandoff,
 ) -> dict[str, object]:
-    raw = scattering_parameters.get(_STAGE2_REPLACEMENT_EXPECTED_KEY, {})
     return {
-        "expected_by_chunk": normalize_stage2_replacement_expected_by_chunk(raw),
-        "run_digest": scattering_parameters.get("scattering_run_digest")
-        or scattering_parameters.get("run_digest"),
-        "source_scattering_commit_digest": scattering_parameters.get(
-            "source_scattering_commit_digest"
+        "expected_by_chunk": normalize_stage2_replacement_expected_by_chunk(
+            handoff.expected_by_chunk()
         ),
+        "run_digest": handoff.scattering_run_digest or handoff.run_digest,
+        "source_scattering_commit_digest": handoff.source_scattering_commit_digest,
     }
 
 
 def _resolve_replacement_expected_metadata(
     *,
-    scattering_parameters: dict[str, object],
+    handoff: ScatteringHandoff,
     artifacts: RunArtifacts,
     parameter_digest: str,
 ) -> tuple[dict[str, object], str]:
-    if _STAGE2_REPLACEMENT_EXPECTED_KEY in scattering_parameters:
-        return _replacement_expected_metadata(scattering_parameters), "scattering"
+    if handoff.has_stage2_replacement_expected:
+        return _replacement_expected_metadata(handoff), "scattering"
 
     expected_from_manifest = load_stage2_replacement_expected_metadata(
         output_dir=artifacts.output_dir,
@@ -189,17 +188,25 @@ class ResidualFieldStage:
         artifacts: RunArtifacts,
         client,
         *,
-        scattering_parameters: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        if scattering_parameters is None:
-            scattering_parameters = {}
+        scattering_parameters: ScatteringHandoff | Mapping[str, object] | None = None,
+    ) -> ScatteringHandoff | Mapping[str, object]:
+        # One-release bridge: accept either the typed handoff or a plain mapping
+        # (or None) and normalise to a ScatteringHandoff for typed reads. The
+        # original argument is returned unchanged so the existing pass-through
+        # contract with workflow/service.py (and direct callers) is preserved.
+        original = scattering_parameters
+        handoff = (
+            scattering_parameters
+            if isinstance(scattering_parameters, ScatteringHandoff)
+            else ScatteringHandoff.from_mapping(scattering_parameters)
+        )
         if _stage2_replacement_enabled(workflow_parameters):
             parameter_digest = str(
-                scattering_parameters.get("residual_parameter_digest")
+                handoff.residual_parameter_digest
                 or build_residual_field_parameter_digest(workflow_parameters)
             )
             expected_metadata, expected_source = _resolve_replacement_expected_metadata(
-                scattering_parameters=scattering_parameters,
+                handoff=handoff,
                 artifacts=artifacts,
                 parameter_digest=parameter_digest,
             )
@@ -220,7 +227,7 @@ class ResidualFieldStage:
                         "Residual-field skipped: Stage-2 replacement outputs are committed for chunks %s.",
                         sorted(expected_by_chunk),
                     )
-                    return scattering_parameters
+                    return original
                 logger.warning(
                     "Stage-2 replacement outputs are incomplete for chunks %s; resetting DB status and running residual fallback.",
                     sorted(chunk_id for chunk_id, complete in complete_by_chunk.items() if not complete),
@@ -235,10 +242,10 @@ class ResidualFieldStage:
                 logger.info(
                     "Residual-field skipped: Stage-2 replacement expected no residual chunks."
                 )
-                return scattering_parameters
-            elif not scattering_parameters:
+                return original
+            elif handoff.is_empty:
                 return {}
-        elif not scattering_parameters:
+        elif handoff.is_empty:
             return {}
         run_residual_field_stage(
             workflow_parameters=workflow_parameters,
@@ -246,4 +253,4 @@ class ResidualFieldStage:
             artifacts=artifacts,
             client=client,
         )
-        return scattering_parameters
+        return original

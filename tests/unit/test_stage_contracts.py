@@ -11,6 +11,9 @@ from core.scattering.contracts import (
     scattering_partial_result_identity,
     validate_scattering_work_unit,
 )
+from core.residual_field.accumulation import (
+    merge_residual_field_partial_results,
+)
 from core.residual_field.contracts import (
     RESIDUAL_FIELD_CHUNK_ARTIFACT_SCHEMA,
     RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS,
@@ -18,11 +21,10 @@ from core.residual_field.contracts import (
     ResidualFieldPartialResult,
     ResidualFieldWorkUnit,
     build_residual_field_output_artifacts,
-    merge_residual_field_partial_results,
     residual_field_partial_result_identity,
     validate_residual_field_work_unit,
 )
-from core.contracts import CompletionStatus, RetryDisposition
+from core.contracts import CompletionStatus, RetryDisposition, ScatteringHandoff
 
 
 def test_scattering_work_unit_and_manifest_are_deterministic(tmp_path):
@@ -202,3 +204,57 @@ def test_residual_field_partial_result_merge_is_metadata_oriented():
     )
     assert identity.output_artifacts == ()
     assert identity.point_ids == ()
+
+
+def test_scattering_handoff_round_trips_through_mapping_bridge():
+    payload = {
+        "scattering_run_digest": "run-digest",
+        "source_scattering_commit_digest": "commit-digest",
+        "residual_parameter_digest": "param-digest",
+        "stage2_replacement_expected_by_chunk": {3: (1, 2)},
+    }
+
+    handoff = ScatteringHandoff.from_mapping(payload)
+
+    assert handoff.scattering_run_digest == "run-digest"
+    assert handoff.source_scattering_commit_digest == "commit-digest"
+    assert handoff.residual_parameter_digest == "param-digest"
+    assert handoff.has_stage2_replacement_expected is True
+    assert handoff.expected_by_chunk() == {3: (1, 2)}
+    assert handoff.is_empty is False
+
+    # to_mapping reproduces exactly the read-relevant key shape and round-trips.
+    assert handoff.to_mapping() == payload
+    assert ScatteringHandoff.from_mapping(handoff.to_mapping()) == handoff
+
+
+def test_scattering_handoff_tolerates_partial_and_empty_mappings():
+    # A partial mapping loads with None/absent defaults, never raising.
+    partial = ScatteringHandoff.from_mapping({"residual_parameter_digest": "abc123"})
+    assert partial.residual_parameter_digest == "abc123"
+    assert partial.scattering_run_digest is None
+    assert partial.source_scattering_commit_digest is None
+    assert partial.run_digest is None
+    # The stage-2 expected key was absent: presence flag stays False.
+    assert partial.has_stage2_replacement_expected is False
+    assert partial.expected_by_chunk() == {}
+    assert partial.is_empty is False
+    assert partial.to_mapping() == {"residual_parameter_digest": "abc123"}
+
+    # None and empty mappings collapse to the empty handoff (old `not params`).
+    assert ScatteringHandoff.from_mapping(None).is_empty is True
+    assert ScatteringHandoff.from_mapping({}).is_empty is True
+    assert ScatteringHandoff.from_mapping({}).to_mapping() == {}
+
+    # A present-but-empty stage-2 key keeps the presence distinction.
+    present_empty = ScatteringHandoff.from_mapping(
+        {"stage2_replacement_expected_by_chunk": {}}
+    )
+    assert present_empty.has_stage2_replacement_expected is True
+    assert present_empty.is_empty is False
+    assert present_empty.to_mapping() == {"stage2_replacement_expected_by_chunk": {}}
+
+    # The legacy run_digest alias is preserved through the bridge.
+    legacy = ScatteringHandoff.from_mapping({"run_digest": "legacy"})
+    assert legacy.run_digest == "legacy"
+    assert legacy.to_mapping() == {"run_digest": "legacy"}

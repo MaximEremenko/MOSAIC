@@ -15,7 +15,6 @@ from core.residual_field.contracts import (
     ResidualFieldPartialResult,
     ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
-    merge_residual_field_partial_results,
     validate_residual_field_partial_result,
 )
 from core.contracts import ArtifactRef
@@ -34,6 +33,113 @@ def _grid_shape_tuple(grid_shape_nd: np.ndarray | None) -> tuple[int, ...] | Non
     if arr.size == 0:
         return None
     return tuple(int(v) for v in arr.ravel())
+
+
+def _merge_artifact_refs(
+    left: tuple[ArtifactRef, ...],
+    right: tuple[ArtifactRef, ...],
+    *,
+    allow_duplicates: bool,
+) -> tuple[ArtifactRef, ...]:
+    merged: dict[str, ArtifactRef] = {artifact.key: artifact for artifact in left}
+    for artifact in right:
+        existing = merged.get(artifact.key)
+        if existing is not None:
+            if existing != artifact and not allow_duplicates:
+                raise ValueError(f"Conflicting artifact ref for key {artifact.key!r}.")
+            continue
+        merged[artifact.key] = artifact
+    return tuple(merged[key] for key in sorted(merged))
+
+
+def merge_residual_field_partial_results(
+    left: ResidualFieldPartialResult,
+    right: ResidualFieldPartialResult,
+) -> ResidualFieldPartialResult:
+    validate_residual_field_partial_result(left)
+    validate_residual_field_partial_result(right)
+    if left.chunk_id != right.chunk_id:
+        raise ValueError("Cannot merge residual-field partials for different chunks.")
+    if left.parameter_digest != right.parameter_digest:
+        raise ValueError("Cannot merge residual-field partials with different parameter_digest.")
+    if left.output_kind != right.output_kind:
+        raise ValueError("Cannot merge residual-field partials with different output_kind.")
+    if left.schema_version != right.schema_version:
+        raise ValueError("Cannot merge residual-field partials with different schema versions.")
+    if left.grid_shape is not None and right.grid_shape is not None and left.grid_shape != right.grid_shape:
+        raise ValueError("Cannot merge residual-field partials with different grid_shape.")
+    if (
+        left.residual_values is not None
+        and right.residual_values is not None
+        and left.residual_values.shape != right.residual_values.shape
+    ):
+        raise ValueError("Cannot merge residual-field partials with different residual_values shape.")
+    if (
+        left.residual_average_values is not None
+        and right.residual_average_values is not None
+        and left.residual_average_values.shape != right.residual_average_values.shape
+    ):
+        raise ValueError(
+            "Cannot merge residual-field partials with different residual_average_values shape."
+        )
+    if (
+        left.residual_values is not None
+        and right.residual_values is not None
+        and left.point_ids != right.point_ids
+    ):
+        raise ValueError(
+            "Cannot merge materialized residual-field partials with different point_ids."
+        )
+    overlap = set(left.contributing_interval_ids) & set(right.contributing_interval_ids)
+    if overlap:
+        raise ValueError(
+            "Cannot merge residual-field partials with duplicate interval ids: "
+            f"{sorted(overlap)}"
+        )
+    merged_point_ids = (
+        left.point_ids
+        if left.residual_values is not None and right.residual_values is not None
+        else tuple(sorted(set(left.point_ids) | set(right.point_ids)))
+    )
+    return ResidualFieldPartialResult(
+        chunk_id=left.chunk_id,
+        contributing_interval_ids=tuple(
+            sorted(left.contributing_interval_ids + right.contributing_interval_ids)
+        ),
+        parameter_digest=left.parameter_digest,
+        output_kind=left.output_kind,
+        source_artifacts=_merge_artifact_refs(
+            left.source_artifacts,
+            right.source_artifacts,
+            allow_duplicates=True,
+        ),
+        output_artifacts=_merge_artifact_refs(
+            left.output_artifacts,
+            right.output_artifacts,
+            allow_duplicates=False,
+        ),
+        grid_shape=left.grid_shape if left.grid_shape is not None else right.grid_shape,
+        point_ids=merged_point_ids,
+        residual_values=(
+            left.residual_values + right.residual_values
+            if left.residual_values is not None and right.residual_values is not None
+            else left.residual_values
+            if left.residual_values is not None
+            else right.residual_values
+        ),
+        residual_average_values=(
+            left.residual_average_values + right.residual_average_values
+            if left.residual_average_values is not None
+            and right.residual_average_values is not None
+            else left.residual_average_values
+            if left.residual_average_values is not None
+            else right.residual_average_values
+        ),
+        reciprocal_point_count=(
+            (left.reciprocal_point_count or 0) + (right.reciprocal_point_count or 0)
+        ),
+        schema_version=left.schema_version,
+    )
 
 
 def build_materialized_residual_field_state(
@@ -200,5 +306,6 @@ __all__ = [
     "build_materialized_residual_field_state_from_shard",
     "materialize_scattering_payload",
     "merge_materialized_residual_field_states",
+    "merge_residual_field_partial_results",
     "validate_materialized_residual_field_state",
 ]

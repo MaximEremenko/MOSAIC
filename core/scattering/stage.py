@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
+from core.contracts import ScatteringHandoff
 from core.scattering.coefficients import CoefficientCenteringService
 from core.scattering.context import build_scattering_execution_context
 from core.scattering.payloads import (
@@ -50,7 +51,7 @@ class ScatteringStage:
         structure: StructureData,
         artifacts: RunArtifacts,
         client,
-    ) -> dict[str, Any]:
+    ) -> ScatteringHandoff:
         context = build_scattering_execution_context(
             workflow_parameters=workflow_parameters,
             structure=structure,
@@ -61,7 +62,7 @@ class ScatteringStage:
             interval_reconstruction_service=self.interval_reconstruction_service,
         )
         if not context.unsaved_interval_chunks:
-            return {}
+            return ScatteringHandoff(is_empty=True)
         base_params = build_base_amplitude_parameters(context)
         amplitude_parameters = build_amplitude_adapter_payload(context, base_params)
         scattering_calculator_impl = self.scattering_weight_registry.create_calculator(
@@ -79,4 +80,4 @@ class ScatteringStage:
         )
         if isinstance(stage_result, dict):
             base_params.update(stage_result)
-        return base_params
+        return ScatteringHandoff.from_mapping(base_params)
