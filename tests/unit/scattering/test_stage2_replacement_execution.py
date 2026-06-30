@@ -23,10 +23,8 @@ import numpy as np
 
 from core.residual_field.artifacts import load_stage2_replacement_expected_metadata
 from core.residual_field.commit import write_residual_attempt
-from core.scattering.execution import (
-    _resolve_scattering_interval_artifact_policy,
-    run_stage2_replacement_execution,
-)
+from core.scattering.execution import _resolve_scattering_interval_artifact_policy
+from core.workflow.stage2_replacement import run_stage2_replacement_execution
 from core.scattering.planning import ScatteringWorkIdentity
 from core.storage.attempt_store import stage_commit_path
 from core.storage.database_manager import DatabaseManager
@@ -340,7 +338,7 @@ def test_stage2_replacement_writes_expected_manifest_before_reduce_failure(
             fake_residual_batch_task,
         )
         monkeypatch.setattr(
-            "core.scattering.execution._commit_stage2_replacement_attempts",
+            "core.workflow.stage2_replacement._commit_stage2_replacement_attempts",
             fail_commit,
         )
 
@@ -463,7 +461,7 @@ def test_stage2_replacement_uses_strict_chunk_owner_affinity(
                 return FakeFuture()
 
         monkeypatch.setattr(
-            "core.scattering.execution.yield_futures_with_results",
+            "core.workflow.stage2_replacement.yield_futures_with_results",
             lambda futures, client: ((future, True) for future in futures),
         )
 
