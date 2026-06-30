@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from core.scattering.commit import (
+    ScatteringAttemptManifest,
+    _candidate_id,
     create_scattering_commit_candidate,
     write_scattering_attempt,
 )
@@ -180,3 +182,59 @@ def test_commit_candidate_rejects_tampered_work_unit_digest(tmp_path):
             chunk_id=3,
             expected_interval_ids=(1,),
         )
+
+
+def _attempt_manifest(*, payload_sha256, work_unit_digest="w" * 64, interval_id=1):
+    # Construct the frozen attempt manifest directly (no disk): the FIX #2 candidate
+    # digest reads ONLY chunk_id + per-attempt {interval_id, work_unit_digest}, so the
+    # remaining manifest fields are irrelevant placeholders here. payload_sha256 is the
+    # field under test -- it must NOT influence the candidate_id.
+    return ScatteringAttemptManifest(
+        run_digest="run123",
+        work_unit_digest=work_unit_digest,
+        attempt_id="try1",
+        interval_id=interval_id,
+        chunk_id=3,
+        scientific_digest="a" * 64,
+        execution_digest="e" * 64,
+        qspace_plan_digest="c" * 64,
+        backend_policy_digest="b" * 64,
+        source_structure_digest="a" * 64,
+        contribution_reciprocal_points=1,
+        runtime_provenance={},
+        payload_path="ignored/path.hdf5",
+        payload_sha256=payload_sha256,
+        file_sha256="f" * 64,
+        payload_nbytes=123,
+    )
+
+
+def test_candidate_id_is_address_based_and_payload_byte_independent(tmp_path):
+    # P11 FIX #2: _candidate_id hashes ONLY chunk_id + per-attempt
+    # {interval_id, work_unit_digest} under the commit_candidate_id.v2 domain. Two
+    # attempt sets that share the same (chunk, interval, work_unit_digest) but DIFFER in
+    # payload_sha256 bytes (a CPU- vs GPU-written payload of the same science) must
+    # therefore produce the SAME candidate_id -- candidate identity is address-based and
+    # device-independent, not payload-byte-derived.
+    del tmp_path  # no disk needed -- manifests are built in memory
+    cpu_attempt = _attempt_manifest(payload_sha256="1" * 64)
+    gpu_attempt = _attempt_manifest(payload_sha256="2" * 64)
+
+    assert cpu_attempt.payload_sha256 != gpu_attempt.payload_sha256
+    assert _candidate_id(chunk_id=3, selected_attempts=(cpu_attempt,)) == _candidate_id(
+        chunk_id=3, selected_attempts=(gpu_attempt,)
+    )
+
+
+def test_candidate_id_still_distinguishes_different_addresses(tmp_path):
+    # Guard the inverse: address-based identity must NOT collapse genuinely different
+    # work. A different work_unit_digest (or interval) is a different address and so a
+    # different candidate_id -- proving the FIX #2 digest still discriminates on the
+    # fields that matter, it just dropped payload_sha256.
+    del tmp_path
+    base = _attempt_manifest(payload_sha256="1" * 64, work_unit_digest="w" * 64)
+    other_work = _attempt_manifest(payload_sha256="1" * 64, work_unit_digest="z" * 64)
+
+    assert _candidate_id(chunk_id=3, selected_attempts=(base,)) != _candidate_id(
+        chunk_id=3, selected_attempts=(other_work,)
+    )

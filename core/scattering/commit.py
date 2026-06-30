@@ -744,20 +744,26 @@ def _candidate_id(
     chunk_id: int,
     selected_attempts: tuple[ScatteringAttemptManifest, ...],
 ) -> str:
+    # P11 address-based identity: the candidate is addressed by its chunk and the
+    # DEVICE-INDEPENDENT work-unit digests of its selected intervals -- NOT by payload
+    # bytes. payload_sha256 stays on each attempt manifest and is verified at load time
+    # for disk integrity, but it is NOT part of commit identity, so a CPU-written and a
+    # GPU-written candidate for the same science map to ONE address (first valid writer
+    # commits; later valid writers, reconciled by the agreement gate, resolve to the
+    # same candidate_id).
     return digest_dict(
         {
             "schema_version": SCATTERING_COMMIT_SCHEMA_VERSION,
             "chunk_id": int(chunk_id),
-            "attempt_payloads": [
+            "attempt_addresses": [
                 {
                     "interval_id": attempt.interval_id,
                     "work_unit_digest": attempt.work_unit_digest,
-                    "payload_sha256": attempt.payload_sha256,
                 }
                 for attempt in selected_attempts
             ],
         },
-        domain="mosaic.scattering.commit_candidate_id.v1",
+        domain="mosaic.scattering.commit_candidate_id.v2",
     )[:32]
 
 
