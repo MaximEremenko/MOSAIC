@@ -72,6 +72,10 @@ from core.scattering.tasks import (
     run_scattering_interval_chunk_task,
     run_scattering_interval_task,
 )
+from core.scattering.work_unit_tiling import (
+    plan_point_tiles,
+    resolve_workunit_byte_budget,
+)
 from core.storage.database_manager import DatabaseManager
 from core.storage.run_state_cache import (
     pending_scattering_interval_chunks,
@@ -794,6 +798,59 @@ def run_interval_precompute(
     return cached + written_files
 
 
+def _log_workunit_byte_budget_tiling_advisory(
+    work_units: list[ScatteringWorkUnit],
+    point_data_list: list[dict],
+) -> None:
+    """ADVISORY ONLY (C2): log a recommended point-tile count per chunk when a byte budget
+    is configured and the whole-chunk output estimate would exceed it.
+
+    This is a pure no-op by default: ``resolve_workunit_byte_budget()`` returns ``None``
+    unless ``MOSAIC_WORKUNIT_BYTE_BUDGET`` is set to a positive integer, so with the default
+    (unset) budget the function returns immediately without logging or computing anything.
+    It NEVER changes which work units are built or executed, nor any durable output -- it
+    only emits INFO logs. Any unexpected error is swallowed so the advisory can never affect
+    execution.
+    """
+    budget = resolve_workunit_byte_budget()
+    if budget is None:
+        return
+    try:
+        samples_by_chunk: dict[int, int] = {}
+        dimension = 0
+        for point_data in point_data_list:
+            chunk_id = int(point_data["chunk_id"])
+            samples_by_chunk[chunk_id] = samples_by_chunk.get(chunk_id, 0) + 1
+            if dimension == 0:
+                dimension = int(len(point_data["coordinates"]))
+        chunk_ids = chunk_ids_for_work_units(work_units)
+        for chunk_id in chunk_ids:
+            total_samples = int(samples_by_chunk.get(int(chunk_id), 0))
+            if total_samples <= 0:
+                continue
+            # grid_shape_nd carries one row per chunk of `dimension` columns; this is the
+            # small fixed overhead term in the output estimate (the per-sample amplitude
+            # payload dominates the split).
+            tiles = plan_point_tiles(
+                total_samples=total_samples,
+                grid_rows=1,
+                grid_cols=max(dimension, 1),
+                byte_budget=budget,
+            )
+            if len(tiles) > 1:
+                logger.info(
+                    "WorkUnit byte-budget advisory: chunk=%d samples=%d budget=%d bytes "
+                    "-> recommended point-tiles=%d (advisory only; execution unchanged).",
+                    int(chunk_id),
+                    total_samples,
+                    int(budget),
+                    len(tiles),
+                )
+    except Exception:
+        # Pure advisory: never let estimation/logging perturb the run.
+        logger.debug("WorkUnit byte-budget tiling advisory skipped.", exc_info=True)
+
+
 def run_interval_chunk_execution(
     work_units: list[ScatteringWorkUnit],
     *,
@@ -855,6 +912,7 @@ def run_interval_chunk_execution(
         run_digest=work_identity.run_digest,
         expected_by_chunk=expected_by_chunk,
     )
+    _log_workunit_byte_budget_tiling_advisory(work_units, point_data_list)
     if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
         failures: list[tuple[ScatteringWorkUnit, str]] = []
