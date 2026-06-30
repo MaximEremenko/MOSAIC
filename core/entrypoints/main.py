@@ -160,7 +160,7 @@ def publish_main(
     run_digest: str,
     replace: bool = False,
 ) -> None:
-    from core.storage.publisher import publish_run
+    from core.workflow.publisher import publish_run
 
     publish_run(output_dir=output_dir, run_digest=run_digest, replace=replace)
 
