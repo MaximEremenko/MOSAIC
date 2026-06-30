@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import inspect
 import math
 import os
 from pathlib import Path
@@ -50,7 +49,6 @@ from core.residual_field.contracts import (
 )
 from core.residual_field.commit import (
     build_residual_work_unit_digest,
-    create_residual_commit_candidate,
     discover_residual_attempts,
     load_residual_attempt_payload,
     write_residual_stage_commit,
@@ -80,6 +78,54 @@ from core.storage.run_state_cache import (
     scan_run_state,
 )
 from core.runtime.nufft_policy import nufft_task_retries
+from core.residual_field.runtime_policy import (
+    DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES,
+    _cleanup_residual_attempts_enabled,
+    _distributed_owner_affinity_enabled,
+    _distributed_owner_local_reducer_supported,
+    _memory_backpressure_poll_seconds,
+    _memory_backpressure_threshold,
+    _owner_local_reducer_enabled,
+    _residual_attempt_cleanup_policy,
+    _residual_nufft_policy,
+    _residual_nufft_prefetch_factor,
+    _residual_nufft_resources,
+    _residual_nufft_settings,
+    _residual_partition_runtime_policy,
+    _residual_rifft_payload_reuse_enabled,
+    _worker_owned_local_reducer_enabled,
+)
+from core.residual_field.progress_logging import (
+    _build_planned_target_metrics,
+    _format_elapsed_eta,
+    _format_progress_bar,
+    _log_async_residual_progress,
+    _log_owner_local_finalize_metrics,
+    _log_partition_effectiveness_report,
+    _planned_partition_imbalance_ratio,
+    _should_log_async_progress,
+    _work_unit_interval_label,
+)
+from core.residual_field.cluster_helpers import (
+    _cap_async_max_inflight,
+    _clear_worker_rifft_payload_caches,
+    _cluster_host_memory_pressure,
+    _current_worker_addresses,
+    _resolve_owner_address,
+    _same_node_local_nufft_capacity,
+    _scheduler_nufft_capacity,
+    _trim_workers_for_memory_pressure,
+)
+from core.residual_field.work_unit_utils import (
+    _hex64_or_digest,
+    _interval_inputs_for_work_unit,
+    _interval_paths_for_work_unit,
+    _reducer_target_key,
+    _sort_work_units_by_target,
+    _unique_reducer_target_keys,
+    _work_unit_expected_interval_ids,
+    _work_unit_sort_key,
+)
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -88,528 +134,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_RESIDUAL_INTERVALS_PER_SHARD = 4
-DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES = 256 * 1024 * 1024
-
-
-def _worker_owned_local_reducer_enabled(workflow_parameters) -> bool:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    override = None
-    if hasattr(runtime_info, "get"):
-        override = runtime_info.get("residual_local_owner_reducer")
-    if override is None:
-        override = os.getenv("MOSAIC_RESIDUAL_LOCAL_OWNER_REDUCER")
-    if override is None:
-        return True
-    if isinstance(override, str):
-        return override.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(override)
-
-
-def _distributed_owner_affinity_enabled(workflow_parameters) -> bool:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    override = None
-    if hasattr(runtime_info, "get"):
-        override = runtime_info.get("residual_distributed_owner_affinity")
-    if override is None:
-        override = os.getenv("MOSAIC_RESIDUAL_DISTRIBUTED_OWNER_AFFINITY")
-    if override is None:
-        return True
-    if isinstance(override, str):
-        return override.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(override)
-
-
-def _distributed_owner_local_reducer_supported(
-    reducer_backend: ResidualFieldReducerBackend,
-    *,
-    reducer_runtime_state,
-) -> bool:
-    support_override = getattr(
-        reducer_backend,
-        "distributed_owner_local_reducer_supported",
-        None,
-    )
-    if support_override is None:
-        support_override = getattr(
-            reducer_backend,
-            "supports_distributed_owner_local_reducer",
-            None,
-        )
-    if support_override is not None:
-        return bool(support_override)
-    return (
-        callable(getattr(reducer_backend, "accept_local_contribution", None))
-        and callable(getattr(reducer_backend, "inspect_local_reducer_target", None))
-        and callable(getattr(reducer_backend, "flush_local_reducer_target", None))
-        and getattr(reducer_runtime_state, "durable_truth_unit", None)
-        == "committed_local_snapshot_generation"
-        and getattr(reducer_runtime_state, "durable_checkpoint_storage_role", None)
-        in {"durable-local-snapshot-generation", "durable-shared-generation"}
-    )
-
-
-def _owner_local_reducer_enabled(
-    *,
-    reducer_backend: ResidualFieldReducerBackend,
-    worker_owned_local_reducer: bool,
-    distributed_owner_local_reducer: bool,
-) -> bool:
-    return bool(worker_owned_local_reducer or distributed_owner_local_reducer)
-
-
-def _residual_partition_runtime_policy(
-    workflow_parameters,
-    *,
-    default_target_bytes: int,
-    effective_nufft_workers: int,
-) -> dict[str, int | float]:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    default_target_bytes = (
-        int(default_target_bytes)
-        if int(default_target_bytes) > 0
-        else DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES
-    )
-
-    def _get_int(name: str, default: int) -> int:
-        value = None
-        if hasattr(runtime_info, "get"):
-            value = runtime_info.get(name)
-        if value is None:
-            env_name = f"MOSAIC_{name.upper()}"
-            value = os.getenv(env_name)
-        return int(value) if value is not None else int(default)
-
-    def _get_float(name: str, default: float) -> float:
-        value = None
-        if hasattr(runtime_info, "get"):
-            value = runtime_info.get(name)
-        if value is None:
-            env_name = f"MOSAIC_{name.upper()}"
-            value = os.getenv(env_name)
-        return float(value) if value is not None else float(default)
-
-    return {
-        "target_partition_bytes": max(1, _get_int("residual_partition_target_bytes", int(default_target_bytes))),
-        "target_partition_bytes_3d": max(
-            1,
-            _get_int(
-                "residual_partition_target_bytes_3d",
-                max(1, int(default_target_bytes) // 2),
-            ),
-        ),
-        "max_partitions_per_chunk": _get_int(
-            "residual_max_partitions_per_chunk",
-            0,  # 0 = auto: let byte budget drive partition count
-        ),
-        "min_points_per_partition": max(
-            1,
-            _get_int("residual_min_points_per_partition", 1),
-        ),
-        "hysteresis_low_factor": _get_float(
-            "residual_partition_hysteresis_low",
-            0.8,
-        ),
-        "hysteresis_high_factor": _get_float(
-            "residual_partition_hysteresis_high",
-            1.2,
-        ),
-    }
-
-
-def _format_progress_bar(count: int, total: int, *, width: int = 20) -> str:
-    total = max(int(total), 1)
-    count = max(0, min(int(count), total))
-    filled = int(round((count / float(total)) * width))
-    return f"[{'#' * filled}{'.' * (width - filled)}]"
-
-
-def _planned_partition_imbalance_ratio(
-    *,
-    rifft_points_per_atom: tuple[int, ...],
-    target_partitions: int,
-) -> float:
-    weights = np.asarray(rifft_points_per_atom, dtype=np.int64)
-    if weights.size == 0 or target_partitions <= 1:
-        return 1.0
-    selections = _weighted_partition_split(
-        np.arange(weights.shape[0], dtype=np.int64),
-        weights,
-        int(target_partitions),
-    )
-    partition_weights = [
-        int(np.sum(weights[selection], dtype=np.int64))
-        for selection in selections
-        if selection.size > 0
-    ]
-    if not partition_weights:
-        return 1.0
-    min_weight = min(partition_weights)
-    max_weight = max(partition_weights)
-    if min_weight <= 0:
-        return float("inf") if max_weight > 0 else 1.0
-    return float(max_weight) / float(min_weight)
-
-
-def _build_planned_target_metrics(
-    partition_plans: dict[int, object],
-) -> dict[tuple[int, int | None], dict[str, object]]:
-    planned_metrics: dict[tuple[int, int | None], dict[str, object]] = {}
-    for chunk_id, plan in partition_plans.items():
-        weights = np.asarray(
-            getattr(
-                plan,
-                "rifft_points_per_atom",
-                np.ones(int(plan.point_count), dtype=np.int64),
-            ),
-            dtype=np.int64,
-        )
-        target_partitions = int(getattr(plan, "target_partitions", 1))
-        if target_partitions <= 1:
-            planned_metrics[(int(chunk_id), None)] = {
-                "planned_partition_count": 1,
-                "planned_rifft_points": int(np.sum(weights, dtype=np.int64)),
-                "planned_estimated_bytes": int(getattr(plan, "estimated_bytes", 0)),
-                "target_partition_bytes": int(getattr(plan, "target_partition_bytes", 0)),
-                "planned_imbalance_ratio": 1.0,
-            }
-            continue
-        selections = _weighted_partition_split(
-            np.arange(weights.shape[0], dtype=np.int64),
-            weights,
-            target_partitions,
-        )
-        imbalance_ratio = _planned_partition_imbalance_ratio(
-            rifft_points_per_atom=tuple(int(value) for value in weights.tolist()),
-            target_partitions=target_partitions,
-        )
-        for partition_id, selection in enumerate(selections):
-            planned_rifft_points = int(np.sum(weights[selection], dtype=np.int64))
-            planned_estimated_bytes = (
-                planned_rifft_points * int(_RESIDUAL_GRID_VALUE_BYTES_PER_POINT)
-            ) + (int(selection.size) * int(getattr(plan, "dimensionality", 1)) * 8)
-            planned_metrics[(int(chunk_id), int(partition_id))] = {
-                "planned_partition_count": int(target_partitions),
-                "planned_rifft_points": int(planned_rifft_points),
-                "planned_estimated_bytes": int(planned_estimated_bytes),
-                "target_partition_bytes": int(getattr(plan, "target_partition_bytes", 0)),
-                "planned_imbalance_ratio": float(imbalance_ratio),
-            }
-    return planned_metrics
-
-
-def _log_partition_effectiveness_report(
-    *,
-    planned_target_metrics: dict[tuple[int, int | None], dict[str, object]],
-    inspected_target_states: dict[tuple[int, int | None], dict[str, object] | None],
-) -> None:
-    if not planned_target_metrics or not inspected_target_states:
-        return
-    for target_key in sorted(planned_target_metrics):
-        planned = planned_target_metrics.get(target_key) or {}
-        actual = inspected_target_states.get(target_key) or {}
-        checkpoint_metrics = actual.get("checkpoint_metrics") if isinstance(actual, dict) else {}
-        if not isinstance(checkpoint_metrics, dict):
-            checkpoint_metrics = {}
-        actual_checkpoint_bytes = int(
-            checkpoint_metrics.get(
-                "latest_checkpoint_bytes_written",
-                checkpoint_metrics.get("total_checkpoint_bytes_written", 0),
-            )
-        )
-        actual_checkpoint_writes = int(checkpoint_metrics.get("total_checkpoint_writes", 0))
-        actual_checkpoint_wall = float(checkpoint_metrics.get("total_checkpoint_wall_seconds", 0.0))
-        target_partition_bytes = int(planned.get("target_partition_bytes", 0))
-        logger.info(
-            "Residual-field partition report | target=%s | planned_rifft_points=%d | planned_bytes=%d | target_bytes=%d | actual_checkpoint_bytes=%d | actual_checkpoint_writes=%d | actual_checkpoint_wall=%.3fs | imbalance=%.3f | over_budget=%s",
-            target_key,
-            int(planned.get("planned_rifft_points", 0)),
-            int(planned.get("planned_estimated_bytes", 0)),
-            target_partition_bytes,
-            actual_checkpoint_bytes,
-            actual_checkpoint_writes,
-            actual_checkpoint_wall,
-            float(planned.get("planned_imbalance_ratio", 1.0)),
-            str(bool(target_partition_bytes > 0 and actual_checkpoint_bytes > target_partition_bytes)).lower(),
-        )
-
-
-def _work_unit_interval_label(work_unit: ResidualFieldWorkUnit) -> str:
-    interval_ids = work_unit.interval_ids or (
-        (work_unit.interval_id,) if work_unit.interval_id is not None else ()
-    )
-    return ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a"
-
-
-def _format_elapsed_eta(elapsed_seconds: float, completed: int, total: int) -> str:
-    """Format elapsed time and estimated remaining time."""
-    def _fmt(seconds: float) -> str:
-        seconds = max(0.0, seconds)
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        minutes = seconds / 60.0
-        if minutes < 60:
-            return f"{minutes:.1f}m"
-        hours = minutes / 60.0
-        return f"{hours:.1f}h"
-
-    parts = [f"elapsed={_fmt(elapsed_seconds)}"]
-    if completed > 0 and completed < total:
-        rate = completed / max(elapsed_seconds, 0.001)
-        remaining = (total - completed) / rate
-        parts.append(f"eta={_fmt(remaining)}")
-        parts.append(f"rate={rate:.1f}/s")
-    return " | ".join(parts)
-
-
-def _log_async_residual_progress(
-    *,
-    enabled: bool,
-    event: str,
-    work_unit: ResidualFieldWorkUnit,
-    completed: int,
-    total: int,
-    submitted: int,
-    running: int,
-    detail: str | None = None,
-    start_time: float | None = None,
-) -> None:
-    if not enabled:
-        return
-    current = int(submitted if event == "queue" else completed)
-    progress_bar_text = _format_progress_bar(current, total)
-    percent = (100.0 * current / float(max(int(total), 1)))
-    suffix = f" | {detail}" if detail else ""
-    timing = ""
-    if start_time is not None and event == "progress":
-        timing = f" | {_format_elapsed_eta(time.monotonic() - start_time, completed, total)}"
-    logger.info(
-        "Residual-field %s %s %d/%d (%.0f%%) | running=%d | chunk=%d | intervals=%s%s%s",
-        event,
-        progress_bar_text,
-        current,
-        int(total),
-        percent,
-        int(running),
-        int(work_unit.chunk_id),
-        _work_unit_interval_label(work_unit),
-        timing,
-        suffix,
-    )
-
-
-def _should_log_async_progress(
-    *,
-    phase: str,
-    count: int,
-    total: int,
-    force: bool = False,
-) -> bool:
-    if force or total <= 0:
-        return True
-    if count <= 1 or count >= total:
-        return True
-    target_updates = 4 if phase == "queue" else 20
-    stride = max(1, int(math.ceil(total / float(target_updates))))
-    return count % stride == 0
-
-
-def _scheduler_nufft_capacity(client) -> tuple[int, int] | None:
-    if client is None or is_sync_client(client):
-        return None
-    try:
-        scheduler_info = client.scheduler_info()
-        workers = scheduler_info.get("workers", {})
-    except Exception:
-        workers = {}
-    if not workers:
-        return (1, 0)
-    nufft_slots = sum(
-        int(worker.get("resources", {}).get("nufft", 0))
-        for worker in workers.values()
-    )
-    if int(nufft_slots) <= 0:
-        raise RuntimeError(
-            "Dask scheduler reports zero total 'nufft' resource capacity; "
-            "residual-field NUFFT tasks would stay queued or overbook. "
-            "Configure worker resources with nufft=N."
-        )
-    return max(1, int(nufft_slots)), len(workers)
-
-
-def _same_node_local_nufft_capacity(client) -> tuple[int, int] | None:
-    if client is None or is_sync_client(client):
-        return None
-    if not is_same_node_local_client(client):
-        return None
-    return _scheduler_nufft_capacity(client)
-
-
-def _residual_nufft_prefetch_factor(workflow_parameters) -> int:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    value = None
-    if hasattr(runtime_info, "get"):
-        value = runtime_info.get("residual_nufft_prefetch_factor")
-    if value is None:
-        value = os.getenv("MOSAIC_RESIDUAL_NUFFT_PREFETCH_FACTOR")
-    try:
-        factor = int(value) if value is not None else 2
-    except (TypeError, ValueError):
-        factor = 2
-    return max(1, min(8, factor))
-
-
-def _residual_rifft_payload_reuse_enabled(workflow_parameters) -> bool:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    value = None
-    if hasattr(runtime_info, "get"):
-        value = runtime_info.get("residual_reuse_rifft_payload")
-    if value is None:
-        value = os.getenv("MOSAIC_RESIDUAL_REUSE_RIFFT_PAYLOAD")
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
-def _cap_async_max_inflight(
-    *,
-    client,
-    requested: int,
-    prefetch_factor: int = 2,
-) -> int:
-    requested = max(1, int(requested))
-    capacity_info = _scheduler_nufft_capacity(client)
-    if capacity_info is None:
-        return requested
-    nufft_slots, worker_count = capacity_info
-    factor = max(1, min(8, int(prefetch_factor)))
-    capacity = max(1, int(nufft_slots) * int(factor))
-    capped = min(requested, capacity)
-    logger.info(
-        "Residual-field local queue cap | requested=%d | effective=%d | workers=%d | nufft_slots=%d | prefetch_factor=%d",
-        requested,
-        capped,
-        int(worker_count),
-        int(nufft_slots),
-        int(factor),
-    )
-    return capped
-
-
-def _memory_backpressure_threshold() -> float:
-    raw = os.getenv("MOSAIC_RESIDUAL_MEMORY_BACKPRESSURE_PCT")
-    try:
-        threshold = float(raw) if raw is not None else 0.72
-    except ValueError:
-        threshold = 0.72
-    return max(0.0, min(1.0, threshold))
-
-
-def _memory_backpressure_poll_seconds() -> float:
-    raw = os.getenv("MOSAIC_RESIDUAL_MEMORY_BACKPRESSURE_POLL_SECONDS")
-    try:
-        seconds = float(raw) if raw is not None else 5.0
-    except ValueError:
-        seconds = 5.0
-    return max(0.0, seconds)
-
-
-def _cluster_host_memory_pressure(
-    client,
-    *,
-    threshold: float | None = None,
-) -> bool:
-    if client is None or is_sync_client(client):
-        return False
-    threshold = _memory_backpressure_threshold() if threshold is None else float(threshold)
-    if threshold <= 0.0:
-        return False
-    try:
-        workers = client.scheduler_info().get("workers", {})
-    except Exception:
-        return False
-    for worker in workers.values():
-        try:
-            memory_limit = int(worker.get("memory_limit") or 0)
-            if memory_limit <= 0:
-                continue
-            metrics = worker.get("metrics", {}) or {}
-            rss = int(metrics.get("memory") or worker.get("memory") or 0)
-            if rss > 0 and float(rss) >= (float(memory_limit) * threshold):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _trim_workers_for_memory_pressure(client) -> None:
-    if client is None or is_sync_client(client):
-        return
-    try:
-        from core.runtime.worker_hooks import trim_worker_memory
-
-        client.run(trim_worker_memory)
-    except Exception:
-        pass
-
-
-def _clear_worker_rifft_payload_caches(client) -> None:
-    try:
-        clear_residual_rifft_payload_cache()
-    except Exception:
-        pass
-    if client is None or is_sync_client(client):
-        return
-    run = getattr(client, "run", None)
-    if not callable(run):
-        return
-    try:
-        run(clear_residual_rifft_payload_cache)
-    except Exception:
-        pass
-
-
-def _current_worker_addresses(client) -> list[str]:
-    if client is None or is_sync_client(client):
-        return []
-    try:
-        workers = client.scheduler_info().get("workers", {})
-    except Exception:
-        workers = {}
-    return sorted(workers)
-
-
-def _resolve_owner_address(
-    *,
-    target_key: tuple[int, int | None],
-    target_owners: dict[tuple[int, int | None], str],
-    worker_addresses: list[str],
-) -> str | None:
-    current_owner = target_owners.get(target_key)
-    if current_owner in worker_addresses:
-        return current_owner
-    if not worker_addresses:
-        return current_owner
-    live_owner_loads = {address: 0 for address in worker_addresses}
-    for other_target_key, owner_address in target_owners.items():
-        if other_target_key == target_key:
-            continue
-        if owner_address in live_owner_loads:
-            live_owner_loads[owner_address] += 1
-    replacement_owner = min(
-        worker_addresses,
-        key=lambda address: (live_owner_loads[address], address),
-    )
-    target_owners[target_key] = replacement_owner
-    if current_owner is not None and current_owner != replacement_owner:
-        logger.warning(
-            "Residual-field owner remap | target=%s | previous=%s | replacement=%s",
-            target_key,
-            current_owner,
-            replacement_owner,
-        )
-    return replacement_owner
 
 
 def _build_task_reducer_backend(
@@ -630,76 +154,6 @@ def _build_task_reducer_backend(
             )
         ),
     )
-
-
-def _interval_paths_for_work_unit(work_unit: ResidualFieldWorkUnit) -> tuple[str, ...]:
-    interval_paths = tuple(
-        artifact.path
-        for artifact in work_unit.source_artifacts
-        if artifact.kind == "interval-precompute" and artifact.path is not None
-    )
-    if not interval_paths:
-        raise ValueError("ResidualFieldWorkUnit is missing source interval artifact paths.")
-    return interval_paths
-
-
-def _interval_inputs_for_work_unit(
-    work_unit: ResidualFieldWorkUnit,
-    *,
-    transient_interval_payloads: dict[int, object] | None,
-):
-    interval_ids = tuple(int(interval_id) for interval_id in (work_unit.interval_ids or ()))
-    if work_unit.interval_id is not None and not interval_ids:
-        interval_ids = (int(work_unit.interval_id),)
-    if transient_interval_payloads:
-        payload_source = transient_interval_payloads
-        if all(int(interval_id) in payload_source for interval_id in interval_ids):
-            values = tuple(payload_source[int(interval_id)] for interval_id in interval_ids)
-            return values[0] if len(values) == 1 else values
-    return _interval_paths_for_work_unit(work_unit)
-
-
-def _reducer_target_key(work_unit: ResidualFieldWorkUnit) -> tuple[int, int | None]:
-    return int(work_unit.chunk_id), (
-        int(work_unit.partition_id) if work_unit.partition_id is not None else None
-    )
-
-
-def _unique_reducer_target_keys(
-    work_units: list[ResidualFieldWorkUnit],
-) -> list[tuple[int, int | None]]:
-    return list(dict.fromkeys(_reducer_target_key(work_unit) for work_unit in work_units))
-
-
-def _work_unit_sort_key(work_unit: ResidualFieldWorkUnit) -> tuple:
-    interval_ids = _work_unit_expected_interval_ids(work_unit)
-    return (
-        _reducer_target_key(work_unit),
-        interval_ids[0] if interval_ids else -1,
-        interval_ids[-1] if interval_ids else -1,
-        int(len(interval_ids)),
-    )
-
-
-def _sort_work_units_by_target(
-    work_units: list[ResidualFieldWorkUnit],
-) -> list[ResidualFieldWorkUnit]:
-    return sorted(work_units, key=_work_unit_sort_key)
-
-
-def _work_unit_expected_interval_ids(work_unit: ResidualFieldWorkUnit) -> tuple[int, ...]:
-    if work_unit.interval_ids:
-        return tuple(int(interval_id) for interval_id in work_unit.interval_ids)
-    if work_unit.interval_id is None:
-        return ()
-    return (int(work_unit.interval_id),)
-
-
-def _hex64_or_digest(value: object, *, domain: str) -> str:
-    text = "" if value is None else str(value)
-    if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
-        return text
-    return digest_dict({"value": text}, domain=domain)
 
 
 def _residual_current_identity(
@@ -819,39 +273,6 @@ def _identity_complete_residual_work_units(
     return completed
 
 
-def _call_accepts_kwarg(func, name: str) -> bool:
-    try:
-        signature = inspect.signature(func)
-    except (TypeError, ValueError):
-        return True
-    return name in signature.parameters or any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-
-
-def _residual_nufft_policy(workflow_parameters) -> str:
-    return _residual_nufft_settings(workflow_parameters).execution_policy
-
-
-def _residual_nufft_settings(workflow_parameters):
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    if not hasattr(runtime_info, "get"):
-        runtime_info = {}
-    requested = runtime_info.get("residual_nufft_policy")
-    if requested is None:
-        requested = runtime_info.get("nufft_execution_policy")
-    if requested is None:
-        requested = runtime_info.get("nufft_policy")
-    eps = runtime_info.get("residual_nufft_eps", runtime_info.get("nufft_eps", 1e-12))
-    dtype = runtime_info.get("residual_dtype", runtime_info.get("nufft_dtype", "complex128"))
-    return resolve_nufft_execution_settings(requested, eps=eps, dtype=dtype)
-
-
-def _residual_nufft_resources(workflow_parameters) -> dict[str, int]:
-    return nufft_task_resources(_residual_nufft_policy(workflow_parameters))
-
-
 def _scheduler_kind(client) -> str:
     if client is None or is_sync_client(client):
         return "sync"
@@ -918,98 +339,6 @@ def _residual_attempt_digests_for_chunk(
         digests.append(_residual_work_unit_digest(work_unit))
     return tuple(sorted(digests))
 
-
-def _commit_residual_attempt_outputs(
-    *,
-    output_dir: str,
-    run_digest: str,
-    planned_work_units: list[ResidualFieldWorkUnit],
-    db_manager,
-) -> None:
-    expected_partition_ids_by_chunk: dict[int, tuple[int, ...]] = {}
-    for chunk_id in sorted({int(work_unit.chunk_id) for work_unit in planned_work_units}):
-        expected_partition_ids_by_chunk[chunk_id] = tuple(
-            sorted(
-                {
-                    int(work_unit.partition_id)
-                    for work_unit in planned_work_units
-                    if int(work_unit.chunk_id) == chunk_id and work_unit.partition_id is not None
-                }
-            )
-        )
-    if not expected_partition_ids_by_chunk:
-        return
-    write_residual_stage_plan(
-        output_dir=output_dir,
-        run_digest=run_digest,
-        expected_by_chunk=expected_partition_ids_by_chunk,
-    )
-    for chunk_id, expected_partition_ids in expected_partition_ids_by_chunk.items():
-        require_chunk_quiescence(
-            (),
-            client=None,
-            output_dir=output_dir,
-            run_digest=run_digest,
-            stage="residual_field",
-            chunk_id=int(chunk_id),
-            expected_work_unit_digests=_residual_attempt_digests_for_chunk(
-                planned_work_units,
-                chunk_id=int(chunk_id),
-            ),
-        )
-        attempts = discover_residual_attempts(
-            output_dir=output_dir,
-            run_digest=run_digest,
-            chunk_id=int(chunk_id),
-        )
-        attempts_by_partition: dict[int, list] = {}
-        for attempt in attempts:
-            attempts_by_partition.setdefault(int(attempt.partition_id), []).append(attempt)
-        expected_partitions: dict[int, tuple[int, ...]] = {}
-        expected_reciprocal_count: int | None = None
-        for partition_id in expected_partition_ids:
-            candidates = attempts_by_partition.get(int(partition_id), [])
-            if not candidates:
-                raise RuntimeError(
-                    f"Missing residual attempt for chunk {chunk_id} partition {partition_id}."
-                )
-            # P11: do NOT bitwise-compare cross-device payloads here. We only read the
-            # structural, device-independent point_ids to build expected_partitions;
-            # numerical agreement is enforced by create_residual_commit_candidate's
-            # predicted-tolerance gate. Pick a deterministic attempt to read ids from.
-            chosen = sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0]
-            datasets, _attrs = load_residual_attempt_payload(chosen, output_dir=output_dir)
-            expected_partitions[int(partition_id)] = tuple(
-                int(item) for item in np.asarray(datasets["point_ids"]).reshape(-1)
-            )
-            if expected_reciprocal_count is None:
-                expected_reciprocal_count = int(chosen.contribution_reciprocal_points)
-        create_residual_commit_candidate(
-            output_dir=output_dir,
-            run_digest=run_digest,
-            chunk_id=int(chunk_id),
-            expected_partitions=expected_partitions,
-            expected_reciprocal_point_count=expected_reciprocal_count,
-        )
-        getattr(residual_commit, "promote_residual" "_chunk_commit_by_scan")(
-            output_dir=output_dir,
-            run_digest=run_digest,
-            chunk_id=int(chunk_id),
-        )
-        for work_unit in planned_work_units:
-            if int(work_unit.chunk_id) != int(chunk_id):
-                continue
-            for interval_id in _work_unit_expected_interval_ids(work_unit):
-                db_manager.update_interval_chunk_status(
-                    int(interval_id),
-                    int(chunk_id),
-                    saved=True,
-                )
-    write_residual_stage_commit(
-        output_dir=output_dir,
-        run_digest=run_digest,
-        chunk_ids=tuple(sorted(expected_partition_ids_by_chunk)),
-    )
 
 
 def _reconcile_and_filter_local_durable_work_units(
@@ -1154,72 +483,6 @@ def _inspect_owner_local_reducer_targets_or_raise(
     return inspected_target_states
 
 
-def _log_owner_local_finalize_metrics(
-    *,
-    inspected_target_states: dict[tuple[int, int | None], dict[str, object] | None],
-    backend_kind: str,
-) -> None:
-    if not inspected_target_states:
-        return
-    total_bytes = 0
-    total_writes = 0
-    total_wall_seconds = 0.0
-    saw_metrics = False
-    for target_key in sorted(inspected_target_states):
-        target_state = inspected_target_states.get(target_key) or {}
-        checkpoint_metrics = target_state.get("checkpoint_metrics")
-        if not isinstance(checkpoint_metrics, dict):
-            checkpoint_metrics = target_state
-        checkpoint_bytes = target_state.get(
-            "total_checkpoint_bytes_written",
-            checkpoint_metrics.get("total_checkpoint_bytes_written")
-            if checkpoint_metrics is not target_state
-            else target_state.get("checkpoint_bytes_written"),
-        )
-        checkpoint_writes = target_state.get(
-            "total_checkpoint_writes",
-            checkpoint_metrics.get("total_checkpoint_writes")
-            if checkpoint_metrics is not target_state
-            else target_state.get("checkpoint_writes"),
-        )
-        checkpoint_wall_seconds = target_state.get(
-            "total_checkpoint_wall_seconds",
-            checkpoint_metrics.get("total_checkpoint_wall_seconds")
-            if checkpoint_metrics is not target_state
-            else target_state.get("checkpoint_wall_seconds"),
-        )
-        if (
-            checkpoint_bytes is None
-            and checkpoint_writes is None
-            and checkpoint_wall_seconds is None
-        ):
-            continue
-        saw_metrics = True
-        target_bytes = int(checkpoint_bytes or 0)
-        target_writes = int(checkpoint_writes or 0)
-        target_wall_seconds = float(checkpoint_wall_seconds or 0.0)
-        total_bytes += target_bytes
-        total_writes += target_writes
-        total_wall_seconds += target_wall_seconds
-        logger.info(
-            "Residual-field finalize checkpoints | backend=%s | target=%s | writes=%d | bytes=%d | wall=%.3fs",
-            backend_kind,
-            target_key,
-            target_writes,
-            target_bytes,
-            target_wall_seconds,
-        )
-    if saw_metrics:
-        logger.info(
-            "Residual-field finalize checkpoints total | backend=%s | targets=%d | writes=%d | bytes=%d | wall=%.3fs",
-            backend_kind,
-            int(len(inspected_target_states)),
-            total_writes,
-            total_bytes,
-            total_wall_seconds,
-        )
-
-
 def _record_residual_task_result(
     *,
     payload,
@@ -1289,30 +552,6 @@ def _flush_local_reducer_targets_or_raise(
     for future, result in yield_futures_with_results(flush_futures, client):
         if future is None:
             continue
-
-
-def _cleanup_residual_attempts_enabled(workflow_parameters) -> bool:
-    return _residual_attempt_cleanup_policy(workflow_parameters) == "delete_reclaimable"
-
-
-def _residual_attempt_cleanup_policy(workflow_parameters) -> str:
-    runtime_policy = workflow_parameters.runtime_info.get(
-        "residual_attempt_cleanup_policy"
-    )
-    if runtime_policy is not None:
-        value = str(runtime_policy).strip().lower()
-        if value in {"off", "keep"}:
-            return "off"
-        if value in {"delete_reclaimable", "cleanup"}:
-            return "delete_reclaimable"
-    runtime_value = workflow_parameters.runtime_info.get("cleanup_residual_attempts")
-    if runtime_value is not None:
-        return "delete_reclaimable" if bool(runtime_value) else "off"
-    return (
-        "delete_reclaimable"
-        if os.getenv("MOSAIC_CLEANUP_RESIDUAL_SHARDS", "0") == "1"
-        else "off"
-    )
 
 
 def _finalize_residual_field_chunks(

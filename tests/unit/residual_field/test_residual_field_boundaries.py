@@ -3142,6 +3142,7 @@ def test_residual_field_async_stage_logs_main_process_progress_when_enabled(
 
     configure_progress(force_progress=None, task_progress=True)
     caplog.set_level(logging.INFO, logger="core.residual_field.execution")
+    caplog.set_level(logging.INFO, logger="core.residual_field.progress_logging")
     try:
         run_residual_field_stage(
             workflow_parameters=workflow_parameters,
