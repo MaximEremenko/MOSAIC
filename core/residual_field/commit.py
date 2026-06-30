@@ -35,7 +35,7 @@ from core.storage.commit_payloads import (
 from core.storage.digests import digest_dict
 from core.storage.fingerprint import file_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
-from core.storage.manifest import read_manifest, write_manifest
+from core.storage.manifest import read_manifest, try_commit_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
 from core.storage.work_identity import assert_device_independent
 
@@ -1041,27 +1041,22 @@ def promote_residual_chunk_commit_by_scan(
         file_sha256=candidate.file_sha256,
         payload_nbytes=int(candidate.payload_nbytes),
     )
-    if target.exists():
-        existing = read_manifest(target, codec=ResidualChunkCommitManifest, output_dir=output_dir)
-        if existing != manifest:
-            raise RuntimeError(
-                f"Residual chunk {candidate.chunk_id} already committed to a different candidate."
-            )
-        _record_residual_commit_scan_seconds(
-            output_dir=output_dir,
-            run_digest=candidate.run_digest,
-            chunk_id=int(candidate.chunk_id),
-            scan_seconds=time.perf_counter() - scan_started,
-        )
-        return existing
-    write_manifest(target, manifest, output_dir=output_dir)
+    committed, _created = try_commit_manifest(
+        target,
+        manifest,
+        codec=ResidualChunkCommitManifest,
+        output_dir=output_dir,
+        conflict_error=lambda _existing: RuntimeError(
+            f"Residual chunk {candidate.chunk_id} already committed to a different candidate."
+        ),
+    )
     _record_residual_commit_scan_seconds(
         output_dir=output_dir,
         run_digest=candidate.run_digest,
         chunk_id=int(candidate.chunk_id),
         scan_seconds=time.perf_counter() - scan_started,
     )
-    return manifest
+    return committed
 
 
 def promote_residual_chunk_commit(
