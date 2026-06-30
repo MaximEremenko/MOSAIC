@@ -1,19 +1,27 @@
 ﻿"""
 tests/unit/test_no_import_cycles.py
 
-Import-cycle guard: walks every module under core/ and asserts each one
-can be imported in a fresh subprocess without ImportError.  Running all
-modules inside a single process would mask cycles that only surface when
-the package is loaded from scratch (because sys.modules caching hides
-them after the first successful import).  Each parametrized test case
-imports the module in isolation via importlib.import_module so that
-accumulated sys.modules state from earlier cases does not hide a genuine
-circular ImportError.
+Import smoke test: discovers every module under core/ and, for each one,
+asserts that importing it raises no ImportError.  Discovery happens via
+pkgutil.walk_packages, and each module name becomes a separate
+pytest.parametrize case.  Every case imports its module with
+importlib.import_module in the SAME process as the rest of the test
+session (there is no subprocess and no fresh-interpreter isolation), so
+modules already pulled in by an earlier case stay cached in sys.modules.
 
-The test does NOT forbid lazy / function-local imports that are
-intentionally deferred for other reasons (e.g. large optional
-dependencies).  It only asserts that no module raises ImportError at the
-point it is imported.
+What this guards against: the common runtime failure mode of a circular
+import, where a module raises ImportError at import time.  Catching that
+ImportError is the whole assertion.
+
+What this does NOT do:
+  * It does NOT prove the import graph is acyclic.  A cycle that happens
+    to resolve without raising ImportError (e.g. because the needed names
+    are already bound by the time they are accessed) will pass here.
+  * It does NOT see TYPE_CHECKING-guarded imports, which are never
+    executed at runtime and so are invisible to importlib.
+  * It does NOT forbid lazy / function-local imports that are
+    intentionally deferred (e.g. large optional dependencies); only
+    top-level import failures are observed.
 """
 from __future__ import annotations
 
@@ -52,11 +60,13 @@ _CORE_MODULES = _discover_core_modules()
 def test_module_imports_without_error(module_name: str, monkeypatch, tmp_path) -> None:
     """Assert that importing *module_name* raises no ImportError.
 
-    Each test case starts from whatever sys.modules state the parametrized
-    fixture provides (modules already imported earlier in the session are
-    cached, which is the normal Python behaviour).  The key property being
-    tested is that no module raises ImportError at import time — which is
-    what a genuine circular import would do.
+    The import runs in the current process via importlib.import_module,
+    reusing whatever sys.modules state earlier parametrized cases left
+    behind (normal Python caching — there is no subprocess isolation).
+    The only property asserted is that the import does not raise
+    ImportError, which is how a runtime circular import typically fails.
+    This does not establish acyclicity and does not exercise
+    TYPE_CHECKING-only imports.
     """
     monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path / "mpl"))
     monkeypatch.setenv("MOSAIC_NUFFT_CPU_ONLY", "1")

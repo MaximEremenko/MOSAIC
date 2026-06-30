@@ -12,7 +12,7 @@ import os
 import logging
 
 # Make sure to import the dimension-aware ReciprocalSpaceIntervalGenerator:
-from core.qspace.intervals import (
+from core.qspace.intervals.interval_generator import (
     ReciprocalSpaceIntervalGenerator,
 )
 from core.runtime.log_utils import short_path

@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 import sympy as sp
-from core.qspace.masking import (
+from core.qspace.masking.logic_parser import (
     allowed_locals,
     parse_logic,
     preprocess,
