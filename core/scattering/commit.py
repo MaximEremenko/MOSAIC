@@ -5,7 +5,6 @@ from pathlib import Path
 import time
 from typing import Any, ClassVar, Mapping
 
-import h5py
 import numpy as np
 
 from core.scattering.accumulation import (
@@ -32,12 +31,17 @@ from core.storage.agreement import (
     predict_agreement_rtol,
     relative_l2,
 )
-from core.storage.digests import digest_dict, normalize_digest_input
-from core.storage.fingerprint import file_sha256, payload_sha256
+from core.storage.commit_payloads import (
+    _payload_datasets,
+    _payload_digest,
+    _read_payload,
+    _resolve_runtime_provenance,
+)
+from core.storage.digests import digest_dict
+from core.storage.fingerprint import file_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.manifest import read_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
-from core.runtime.gpu_admission import runtime_provenance_for_attempt
 
 
 SCATTERING_ATTEMPT_SCHEMA = "mosaic.scattering.attempt"
@@ -85,27 +89,6 @@ def build_scattering_work_unit_digest(
     )
 
 
-def _payload_datasets(
-    *,
-    point_ids: np.ndarray,
-    grid_shape_nd: np.ndarray,
-    amplitudes_delta: np.ndarray,
-    amplitudes_average: np.ndarray,
-) -> dict[str, np.ndarray]:
-    delta = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
-    average = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
-    point_id_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
-    if average.shape != delta.shape:
-        raise ValueError("amplitudes_delta and amplitudes_average must have matching shapes.")
-    if point_id_arr.shape != delta.shape:
-        raise ValueError("point_ids must align with amplitude arrays.")
-    return {
-        "point_ids": point_id_arr,
-        "grid_shape_nd": np.asarray(grid_shape_nd, dtype=np.int64),
-        "amplitudes_delta": delta,
-        "amplitudes_average": average,
-    }
-
 
 def _attempt_payload_attrs(
     *,
@@ -146,47 +129,6 @@ def _candidate_payload_attrs(
         "reciprocal_point_count": int(reciprocal_point_count),
     }
 
-
-def _payload_digest(
-    *,
-    expected_set_digest: str,
-    datasets: Mapping[str, np.ndarray],
-    attrs: Mapping[str, Any],
-) -> str:
-    semantic_attrs = {
-        key: value
-        for key, value in attrs.items()
-        if key not in {"attempt_id"}
-    }
-    return payload_sha256(
-        schema=str(attrs["schema"]),
-        expected_set_digest=str(expected_set_digest),
-        datasets=datasets,
-        attrs=semantic_attrs,
-    )
-
-
-def _read_payload(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    with h5py.File(path, "r") as h5file:
-        datasets = {name: np.asarray(h5file[name]) for name in h5file.keys()}
-        attrs = {
-            key: (value.item() if isinstance(value, np.generic) else value)
-            for key, value in h5file.attrs.items()
-        }
-    return datasets, attrs
-
-
-def _resolve_runtime_provenance(
-    runtime_provenance: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    base = dict(runtime_provenance or {})
-    return runtime_provenance_for_attempt(
-        fs_capability_digest=base.get("fs_capability_digest"),
-        scheduler_kind=str(base.get("scheduler_kind", "local")),
-        nufft_policy=base.get("nufft_policy", "auto"),
-        resource_requirements=base.get("resource_requirements"),
-        cuda_probe=str(base.get("nufft_policy", "auto")) in {"gpu-required", "allow-fallback"},
-    )
 
 
 @dataclass(frozen=True)
@@ -627,6 +569,7 @@ def write_scattering_attempt(
         runtime_provenance=_resolve_runtime_provenance(runtime_provenance),
         payload_path=relative_to_output(payload_path, output_dir=output_dir),
         payload_sha256=_payload_digest(
+            schema=str(attrs["schema"]),
             expected_set_digest=work_unit_digest,
             datasets=datasets,
             attrs=attrs,
@@ -680,6 +623,7 @@ def load_scattering_attempt_partial(
     if int(payload_path.stat().st_size) != int(manifest.payload_nbytes):
         raise ValueError(f"Attempt payload byte-size mismatch: {manifest.payload_path}")
     expected_payload_sha = _payload_digest(
+        schema=str(attrs["schema"]),
         expected_set_digest=manifest.work_unit_digest,
         datasets=datasets,
         attrs=attrs,
@@ -885,6 +829,7 @@ def create_scattering_commit_candidate(
         ),
         payload_path=relative_to_output(payload_path, output_dir=output_dir),
         payload_sha256=_payload_digest(
+            schema=str(attrs["schema"]),
             expected_set_digest=candidate_id,
             datasets=datasets,
             attrs=attrs,
@@ -958,6 +903,7 @@ def _load_scattering_candidate_payload(
     if int(payload_path.stat().st_size) != int(candidate.payload_nbytes):
         raise ValueError(f"Scattering candidate byte-size mismatch: {candidate.payload_path}")
     expected_payload_sha = _payload_digest(
+        schema=str(attrs["schema"]),
         expected_set_digest=candidate.candidate_id,
         datasets=datasets,
         attrs=attrs,

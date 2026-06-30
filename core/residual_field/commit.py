@@ -5,7 +5,6 @@ from pathlib import Path
 import time
 from typing import Any, ClassVar, Mapping, Sequence
 
-import h5py
 import numpy as np
 
 from core.storage.attempt_store import (
@@ -27,12 +26,17 @@ from core.storage.agreement import (
     predict_agreement_rtol,
     relative_l2,
 )
+from core.storage.commit_payloads import (
+    _payload_datasets,
+    _payload_digest,
+    _read_payload,
+    _resolve_runtime_provenance,
+)
 from core.storage.digests import digest_dict
-from core.storage.fingerprint import file_sha256, payload_sha256
+from core.storage.fingerprint import file_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.manifest import read_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
-from core.runtime.gpu_admission import runtime_provenance_for_attempt
 
 
 RESIDUAL_FIELD_ATTEMPT_SCHEMA = "mosaic.residual_field.attempt"
@@ -94,27 +98,6 @@ def build_residual_work_unit_digest(
     )
 
 
-def _payload_datasets(
-    *,
-    point_ids: np.ndarray,
-    grid_shape_nd: np.ndarray,
-    amplitudes_delta: np.ndarray,
-    amplitudes_average: np.ndarray,
-) -> dict[str, np.ndarray]:
-    delta = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
-    average = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
-    point_id_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
-    if average.shape != delta.shape:
-        raise ValueError("residual amplitudes_delta and amplitudes_average must match.")
-    if point_id_arr.shape != delta.shape:
-        raise ValueError("residual point_ids must align with amplitude arrays.")
-    return {
-        "point_ids": point_id_arr,
-        "grid_shape_nd": np.asarray(grid_shape_nd, dtype=np.int64),
-        "amplitudes_delta": delta,
-        "amplitudes_average": average,
-    }
-
 
 def _payload_attrs(
     *,
@@ -144,48 +127,6 @@ def _payload_attrs(
         attrs["attempt_id"] = str(attempt_id)
     return attrs
 
-
-def _payload_digest(
-    *,
-    schema: str,
-    expected_set_digest: str,
-    datasets: Mapping[str, np.ndarray],
-    attrs: Mapping[str, Any],
-) -> str:
-    semantic_attrs = {
-        key: value
-        for key, value in attrs.items()
-        if key not in {"attempt_id"}
-    }
-    return payload_sha256(
-        schema=schema,
-        expected_set_digest=str(expected_set_digest),
-        datasets=datasets,
-        attrs=semantic_attrs,
-    )
-
-
-def _read_payload(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    with h5py.File(path, "r") as h5file:
-        datasets = {name: np.asarray(h5file[name]) for name in h5file.keys()}
-        attrs = {
-            key: (value.item() if isinstance(value, np.generic) else value)
-            for key, value in h5file.attrs.items()
-        }
-    return datasets, attrs
-
-
-def _resolve_runtime_provenance(
-    runtime_provenance: Mapping[str, Any] | None,
-) -> dict[str, Any]:
-    base = dict(runtime_provenance or {})
-    return runtime_provenance_for_attempt(
-        fs_capability_digest=base.get("fs_capability_digest"),
-        scheduler_kind=str(base.get("scheduler_kind", "local")),
-        nufft_policy=base.get("nufft_policy", "auto"),
-        resource_requirements=base.get("resource_requirements"),
-        cuda_probe=str(base.get("nufft_policy", "auto")) in {"gpu-required", "allow-fallback"},
-    )
 
 
 @dataclass(frozen=True)
