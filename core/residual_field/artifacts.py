@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
-import re
 import shutil
 import tempfile
 import threading
 import time
-from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Callable
 
@@ -34,27 +30,58 @@ from core.residual_field.contracts import (
     build_residual_field_output_artifacts,
     build_residual_field_shard_artifacts,
     make_residual_field_artifact_key,
-    make_residual_field_reducer_key,
     validate_residual_field_artifact_manifest,
-    validate_residual_field_reducer_progress_manifest,
     validate_residual_field_shard_manifest,
 )
 from core.contracts import (
     ArtifactManifestAssessment,
     ArtifactRef,
     CompletionStatus,
-    RetryDisposition,
-    RetryIdempotencySemantics,
 )
 from core.runtime import chunk_mutex
 from core.storage.database_manager import create_db_manager_for_thread
 
+# ---------------------------------------------------------------------------
+# Re-exports from extracted modules (all public names remain importable from
+# core.residual_field.artifacts for backward compatibility).
+# ---------------------------------------------------------------------------
+from core.residual_field.manifest_io import (  # noqa: E402
+    _GENERATION_FILENAME_RE,
+    _artifact_ref_from_payload,
+    _build_residual_field_reducer_progress_manifest,
+    _load_array_payload,
+    _normalize_residual_shard_cleanup_policy,
+    _residual_field_reducer_progress_manifest_to_payload,
+    _residual_field_shard_manifest_to_payload,
+    _write_json_atomic,
+    _write_residual_field_shard_manifest_json,
+    build_residual_field_reducer_progress_artifact,
+    load_residual_field_generation_metadata,
+    load_residual_field_reducer_progress_manifest,
+    load_residual_field_shard_manifest,
+    parse_residual_field_generation_ref,
+    write_residual_field_reducer_progress_manifest,
+)
+from core.residual_field.stage2_replacement import (  # noqa: E402
+    build_stage2_replacement_expected_artifact,
+    load_stage2_replacement_expected_manifest,
+    load_stage2_replacement_expected_metadata,
+    normalize_stage2_replacement_expected_by_chunk,
+    normalize_stage2_replacement_expected_metadata,
+    stage2_replacement_expected_digest,
+    write_stage2_replacement_expected_manifest,
+)
+from core.residual_field.shard_discovery import (  # noqa: E402
+    _merge_residual_field_shard_manifests,
+    _shard_manifests_by_key,
+    discover_residual_field_reducer_progress_manifest,
+    discover_residual_field_shard_manifests,
+    discover_stale_residual_field_generation_manifests,
+    list_reclaimable_residual_field_shards,
+)
+
 
 logger = logging.getLogger(__name__)
-
-_GENERATION_FILENAME_RE = re.compile(
-    r"^generation_partition_(?P<partition_token>[^_]+)_seq_(?P<generation_seq>\d+)_params_(?P<parameter_digest>.+)$"
-)
 
 
 def _fsync_path(path: Path) -> None:
@@ -200,182 +227,6 @@ def build_residual_field_output_artifact_refs(
     return build_residual_field_output_artifacts(output_dir, chunk_id)
 
 
-def build_residual_field_reducer_progress_artifact(
-    output_dir: str,
-    *,
-    chunk_id: int,
-    parameter_digest: str,
-) -> ArtifactRef:
-    shard_dir = Path(output_dir) / "residual_checkpoints" / f"chunk_{chunk_id}"
-    return ArtifactRef(
-        stage="residual_field",
-        kind="residual-reducer-progress-manifest",
-        key=make_residual_field_artifact_key(
-            "residual-reducer-progress-manifest",
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-        ),
-        path=str(shard_dir / f"reducer_progress_params_{parameter_digest}.manifest.json"),
-        schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
-    )
-
-
-def normalize_stage2_replacement_expected_by_chunk(
-    raw: Mapping[object, Iterable[object]] | None,
-) -> dict[int, tuple[int, ...]]:
-    if raw is None:
-        return {}
-    if not isinstance(raw, Mapping):
-        raise ValueError("Stage-2 replacement expected coverage must be a mapping.")
-    expected: dict[int, tuple[int, ...]] = {}
-    for chunk_id, interval_ids in raw.items():
-        try:
-            normalized_ids = tuple(
-                sorted({int(interval_id) for interval_id in interval_ids})
-            )
-        except TypeError as exc:
-            raise ValueError(
-                "Stage-2 replacement expected interval ids must be iterable."
-            ) from exc
-        expected[int(chunk_id)] = normalized_ids
-    return dict(sorted(expected.items()))
-
-
-def stage2_replacement_expected_digest(
-    expected_by_chunk: Mapping[object, Iterable[object]] | None,
-) -> str:
-    normalized = normalize_stage2_replacement_expected_by_chunk(expected_by_chunk)
-    payload = {
-        str(chunk_id): list(interval_ids)
-        for chunk_id, interval_ids in normalized.items()
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def normalize_stage2_replacement_expected_metadata(
-    raw: Mapping[str, object],
-) -> dict[str, object]:
-    expected = normalize_stage2_replacement_expected_by_chunk(
-        raw.get("expected_by_chunk", {})
-    )
-    expected_digest = raw.get("expected_digest")
-    if (
-        expected_digest is not None
-        and str(expected_digest) != stage2_replacement_expected_digest(expected)
-    ):
-        raise ValueError("Stage-2 replacement expected manifest digest mismatch.")
-    return {
-        "expected_by_chunk": expected,
-        "run_digest": None if raw.get("run_digest") is None else str(raw["run_digest"]),
-        "source_scattering_commit_digest": (
-            None
-            if raw.get("source_scattering_commit_digest") is None
-            else str(raw["source_scattering_commit_digest"])
-        ),
-    }
-
-
-def build_stage2_replacement_expected_artifact(
-    output_dir: str,
-    *,
-    parameter_digest: str,
-) -> ArtifactRef:
-    path = (
-        Path(output_dir)
-        / "residual_checkpoints"
-        / f"stage2_replacement_expected_params_{parameter_digest}.manifest.json"
-    )
-    return ArtifactRef(
-        stage="residual_field",
-        kind="stage2-replacement-expected-manifest",
-        key=f"stage2-replacement-expected:params-{parameter_digest}",
-        path=str(path),
-        schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
-    )
-
-
-def write_stage2_replacement_expected_manifest(
-    *,
-    output_dir: str,
-    parameter_digest: str,
-    expected_by_chunk: Mapping[object, Iterable[object]] | None,
-    run_digest: str | None = None,
-    source_scattering_commit_digest: str | None = None,
-) -> ArtifactRef:
-    artifact = build_stage2_replacement_expected_artifact(
-        output_dir,
-        parameter_digest=parameter_digest,
-    )
-    if artifact.path is None:
-        raise ValueError("Stage-2 replacement expected manifest path is required.")
-    normalized = normalize_stage2_replacement_expected_by_chunk(expected_by_chunk)
-    payload = {
-        "schema_version": RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
-        "stage": artifact.stage,
-        "kind": artifact.kind,
-        "artifact": {
-            "stage": artifact.stage,
-            "kind": artifact.kind,
-            "key": artifact.key,
-            "path": artifact.path,
-            "schema_version": artifact.schema_version,
-        },
-        "parameter_digest": str(parameter_digest),
-        "run_digest": None if run_digest is None else str(run_digest),
-        "source_scattering_commit_digest": (
-            None
-            if source_scattering_commit_digest is None
-            else str(source_scattering_commit_digest)
-        ),
-        "expected_digest": stage2_replacement_expected_digest(normalized),
-        "expected_by_chunk": {
-            str(chunk_id): list(interval_ids)
-            for chunk_id, interval_ids in normalized.items()
-        },
-    }
-    _write_json_atomic(Path(artifact.path), payload)
-    return artifact
-
-
-def load_stage2_replacement_expected_metadata(
-    *,
-    output_dir: str,
-    parameter_digest: str,
-) -> dict[str, object] | None:
-    artifact = build_stage2_replacement_expected_artifact(
-        output_dir,
-        parameter_digest=parameter_digest,
-    )
-    if artifact.path is None:
-        raise ValueError("Stage-2 replacement expected manifest path is required.")
-    path = Path(artifact.path)
-    if not path.exists():
-        return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if str(payload.get("kind")) != artifact.kind:
-        raise ValueError("Stage-2 replacement expected manifest has invalid kind.")
-    if str(payload.get("parameter_digest")) != str(parameter_digest):
-        raise ValueError(
-            "Stage-2 replacement expected manifest parameter digest mismatch."
-        )
-    return normalize_stage2_replacement_expected_metadata(payload)
-
-
-def load_stage2_replacement_expected_manifest(
-    *,
-    output_dir: str,
-    parameter_digest: str,
-) -> dict[int, tuple[int, ...]] | None:
-    metadata = load_stage2_replacement_expected_metadata(
-        output_dir=output_dir,
-        parameter_digest=parameter_digest,
-    )
-    if metadata is None:
-        return None
-    return dict(metadata["expected_by_chunk"])
-
-
 def build_residual_field_chunk_manifest(
     work_unit: ResidualFieldWorkUnit,
     *,
@@ -466,23 +317,6 @@ def build_residual_field_generation_artifacts(
     )
 
 
-def parse_residual_field_generation_ref(
-    manifest: ResidualFieldShardManifest,
-) -> tuple[int | None, int] | None:
-    manifest_ref = next(
-        (artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"),
-        None,
-    )
-    if manifest_ref is None or manifest_ref.path is None:
-        return None
-    match = _GENERATION_FILENAME_RE.match(Path(manifest_ref.path).stem.removesuffix(".manifest"))
-    if match is None:
-        return None
-    partition_token = match.group("partition_token")
-    partition_id = None if partition_token == "owner" else int(partition_token)
-    return partition_id, int(match.group("generation_seq"))
-
-
 def _missing_artifact_kinds(
     manifest: ResidualFieldArtifactManifest,
 ) -> tuple[str, ...]:
@@ -506,116 +340,6 @@ def _missing_artifact_paths(artifacts: tuple[ArtifactRef, ...]) -> tuple[str, ..
         missing.append(artifact.key)
     return tuple(sorted(missing))
 
-
-def _residual_field_shard_manifest_to_payload(
-    manifest: ResidualFieldShardManifest,
-) -> dict[str, object]:
-    return {
-        "artifact_key": manifest.artifact_key,
-        "completion_status": manifest.completion_status.value,
-        "retry": {
-            "failure_unit": manifest.retry.failure_unit,
-            "retry_unit": manifest.retry.retry_unit,
-            "idempotency_key": manifest.retry.idempotency_key,
-            "replay_disposition": manifest.retry.replay_disposition.value,
-            "crash_recovery_rule": manifest.retry.crash_recovery_rule,
-        },
-        "interval_id": manifest.interval_id,
-        "contributing_interval_ids": list(manifest.contributing_interval_ids),
-        "chunk_id": manifest.chunk_id,
-        "parameter_digest": manifest.parameter_digest,
-        "point_count": manifest.point_count,
-        "contribution_reciprocal_point_count": manifest.contribution_reciprocal_point_count,
-        "total_reciprocal_point_count": manifest.total_reciprocal_point_count,
-        "scratch_root": manifest.scratch_root,
-        "producer_stage": manifest.producer_stage,
-        "consumer_stage": manifest.consumer_stage,
-        "artifact_schema_name": manifest.artifact_schema_name,
-        "schema_version": manifest.schema_version,
-        "artifacts": [
-            {
-                "stage": artifact.stage,
-                "kind": artifact.kind,
-                "key": artifact.key,
-                "path": artifact.path,
-                "schema_version": artifact.schema_version,
-            }
-            for artifact in manifest.artifacts
-        ],
-        "upstream_artifacts": [
-            {
-                "stage": artifact.stage,
-                "kind": artifact.kind,
-                "key": artifact.key,
-                "path": artifact.path,
-                "schema_version": artifact.schema_version,
-            }
-            for artifact in manifest.upstream_artifacts
-        ],
-    }
-
-
-def _residual_field_reducer_progress_manifest_to_payload(
-    manifest: ResidualFieldReducerProgressManifest,
-) -> dict[str, object]:
-    return {
-        "artifact": {
-            "stage": manifest.artifact.stage,
-            "kind": manifest.artifact.kind,
-            "key": manifest.artifact.key,
-            "path": manifest.artifact.path,
-            "schema_version": manifest.artifact.schema_version,
-        },
-        "reducer_key": manifest.reducer_key,
-        "chunk_id": manifest.chunk_id,
-        "parameter_digest": manifest.parameter_digest,
-        "completion_status": manifest.completion_status.value,
-        "durable_truth_unit": manifest.durable_truth_unit,
-        "incorporated_shard_keys": list(manifest.incorporated_shard_keys),
-        "incorporated_interval_ids": list(manifest.incorporated_interval_ids),
-        "pending_shard_keys": list(manifest.pending_shard_keys),
-        "pending_interval_ids": list(manifest.pending_interval_ids),
-        "reclaimable_shard_keys": list(manifest.reclaimable_shard_keys),
-        "cleanup_policy": manifest.cleanup_policy,
-        "final_artifacts": [
-            {
-                "stage": artifact.stage,
-                "kind": artifact.kind,
-                "key": artifact.key,
-                "path": artifact.path,
-                "schema_version": artifact.schema_version,
-            }
-            for artifact in manifest.final_artifacts
-        ],
-        "schema_version": manifest.schema_version,
-    }
-
-
-def _artifact_ref_from_payload(payload: dict[str, object]) -> ArtifactRef:
-    return ArtifactRef(
-        stage=str(payload["stage"]),
-        kind=str(payload["kind"]),
-        key=str(payload["key"]),
-        path=str(payload["path"]) if payload.get("path") is not None else None,
-        schema_version=int(payload.get("schema_version", RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION)),
-    )
-
-
-def _write_json_atomic(target_path: Path, payload: dict[str, object]) -> None:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=target_path.parent,
-        prefix=f"{target_path.stem}_",
-        suffix=".tmp",
-        delete=False,
-        mode="w",
-        encoding="utf-8",
-    ) as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    Path(handle.name).replace(target_path)
-    _fsync_parent(target_path)
 
 
 def _write_hdf5_payload_atomic(
@@ -660,200 +384,6 @@ def _write_hdf5_payload_atomic(
     finally:
         temp_path.unlink(missing_ok=True)
 
-
-def _load_array_payload(path: str | Path) -> dict[str, np.ndarray]:
-    payload_path = Path(path)
-    if payload_path.suffix in {".h5", ".hdf5"}:
-        with h5py.File(payload_path, "r") as h5file:
-            return {name: np.asarray(h5file[name]) for name in h5file.keys()}
-    with np.load(payload_path, allow_pickle=False) as data:
-        return {name: np.asarray(data[name]) for name in data.files}
-
-
-def load_residual_field_shard_manifest(manifest_path: str | Path) -> ResidualFieldShardManifest:
-    payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    retry_payload = payload["retry"]
-    manifest = ResidualFieldShardManifest(
-        artifact_key=str(payload["artifact_key"]),
-        artifacts=tuple(_artifact_ref_from_payload(item) for item in payload["artifacts"]),
-        completion_status=CompletionStatus(str(payload["completion_status"])),
-        retry=RetryIdempotencySemantics(
-            failure_unit=str(retry_payload["failure_unit"]),
-            retry_unit=str(retry_payload["retry_unit"]),
-            idempotency_key=str(retry_payload["idempotency_key"]),
-            replay_disposition=RetryDisposition(str(retry_payload["replay_disposition"])),
-            crash_recovery_rule=str(retry_payload["crash_recovery_rule"]),
-        ),
-        interval_id=int(payload["interval_id"]),
-        contributing_interval_ids=tuple(
-            int(interval_id)
-            for interval_id in payload.get(
-                "contributing_interval_ids",
-                [payload["interval_id"]],
-            )
-        ),
-        chunk_id=int(payload["chunk_id"]),
-        parameter_digest=str(payload["parameter_digest"]),
-        point_count=int(payload["point_count"]),
-        contribution_reciprocal_point_count=int(payload["contribution_reciprocal_point_count"]),
-        total_reciprocal_point_count=int(payload["total_reciprocal_point_count"]),
-        scratch_root=(
-            str(payload["scratch_root"])
-            if payload.get("scratch_root") is not None
-            else None
-        ),
-        producer_stage=str(payload.get("producer_stage", "residual_field")),
-        consumer_stage=payload.get("consumer_stage"),
-        upstream_artifacts=tuple(
-            _artifact_ref_from_payload(item) for item in payload.get("upstream_artifacts", [])
-        ),
-        artifact_schema_name=str(payload.get("artifact_schema_name", RESIDUAL_FIELD_SHARD_ARTIFACT_SCHEMA.name)),
-        schema_version=int(payload.get("schema_version", RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION)),
-    )
-    validate_residual_field_shard_manifest(manifest)
-    return manifest
-
-
-def _write_residual_field_shard_manifest_json(
-    manifest: ResidualFieldShardManifest,
-    *,
-    extra_payload: dict[str, object] | None = None,
-) -> None:
-    manifest_ref = next(
-        artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"
-    )
-    if manifest_ref.path is None:
-        raise ValueError("Residual-field shard manifest path is required.")
-    payload = _residual_field_shard_manifest_to_payload(manifest)
-    if extra_payload:
-        payload.update(extra_payload)
-    _write_json_atomic(
-        Path(manifest_ref.path),
-        payload,
-    )
-
-
-def load_residual_field_generation_metadata(
-    manifest: ResidualFieldShardManifest,
-) -> dict[str, object]:
-    manifest_ref = next(
-        artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"
-    )
-    if manifest_ref.path is None or not Path(manifest_ref.path).exists():
-        return {}
-    payload = json.loads(Path(manifest_ref.path).read_text(encoding="utf-8"))
-    generation_ref = parse_residual_field_generation_ref(manifest)
-    partition_id = None
-    generation_seq = None
-    if generation_ref is not None:
-        partition_id, generation_seq = generation_ref
-    return {
-        "partition_id": (
-            int(payload["partition_id"])
-            if payload.get("partition_id") is not None
-            else partition_id
-        ),
-        "generation_seq": (
-            int(payload["generation_seq"])
-            if payload.get("generation_seq") is not None
-            else generation_seq
-        ),
-        "checkpoint_bytes_written": int(payload.get("checkpoint_bytes_written", 0)),
-        "checkpoint_wall_seconds": float(payload.get("checkpoint_wall_seconds", 0.0)),
-        "compression": str(payload.get("compression", "")),
-    }
-
-
-def load_residual_field_reducer_progress_manifest(
-    manifest_path: str | Path,
-) -> ResidualFieldReducerProgressManifest:
-    payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    manifest = ResidualFieldReducerProgressManifest(
-        artifact=_artifact_ref_from_payload(payload["artifact"]),
-        reducer_key=str(
-            payload.get(
-                "reducer_key",
-                make_residual_field_reducer_key(
-                    chunk_id=int(payload["chunk_id"]),
-                    parameter_digest=str(payload["parameter_digest"]),
-                ),
-            )
-        ),
-        chunk_id=int(payload["chunk_id"]),
-        parameter_digest=str(payload["parameter_digest"]),
-        completion_status=CompletionStatus(str(payload["completion_status"])),
-        durable_truth_unit=str(
-            payload.get("durable_truth_unit", "committed_shard_checkpoint")
-        ),
-        incorporated_shard_keys=tuple(str(key) for key in payload["incorporated_shard_keys"]),
-        incorporated_interval_ids=tuple(int(interval_id) for interval_id in payload["incorporated_interval_ids"]),
-        pending_shard_keys=tuple(str(key) for key in payload.get("pending_shard_keys", [])),
-        pending_interval_ids=tuple(int(interval_id) for interval_id in payload.get("pending_interval_ids", [])),
-        reclaimable_shard_keys=tuple(str(key) for key in payload.get("reclaimable_shard_keys", [])),
-        cleanup_policy=str(payload.get("cleanup_policy", "off")),
-        final_artifacts=tuple(
-            _artifact_ref_from_payload(item) for item in payload.get("final_artifacts", [])
-        ),
-        schema_version=int(payload.get("schema_version", RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION)),
-    )
-    validate_residual_field_reducer_progress_manifest(manifest)
-    return manifest
-
-
-def write_residual_field_reducer_progress_manifest(
-    manifest: ResidualFieldReducerProgressManifest,
-) -> ResidualFieldReducerProgressManifest:
-    validate_residual_field_reducer_progress_manifest(manifest)
-    if manifest.artifact.path is None:
-        raise ValueError("Reducer progress manifest path is required.")
-    _write_json_atomic(
-        Path(manifest.artifact.path),
-        _residual_field_reducer_progress_manifest_to_payload(manifest),
-    )
-    return manifest
-
-
-def _build_residual_field_reducer_progress_manifest(
-    *,
-    output_dir: str,
-    chunk_id: int,
-    parameter_digest: str,
-    completion_status: CompletionStatus,
-    durable_truth_unit: str = "committed_shard_checkpoint",
-    incorporated_shard_keys: tuple[str, ...],
-    incorporated_interval_ids: tuple[int, ...],
-    reclaimable_shard_keys: tuple[str, ...],
-    final_artifacts: tuple[ArtifactRef, ...],
-    pending_shard_keys: tuple[str, ...] = (),
-    pending_interval_ids: tuple[int, ...] = (),
-    cleanup_policy: str = "off",
-) -> ResidualFieldReducerProgressManifest:
-    return ResidualFieldReducerProgressManifest(
-        artifact=build_residual_field_reducer_progress_artifact(
-            output_dir,
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-        ),
-        reducer_key=make_residual_field_reducer_key(
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-        ),
-        chunk_id=chunk_id,
-        parameter_digest=parameter_digest,
-        completion_status=completion_status,
-        durable_truth_unit=str(durable_truth_unit),
-        incorporated_shard_keys=tuple(sorted(set(str(key) for key in incorporated_shard_keys))),
-        incorporated_interval_ids=tuple(
-            sorted(set(int(interval_id) for interval_id in incorporated_interval_ids))
-        ),
-        reclaimable_shard_keys=tuple(sorted(set(str(key) for key in reclaimable_shard_keys))),
-        final_artifacts=final_artifacts,
-        pending_shard_keys=tuple(sorted(set(str(key) for key in pending_shard_keys))),
-        pending_interval_ids=tuple(
-            sorted(set(int(interval_id) for interval_id in pending_interval_ids))
-        ),
-        cleanup_policy=_normalize_residual_shard_cleanup_policy(cleanup_policy),
-    )
 
 
 def assess_residual_field_manifest(
@@ -1309,129 +839,6 @@ def load_residual_field_generation_payload(
     }
 
 
-def discover_residual_field_shard_manifests(
-    *,
-    output_dir: str,
-    chunk_id: int,
-    parameter_digest: str,
-    shard_storage_root: str | None = None,
-    include_stale_generations: bool = False,
-) -> list[ResidualFieldShardManifest]:
-    shard_dir = Path(shard_storage_root or output_dir) / "residual_checkpoints" / f"chunk_{chunk_id}"
-    if not shard_dir.exists():
-        return []
-    manifests: list[ResidualFieldShardManifest] = []
-    for path in sorted(shard_dir.glob(f"batch_*_params_{parameter_digest}.manifest.json")):
-        manifests.append(load_residual_field_shard_manifest(path))
-    generation_manifests: list[ResidualFieldShardManifest] = []
-    for path in sorted(shard_dir.glob(f"generation_*_params_{parameter_digest}.manifest.json")):
-        generation_manifests.append(load_residual_field_shard_manifest(path))
-    if include_stale_generations:
-        manifests.extend(generation_manifests)
-        return manifests
-    latest_generations: dict[int | None, tuple[int, ResidualFieldShardManifest]] = {}
-    for manifest in generation_manifests:
-        generation_ref = parse_residual_field_generation_ref(manifest)
-        if generation_ref is None:
-            manifests.append(manifest)
-            continue
-        partition_id, generation_seq = generation_ref
-        existing = latest_generations.get(partition_id)
-        if existing is None or generation_seq > existing[0]:
-            latest_generations[partition_id] = (generation_seq, manifest)
-    manifests.extend(
-        manifest
-        for _, manifest in sorted(
-            latest_generations.values(),
-            key=lambda item: (
-                -1 if parse_residual_field_generation_ref(item[1])[0] is None else int(parse_residual_field_generation_ref(item[1])[0]),
-                item[0],
-            ),
-        )
-    )
-    return manifests
-
-
-def discover_stale_residual_field_generation_manifests(
-    *,
-    output_dir: str,
-    chunk_id: int,
-    parameter_digest: str,
-    shard_storage_root: str | None = None,
-) -> list[ResidualFieldShardManifest]:
-    all_manifests = discover_residual_field_shard_manifests(
-        output_dir=output_dir,
-        chunk_id=chunk_id,
-        parameter_digest=parameter_digest,
-        shard_storage_root=shard_storage_root,
-        include_stale_generations=True,
-    )
-    latest_generation_keys = {
-        manifest.artifact_key
-        for manifest in discover_residual_field_shard_manifests(
-            output_dir=output_dir,
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            shard_storage_root=shard_storage_root,
-            include_stale_generations=False,
-        )
-        if parse_residual_field_generation_ref(manifest) is not None
-    }
-    return [
-        manifest
-        for manifest in all_manifests
-        if parse_residual_field_generation_ref(manifest) is not None
-        and manifest.artifact_key not in latest_generation_keys
-    ]
-
-
-def _merge_residual_field_shard_manifests(
-    *manifest_groups: list[ResidualFieldShardManifest] | tuple[ResidualFieldShardManifest, ...] | None,
-) -> list[ResidualFieldShardManifest]:
-    merged: dict[str, ResidualFieldShardManifest] = {}
-    for manifest_group in manifest_groups:
-        if not manifest_group:
-            continue
-        for manifest in manifest_group:
-            merged[manifest.artifact_key] = manifest
-    return [merged[key] for key in sorted(merged)]
-
-
-def _shard_manifests_by_key(
-    manifests: list[ResidualFieldShardManifest],
-) -> dict[str, ResidualFieldShardManifest]:
-    return {manifest.artifact_key: manifest for manifest in manifests}
-
-
-def _normalize_residual_shard_cleanup_policy(policy: str | bool | None) -> str:
-    if isinstance(policy, bool):
-        return "delete_reclaimable" if policy else "off"
-    normalized = str(policy or "off").strip().lower()
-    if normalized in {"off", "false", "0", "keep"}:
-        return "off"
-    if normalized in {"delete_reclaimable", "cleanup", "on", "true", "1"}:
-        return "delete_reclaimable"
-    raise ValueError(
-        "Residual-field cleanup policy must be 'off' or 'delete_reclaimable'."
-    )
-
-
-def discover_residual_field_reducer_progress_manifest(
-    *,
-    output_dir: str,
-    chunk_id: int,
-    parameter_digest: str,
-) -> ResidualFieldReducerProgressManifest | None:
-    artifact = build_residual_field_reducer_progress_artifact(
-        output_dir,
-        chunk_id=chunk_id,
-        parameter_digest=parameter_digest,
-    )
-    if artifact.path is None or not Path(artifact.path).exists():
-        return None
-    return load_residual_field_reducer_progress_manifest(artifact.path)
-
-
 def is_residual_field_shard_reclaimable(
     manifest: ResidualFieldShardManifest,
     *,
@@ -1475,35 +882,6 @@ def is_residual_field_shard_reclaimable(
             set(int(interval_id) for interval_id in progress.incorporated_interval_ids)
         )
     )
-
-
-def list_reclaimable_residual_field_shards(
-    *,
-    output_dir: str,
-    chunk_id: int,
-    parameter_digest: str,
-    shard_storage_root: str | None = None,
-) -> list[ResidualFieldShardManifest]:
-    progress = discover_residual_field_reducer_progress_manifest(
-        output_dir=output_dir,
-        chunk_id=chunk_id,
-        parameter_digest=parameter_digest,
-    )
-    if progress is None:
-        return []
-    reclaimable = set(progress.reclaimable_shard_keys)
-    if not reclaimable:
-        return []
-    return [
-        manifest
-        for manifest in discover_residual_field_shard_manifests(
-            output_dir=output_dir,
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            shard_storage_root=shard_storage_root,
-        )
-        if manifest.artifact_key in reclaimable
-    ]
 
 
 def delete_reclaimable_residual_field_shards(
