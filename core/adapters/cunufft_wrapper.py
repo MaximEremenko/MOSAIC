@@ -21,6 +21,8 @@ import time
 import warnings
 import numpy as np
 
+from core.adapters._direct_dft import direct_dft_type3
+
 
 logger = logging.getLogger(__name__)
 _LAST_NUFFT_TELEMETRY = None
@@ -1895,18 +1897,15 @@ def _direct_cpu_fallback(
     target_batch = min(int(batch), _DIRECT_CPU_FALLBACK_MAX_TARGETS)
     target_batch = max(1, target_batch)
     isign = -1 if inverse else 1
-    out = np.zeros(n_targets, dtype=np.complex128)
     sources_t = np.ascontiguousarray(sources.T)
 
-    start = 0
-    while start < n_targets:
-        end = min(start + target_batch, n_targets)
-        target_chunk = targets[start:end]
-        phase = target_chunk @ sources_t
-        out[start:end] = np.exp(1j * isign * phase) @ coeffs
-        start = end
-
-    return out
+    return direct_dft_type3(
+        targets,
+        sources_t,
+        coeffs,
+        isign=isign,
+        batch=target_batch,
+    )
 
 
 ###############################################################################
