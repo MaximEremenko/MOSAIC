@@ -26,8 +26,8 @@ import types
 import numpy as np
 import pytest
 
-from core.decoding.displacement_service import compute_and_save_displacements
-from core.decoding.processor import PointDataPostprocessingProcessor
+from core.decoding.displacement import compute_and_save_displacements
+from core.decoding.decode_chunk import PointDataPostprocessingProcessor
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ def test_compute_and_save_displacements_returns_out_table(monkeypatch, tmp_path)
             return str(tmp_path)
 
     monkeypatch.setattr(
-        "core.decoding.displacement_service.write_displacements_csv",
+        "core.decoding.displacement.write_displacements_csv",
         lambda path, ids, U: None,
     )
 

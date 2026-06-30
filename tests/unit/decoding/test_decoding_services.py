@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from core.decoding.contracts import DecoderSourceProvenance, DisplacementDecoderSourcePolicy
-from core.decoding.displacement_service import prepare_displacement_decoder_inputs
+from core.decoding.displacement import prepare_displacement_decoder_inputs
 from core.decoding.decoder_cache import (
     build_decoder_cache_path,
     build_decoder_provenance_path,
@@ -13,7 +13,7 @@ from core.decoding.decoder_cache import (
     save_decoder_provenance,
     save_decoder_cache,
 )
-from core.decoding.decoder_service import (
+from core.decoding.decoder_training import (
     DisplacementDecoderKey,
     DisplacementPatchSpec,
     DisplacementDecoderSourceService,
@@ -715,7 +715,7 @@ def test_decoder_source_service_current_mode_fresh_start_rejects_missing_stage_i
         decoder_source_provenance=None,
     )
     monkeypatch.setattr(
-        "core.decoding.decoder_service.build_decoder_training_payload",
+        "core.decoding.decoder_training.build_decoder_training_payload",
         lambda *args, **kwargs: {
             "features_train": [np.ones(5, dtype=np.float64)],
             "u_train": [np.array([0.25], dtype=np.float64)],
@@ -909,7 +909,7 @@ def test_decoder_source_service_compute_mode_rebuilds_stale_decoder_cache(
         vectors=np.array([[1.0]], dtype=np.float64),
     )
     monkeypatch.setattr(
-        "core.decoding.decoder_service.build_decoder_training_payload",
+        "core.decoding.decoder_training.build_decoder_training_payload",
         lambda *args, **kwargs: {
             "features_train": [np.ones(5, dtype=np.float64)],
             "u_train": [np.array([0.25], dtype=np.float64)],
@@ -1037,7 +1037,7 @@ def test_decoder_source_service_compute_mode_fresh_start_rebuilds_valid_decoder_
         vectors=np.array([[1.0]], dtype=np.float64),
     )
     monkeypatch.setattr(
-        "core.decoding.decoder_service.build_decoder_training_payload",
+        "core.decoding.decoder_training.build_decoder_training_payload",
         lambda *args, **kwargs: {
             "features_train": [np.ones(5, dtype=np.float64)],
             "u_train": [np.array([0.25], dtype=np.float64)],

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 from core.decoding.context import build_decoding_context
 from core.decoding.payloads import build_decoding_payload
-from core.decoding.processor import PointDataPostprocessingProcessor
+from core.decoding.decode_chunk import PointDataPostprocessingProcessor
 from core.models import StructureData, WorkflowParameters
 
 if TYPE_CHECKING:

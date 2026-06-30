@@ -229,8 +229,8 @@ def _has_any_decoder(processor) -> bool:
 
 # ---------------------------------------------------------------------------
 # Decoder application helpers
-# These live here (a leaf module) so that both decoder_service and
-# displacement_service can import them without creating a circular dependency.
+# These live here (a leaf module) so that both decoder_training and
+# displacement can import them without creating a circular dependency.
 # ---------------------------------------------------------------------------
 
 def _stack_features_into_columns(features: list) -> np.ndarray:

@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from core.decoding.decoder_service import _stack_features_into_columns
+from core.decoding.decoder_training import _stack_features_into_columns
 
 
 @pytest.mark.parametrize("dtype", [np.float64, np.float32, np.complex128])

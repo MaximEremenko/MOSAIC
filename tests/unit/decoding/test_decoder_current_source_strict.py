@@ -11,7 +11,7 @@ from core.decoding.decoder_cache import (
     resolve_current_residual_source_identity,
     save_decoder_cache,
 )
-from core.decoding.decoder_service import DisplacementDecoderSourceService
+from core.decoding.decoder_training import DisplacementDecoderSourceService
 from core.residual_field.commit import (
     create_residual_commit_candidate,
     promote_residual_chunk_commit,

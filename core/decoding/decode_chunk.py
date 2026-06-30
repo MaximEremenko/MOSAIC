@@ -6,10 +6,10 @@ import os
 from numba import config as numba_config, set_num_threads
 
 from core.decoding.decoder_cache import build_decoder_cache_path
-from core.decoding.displacement_service import (
+from core.decoding.displacement import (
     compute_and_save_displacements,
 )
-from core.decoding.site_intensity_service import (
+from core.decoding.site_intensity import (
     compute_and_save_site_intensities,
 )
 from core.decoding.state import build_postprocessing_processor_state

@@ -4,7 +4,7 @@ from core.scattering.stage import ScatteringStage
 from core.scattering.coefficients import CoefficientCenteringService
 from core.scattering.form_factors.registry import ScatteringWeightRegistry
 from core.patch_centers.service import PointSelectionService
-from core.decoding.decoder_service import DisplacementDecoderSourceService
+from core.decoding.decoder_training import DisplacementDecoderSourceService
 from core.decoding.stage import DecodingStage, build_default_decoding_processor
 from core.qspace.service import ReciprocalSpacePreparationService
 from core.residual_field.stage import ResidualFieldStage

@@ -47,7 +47,7 @@ from core.decoding.displacement_inputs import (
     validate_global_displacement_patch_specs,
 )
 from core.decoding.loader import resolve_output_dir
-from core.decoding.processor import PointDataPostprocessingProcessor
+from core.decoding.decode_chunk import PointDataPostprocessingProcessor
 from core.decoding.state import build_postprocessing_processor_state
 from core.models import WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
