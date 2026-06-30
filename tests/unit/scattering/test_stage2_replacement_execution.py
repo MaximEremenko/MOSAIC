@@ -1,3 +1,20 @@
+"""Stage-2 replacement execution coverage, including P11 FIX #1 reconciliation.
+
+FIX #1 removed the bitwise ``Conflicting stage-2 replacement attempts ...`` gate that
+``_commit_stage2_replacement_attempts`` previously raised whenever two attempts for one
+partition differed in ``payload_sha256``. Reconciliation is now delegated to
+``create_residual_commit_candidate`` (the predicted numerical-agreement tolerance gate).
+
+FIX #1 is covered here DIRECTLY at the stage-2 entry point
+``run_stage2_replacement_execution`` (which drives ``_commit_stage2_replacement_attempts``):
+``test_stage2_replacement_accepts_agreeing_byte_different_attempts`` proves agreeing
+byte-different attempts reconcile and commit, and
+``test_stage2_replacement_fails_closed_on_divergent_attempts`` proves a genuine divergence
+still fails closed. The delegated boundary itself (``create_residual_commit_candidate`` with
+agreeing-vs-divergent attempts) is additionally covered TRANSITIVELY by the canonical-path
+tests in ``tests/unit/residual_field/test_residual_commit_candidates.py``.
+"""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -132,6 +149,138 @@ def test_stage2_replacement_execution_reduces_to_residual_outputs(
         assert db.get_unsaved_interval_chunks() == []
         assert stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
         assert not (tmp_path / "residual_chunk_3_amplitudes.hdf5").exists()
+    finally:
+        db.close()
+
+
+def _make_two_attempt_residual_task(delta_a, delta_b):
+    # Build a fake stage-2 map task that writes TWO same-work attempts for the one
+    # partition, differing only in attempt_id and payload BYTES (delta_a vs delta_b).
+    # This drives the FIX #1 stage-2 reconciliation path
+    # (_commit_stage2_replacement_attempts -> create_residual_commit_candidate ->
+    # _select_attempts_by_partition -> _assert_residual_partials_agree): agreeing
+    # bytes-different attempts must be accepted; divergent ones must fail closed.
+    def fake_residual_batch_task(
+        work_unit,
+        interval_inputs,
+        atoms,
+        *,
+        total_reciprocal_points,
+        output_dir,
+        db_path,
+        scratch_root,
+        reducer_backend,
+        owner_local_reducer,
+        quiet_logs,
+        **kwargs,
+    ):
+        del interval_inputs, atoms, db_path, scratch_root
+        del reducer_backend, owner_local_reducer, quiet_logs, kwargs
+        common = dict(
+            output_dir=output_dir,
+            run_digest=str(work_unit.run_digest),
+            chunk_id=int(work_unit.chunk_id),
+            partition_id=int(work_unit.partition_id),
+            point_start=int(work_unit.point_start),
+            point_stop=int(work_unit.point_stop),
+            interval_ids=tuple(int(item) for item in work_unit.interval_ids),
+            parameter_digest=str(work_unit.parameter_digest),
+            partition_plan_digest=str(work_unit.partition_plan_digest),
+            source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
+            source_replacement_digest=work_unit.source_replacement_digest,
+            backend_policy_digest=str(work_unit.backend_policy_digest),
+            expected_output_digest=str(work_unit.expected_output_digest),
+            grid_shape_nd=np.array([[1]], dtype=np.int64),
+            contribution_reciprocal_points=5,
+            amplitudes_average=np.array([7 + 0j]),
+            point_ids=np.array([10]),
+        )
+        write_residual_attempt(
+            attempt_id="try1",
+            amplitudes_delta=np.array([delta_a]),
+            **common,
+        )
+        return write_residual_attempt(
+            attempt_id="try2",
+            amplitudes_delta=np.array([delta_b]),
+            **common,
+        )
+
+    return fake_residual_batch_task
+
+
+def test_stage2_replacement_accepts_agreeing_byte_different_attempts(
+    tmp_path,
+    monkeypatch,
+):
+    # FIX #1 (stage-2 path, DIRECT coverage): two same-work attempts for one partition
+    # that differ in BYTES but AGREE within the predicted tolerance (a non-deterministic
+    # relaunch / CPU-vs-GPU) must NOT raise the removed bitwise "Conflicting stage-2
+    # replacement attempts" gate -- they must reconcile and produce a residual commit.
+    db, interval_ids = _db_with_replacement_work(tmp_path)
+    try:
+        point_rows = db.get_point_data_for_chunk(3)
+        monkeypatch.setattr(
+            "core.residual_field.tasks.run_residual_field_interval_chunk_task",
+            _make_two_attempt_residual_task(5 + 0j, 5 + 1e-12j),
+        )
+
+        expected = run_stage2_replacement_execution(
+            unsaved_interval_chunks=db.get_unsaved_interval_chunks(),
+            total_reciprocal_points=11,
+            point_data_list=point_rows,
+            db_manager=db,
+            client=None,
+            output_dir=str(tmp_path),
+            parameter_digest="abc123",
+            work_identity=_work_identity(),
+            max_intervals_per_shard=2,
+            max_inflight=4,
+        )
+
+        assert expected == {3: interval_ids}
+        assert db.get_unsaved_interval_chunks() == []
+        assert stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
+    finally:
+        db.close()
+
+
+def test_stage2_replacement_fails_closed_on_divergent_attempts(
+    tmp_path,
+    monkeypatch,
+):
+    # FIX #1 (stage-2 path, DIRECT coverage): a GENUINE numerical divergence between two
+    # same-work attempts for one partition must STILL fail closed. The removed bitwise
+    # gate was replaced by the predicted-tolerance agreement gate, not by silent
+    # acceptance.
+    db, _interval_ids = _db_with_replacement_work(tmp_path)
+    try:
+        point_rows = db.get_point_data_for_chunk(3)
+        monkeypatch.setattr(
+            "core.residual_field.tasks.run_residual_field_interval_chunk_task",
+            _make_two_attempt_residual_task(5 + 0j, 9 + 0j),
+        )
+
+        try:
+            run_stage2_replacement_execution(
+                unsaved_interval_chunks=db.get_unsaved_interval_chunks(),
+                total_reciprocal_points=11,
+                point_data_list=point_rows,
+                db_manager=db,
+                client=None,
+                output_dir=str(tmp_path),
+                parameter_digest="abc123",
+                work_identity=_work_identity(),
+                max_intervals_per_shard=2,
+                max_inflight=4,
+            )
+        except RuntimeError as exc:
+            assert "Divergent residual results" in str(exc)
+        else:
+            raise AssertionError(
+                "Divergent stage-2 replacement attempts should fail closed"
+            )
+        assert not stage_commit_path(tmp_path, "stage2run", "residual_field").exists()
     finally:
         db.close()
 
