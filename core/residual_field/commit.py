@@ -37,6 +37,7 @@ from core.storage.fingerprint import file_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.manifest import read_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
+from core.storage.work_identity import assert_device_independent
 
 
 RESIDUAL_FIELD_ATTEMPT_SCHEMA = "mosaic.residual_field.attempt"
@@ -76,24 +77,32 @@ def build_residual_work_unit_digest(
     METADATA. ``run_digest`` is already device-independent (it propagates the
     scattering run identity). Domain bumped to ``v2`` (no released data to migrate).
     """
+    identity_payload = {
+        "schema_version": RESIDUAL_FIELD_COMMIT_SCHEMA_VERSION,
+        "stage": RESIDUAL_FIELD_STAGE,
+        "run_digest": str(run_digest),
+        "chunk_id": int(chunk_id),
+        "partition_id": int(partition_id),
+        "point_start": int(point_start),
+        "point_stop": int(point_stop),
+        "interval_ids": [int(item) for item in sorted(interval_ids)],
+        "parameter_digest": str(parameter_digest),
+        "partition_plan_digest": str(partition_plan_digest),
+        "source_scattering_commit_digest": str(source_scattering_commit_digest),
+        "source_replacement_digest": (
+            None if source_replacement_digest is None else str(source_replacement_digest)
+        ),
+        "expected_output_digest": str(expected_output_digest),
+    }
+    # P11 tripwire: pin the device-INDEPENDENCE invariant immediately before
+    # hashing. This payload already excludes backend_policy_digest, so this is a
+    # no-op today -- it fails loudly only if a future edit folds a device/runtime
+    # field into the residual work-unit identity.
+    assert_device_independent(
+        identity_payload, context="residual work-unit digest"
+    )
     return digest_dict(
-        {
-            "schema_version": RESIDUAL_FIELD_COMMIT_SCHEMA_VERSION,
-            "stage": RESIDUAL_FIELD_STAGE,
-            "run_digest": str(run_digest),
-            "chunk_id": int(chunk_id),
-            "partition_id": int(partition_id),
-            "point_start": int(point_start),
-            "point_stop": int(point_stop),
-            "interval_ids": [int(item) for item in sorted(interval_ids)],
-            "parameter_digest": str(parameter_digest),
-            "partition_plan_digest": str(partition_plan_digest),
-            "source_scattering_commit_digest": str(source_scattering_commit_digest),
-            "source_replacement_digest": (
-                None if source_replacement_digest is None else str(source_replacement_digest)
-            ),
-            "expected_output_digest": str(expected_output_digest),
-        },
+        identity_payload,
         domain="mosaic.residual_field.work_unit.v2",
     )
 

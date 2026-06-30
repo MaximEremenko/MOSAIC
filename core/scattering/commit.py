@@ -42,6 +42,7 @@ from core.storage.fingerprint import file_sha256
 from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.manifest import read_manifest, write_manifest
 from core.storage.performance import write_performance_metrics
+from core.storage.work_identity import assert_device_independent
 
 
 SCATTERING_ATTEMPT_SCHEMA = "mosaic.scattering.attempt"
@@ -75,16 +76,24 @@ def build_scattering_work_unit_digest(
     the run tree this address lives under. Domain bumped to ``v2`` to mark the model
     change (no released data to migrate).
     """
+    identity_payload = {
+        "schema_version": SCATTERING_COMMIT_SCHEMA_VERSION,
+        "stage": SCATTERING_STAGE,
+        "interval_id": int(interval_id),
+        "chunk_id": int(chunk_id),
+        "scientific_digest": str(scientific_digest),
+        "qspace_plan_digest": str(qspace_plan_digest),
+        "source_structure_digest": str(source_structure_digest),
+    }
+    # P11 tripwire: pin the device-INDEPENDENCE invariant immediately before
+    # hashing. This payload already excludes execution_digest /
+    # backend_policy_digest, so this is a no-op today -- it fails loudly only if a
+    # future edit folds a device/runtime field into the work-unit identity.
+    assert_device_independent(
+        identity_payload, context="scattering work-unit digest"
+    )
     return digest_dict(
-        {
-            "schema_version": SCATTERING_COMMIT_SCHEMA_VERSION,
-            "stage": SCATTERING_STAGE,
-            "interval_id": int(interval_id),
-            "chunk_id": int(chunk_id),
-            "scientific_digest": str(scientific_digest),
-            "qspace_plan_digest": str(qspace_plan_digest),
-            "source_structure_digest": str(source_structure_digest),
-        },
+        identity_payload,
         domain="mosaic.scattering.work_unit.v2",
     )
 
