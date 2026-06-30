@@ -119,11 +119,25 @@ class ResidualFieldReducerRuntimeState:
 # Protocol
 # ---------------------------------------------------------------------------
 
-class ResidualFieldReducerBackend(Protocol):
+# The reducer interface is segregated into capability facets (A2). Each facet is a
+# small structural Protocol; ``ResidualFieldReducerBackend`` is their composition, so
+# the runtime contract is UNCHANGED (the union of methods is identical) while callers
+# and type-checkers can depend on the narrow capability they actually use. The
+# concrete ``ManifestDrivenResidualFieldReducerBackend`` still implements the whole
+# union; this split is pure typing with no runtime effect.
+
+
+class ResidualFieldReducerCapabilities(Protocol):
+    """Policy/capability queries — what backing model this reducer follows."""
+
     layout: ResidualFieldReducerBackendLayout
 
     def uses_local_chunk_accumulator(self) -> bool:
         ...
+
+
+class ResidualFieldReducerAccumulation(Protocol):
+    """Building and accepting per-interval contributions into the chunk reduce."""
 
     def build_local_partial(
         self,
@@ -138,13 +152,51 @@ class ResidualFieldReducerBackend(Protocol):
     ) -> ResidualFieldLocalAccumulatorPartial:
         ...
 
-    def describe_runtime_state(
+    def accept_partial(
         self,
+        partial: ResidualFieldLocalAccumulatorPartial,
         *,
         output_dir: str,
-        scratch_root: str | None,
-    ) -> ResidualFieldReducerRuntimeState:
+        scratch_root: str,
+        db_path: str,
+        total_expected_partials: int,
+        cleanup_policy: str = "off",
+    ) -> None:
         ...
+
+    def accept_local_contribution(
+        self,
+        work_unit: ResidualFieldWorkUnit,
+        *,
+        grid_shape_nd: np.ndarray,
+        total_reciprocal_points: int,
+        contribution_reciprocal_points: int,
+        amplitudes_delta: np.ndarray,
+        amplitudes_average: np.ndarray,
+        point_ids: np.ndarray,
+        output_dir: str,
+        scratch_root: str,
+        db_path: str,
+        total_expected_partials: int,
+        cleanup_policy: str = "off",
+    ) -> None:
+        ...
+
+    def flush_local_reducer_target(
+        self,
+        *,
+        chunk_id: int,
+        parameter_digest: str,
+        partition_id: int | None,
+        output_dir: str,
+        db_path: str,
+        cleanup_policy: str = "off",
+    ) -> bool:
+        ...
+
+
+class ResidualFieldReducerPersistence(Protocol):
+    """Durable shard/progress checkpoint persistence, discovery, reconciliation."""
 
     def persist_shard_checkpoint(
         self,
@@ -199,6 +251,22 @@ class ResidualFieldReducerBackend(Protocol):
     ) -> ResidualFieldReducerProgressManifest | None:
         ...
 
+    def cleanup_reclaimable_shards(
+        self,
+        *,
+        output_dir: str,
+        chunk_id: int,
+        parameter_digest: str,
+        db_path: str,
+        manifests: list[ResidualFieldShardManifest] | None = None,
+        scratch_root: str | None = None,
+    ) -> tuple[str, ...]:
+        ...
+
+
+class ResidualFieldReducerFinalization(Protocol):
+    """The durable chunk reduce — fold committed shards into the final artifact."""
+
     def finalize_chunk(
         self,
         *,
@@ -213,46 +281,16 @@ class ResidualFieldReducerBackend(Protocol):
     ) -> ResidualFieldArtifactManifest | None:
         ...
 
-    def cleanup_reclaimable_shards(
-        self,
-        *,
-        output_dir: str,
-        chunk_id: int,
-        parameter_digest: str,
-        db_path: str,
-        manifests: list[ResidualFieldShardManifest] | None = None,
-        scratch_root: str | None = None,
-    ) -> tuple[str, ...]:
-        ...
 
-    def accept_partial(
-        self,
-        partial: ResidualFieldLocalAccumulatorPartial,
-        *,
-        output_dir: str,
-        scratch_root: str,
-        db_path: str,
-        total_expected_partials: int,
-        cleanup_policy: str = "off",
-    ) -> None:
-        ...
+class ResidualFieldReducerIntrospection(Protocol):
+    """Read-only state description for diagnostics / reducer-target inspection."""
 
-    def accept_local_contribution(
+    def describe_runtime_state(
         self,
-        work_unit: ResidualFieldWorkUnit,
         *,
-        grid_shape_nd: np.ndarray,
-        total_reciprocal_points: int,
-        contribution_reciprocal_points: int,
-        amplitudes_delta: np.ndarray,
-        amplitudes_average: np.ndarray,
-        point_ids: np.ndarray,
         output_dir: str,
-        scratch_root: str,
-        db_path: str,
-        total_expected_partials: int,
-        cleanup_policy: str = "off",
-    ) -> None:
+        scratch_root: str | None,
+    ) -> ResidualFieldReducerRuntimeState:
         ...
 
     def inspect_local_reducer_target(
@@ -265,17 +303,20 @@ class ResidualFieldReducerBackend(Protocol):
     ) -> dict[str, object] | None:
         ...
 
-    def flush_local_reducer_target(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        partition_id: int | None,
-        output_dir: str,
-        db_path: str,
-        cleanup_policy: str = "off",
-    ) -> bool:
-        ...
+
+class ResidualFieldReducerBackend(
+    ResidualFieldReducerCapabilities,
+    ResidualFieldReducerAccumulation,
+    ResidualFieldReducerPersistence,
+    ResidualFieldReducerFinalization,
+    ResidualFieldReducerIntrospection,
+    Protocol,
+):
+    """Full reducer contract — the composition of the capability facets above.
+
+    Retained as the single name existing callers depend on; its method set is exactly
+    the union of the facets, so this is a behavior-preserving re-grouping.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -353,9 +394,14 @@ SHARED_DURABLE_LAYOUT = ResidualFieldReducerBackendLayout(
 __all__ = [
     "LOCAL_RESTARTABLE_LAYOUT",
     "ResidualFieldCheckpointPolicy",
+    "ResidualFieldReducerAccumulation",
     "ResidualFieldReducerBackend",
     "ResidualFieldReducerBackendKind",
     "ResidualFieldReducerBackendLayout",
+    "ResidualFieldReducerCapabilities",
+    "ResidualFieldReducerFinalization",
+    "ResidualFieldReducerIntrospection",
+    "ResidualFieldReducerPersistence",
     "ResidualFieldReducerRuntimeState",
     "ResidualShardCheckpointPolicy",
     "ScatteringIntervalArtifactPolicy",

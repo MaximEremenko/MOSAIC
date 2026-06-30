@@ -120,8 +120,36 @@ def _normalize_reducer_backend_kind(value: str) -> str:
     )
 
 
+def checkpoint_cadence(
+    total_expected_partials: int,
+    *,
+    uses_shared_durable_generations: bool,
+) -> int:
+    """Durable-snapshot cadence (every N accepted partials). Pure POLICY, not state.
+
+    For shared-durable generations an env override is honored; otherwise a quarter of
+    the expected partials, floored at 1. Lifted verbatim from the reducer backend so
+    the cadence policy lives beside the other stateless reducer helpers.
+    """
+    if uses_shared_durable_generations:
+        override = os.getenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE")
+        if override is not None and str(override).strip():
+            return max(int(override), 1)
+    return max(int(total_expected_partials) // 4, 1)
+
+
+def live_trim_cadence(checkpoint_cadence_value: int) -> int:
+    """Live in-RAM trim cadence (env-overridable), floored at 8. Pure POLICY."""
+    override = os.getenv("MOSAIC_LOCAL_ACCUMULATOR_TRIM_CADENCE_BATCHES")
+    if override is not None and str(override).strip():
+        return max(int(override), 1)
+    return max(int(checkpoint_cadence_value) // 2, 8)
+
+
 __all__ = [
     "_allocate_finalize_output",
+    "checkpoint_cadence",
+    "live_trim_cadence",
     "_finalize_scratch_dir",
     "_manifest_final_artifacts_present",
     "_mark_residual_intervals_saved",

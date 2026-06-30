@@ -59,6 +59,8 @@ from core.residual_field.reducer_helpers import (  # noqa: F401
     _manifest_final_artifacts_present,
     _mark_residual_intervals_saved,
     _normalize_reducer_backend_kind,
+    checkpoint_cadence as _checkpoint_cadence_policy,
+    live_trim_cadence as _live_trim_cadence_policy,
     DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES,
     is_same_node_local_client,
 )
@@ -643,17 +645,15 @@ class ManifestDrivenResidualFieldReducerBackend:
         return set(expected_interval_ids).issubset(durable_intervals)
 
     def _checkpoint_cadence(self, total_expected_partials: int) -> int:
-        if self.uses_shared_durable_generations():
-            override = os.getenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE")
-            if override is not None and str(override).strip():
-                return max(int(override), 1)
-        return max(int(total_expected_partials) // 4, 1)
+        # Cadence is pure POLICY (see reducer_helpers); the method stays as a thin
+        # delegator so call sites are unchanged.
+        return _checkpoint_cadence_policy(
+            total_expected_partials,
+            uses_shared_durable_generations=self.uses_shared_durable_generations(),
+        )
 
     def _live_trim_cadence(self, checkpoint_cadence: int) -> int:
-        override = os.getenv("MOSAIC_LOCAL_ACCUMULATOR_TRIM_CADENCE_BATCHES")
-        if override is not None and str(override).strip():
-            return max(int(override), 1)
-        return max(int(checkpoint_cadence) // 2, 8)
+        return _live_trim_cadence_policy(checkpoint_cadence)
 
     def _parse_generation_shard_key(
         self,
