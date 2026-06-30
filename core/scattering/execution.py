@@ -17,13 +17,13 @@ from core.residual_field.backend import (
 )
 from core.residual_field import commit as residual_commit
 from core.residual_field.commit import (
-    build_residual_work_unit_digest,
     create_residual_commit_candidate,
     discover_residual_attempts,
     load_residual_attempt_payload,
     write_residual_stage_commit,
     write_residual_stage_plan,
 )
+from core.residual_field.execution import _residual_work_unit_digest
 from core.residual_field.artifacts import write_stage2_replacement_expected_manifest
 from core.residual_field.contracts import ResidualFieldWorkUnit
 from core.scattering.artifacts import (
@@ -319,25 +319,6 @@ def _scattering_work_unit_digest(work_unit: ScatteringWorkUnit) -> str:
         source_structure_digest=str(work_unit.source_structure_digest),
     )
 
-
-def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
-    # P11 C-4: device-independent residual checkpoint address (backend policy is
-    # metadata, not identity). Mirrors residual_field/execution.py's builder; the
-    # stage2-replacement bridge persists residual outputs and must use the same
-    # device-independent address so CPU/GPU bridged results share one checkpoint.
-    return build_residual_work_unit_digest(
-        run_digest=str(work_unit.run_digest),
-        chunk_id=int(work_unit.chunk_id),
-        partition_id=int(work_unit.partition_id),
-        point_start=int(work_unit.point_start),
-        point_stop=int(work_unit.point_stop),
-        interval_ids=tuple(int(item) for item in work_unit.interval_ids),
-        parameter_digest=str(work_unit.parameter_digest),
-        partition_plan_digest=str(work_unit.partition_plan_digest),
-        source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
-        source_replacement_digest=work_unit.source_replacement_digest,
-        expected_output_digest=str(work_unit.expected_output_digest),
-    )
 
 
 def _current_scattering_identity(
@@ -1417,6 +1398,7 @@ def _commit_stage2_replacement_attempts(
     db_manager: DatabaseManager | None = None,
     db_path: str | None = None,
     db_dimension: int = 3,
+    eps: float = DEFAULT_NUFFT_EPS,
 ) -> dict[int, tuple[int, ...]]:
     owns_db = False
     if db_manager is None:
@@ -1505,6 +1487,7 @@ def _commit_stage2_replacement_attempts(
             chunk_id=int(chunk_id),
             expected_partitions=expected_partitions,
             expected_reciprocal_point_count=expected_reciprocal_count,
+            eps=eps,
         )
         getattr(residual_commit, "promote_residual" "_chunk_commit_by_scan")(
             output_dir=output_dir,
@@ -1689,6 +1672,7 @@ def run_stage2_replacement_execution(
             run_digest=work_identity.run_digest,
             db_manager=db_manager,
             planned_work_units=work_units,
+            eps=float(nufft_settings.eps),
         )
         logger.info("Stage-2 replacement finished (sync).")
         return expected_by_chunk
@@ -1809,6 +1793,7 @@ def run_stage2_replacement_execution(
                 for work_unit in work_units
                 if int(work_unit.chunk_id) == int(chunk_id)
             ],
+            eps=float(nufft_settings.eps),
             pure=False,
             retries=DEFAULT_TASK_RETRIES,
         )
