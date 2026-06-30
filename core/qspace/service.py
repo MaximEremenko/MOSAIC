@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 from typing import Callable
 
@@ -108,9 +107,8 @@ class ReciprocalSpacePreparationService:
             "workflow_parameters": workflow_parameters,
             "output_dir": output_dir,
             "supercell": supercell,
+            "db_cache_config": db_cache_config,
         }
-        if "db_cache_config" in inspect.signature(self.artifact_builder.create).parameters:
-            create_kwargs["db_cache_config"] = db_cache_config
         artifact_bundle = self.artifact_builder.create(**create_kwargs)
         artifact_bundle.point_data_processor.process_point_data(point_data)
         artifact_bundle.db_manager.insert_point_data_batch(

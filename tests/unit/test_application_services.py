@@ -476,7 +476,7 @@ def test_reciprocal_space_service_uses_injected_artifact_builder(tmp_path):
             calls.append(("process_intervals", None))
 
     class FakeArtifactBuilder:
-        def create(self, *, workflow_parameters, output_dir, supercell):
+        def create(self, *, workflow_parameters, output_dir, supercell, db_cache_config=None):
             calls.append(("build_artifacts", output_dir, tuple(supercell.tolist())))
             return SimpleNamespace(
                 parameters=workflow_parameters.to_payload(),

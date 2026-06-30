@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from core.decoding.context import build_decoding_context
 from core.decoding.payloads import build_decoding_payload
 from core.decoding.processor import PointDataPostprocessingProcessor
 from core.models import StructureData, WorkflowParameters
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 def build_default_decoding_processor(db_manager, point_data_processor, parameters):
@@ -23,7 +28,7 @@ class DecodingStage:
         self,
         workflow_parameters: WorkflowParameters,
         structure: StructureData,
-        artifacts,
+        artifacts: RunArtifacts,
         client,
     ) -> None:
         context = build_decoding_context(

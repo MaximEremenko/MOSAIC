@@ -25,6 +25,7 @@ from core.scattering.contracts import (
 from core.scattering.kernels import IntervalTask
 from core.contracts import ArtifactManifestAssessment, CompletionStatus
 from core.runtime import TIMER, chunk_mutex
+from core.scattering.commit import write_scattering_attempt
 from core.storage.database_manager import create_db_manager_for_thread
 from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver
@@ -567,8 +568,6 @@ def persist_scattering_interval_chunk_shard(
         work_unit.source_structure_digest,
     )
     if all(isinstance(value, str) and value for value in identity_fields):
-        from core.scattering.commit import write_scattering_attempt
-
         write_scattering_attempt(
             output_dir=output_dir,
             run_digest=str(work_unit.run_digest),

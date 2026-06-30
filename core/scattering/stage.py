@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from core.scattering.coefficients import CoefficientCenteringService
 from core.scattering.context import build_scattering_execution_context
@@ -15,11 +15,13 @@ from core.qspace.intervals.interval_reconstruction import (
     IntervalReconstructionService,
 )
 from core.models import StructureData, WorkflowParameters
+from core.scattering.calculator import compute_amplitudes_delta
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 def _compute_amplitudes(**kwargs):
-    from core.scattering.calculator import compute_amplitudes_delta
-
     return compute_amplitudes_delta(**kwargs)
 
 
@@ -46,7 +48,7 @@ class ScatteringStage:
         self,
         workflow_parameters: WorkflowParameters,
         structure: StructureData,
-        artifacts,
+        artifacts: RunArtifacts,
         client,
     ) -> dict[str, Any]:
         context = build_scattering_execution_context(

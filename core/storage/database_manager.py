@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from core.models import ReciprocalInterval
 from core.storage.sqlite_repositories import create_database_parts
 
 
@@ -167,8 +168,6 @@ class ManifestOnlyDatabaseManager:
         return [dict(row) for row in self._points if int(row.get("id", -1)) in wanted]
 
     def get_intervals_by_ids(self, interval_ids: list[int]):
-        from core.models import ReciprocalInterval
-
         result = []
         for interval_id in interval_ids:
             item = self._intervals.get(int(interval_id))

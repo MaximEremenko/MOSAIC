@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from core.scattering.stage import ScatteringStage
 from core.patch_centers.service import PointSelectionService
@@ -13,6 +14,9 @@ from core.structure.service import StructureLoadingService
 from core.models import RunSettings, WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
 from core.storage.db_cache import resolve_db_cache_config
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +49,7 @@ class WorkflowService:
         db_path: str | None = None,
         no_db_cache: bool = False,
     ) -> None:
-        artifacts = None
+        artifacts: RunArtifacts | None = None
         structure = self.structure_loading_service.load(
             workflow_parameters,
             str(run_settings.working_path),

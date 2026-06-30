@@ -35,6 +35,7 @@ from core.residual_field.contracts import (
 from core.adapters.cunufft_wrapper import (
     execute_inverse_cunufft_super_batch,
 )
+from core.residual_field.commit import write_residual_attempt
 from core.runtime import handle_worker_gpu_failure, task_progress_enabled
 
 
@@ -626,8 +627,6 @@ def run_residual_field_interval_chunk_task(
                 ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a",
             )
         if _has_residual_attempt_identity(work_unit):
-            from core.residual_field.commit import write_residual_attempt
-
             return write_residual_attempt(
                 output_dir=output_dir,
                 run_digest=str(work_unit.run_digest),

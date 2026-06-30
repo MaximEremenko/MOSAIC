@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from core.residual_field.artifacts import (
     is_residual_field_replacement_complete,
@@ -15,6 +16,9 @@ from core.residual_field.execution import run_residual_field_stage
 from core.residual_field.planning import build_residual_field_parameter_digest
 from core.models import StructureData, WorkflowParameters
 from core.runtime import resolve_worker_scratch_root, short_path
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +56,7 @@ def _replacement_expected_metadata(
 def _resolve_replacement_expected_metadata(
     *,
     scattering_parameters: dict[str, object],
-    artifacts,
+    artifacts: RunArtifacts,
     parameter_digest: str,
 ) -> tuple[dict[str, object], str]:
     if _STAGE2_REPLACEMENT_EXPECTED_KEY in scattering_parameters:
@@ -73,7 +77,7 @@ def _resolve_replacement_expected_metadata(
 
 def _write_empty_replacement_no_output_manifest(
     *,
-    artifacts,
+    artifacts: RunArtifacts,
     metadata: dict[str, object],
     expected_source: str,
 ) -> None:
@@ -92,7 +96,7 @@ def _write_empty_replacement_no_output_manifest(
     )
 
 
-def _reset_expected_interval_chunks(artifacts, expected_by_chunk: dict[int, tuple[int, ...]]) -> None:
+def _reset_expected_interval_chunks(artifacts: RunArtifacts, expected_by_chunk: dict[int, tuple[int, ...]]) -> None:
     for chunk_id, interval_ids in expected_by_chunk.items():
         for interval_id in interval_ids:
             artifacts.db_manager.update_interval_chunk_status(
@@ -107,7 +111,7 @@ class ResidualFieldStage:
         self,
         *,
         workflow_parameters: WorkflowParameters,
-        artifacts,
+        artifacts: RunArtifacts,
         client,
     ) -> list[int]:
         """Finalize any committed local-restart chunk state before scattering.
@@ -182,7 +186,7 @@ class ResidualFieldStage:
         self,
         workflow_parameters: WorkflowParameters,
         structure: StructureData,
-        artifacts,
+        artifacts: RunArtifacts,
         client,
         *,
         scattering_parameters: dict[str, object] | None = None,
