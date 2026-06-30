@@ -5,12 +5,12 @@ import os
 
 import numpy as np
 
-from core.decoding.decoder_service import (
+from core.decoding.displacement_inputs import (
     apply_decoder,
     apply_decoder_family,
     ensure_decoder,
+    prepare_displacement_decoder_inputs,
 )
-from core.decoding.displacement_inputs import prepare_displacement_decoder_inputs
 from core.decoding.io import write_displacements_csv
 
 
@@ -21,7 +21,6 @@ def compute_and_save_displacements(
     rifft_saver,
     point_data_list,
     output_dir=None,
-    broadcast_into_rows=False,
 ):
     log = logging.getLogger(__name__)
     prepared = prepare_displacement_decoder_inputs(
@@ -32,7 +31,6 @@ def compute_and_save_displacements(
         output_dir=output_dir,
     )
     output_dir = prepared["output_dir"]
-    data = prepared["data"]
     features_all = prepared["features_all"]
     cids_all = prepared["cids_all"]
     decoder_keys_all = prepared["decoder_keys_all"]
@@ -61,24 +59,5 @@ def compute_and_save_displacements(
     csv_path = os.path.join(output_dir, f"chunk_{chunk_id}_site_displacements.csv")
     rifft_saver.save_data(out_table, h5_path)
     write_displacements_csv(csv_path, ids, U)
-
-    if broadcast_into_rows:
-        cid2u = {int(i): U[k, :] for k, i in enumerate(ids)}
-        urows = np.stack([cid2u[int(c)] for c in ids_all], axis=0)
-        if amplitudes.ndim == 1:
-            aug = np.column_stack([amplitudes, urows])
-        else:
-            aug = np.concatenate([amplitudes, urows], axis=1)
-
-        d_aug = dict(data)
-        d_aug["amplitudes_with_displacement"] = aug
-        d_aug["amplitudes_with_displacement_columns"] = np.array(
-            ["<orig...>", *["ux", "uy", "uz"][: urows.shape[1]]], dtype=object
-        )
-        h5_aug = os.path.join(
-            output_dir,
-            f"chunk_{chunk_id}_residual_field_decoded.h5",
-        )
-        rifft_saver.save_data(d_aug, h5_aug)
 
     return out_table

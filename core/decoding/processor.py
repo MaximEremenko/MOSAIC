@@ -55,9 +55,6 @@ class PointDataPostprocessingProcessor:
             rifft_saver=rifft_saver,
             point_data_list=point_data_list,
             output_dir=output_dir,
-            broadcast_into_rows=self.parameters.get(
-                "broadcast_displacement_into_rows", False
-            ),
         )
 
     def _get_decoder_cache_path(self, output_dir: str) -> str:
@@ -70,7 +67,6 @@ class PointDataPostprocessingProcessor:
         rifft_saver,
         point_data_list,
         output_dir=None,
-        broadcast_into_rows=False,
     ):
         return compute_and_save_displacements(
             self,
@@ -78,7 +74,6 @@ class PointDataPostprocessingProcessor:
             rifft_saver=rifft_saver,
             point_data_list=point_data_list,
             output_dir=output_dir,
-            broadcast_into_rows=broadcast_into_rows,
         )
 
     def compute_and_save_site_intensities(

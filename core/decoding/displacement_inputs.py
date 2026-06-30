@@ -227,6 +227,132 @@ def _has_any_decoder(processor) -> bool:
     return _has_single_decoder(processor) or _has_decoder_family(processor)
 
 
+# ---------------------------------------------------------------------------
+# Decoder application helpers
+# These live here (a leaf module) so that both decoder_service and
+# displacement_service can import them without creating a circular dependency.
+# ---------------------------------------------------------------------------
+
+def _stack_features_into_columns(features: list) -> np.ndarray:
+    """Preallocate an (P, N) column stack.
+
+    Bitwise-identical to ``np.stack(features, axis=1)`` for 1-D inputs: only
+    copies bytes into a pre-sized buffer, no arithmetic or float-reordering.
+    """
+    P = int(features[0].size)
+    N = len(features)
+    out = np.empty((P, N), dtype=features[0].dtype)
+    for i, f in enumerate(features):
+        out[:, i] = f
+    return out
+
+
+def apply_decoder(processor, features_all):
+    """Apply the single linear decoder matrix to a list of feature vectors."""
+    assignment = _decoder_assignment_mode(processor)
+    if assignment == "family" and not _has_single_decoder(processor):
+        raise RuntimeError(
+            "Decoder-family application requires decoder keys. "
+            "Call apply_decoder(...) with decoder_keys_all in family mode."
+        )
+    R_all = _stack_features_into_columns(features_all)
+    return (processor._decoder_M @ R_all).T
+
+
+def apply_decoder_family(processor, features_all, decoder_keys_all):
+    """Apply a per-key decoder family to a list of feature vectors."""
+    family = _decoder_family(processor)
+    if not family:
+        if _has_single_decoder(processor):
+            return apply_decoder(processor, features_all)
+        raise RuntimeError("No decoder family is prepared.")
+    output_dim = next(iter(family.values())).shape[0]
+    U_all = np.zeros((len(features_all), output_dim), dtype=np.float64)
+    grouped_indices: dict[DisplacementDecoderKey, list[int]] = {}
+    for index, key in enumerate(decoder_keys_all):
+        grouped_indices.setdefault(key, []).append(index)
+    for key, indices in grouped_indices.items():
+        decoder_M = family[key]
+        R_group = _stack_features_into_columns([features_all[index] for index in indices])
+        U_group = (decoder_M @ R_group).T
+        for position, index in enumerate(indices):
+            U_all[index, :] = U_group[position, :]
+    return U_all
+
+
+def ensure_decoder(
+    processor,
+    *,
+    features_all,
+    decoder_keys_all=None,
+    logger=None,
+):
+    """Validate that the processor has a usable decoder and that feature dims match."""
+    if not features_all:
+        raise RuntimeError("No site features constructed; nothing to do.")
+    assignment = _decoder_assignment_mode(processor)
+    if assignment == "family":
+        family = _decoder_family(processor)
+        feature_dims = _decoder_feature_dims(processor)
+        if not family and _has_single_decoder(processor):
+            unique_keys = []
+            seen = set()
+            for key in decoder_keys_all or ():
+                if key not in seen:
+                    seen.add(key)
+                    unique_keys.append(key)
+            if len(unique_keys) <= 1:
+                if any(feature.size != processor._feature_dim for feature in features_all):
+                    raise RuntimeError(
+                        "Feature dimension mismatch: decoder expects "
+                        f"{processor._feature_dim}, but some features differ."
+                    )
+                return
+        if not family or not feature_dims:
+            raise RuntimeError(
+                "No prepared M-decoder family is available for displacement decoding. "
+                "Family assignment mode requires one decoder per (site class, patch spec) key."
+            )
+        if decoder_keys_all is None:
+            raise RuntimeError("Decoder keys are required for decoder-family validation.")
+        missing = [
+            key.to_mapping()
+            for key in decoder_keys_all
+            if key not in family or key not in feature_dims
+        ]
+        if missing:
+            raise RuntimeError(
+                "No prepared decoder family member is available for some displacement "
+                f"decoder keys: {missing}"
+            )
+        for feature, key in zip(features_all, decoder_keys_all):
+            expected_dim = int(feature_dims[key])
+            if feature.size != expected_dim:
+                raise RuntimeError(
+                    "Feature dimension mismatch for decoder family key "
+                    f"{key.to_mapping()}: decoder expects {expected_dim}, "
+                    f"but got {feature.size}."
+                )
+        return
+
+    if processor._decoder_M is None or processor._feature_dim is None:
+        raise RuntimeError(
+            "No prepared M-decoder is available for displacement decoding. "
+            "Set processing.decoder.source to 'cache' with a valid cache_path, "
+            "or use processing.decoder.source='compute' with a separate "
+            "compute_output_directory, or use processing.decoder.source='current' "
+            "to train from current residual artifacts."
+        )
+
+    if processor._feature_dim is None:
+        processor._feature_dim = processor._decoder_M.shape[1]
+    if any(f.size != processor._feature_dim for f in features_all):
+        raise RuntimeError(
+            "Feature dimension mismatch: decoder expects "
+            f"{processor._feature_dim}, but some features differ."
+        )
+
+
 def build_feature_sets(
     processor,
     *,

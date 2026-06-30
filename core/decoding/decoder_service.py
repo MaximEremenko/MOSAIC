@@ -35,15 +35,21 @@ from core.decoding.displacement_inputs import (
     _normalize_patch_axis,
     _reference_number_for_point,
     _site_class_key_for_point,
+    _stack_features_into_columns,
+    apply_decoder,
+    apply_decoder_family,
     build_displacement_decoder_key,
     build_displacement_patch_spec,
     build_feature_sets,
     collect_displacement_decoder_keys,
+    ensure_decoder,
     prepare_displacement_decoder_inputs,
     validate_global_displacement_patch_specs,
 )
 from core.decoding.loader import resolve_output_dir
+from core.decoding.processor import PointDataPostprocessingProcessor
 from core.decoding.state import build_postprocessing_processor_state
+from core.models import WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
 from core.storage.digests import digest_dict
 from core.storage.fingerprint import file_sha256
@@ -307,18 +313,6 @@ def train_decoder_from_samples(
     save_decoder_cache(cache_path, processor._decoder_M, processor._feature_dim, logger)
 
 
-def _stack_features_into_columns(features: list[np.ndarray]) -> np.ndarray:
-    """Preallocate an (P, N) column stack. Bitwise-identical to
-    ``np.stack(features, axis=1)`` for 1-D inputs: only copies bytes into a
-    pre-sized buffer, no arithmetic or float-reordering."""
-    P = int(features[0].size)
-    N = len(features)
-    out = np.empty((P, N), dtype=features[0].dtype)
-    for i, f in enumerate(features):
-        out[:, i] = f
-    return out
-
-
 def _stack_decoder_training_samples(
     training_features: list[np.ndarray],
     training_targets: list[np.ndarray],
@@ -433,109 +427,6 @@ def train_decoder_family_from_samples(
         feature_dims[key] = P
     _set_decoder_family(processor, decoder_family, feature_dims)
     logger.info("Decoder family trained with %d keys.", len(decoder_family))
-
-
-def ensure_decoder(
-    processor,
-    *,
-    features_all,
-    decoder_keys_all=None,
-    logger=None,
-):
-    if not features_all:
-        raise RuntimeError("No site features constructed; nothing to do.")
-    assignment = _decoder_assignment_mode(processor)
-    if assignment == "family":
-        family = _decoder_family(processor)
-        feature_dims = _decoder_feature_dims(processor)
-        if not family and _has_single_decoder(processor):
-            unique_keys = []
-            seen = set()
-            for key in decoder_keys_all or ():
-                if key not in seen:
-                    seen.add(key)
-                    unique_keys.append(key)
-            if len(unique_keys) <= 1:
-                if any(feature.size != processor._feature_dim for feature in features_all):
-                    raise RuntimeError(
-                        "Feature dimension mismatch: decoder expects "
-                        f"{processor._feature_dim}, but some features differ."
-                    )
-                return
-        if not family or not feature_dims:
-            raise RuntimeError(
-                "No prepared M-decoder family is available for displacement decoding. "
-                "Family assignment mode requires one decoder per (site class, patch spec) key."
-            )
-        if decoder_keys_all is None:
-            raise RuntimeError("Decoder keys are required for decoder-family validation.")
-        missing = [
-            key.to_mapping()
-            for key in decoder_keys_all
-            if key not in family or key not in feature_dims
-        ]
-        if missing:
-            raise RuntimeError(
-                "No prepared decoder family member is available for some displacement "
-                f"decoder keys: {missing}"
-            )
-        for feature, key in zip(features_all, decoder_keys_all):
-            expected_dim = int(feature_dims[key])
-            if feature.size != expected_dim:
-                raise RuntimeError(
-                    "Feature dimension mismatch for decoder family key "
-                    f"{key.to_mapping()}: decoder expects {expected_dim}, "
-                    f"but got {feature.size}."
-                )
-        return
-
-    if processor._decoder_M is None or processor._feature_dim is None:
-        raise RuntimeError(
-            "No prepared M-decoder is available for displacement decoding. "
-            "Set processing.decoder.source to 'cache' with a valid cache_path, "
-            "or use processing.decoder.source='compute' with a separate "
-            "compute_output_directory, or use processing.decoder.source='current' "
-            "to train from current residual artifacts."
-        )
-
-    if processor._feature_dim is None:
-        processor._feature_dim = processor._decoder_M.shape[1]
-    if any(f.size != processor._feature_dim for f in features_all):
-        raise RuntimeError(
-            "Feature dimension mismatch: decoder expects "
-            f"{processor._feature_dim}, but some features differ."
-        )
-
-
-def apply_decoder(processor, features_all):
-    assignment = _decoder_assignment_mode(processor)
-    if assignment == "family" and not _has_single_decoder(processor):
-        raise RuntimeError(
-            "Decoder-family application requires decoder keys. "
-            "Call apply_decoder(...) with decoder_keys_all in family mode."
-        )
-    R_all = _stack_features_into_columns(features_all)
-    return (processor._decoder_M @ R_all).T
-
-
-def apply_decoder_family(processor, features_all, decoder_keys_all):
-    family = _decoder_family(processor)
-    if not family:
-        if _has_single_decoder(processor):
-            return apply_decoder(processor, features_all)
-        raise RuntimeError("No decoder family is prepared.")
-    output_dim = next(iter(family.values())).shape[0]
-    U_all = np.zeros((len(features_all), output_dim), dtype=np.float64)
-    grouped_indices: dict[DisplacementDecoderKey, list[int]] = {}
-    for index, key in enumerate(decoder_keys_all):
-        grouped_indices.setdefault(key, []).append(index)
-    for key, indices in grouped_indices.items():
-        decoder_M = family[key]
-        R_group = _stack_features_into_columns([features_all[index] for index in indices])
-        U_group = (decoder_M @ R_group).T
-        for position, index in enumerate(indices):
-            U_all[index, :] = U_group[position, :]
-    return U_all
 
 
 class DisplacementDecoderSourceService:
@@ -1018,8 +909,6 @@ class DisplacementDecoderSourceService:
                 **processor.parameters,
                 **build_decoding_payload(decoding_context),
             }
-            from core.decoding.processor import PointDataPostprocessingProcessor
-
             training_processor = PointDataPostprocessingProcessor(
                 compute_artifacts.db_manager,
                 compute_artifacts.point_data_processor,
@@ -1070,6 +959,4 @@ class DisplacementDecoderSourceService:
             decoder_payload["assignment"] = original_decoder["assignment"]
         rspace_info["decoder"] = decoder_payload
         payload["rspace_info"] = rspace_info
-        from core.models import WorkflowParameters
-
         return WorkflowParameters.from_payload(payload)
