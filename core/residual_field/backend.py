@@ -91,6 +91,258 @@ _PROCESS_LOCAL_REDUCER_BACKENDS: dict[
 ] = {}
 
 
+def assemble_durable_generation_chunk_payload(
+    *,
+    sorted_manifests,
+    total_reciprocal_points,
+    scratch_dir,
+    chunk_id,
+) -> dict:
+    # Pass 1: load each snapshot briefly to record shape, then
+    # release it. Peak memory = one block at a time.
+    # Match np.vstack semantics: 1-D block of shape (k,) counts
+    # as 1 row × k columns; 2-D block (r, c) is r rows × c cols.
+    sizes: list[tuple[int, int]] = []
+    total_points = 0
+    total_rows = 0
+    grid_cols: int | None = None
+    for manifest in sorted_manifests:
+        snapshot = load_residual_field_generation_payload(manifest)
+        n_points = int(
+            np.asarray(snapshot["amplitudes_delta"]).reshape(-1).shape[0]
+        )
+        grid_arr = np.asarray(snapshot["grid_shape_nd"])
+        if grid_arr.ndim == 1:
+            block_rows = 1
+            block_cols = int(grid_arr.shape[0])
+        elif grid_arr.ndim >= 2:
+            block_rows = int(grid_arr.shape[0])
+            block_cols = int(grid_arr.shape[1])
+        else:
+            block_rows = 0
+            block_cols = 1
+        if grid_cols is None:
+            grid_cols = block_cols
+        sizes.append((n_points, block_rows))
+        total_points += n_points
+        total_rows += block_rows
+        del snapshot, grid_arr
+    grid_shape = (total_rows, int(grid_cols or 1))
+    final_point_ids = _allocate_finalize_output(
+        shape=(total_points,), dtype=np.int64,
+        scratch_dir=scratch_dir, name="point_ids",
+    )
+    final_delta = _allocate_finalize_output(
+        shape=(total_points,), dtype=np.complex128,
+        scratch_dir=scratch_dir, name="delta",
+    )
+    final_average = _allocate_finalize_output(
+        shape=(total_points,), dtype=np.complex128,
+        scratch_dir=scratch_dir, name="average",
+    )
+    final_grid_shape_nd = _allocate_finalize_output(
+        shape=grid_shape, dtype=np.int64,
+        scratch_dir=scratch_dir, name="grid_shape_nd",
+    )
+    # Pass 2: stream each block into its preallocated slot.
+    point_offset = 0
+    row_offset = 0
+    applied_set: set[int] = set()
+    reciprocal_point_count = 0
+    for manifest, (n_points, n_rows) in zip(sorted_manifests, sizes):
+        snapshot = load_residual_field_generation_payload(manifest)
+        snapshot_point_ids = np.asarray(snapshot["point_ids"], dtype=np.int64).reshape(-1)
+        expected_point_ids = np.arange(
+            point_offset,
+            point_offset + n_points,
+            dtype=np.int64,
+        )
+        if snapshot_point_ids.shape != expected_point_ids.shape or not np.array_equal(
+            snapshot_point_ids,
+            expected_point_ids,
+        ):
+            raise RuntimeError(
+                "Residual-field checkpoint point IDs do not match the expected "
+                "absolute chunk-row IDs for the current artifact contract."
+            )
+        final_point_ids[point_offset:point_offset + n_points] = snapshot_point_ids
+        final_delta[point_offset:point_offset + n_points] = np.asarray(
+            snapshot["amplitudes_delta"], dtype=np.complex128
+        ).reshape(-1)
+        final_average[point_offset:point_offset + n_points] = np.asarray(
+            snapshot["amplitudes_average"], dtype=np.complex128
+        ).reshape(-1)
+        grid_block = np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
+        if final_grid_shape_nd.ndim == 2 and grid_block.ndim == 1:
+            grid_block = grid_block.reshape(1, -1)
+        final_grid_shape_nd[row_offset:row_offset + n_rows] = grid_block
+        point_offset += n_points
+        row_offset += n_rows
+        reciprocal_point_count += int(snapshot["reciprocal_point_count"])
+        applied_set.update(
+            int(interval_id)
+            for interval_id in snapshot["incorporated_interval_ids"]
+        )
+        del snapshot, grid_block, snapshot_point_ids
+    if np.unique(np.asarray(final_point_ids)).shape[0] != int(total_points):
+        raise RuntimeError(
+            "Residual-field partition finalization produced duplicate point_ids "
+            f"for chunk={int(chunk_id)}."
+        )
+    snapshot_payload = {
+        "point_ids": final_point_ids,
+        "grid_shape_nd": final_grid_shape_nd,
+        "amplitudes_delta": final_delta,
+        "amplitudes_average": final_average,
+        "reciprocal_point_count": int(reciprocal_point_count),
+        "total_reciprocal_points": int(total_reciprocal_points),
+        "incorporated_interval_ids": tuple(sorted(applied_set)),
+    }
+    return snapshot_payload
+
+
+def assemble_local_snapshot_chunk_payload(
+    *,
+    snapshot_metadata,
+    chunk_id,
+    parameter_digest,
+    output_dir,
+    scratch_dir,
+) -> dict | None:
+    # Pass 1: load one snapshot at a time to inspect shape, then
+    # drop it. This keeps peak finalize RAM near one partition plus
+    # the output buffers instead of all partitions at once.
+    # Match np.vstack semantics: 1-D block of shape (k,) counts
+    # as 1 row × k columns; 2-D block (r, c) is r rows × c cols.
+    per_snapshot_sizes: list[tuple[int | None, int, int, int]] = []
+    total_points = 0
+    total_rows = 0
+    grid_cols: int | None = None
+    total_reciprocal_points: int | None = None
+    for partition_id, snapshot_seq, _metadata in snapshot_metadata:
+        snapshot = load_local_accumulator_snapshot(
+            output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            partition_id=partition_id,
+            snapshot_seq=snapshot_seq,
+        )
+        if snapshot is None:
+            continue
+        n_points = int(
+            np.asarray(snapshot["amplitudes_delta"]).reshape(-1).shape[0]
+        )
+        grid_arr = np.asarray(snapshot["grid_shape_nd"])
+        if grid_arr.ndim == 1:
+            block_rows = 1
+            block_cols = int(grid_arr.shape[0])
+        elif grid_arr.ndim >= 2:
+            block_rows = int(grid_arr.shape[0])
+            block_cols = int(grid_arr.shape[1])
+        else:
+            block_rows = 0
+            block_cols = 1
+        if grid_cols is None:
+            grid_cols = block_cols
+        per_snapshot_sizes.append(
+            (partition_id, int(snapshot_seq), n_points, block_rows)
+        )
+        total_points += n_points
+        total_rows += block_rows
+        if total_reciprocal_points is None:
+            total_reciprocal_points = int(snapshot["total_reciprocal_points"])
+        del snapshot, grid_arr
+    if not per_snapshot_sizes:
+        return None
+    # np.vstack always returns 2-D; mirror that unconditionally.
+    grid_shape = (total_rows, int(grid_cols or 1))
+    final_point_ids = _allocate_finalize_output(
+        shape=(total_points,), dtype=np.int64,
+        scratch_dir=scratch_dir, name="point_ids",
+    )
+    final_delta = _allocate_finalize_output(
+        shape=(total_points,), dtype=np.complex128,
+        scratch_dir=scratch_dir, name="delta",
+    )
+    final_average = _allocate_finalize_output(
+        shape=(total_points,), dtype=np.complex128,
+        scratch_dir=scratch_dir, name="average",
+    )
+    final_grid_shape_nd = _allocate_finalize_output(
+        shape=grid_shape, dtype=np.int64,
+        scratch_dir=scratch_dir, name="grid_shape_nd",
+    )
+    # Pass 2: slot-assign. Preserves the original semantic of
+    # point_ids = np.arange(0, total_points) across the ordered
+    # snapshots (bitwise identical to the former np.arange /
+    # np.concatenate construction).
+    point_offset = 0
+    row_offset = 0
+    applied_set: set[int] = set()
+    reciprocal_point_count = 0
+    for partition_id, snapshot_seq, n_points, n_rows in per_snapshot_sizes:
+        snapshot = load_local_accumulator_snapshot(
+            output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            partition_id=partition_id,
+            snapshot_seq=snapshot_seq,
+        )
+        if snapshot is None:
+            raise RuntimeError(
+                "Residual-field local finalization lost a snapshot during "
+                f"publish: chunk={int(chunk_id)} partition={partition_id} "
+                f"seq={int(snapshot_seq)}."
+            )
+        delta_block = np.asarray(
+            snapshot["amplitudes_delta"], dtype=np.complex128
+        ).reshape(-1)
+        average_block = np.asarray(
+            snapshot["amplitudes_average"], dtype=np.complex128
+        ).reshape(-1)
+        final_delta[point_offset:point_offset + n_points] = delta_block
+        final_average[point_offset:point_offset + n_points] = average_block
+        expected_point_ids = np.arange(
+            point_offset, point_offset + n_points, dtype=np.int64
+        )
+        snapshot_point_ids = np.asarray(
+            snapshot["point_ids"], dtype=np.int64
+        ).reshape(-1)
+        if (
+            snapshot_point_ids.shape == expected_point_ids.shape
+            and np.array_equal(snapshot_point_ids, expected_point_ids)
+        ):
+            final_point_ids[point_offset:point_offset + n_points] = snapshot_point_ids
+        else:
+            # Partition snapshots use task-local point offsets. The
+            # public chunk payload uses contiguous residual row IDs
+            # after concatenating partitions.
+            final_point_ids[point_offset:point_offset + n_points] = expected_point_ids
+        del expected_point_ids, snapshot_point_ids
+        grid_block = np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
+        if final_grid_shape_nd.ndim == 2 and grid_block.ndim == 1:
+            grid_block = grid_block.reshape(1, -1)
+        final_grid_shape_nd[row_offset:row_offset + n_rows] = grid_block
+        point_offset += n_points
+        row_offset += n_rows
+        reciprocal_point_count += int(snapshot["reciprocal_point_count"])
+        applied_set.update(
+            int(interval_id)
+            for interval_id in snapshot["incorporated_interval_ids"]
+        )
+        del snapshot, delta_block, average_block, grid_block
+    snapshot_payload = {
+        "point_ids": final_point_ids,
+        "grid_shape_nd": final_grid_shape_nd,
+        "amplitudes_delta": final_delta,
+        "amplitudes_average": final_average,
+        "reciprocal_point_count": int(reciprocal_point_count),
+        "total_reciprocal_points": int(total_reciprocal_points or 0),
+        "incorporated_interval_ids": tuple(sorted(applied_set)),
+    }
+    return snapshot_payload
+
+
 class ManifestDrivenResidualFieldReducerBackend:
     """
     Wave 1 concrete backend.
@@ -1366,111 +1618,20 @@ class ManifestDrivenResidualFieldReducerBackend:
                         else parse_residual_field_generation_ref(m)[0] or -1
                     ),
                 )
-                # Pass 1: load each snapshot briefly to record shape, then
-                # release it. Peak memory = one block at a time.
-                # Match np.vstack semantics: 1-D block of shape (k,) counts
-                # as 1 row × k columns; 2-D block (r, c) is r rows × c cols.
-                sizes: list[tuple[int, int]] = []
-                total_points = 0
-                total_rows = 0
-                grid_cols: int | None = None
-                for manifest in sorted_manifests:
-                    snapshot = load_residual_field_generation_payload(manifest)
-                    n_points = int(
-                        np.asarray(snapshot["amplitudes_delta"]).reshape(-1).shape[0]
-                    )
-                    grid_arr = np.asarray(snapshot["grid_shape_nd"])
-                    if grid_arr.ndim == 1:
-                        block_rows = 1
-                        block_cols = int(grid_arr.shape[0])
-                    elif grid_arr.ndim >= 2:
-                        block_rows = int(grid_arr.shape[0])
-                        block_cols = int(grid_arr.shape[1])
-                    else:
-                        block_rows = 0
-                        block_cols = 1
-                    if grid_cols is None:
-                        grid_cols = block_cols
-                    sizes.append((n_points, block_rows))
-                    total_points += n_points
-                    total_rows += block_rows
-                    del snapshot, grid_arr
                 scratch_dir = _finalize_scratch_dir(
                     scratch_root,
                     chunk_id=chunk_id,
                     parameter_digest=parameter_digest,
                 )
-                grid_shape = (total_rows, int(grid_cols or 1))
-                final_point_ids = _allocate_finalize_output(
-                    shape=(total_points,), dtype=np.int64,
-                    scratch_dir=scratch_dir, name="point_ids",
+                snapshot_payload = assemble_durable_generation_chunk_payload(
+                    sorted_manifests=sorted_manifests,
+                    total_reciprocal_points=total_reciprocal_points,
+                    scratch_dir=scratch_dir,
+                    chunk_id=chunk_id,
                 )
-                final_delta = _allocate_finalize_output(
-                    shape=(total_points,), dtype=np.complex128,
-                    scratch_dir=scratch_dir, name="delta",
+                applied_set = set(
+                    int(x) for x in snapshot_payload["incorporated_interval_ids"]
                 )
-                final_average = _allocate_finalize_output(
-                    shape=(total_points,), dtype=np.complex128,
-                    scratch_dir=scratch_dir, name="average",
-                )
-                final_grid_shape_nd = _allocate_finalize_output(
-                    shape=grid_shape, dtype=np.int64,
-                    scratch_dir=scratch_dir, name="grid_shape_nd",
-                )
-                # Pass 2: stream each block into its preallocated slot.
-                point_offset = 0
-                row_offset = 0
-                applied_set: set[int] = set()
-                reciprocal_point_count = 0
-                for manifest, (n_points, n_rows) in zip(sorted_manifests, sizes):
-                    snapshot = load_residual_field_generation_payload(manifest)
-                    snapshot_point_ids = np.asarray(snapshot["point_ids"], dtype=np.int64).reshape(-1)
-                    expected_point_ids = np.arange(
-                        point_offset,
-                        point_offset + n_points,
-                        dtype=np.int64,
-                    )
-                    if snapshot_point_ids.shape != expected_point_ids.shape or not np.array_equal(
-                        snapshot_point_ids,
-                        expected_point_ids,
-                    ):
-                        raise RuntimeError(
-                            "Residual-field checkpoint point IDs do not match the expected "
-                            "absolute chunk-row IDs for the current artifact contract."
-                        )
-                    final_point_ids[point_offset:point_offset + n_points] = snapshot_point_ids
-                    final_delta[point_offset:point_offset + n_points] = np.asarray(
-                        snapshot["amplitudes_delta"], dtype=np.complex128
-                    ).reshape(-1)
-                    final_average[point_offset:point_offset + n_points] = np.asarray(
-                        snapshot["amplitudes_average"], dtype=np.complex128
-                    ).reshape(-1)
-                    grid_block = np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
-                    if final_grid_shape_nd.ndim == 2 and grid_block.ndim == 1:
-                        grid_block = grid_block.reshape(1, -1)
-                    final_grid_shape_nd[row_offset:row_offset + n_rows] = grid_block
-                    point_offset += n_points
-                    row_offset += n_rows
-                    reciprocal_point_count += int(snapshot["reciprocal_point_count"])
-                    applied_set.update(
-                        int(interval_id)
-                        for interval_id in snapshot["incorporated_interval_ids"]
-                    )
-                    del snapshot, grid_block, snapshot_point_ids
-                if np.unique(np.asarray(final_point_ids)).shape[0] != int(total_points):
-                    raise RuntimeError(
-                        "Residual-field partition finalization produced duplicate point_ids "
-                        f"for chunk={int(chunk_id)}."
-                    )
-                snapshot_payload = {
-                    "point_ids": final_point_ids,
-                    "grid_shape_nd": final_grid_shape_nd,
-                    "amplitudes_delta": final_delta,
-                    "amplitudes_average": final_average,
-                    "reciprocal_point_count": int(reciprocal_point_count),
-                    "total_reciprocal_points": int(total_reciprocal_points),
-                    "incorporated_interval_ids": tuple(sorted(applied_set)),
-                }
             else:
                 snapshot_payload = first_snapshot
                 applied_set = set(
@@ -1623,142 +1784,23 @@ class ManifestDrivenResidualFieldReducerBackend:
                 for _, _, metadata in snapshot_metadata
             )
             if partitioned:
-                # Pass 1: load one snapshot at a time to inspect shape, then
-                # drop it. This keeps peak finalize RAM near one partition plus
-                # the output buffers instead of all partitions at once.
-                # Match np.vstack semantics: 1-D block of shape (k,) counts
-                # as 1 row × k columns; 2-D block (r, c) is r rows × c cols.
-                per_snapshot_sizes: list[tuple[int | None, int, int, int]] = []
-                total_points = 0
-                total_rows = 0
-                grid_cols: int | None = None
-                total_reciprocal_points: int | None = None
-                for partition_id, snapshot_seq, _metadata in snapshot_metadata:
-                    snapshot = load_local_accumulator_snapshot(
-                        output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        partition_id=partition_id,
-                        snapshot_seq=snapshot_seq,
-                    )
-                    if snapshot is None:
-                        continue
-                    n_points = int(
-                        np.asarray(snapshot["amplitudes_delta"]).reshape(-1).shape[0]
-                    )
-                    grid_arr = np.asarray(snapshot["grid_shape_nd"])
-                    if grid_arr.ndim == 1:
-                        block_rows = 1
-                        block_cols = int(grid_arr.shape[0])
-                    elif grid_arr.ndim >= 2:
-                        block_rows = int(grid_arr.shape[0])
-                        block_cols = int(grid_arr.shape[1])
-                    else:
-                        block_rows = 0
-                        block_cols = 1
-                    if grid_cols is None:
-                        grid_cols = block_cols
-                    per_snapshot_sizes.append(
-                        (partition_id, int(snapshot_seq), n_points, block_rows)
-                    )
-                    total_points += n_points
-                    total_rows += block_rows
-                    if total_reciprocal_points is None:
-                        total_reciprocal_points = int(snapshot["total_reciprocal_points"])
-                    del snapshot, grid_arr
-                if not per_snapshot_sizes:
-                    return None
                 scratch_dir = _finalize_scratch_dir(
                     scratch_root,
                     chunk_id=chunk_id,
                     parameter_digest=parameter_digest,
                 )
-                # np.vstack always returns 2-D; mirror that unconditionally.
-                grid_shape = (total_rows, int(grid_cols or 1))
-                final_point_ids = _allocate_finalize_output(
-                    shape=(total_points,), dtype=np.int64,
-                    scratch_dir=scratch_dir, name="point_ids",
+                snapshot_payload = assemble_local_snapshot_chunk_payload(
+                    snapshot_metadata=snapshot_metadata,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                    output_dir=output_dir,
+                    scratch_dir=scratch_dir,
                 )
-                final_delta = _allocate_finalize_output(
-                    shape=(total_points,), dtype=np.complex128,
-                    scratch_dir=scratch_dir, name="delta",
+                if snapshot_payload is None:
+                    return None
+                applied_set = set(
+                    int(x) for x in snapshot_payload["incorporated_interval_ids"]
                 )
-                final_average = _allocate_finalize_output(
-                    shape=(total_points,), dtype=np.complex128,
-                    scratch_dir=scratch_dir, name="average",
-                )
-                final_grid_shape_nd = _allocate_finalize_output(
-                    shape=grid_shape, dtype=np.int64,
-                    scratch_dir=scratch_dir, name="grid_shape_nd",
-                )
-                # Pass 2: slot-assign. Preserves the original semantic of
-                # point_ids = np.arange(0, total_points) across the ordered
-                # snapshots (bitwise identical to the former np.arange /
-                # np.concatenate construction).
-                point_offset = 0
-                row_offset = 0
-                applied_set: set[int] = set()
-                reciprocal_point_count = 0
-                for partition_id, snapshot_seq, n_points, n_rows in per_snapshot_sizes:
-                    snapshot = load_local_accumulator_snapshot(
-                        output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        partition_id=partition_id,
-                        snapshot_seq=snapshot_seq,
-                    )
-                    if snapshot is None:
-                        raise RuntimeError(
-                            "Residual-field local finalization lost a snapshot during "
-                            f"publish: chunk={int(chunk_id)} partition={partition_id} "
-                            f"seq={int(snapshot_seq)}."
-                        )
-                    delta_block = np.asarray(
-                        snapshot["amplitudes_delta"], dtype=np.complex128
-                    ).reshape(-1)
-                    average_block = np.asarray(
-                        snapshot["amplitudes_average"], dtype=np.complex128
-                    ).reshape(-1)
-                    final_delta[point_offset:point_offset + n_points] = delta_block
-                    final_average[point_offset:point_offset + n_points] = average_block
-                    expected_point_ids = np.arange(
-                        point_offset, point_offset + n_points, dtype=np.int64
-                    )
-                    snapshot_point_ids = np.asarray(
-                        snapshot["point_ids"], dtype=np.int64
-                    ).reshape(-1)
-                    if (
-                        snapshot_point_ids.shape == expected_point_ids.shape
-                        and np.array_equal(snapshot_point_ids, expected_point_ids)
-                    ):
-                        final_point_ids[point_offset:point_offset + n_points] = snapshot_point_ids
-                    else:
-                        # Partition snapshots use task-local point offsets. The
-                        # public chunk payload uses contiguous residual row IDs
-                        # after concatenating partitions.
-                        final_point_ids[point_offset:point_offset + n_points] = expected_point_ids
-                    del expected_point_ids, snapshot_point_ids
-                    grid_block = np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
-                    if final_grid_shape_nd.ndim == 2 and grid_block.ndim == 1:
-                        grid_block = grid_block.reshape(1, -1)
-                    final_grid_shape_nd[row_offset:row_offset + n_rows] = grid_block
-                    point_offset += n_points
-                    row_offset += n_rows
-                    reciprocal_point_count += int(snapshot["reciprocal_point_count"])
-                    applied_set.update(
-                        int(interval_id)
-                        for interval_id in snapshot["incorporated_interval_ids"]
-                    )
-                    del snapshot, delta_block, average_block, grid_block
-                snapshot_payload = {
-                    "point_ids": final_point_ids,
-                    "grid_shape_nd": final_grid_shape_nd,
-                    "amplitudes_delta": final_delta,
-                    "amplitudes_average": final_average,
-                    "reciprocal_point_count": int(reciprocal_point_count),
-                    "total_reciprocal_points": int(total_reciprocal_points or 0),
-                    "incorporated_interval_ids": tuple(sorted(applied_set)),
-                }
             else:
                 partition_id, snapshot_seq, _metadata = snapshot_metadata[0]
                 snapshot_payload = load_local_accumulator_snapshot(
