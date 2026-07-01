@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
   "paths": {
-    "config_root": "/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/config_2D/chemical_ordering",
+    "config_root": ".",
     "structure_file": "sample_2d_chem_PMN_proj_101.f2d",
-    "output_directory": "/home/user/mosaic_out/proj101_all"
+    "output_directory": "output/proj101_all"
   },
   "structure": {
     "dimension": 2,
