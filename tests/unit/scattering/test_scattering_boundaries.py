@@ -126,14 +126,14 @@ def test_scattering_accumulation_builds_and_applies_partial_results():
         mirrored_average_rows[:, 1],
         np.array([1.0 + 0.0j, 0.5 + 0.0j]),
     )
-    # A5 double-count fix: the conjugate reconstruction doubles the AMPLITUDE but the
+    # Double-count correction: the conjugate reconstruction doubles the AMPLITUDE but the
     # reciprocal_point_count (already multiplicity-applied) is added exactly ONCE, not
     # twice. Previously this asserted 10 (5 * 2); the corrected value is 5.
     assert mirrored_count == 5
 
 
 def test_apply_scattering_partial_result_does_not_double_count_reciprocal_points():
-    """A5 regression: mirror_conjugate_symmetry must NOT multiply reciprocal_point_count.
+    """Regression: mirror_conjugate_symmetry must NOT multiply reciprocal_point_count.
 
     The partial's reciprocal_point_count already encodes accepted x multiplicity (the
     q-normalization contract). Doubling the amplitude via delta + conj(delta) is the

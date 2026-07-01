@@ -57,7 +57,7 @@ def test_scattering_attempt_writes_only_run_scoped_attempt_paths(tmp_path):
 
 
 def test_attempt_coverage_gate_rejects_amplitudes_inconsistent_with_grid_geometry(tmp_path):
-    # P11 C-3b: coverage is gated against the DECLARED grid geometry
+    # coverage validation: coverage is gated against the DECLARED grid geometry
     # (sum_i prod(grid_shape_nd[i]) = 2*2 = 4 samples), NOT against len(amplitudes)
     # (= 2). A result whose amplitude length disagrees with its declared partition
     # geometry fails closed at write time instead of self-validating against

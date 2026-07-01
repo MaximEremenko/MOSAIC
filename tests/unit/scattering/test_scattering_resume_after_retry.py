@@ -47,7 +47,7 @@ def test_retry_with_matching_payload_dedupes_to_one_selected_attempt(tmp_path):
 
 
 def test_retry_with_divergent_payload_fails_closed(tmp_path):
-    # P11: a retry that produces a numerically DIVERGENT payload (real bug, not
+    # a retry that produces a numerically DIVERGENT payload (real bug, not
     # float noise) still fails closed -- the numerical agreement gate replaced the
     # old exact-hash check, it did not remove the safety.
     _attempt(tmp_path, attempt_id="attempt-a", delta=2.0 + 0.0j)

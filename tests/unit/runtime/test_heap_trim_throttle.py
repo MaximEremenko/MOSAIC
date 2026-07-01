@@ -1,4 +1,4 @@
-"""T4: verify _PerTaskHeapTrim.transition fires only every Nth released task."""
+"""Verify _PerTaskHeapTrim.transition fires only every Nth released task."""
 from __future__ import annotations
 
 import importlib

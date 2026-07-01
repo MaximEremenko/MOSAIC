@@ -1,6 +1,6 @@
-"""P11 C-4 residual commit identity: numerical agreement gate + device-independence.
+"""Residual commit identity: numerical agreement gate and device-independence.
 
-Mirrors the scattering C-2/C-3 contract for the residual stage:
+Mirrors the scattering identity and coverage contract for the residual stage:
 
 * same-work residual retries (non-deterministic GPU relaunches, or a CPU vs GPU
   attempt for the same partition) need not be bit-identical, but a real numerical
@@ -89,7 +89,7 @@ def test_residual_candidate_accepts_agreeing_retry_attempts_and_picks_winner(tmp
 
 
 def test_residual_candidate_treats_cpu_and_gpu_attempts_as_shared_checkpoint(tmp_path):
-    # P11 C-4: a CPU attempt and a GPU attempt for the same partition science differ
+    # A CPU attempt and a GPU attempt for the same partition science differ
     # ONLY in device-bound metadata (backend_policy_digest). They must map to ONE
     # checkpoint identity -- NOT be rejected as "conflicting" -- and, agreeing within
     # tolerance, promote to a single deterministically-chosen attempt.
@@ -113,7 +113,7 @@ def test_residual_candidate_treats_cpu_and_gpu_attempts_as_shared_checkpoint(tmp
 
 
 def _attempt_manifest(*, payload_sha256, work_unit_digest="w" * 64, partition_id=0):
-    # Construct the frozen attempt manifest directly (no disk): the FIX #2 candidate
+    # Construct the frozen attempt manifest directly (no disk): the candidate identity
     # digest reads ONLY chunk_id + per-attempt {partition_id, work_unit_digest}, so the
     # remaining manifest fields are irrelevant placeholders here. payload_sha256 is the
     # field under test -- it must NOT influence the candidate_id.
@@ -142,7 +142,7 @@ def _attempt_manifest(*, payload_sha256, work_unit_digest="w" * 64, partition_id
 
 
 def test_candidate_id_is_address_based_and_payload_byte_independent(tmp_path):
-    # P11 FIX #2: _candidate_id hashes ONLY chunk_id + per-attempt
+    # Candidate identity: _candidate_id hashes ONLY chunk_id + per-attempt
     # {partition_id, work_unit_digest} under the commit_candidate_id.v2 domain. Two
     # attempt sets that share the same (chunk, partition, work_unit_digest) but DIFFER
     # in payload_sha256 bytes (a CPU- vs GPU-written payload of the same science) must
@@ -161,7 +161,7 @@ def test_candidate_id_is_address_based_and_payload_byte_independent(tmp_path):
 def test_candidate_id_still_distinguishes_different_addresses(tmp_path):
     # Guard the inverse: address-based identity must NOT collapse genuinely different
     # work. A different work_unit_digest (or partition) is a different address and so a
-    # different candidate_id -- proving the FIX #2 digest still discriminates on the
+    # different candidate_id -- proving the candidate identity digest still discriminates on the
     # fields that matter, it just dropped payload_sha256.
     del tmp_path
     base = _attempt_manifest(payload_sha256="1" * 64, work_unit_digest="w" * 64)

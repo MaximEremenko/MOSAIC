@@ -30,7 +30,7 @@ def _provenance() -> dict[str, object]:
         "synthetic_only": True,
         "public_representative_fixture": {
             "status": "deferred",
-            "reason": "No committed representative public fixture has been selected for P0.0.",
+            "reason": "No committed representative public fixture has been selected.",
         },
     }
 

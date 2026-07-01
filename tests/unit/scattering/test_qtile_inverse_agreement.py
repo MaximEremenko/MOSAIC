@@ -1,4 +1,4 @@
-"""C3b: NUMERICAL VIABILITY PROOF that q-tiling the inverse NUFFT is sound.
+"""Numerical viability proof that q-tiling the inverse NUFFT is sound.
 
 Q-tiling splits the reciprocal q_grid into contiguous sub-ranges. Because the inverse
 (type-3) NUFFT SUMS over q-points, the full inverse result equals the SUM of the per-tile

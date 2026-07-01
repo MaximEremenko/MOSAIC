@@ -11,7 +11,7 @@ from scripts import release_evidence
 
 REPO_ROOT = Path(release_evidence.__file__).resolve().parents[1]
 
-# Every path the explicit ``final_plan.md`` section 13 layout must account for.
+# Every path the release evidence layout must account for.
 EXPECTED_LAYOUT = {
     "commit.txt",
     "ci_urls.txt",

@@ -1,4 +1,4 @@
-"""T1: bounded cuFINUFFT plan cache — numerical identity + LRU bound."""
+"""Bounded cuFINUFFT plan cache: numerical identity and LRU bound."""
 from __future__ import annotations
 
 import threading

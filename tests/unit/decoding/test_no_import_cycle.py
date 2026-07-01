@@ -1,6 +1,6 @@
-"""Verify that the decoding import cycle (A3) stays fixed.
+"""Verify that the decoding import cycle stays closed.
 
-Before the fix, ``decoder_training`` used a function-local
+Previously, ``decoder_training`` used a function-local
 ``from core.decoding.decode_chunk import PointDataPostprocessingProcessor``
 to dodge the cycle:
 

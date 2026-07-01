@@ -1,4 +1,4 @@
-"""C2: byte-budgeted point-tiling plan (additive, default-off).
+"""Byte-budgeted point-tiling plan (optional by default).
 
 Pins the contract of ``core.scattering.work_unit_tiling``:
   * the env-driven budget resolver (unset/empty/<=0 -> UNLIMITED -> None),

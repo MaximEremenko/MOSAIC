@@ -1,11 +1,11 @@
-"""Unit tests for the P11 Phase A scattering-invariant validation module.
+"""Unit tests for the scattering-invariant validation module.
 
 Hard gates (finiteness, shape/dtype, exact point coverage) each have a passing
 case and a failing case. The amplitude-norm ratio, half-space imag/real-ratio,
 and conjugate-symmetry checks are NON-GATING advisory (scientist directive): they
 always return ``ok=True`` (the norm ratio because "too large but finite" is a
 scientific judgment; the half-space checks never call reconstruction math), so
-their tests assert exactly that, including that they never reject the frozen P0.0
+their tests assert exactly that, including that they never reject the frozen synthetic
 baseline.
 
 Some failure cases violate the ``ScatteringPartialResult`` construction contract
@@ -93,7 +93,7 @@ def _make_result(
 
 # --------------------------------------------------------------------------- #
 # Baseline acceptance (REQUIRED): the non-gating half-space stubs MUST NOT reject
-# the frozen P0.0 synthetic_half_space_v1 baseline. The stubs always return
+# the frozen synthetic synthetic_half_space_v1 baseline. The stubs always return
 # ok=True; this test pins that they accept the real baseline amplitudes too.
 # --------------------------------------------------------------------------- #
 

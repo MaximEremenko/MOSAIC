@@ -235,7 +235,7 @@ def test_scattering_handoff_tolerates_partial_and_empty_mappings():
     assert partial.scattering_run_digest is None
     assert partial.source_scattering_commit_digest is None
     assert partial.run_digest is None
-    # The stage-2 expected key was absent: presence flag stays False.
+    # Replacement expected coverage was absent: presence flag stays False.
     assert partial.has_stage2_replacement_expected is False
     assert partial.expected_by_chunk() == {}
     assert partial.is_empty is False
@@ -246,7 +246,7 @@ def test_scattering_handoff_tolerates_partial_and_empty_mappings():
     assert ScatteringHandoff.from_mapping({}).is_empty is True
     assert ScatteringHandoff.from_mapping({}).to_mapping() == {}
 
-    # A present-but-empty stage-2 key keeps the presence distinction.
+    # A present-but-empty replacement expected-coverage payload keeps the presence distinction.
     present_empty = ScatteringHandoff.from_mapping(
         {"stage2_replacement_expected_by_chunk": {}}
     )

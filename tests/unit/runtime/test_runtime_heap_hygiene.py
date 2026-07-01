@@ -8,7 +8,7 @@ import os
 import pytest
 
 
-# --- Fix A: _final_cleanup tolerates missing glibc malloc_trim -------------
+# --- _final_cleanup tolerates missing glibc malloc_trim --------------------
 
 def test_final_cleanup_survives_missing_malloc_trim(monkeypatch):
     """ctypes.CDLL('libc.so.6') raises OSError on non-glibc platforms."""
@@ -64,7 +64,7 @@ def test_per_task_heap_trim_plugin_released_only(monkeypatch):
     plugin.transition("k", "memory", "released")
 
 
-# --- Fix B: shutdown_dask reclaims cluster children ------------------------
+# --- shutdown_dask reclaims cluster children -------------------------------
 
 @pytest.mark.skipif(
     os.name == "nt",

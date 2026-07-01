@@ -30,7 +30,7 @@
     "generator_command": "python3 tests/fixtures/baselines/residual_full_synthetic_v1/generate.py",
     "input_files": [],
     "public_representative_fixture": {
-      "reason": "No committed representative public fixture has been selected for P0.0.",
+      "reason": "No committed representative public fixture has been selected.",
       "status": "deferred"
     },
     "synthetic_only": true

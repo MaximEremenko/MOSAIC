@@ -1,18 +1,13 @@
-"""Stage-2 replacement execution coverage, including P11 FIX #1 reconciliation.
+"""Replacement execution coverage, including attempt reconciliation.
 
-FIX #1 removed the bitwise ``Conflicting stage-2 replacement attempts ...`` gate that
-``_commit_stage2_replacement_attempts`` previously raised whenever two attempts for one
-partition differed in ``payload_sha256``. Reconciliation is now delegated to
-``create_residual_commit_candidate`` (the predicted numerical-agreement tolerance gate).
+The reconciliation path no longer rejects attempts solely because their
+``payload_sha256`` values differ. Reconciliation is delegated to the predicted
+numerical-agreement tolerance gate.
 
-FIX #1 is covered here DIRECTLY at the stage-2 entry point
-``run_stage2_replacement_execution`` (which drives ``_commit_stage2_replacement_attempts``):
-``test_stage2_replacement_accepts_agreeing_byte_different_attempts`` proves agreeing
-byte-different attempts reconcile and commit, and
-``test_stage2_replacement_fails_closed_on_divergent_attempts`` proves a genuine divergence
-still fails closed. The delegated boundary itself (``create_residual_commit_candidate`` with
-agreeing-vs-divergent attempts) is additionally covered TRANSITIVELY by the canonical-path
-tests in ``tests/unit/residual_field/test_residual_commit_candidates.py``.
+The tests here cover the replacement execution entry point: agreeing
+byte-different attempts reconcile and commit, while a genuine numerical
+divergence still fails closed. The delegated residual commit boundary is covered
+separately by the residual-field commit-candidate tests.
 """
 
 from __future__ import annotations
@@ -152,11 +147,10 @@ def test_stage2_replacement_execution_reduces_to_residual_outputs(
 
 
 def _make_two_attempt_residual_task(delta_a, delta_b):
-    # Build a fake stage-2 map task that writes TWO same-work attempts for the one
+    # Build a fake replacement map task that writes TWO same-work attempts for the one
     # partition, differing only in attempt_id and payload BYTES (delta_a vs delta_b).
-    # This drives the FIX #1 stage-2 reconciliation path
-    # (_commit_stage2_replacement_attempts -> create_residual_commit_candidate ->
-    # _select_attempts_by_partition -> _assert_residual_partials_agree): agreeing
+    # This drives the replacement reconciliation path
+    # The reducer delegates to the residual commit-candidate path: agreeing
     # bytes-different attempts must be accepted; divergent ones must fail closed.
     def fake_residual_batch_task(
         work_unit,
@@ -211,9 +205,9 @@ def test_stage2_replacement_accepts_agreeing_byte_different_attempts(
     tmp_path,
     monkeypatch,
 ):
-    # FIX #1 (stage-2 path, DIRECT coverage): two same-work attempts for one partition
+    # Replacement reconciliation path: two same-work attempts for one partition
     # that differ in BYTES but AGREE within the predicted tolerance (a non-deterministic
-    # relaunch / CPU-vs-GPU) must NOT raise the removed bitwise "Conflicting stage-2
+    # relaunch / CPU-vs-GPU) must NOT raise the removed bitwise "Conflicting replacement
     # replacement attempts" gate -- they must reconcile and produce a residual commit.
     db, interval_ids = _db_with_replacement_work(tmp_path)
     try:
@@ -247,7 +241,7 @@ def test_stage2_replacement_fails_closed_on_divergent_attempts(
     tmp_path,
     monkeypatch,
 ):
-    # FIX #1 (stage-2 path, DIRECT coverage): a GENUINE numerical divergence between two
+    # Replacement reconciliation path: a GENUINE numerical divergence between two
     # same-work attempts for one partition must STILL fail closed. The removed bitwise
     # gate was replaced by the predicted-tolerance agreement gate, not by silent
     # acceptance.

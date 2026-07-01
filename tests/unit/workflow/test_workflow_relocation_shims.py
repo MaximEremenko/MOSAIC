@@ -1,4 +1,4 @@
-"""W2.2 relocation guard: workflow modules and storage compatibility shims.
+"""Relocation guard: workflow modules and storage compatibility shims.
 
 ``publisher`` and ``cleanup`` were post-stage orchestration misfiled under
 ``core/storage`` (they import UP into the science-stage ``commit`` modules). They

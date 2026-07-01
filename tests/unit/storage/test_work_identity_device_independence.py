@@ -1,4 +1,4 @@
-"""P11 W2.1: shared device-independence tripwire for durable work-unit identity.
+"""shared device-independence tripwire for durable work-unit identity.
 
 Durable work-unit identity (the checkpoint/work-unit digest) MUST be
 device-INDEPENDENT so a CPU-computed unit and a GPU-computed unit for the same

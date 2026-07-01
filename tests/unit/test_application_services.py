@@ -660,7 +660,7 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
 
 
 def test_workflow_service_recovers_local_residual_state_before_scattering(tmp_path):
-    # A4 (P11): residual restart recovery is owned by the residual_field stage
+    # Residual restart recovery is owned by the residual_field stage
     # (ResidualFieldStage.recover_pending); the orchestrator only calls it, and
     # must call it BEFORE scattering. The recovery internals (backend layout,
     # scratch roots, parameter digests, finalize_chunk) are covered by

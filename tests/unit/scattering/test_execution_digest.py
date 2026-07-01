@@ -67,7 +67,7 @@ def test_run_digest_is_deterministic_execution_digest_prefix_identity():
 
 
 def test_run_identity_run_digest_is_device_independent():
-    # P11 C-2: the run/checkpoint tree is addressed device-INDEPENDENTLY. A CPU run
+    # device-independent identity: the run/checkpoint tree is addressed device-INDEPENDENTLY. A CPU run
     # and a GPU run of the same science + numerical contract share ONE run_digest
     # (one `.mosaic/runs/<digest>/` tree), so either device can resume/promote the
     # other's chunks. The device-bound execution_digest still differs and is retained

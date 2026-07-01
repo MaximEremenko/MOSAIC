@@ -1,9 +1,9 @@
-"""W2.3 regression: address-based GC of superseded commit candidates.
+"""address-based GC of superseded commit candidates.
 
-Before P11, ``core/workflow/cleanup.py`` (then ``core/storage/cleanup.py``)
+The earlier implementation ``core/workflow/cleanup.py`` (then ``core/storage/cleanup.py``)
 gated candidate deletion on a BITWISE rule: if the valid candidates for a chunk
 did not all share one ``payload_sha256`` it retained ALL of them as
-"conflicting candidates". Under P11 address-based identity, a candidate is
+"conflicting candidates". Under address-based identity, a candidate is
 addressed by ``candidate_id`` (chunk + device-independent work-unit addresses),
 NOT by payload bytes, and per-attempt byte integrity is verified separately at
 load. The durable chunk commit names the winning ``selected_candidate_id``, so
@@ -12,7 +12,7 @@ bytes.
 
 These tests construct two VALID candidates for one chunk that AGREE numerically
 but differ in ``payload_sha256`` (the candidate payload digest folds in the
-candidate_id) -- exactly the pre-P11 "conflicting" trigger -- and assert the
+candidate_id) -- exactly the previous "conflicting" trigger -- and assert the
 superseded one is GC'd down to the selected candidate, NOT retained.
 """
 from __future__ import annotations
@@ -80,7 +80,7 @@ def _forge_sibling_candidate(
     attempts and arrays. The candidate payload digest folds in the candidate_id
     (``expected_set_digest=candidate_id``), so the sibling's ``payload_sha256``
     DIFFERS from the selected candidate's even though the arrays are identical --
-    reproducing the pre-P11 "len(payload_hashes) != 1" trigger with genuinely
+    reproducing the previous "len(payload_hashes) != 1" trigger with genuinely
     valid, numerically-agreeing candidates.
     """
     datasets, _ = _read_payload(output_dir / selected.payload_path)
@@ -176,7 +176,7 @@ def test_cleanup_gcs_superseded_scattering_candidate_despite_byte_difference(tmp
     )
 
     # Preconditions: both candidates are VALID, share the same arrays, and have
-    # DIFFERENT payload_sha256 (the exact pre-P11 "conflicting" trigger).
+    # DIFFERENT payload_sha256 (the exact previous "conflicting" trigger).
     validate_scattering_commit_candidate(selected, output_dir=tmp_path)
     validate_scattering_commit_candidate(sibling, output_dir=tmp_path)
     assert sibling.candidate_id != selected.candidate_id

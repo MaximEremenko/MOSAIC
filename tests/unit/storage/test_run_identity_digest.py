@@ -1,6 +1,6 @@
-"""P11 device-independent run/checkpoint identity (`build_run_identity_digest`).
+"""device-independent run/checkpoint identity (`build_run_identity_digest`).
 
-The whole point of P11 is that a durable checkpoint is addressed by the science +
+The whole point of is that a durable checkpoint is addressed by the science +
 numerical contract, NOT by the device that computed it -- so CPU and GPU runs of
 the same science share one run tree and one set of checkpoint addresses, and
 cross-device promotion is decided by scientific-invariant validation rather than
@@ -47,7 +47,7 @@ def test_run_identity_is_device_independent_unlike_execution_digest():
     gpu_exec = build_execution_digest(backend="cuda", **common)
     assert cpu_exec != gpu_exec  # device-bound identity separates CPU and GPU
 
-    # ... but the P11 run identity takes no backend at all: there is no input by
+    # ... but the run identity takes no backend at all: there is no input by
     # which CPU and GPU of the same science/contract could ever diverge, so they
     # address the SAME checkpoint.
     assert _run_identity() == _run_identity()

@@ -1,4 +1,4 @@
-"""Phase A: the q-normalization sidecar (q_normalization.json) round-trip.
+"""Q-normalization sidecar (q_normalization.json) round-trip.
 
 Pins ``to_payload``/``from_payload`` on the contract and the
 ``write_q_normalization_sidecar`` / ``load_q_normalization_contract`` pair. The sidecar

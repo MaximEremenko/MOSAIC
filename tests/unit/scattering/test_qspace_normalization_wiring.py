@@ -1,4 +1,4 @@
-"""Phase A wiring: build_qspace_plan contracts, the qspace_plan_digest stability
+"""Q-normalization wiring: build_qspace_plan contracts, the qspace_plan_digest stability
 guarantee, and the commit-time reciprocal-point reconciliation assertion.
 """
 from __future__ import annotations
@@ -109,7 +109,7 @@ def test_qspace_plan_digest_is_byte_stable_with_and_without_contracts():
     )
     assert plan_with.q_normalization_contracts  # contracts are present in memory
 
-    # A plan stripped of contracts (simulating the pre-feature shape) must serialize to
+    # A plan stripped of contracts (simulating an older shape) must serialize to
     # the same bytes -- to_payload deliberately excludes the contracts.
     plan_without = plan_with.__class__(
         run_digest=plan_with.run_digest,
@@ -156,7 +156,7 @@ def test_prepare_run_identity_writes_sidecar_and_keeps_plan_digest_stable(tmp_pa
 
 
 _ATTEMPT_IDENTITY = {
-    "run_digest": "runA1A4",
+    "run_digest": "run_qnorm",
     "scientific_digest": "a" * 64,
     "execution_digest": "e" * 64,
     "qspace_plan_digest": "c" * 64,

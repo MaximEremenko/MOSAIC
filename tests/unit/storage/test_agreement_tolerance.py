@@ -1,4 +1,4 @@
-"""P11 predicted numerical-agreement tolerance (core/storage/agreement.py).
+"""Predicted numerical-agreement tolerance (core/storage/agreement.py).
 
 The agreement tolerance is the computation's PREDICTED forward-error bound
 ``rtol = S*(eps + M*u)*kappa`` -- tied to the NUFFT ``eps``, the reciprocal-point

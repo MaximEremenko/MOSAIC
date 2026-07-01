@@ -1,4 +1,4 @@
-"""W6.2 #1: the single authoritative q-normalization record + byte estimators.
+"""Single authoritative q-normalization record and byte estimators.
 
 Pins that planned/accepted counts are multiplicity-free and comparable, that masking is
 explicit, that multiplicity is applied exactly once, and that the output-byte estimate

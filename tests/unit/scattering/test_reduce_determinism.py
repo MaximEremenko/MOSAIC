@@ -1,4 +1,4 @@
-"""Cross-environment reduce-order determinism for scattering partials (plan_2 Phase 2, G1).
+"""Cross-environment reduce-order determinism for scattering partials (reduce-order determinism).
 
 The durable model promotes a chunk only on an EXACT ``payload_sha256`` match and is
 fail-closed: a chunk that hashes differently across worker count / partition layout
@@ -208,7 +208,7 @@ def test_numpy_add_is_not_associative_for_this_data():
     )
 
 
-# --- The Phase 2 claim under test (currently XFAIL: see findings note) ---
+# --- The reduce-order determinism claim under test ---
 
 
 @pytest.mark.xfail(

@@ -1,4 +1,4 @@
-"""C3a: byte-budgeted q-space tiling plan (additive, default-off).
+"""Byte-budgeted q-space tiling plan (optional by default).
 
 Pins the contract of ``core.scattering.work_unit_tiling.plan_qspace_tiles`` and its env
 resolver ``resolve_qspace_byte_budget``:
