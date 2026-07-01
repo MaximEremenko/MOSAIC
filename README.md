@@ -75,6 +75,12 @@ Minimal editable install in an existing Python environment:
 pip install -e .
 ```
 
+Cluster scheduler support is exposed through the `hpc` extra:
+
+```bash
+pip install -e '.[hpc]'
+```
+
 ### CUDA / GPU
 
 Two supported paths:
@@ -112,6 +118,9 @@ The tested CUDA stack is CUDA 12.4 + `cupy-cuda12x` + `cufinufft==2.5.1`.
 The `cufinufft` wheel links against CUDA 12 libraries, so a CUDA-13-only
 runtime is not a supported wheel-based setup.
 
+The public pip extras are `hpc`, `test`, and `cuda12`. CUDA 11 is not exposed
+as a supported pip extra.
+
 ### Practical requirements
 
 - Python 3.11+
@@ -137,6 +146,15 @@ mosaic examples/config_1D/displacement/run_parameters.json
 Expected output location:
 
 - `examples/config_1D/displacement/output_displacement/processed_point_data/`
+
+Durable run state is stored under
+`examples/config_1D/displacement/output_displacement/processed_point_data/.mosaic/runs/`.
+Files directly under `processed_point_data/` remain a compatibility projection
+for existing analysis scripts and are written by the explicit publish step:
+
+```bash
+mosaic publish --output-dir <processed_point_data> --run-digest <run_digest>
+```
 
 Bounded smoke helper:
 

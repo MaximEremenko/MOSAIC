@@ -113,5 +113,17 @@ Current example outputs:
 - `examples/config_3D/displacement/output_displacement`
 - `examples/config_3D/chemical_ordering/output_chemical_ordering`
 
-Most generated artifacts live under `processed_point_data/`. Some modes also
-produce `residual_shards/` for intermediate accumulation data.
+The manifest-authoritative run state lives under
+`processed_point_data/.mosaic/runs/<run_digest>/`. Files directly under
+`processed_point_data/` are a compatibility projection for existing analysis
+scripts and are written only by the explicit public finalizer:
+
+```bash
+mosaic publish --output-dir <processed_point_data> --run-digest <run_digest>
+```
+
+Residual-field checkpoint state for current runs lives under
+`residual_checkpoints/` or the private `.mosaic/runs/<run_digest>/` namespace,
+depending on backend and stage. Use `mosaic cleanup --output-dir
+<processed_point_data> --run-digest <run_digest>` as a separate retention step
+after manifest truth is proven.
