@@ -3,7 +3,7 @@
   "paths": {
     "config_root": "/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/config_2D/chemical_ordering",
     "structure_file": "sample_2d_chem_PMN_proj_101.f2d",
-    "output_directory": "/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/config_2D/chemical_ordering/output_demo_pmn_proj101_rest"
+    "output_directory": "/home/user/mosaic_out/proj101_rest"
   },
   "structure": {
     "dimension": 2,
