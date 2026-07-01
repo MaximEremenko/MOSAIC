@@ -313,7 +313,7 @@ def build_run_identity(
         reducer_strategy=reducer_strategy,
         backend_policy_digest=backend_policy_digest,
     )
-    # P11 C-2: the run/checkpoint tree is addressed by the DEVICE-INDEPENDENT run
+    # Device-independent identity: the run/checkpoint tree is addressed by the DEVICE-INDEPENDENT run
     # identity (science + numerical contract: eps/dtype/pre-sum/reducer), NOT by the
     # device-bound execution_digest. A CPU run and a GPU run of the same science thus
     # share one `.mosaic/runs/<run_digest>/` tree; the device-bound execution_digest
@@ -474,7 +474,7 @@ def prepare_scattering_run_identity(
         MaskStrategy=MaskStrategy,
     )
     qspace_path = write_qspace_plan(output_dir, qspace_plan)
-    # A3: persist the per-interval q-normalization contracts to the SEPARATE sidecar
+    # Persist the per-interval q-normalization contracts to the SEPARATE sidecar
     # (q_normalization.json) next to qspace_plan.json. This never touches the plan file,
     # so qspace_plan_digest (file_sha256 of qspace_path) below is unchanged.
     write_q_normalization_sidecar(
@@ -561,10 +561,10 @@ def build_qspace_plan(
             MaskStrategy,
             supercell,
         )
-        # A1: the masked q_grid is already in scope -- its row count is the
+        # The masked q_grid is already in scope -- its row count is the
         # multiplicity-FREE accepted (post-mask) count.
         accepted_count = int(np.asarray(q_grid).shape[0])
-        # A2: multiplicity-FREE dense planned count (mask-blind). This is comparable to
+        # Multiplicity-FREE dense planned count (mask-blind). This is comparable to
         # accepted_count; the multiplicity-FOLDED value still feeds the persisted
         # QSpaceIntervalPlan.reciprocal_point_count below (byte-identical, unchanged).
         planned_count = int(
@@ -582,7 +582,7 @@ def build_qspace_plan(
             q_digest=q_digest,
         )
         normalization_contracts.append(contract)
-        logger.info(
+        logger.debug(
             "qspace interval %d q-normalization: planned=%d accepted=%d "
             "mask_rejected=%d multiplicity=%d (role=%s)",
             int(interval["id"]),
@@ -606,6 +606,20 @@ def build_qspace_plan(
                 l_coverage=_l_coverage_for_role(role),
             )
         )
+    # One INFO summary instead of one line per interval (per-interval detail is at DEBUG).
+    _total_mask_rejected = sum(c.mask_rejected for c in normalization_contracts)
+    _multiplicity_counts: dict[int, int] = {}
+    for _contract in normalization_contracts:
+        _multiplicity_counts[_contract.multiplicity] = (
+            _multiplicity_counts.get(_contract.multiplicity, 0) + 1
+        )
+    logger.info(
+        "qspace q-normalization: %d intervals | total mask_rejected=%d | multiplicities=%s "
+        "(per-interval detail at DEBUG)",
+        len(normalization_contracts),
+        _total_mask_rejected,
+        dict(sorted(_multiplicity_counts.items())),
+    )
     q_grid_set_digest = digest_dict(
         {
             "schema_version": SCATTERING_IDENTITY_SCHEMA_VERSION,

@@ -1,10 +1,9 @@
 """
 core/qspace/normalization.py
 
-Single authoritative q-normalization record (W6.2 #1 — additive foundation).
+Single authoritative q-normalization record and byte estimators.
 
-Today three reciprocal-space counts are computed independently and never reconciled
-(see plan_phase2_w6_scaling_design.md, W6.0):
+Three reciprocal-space counts are computed independently and must be reconciled:
 
 * the PLANNED interval-bound count (mask-blind, dense) -- folds multiplicity in;
 * the ACCEPTED masked q_grid count (multiplicity-free, currently telemetry-only);
@@ -16,13 +15,13 @@ accepted counts side by side, applies half-space multiplicity in EXACTLY one pla
 a pure leaf (imports only the stdlib) so it can be referenced from any layer without an
 import cycle.
 
-It is intentionally NOT yet wired into the durable qspace plan / commit identity: this is
-the additive first increment of the byte-budgeted-tiling roadmap. Wiring it into
-``build_qspace_plan`` (where both counts are already in scope, planning.py:511-549) and
-asserting the persisted ``contribution_reciprocal_points`` against it is a later,
-digest-affecting increment that must be gated separately.
+It is intentionally stored outside the durable qspace plan / commit identity.
+``build_qspace_plan`` writes the sidecar, and commit-time validation compares the
+persisted ``contribution_reciprocal_points`` against it explicitly.
 """
 from __future__ import annotations
+
+import functools
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping
@@ -210,6 +209,27 @@ def write_q_normalization_sidecar(
     return path
 
 
+@functools.lru_cache(maxsize=32)
+def _load_sidecar_index(path_str: str, mtime_ns: int) -> "dict[int, dict[str, Any]]":
+    """Parse the sidecar ONCE per (path, mtime) and index its contracts by interval_id.
+
+    ``mtime_ns`` is part of the cache key so a rewritten sidecar is re-read. This exists
+    because the commit-time reconciliation calls :func:`load_q_normalization_contract`
+    once PER ATTEMPT; without this cache each call re-opened and fully re-parsed the whole
+    sidecar (O(N**2) over a run's attempts at scattering scale).
+    """
+    import json
+
+    with open(path_str, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    index: "dict[int, dict[str, Any]]" = {}
+    for entry in payload.get("intervals", []):
+        interval_id = entry.get("interval_id")
+        if interval_id is not None:
+            index[int(interval_id)] = entry
+    return index
+
+
 def load_q_normalization_contract(
     output_dir: "str | Path",
     run_digest: str,
@@ -219,19 +239,18 @@ def load_q_normalization_contract(
 
     Returns ``None`` when the sidecar file does not exist (older runs predate the
     feature) or contains no entry for ``interval_id`` -- callers SKIP their assertion in
-    that case for back-compatibility.
+    that case for back-compatibility. The sidecar is parsed once per (path, mtime) and
+    cached, so repeated per-attempt lookups during a run are O(1).
     """
-    import json
-
     path = _q_normalization_sidecar_path(output_dir, run_digest)
-    if not path.exists():
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
         return None
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    for entry in payload.get("intervals", []):
-        if entry.get("interval_id") is not None and int(entry["interval_id"]) == int(interval_id):
-            return QNormalizationContract.from_payload(entry)
-    return None
+    entry = _load_sidecar_index(str(path), mtime_ns).get(int(interval_id))
+    if entry is None:
+        return None
+    return QNormalizationContract.from_payload(entry)
 
 
 __all__ = [
