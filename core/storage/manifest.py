@@ -287,10 +287,6 @@ def try_commit_manifest(
       raises — by default a ``RuntimeError`` describing the conflict, or the
       exception built by ``conflict_error(existing)`` when the caller supplies one
       (so each promote path can preserve its existing error wording).
-
-    This replaces the ``if target.exists(): match-or-raise else write_manifest``
-    pattern, which had both an atomic-overwrite (last-writer-wins) write and a
-    check-then-write TOCTOU window.
     """
     payload = _payload_from_manifest(manifest)
     expected_schema = getattr(manifest, "schema", None)

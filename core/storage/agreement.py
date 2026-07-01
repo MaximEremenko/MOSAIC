@@ -1,6 +1,6 @@
 """Predicted numerical-agreement tolerance for same-work commit reconciliation.
 
-P11 reconciles same-work results (CPU vs GPU, or non-deterministic GPU relaunches)
+reconciles same-work results (CPU vs GPU, or non-deterministic GPU relaunches)
 by NUMERICAL agreement rather than bit equality. The agreement tolerance is NOT a
 magic constant: two *correct* results can legitimately differ by up to ~2x the
 **forward error** each carries, and that error is predictable from the computation:

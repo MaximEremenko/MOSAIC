@@ -1,8 +1,8 @@
 """
 Refactored amplitude-delta calculator facade.
 
-The public API remains ``compute_amplitudes_delta()``, while Phase 3 scattering
-execution now lives behind the explicit ``planning / execution / tasks /
+The public API remains ``compute_amplitudes_delta()``, while scattering
+execution lives behind the explicit ``planning / execution / tasks /
 accumulation / artifacts / kernels`` boundaries.
 """
 

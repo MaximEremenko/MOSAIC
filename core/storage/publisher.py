@@ -1,11 +1,11 @@
 """Compatibility shim.
 
-This module was relocated to :mod:`core.workflow.publisher` (W2.2): publishing
+This module was relocated to :mod:`core.workflow.publisher`: publishing
 a run as a public compatibility projection is post-stage *orchestration* and
 depends UP on the scattering/residual/decoding ``commit`` modules, which is not
 allowed for the device-independent ``core.storage`` primitives layer. The
 implementation now lives under ``core.workflow``; this shim preserves the
-historical ``core.storage.publisher`` import path.
+``core.storage.publisher`` import path.
 """
 from __future__ import annotations
 

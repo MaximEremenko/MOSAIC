@@ -63,7 +63,7 @@ def build_scattering_work_unit_digest(
     qspace_plan_digest: str,
     source_structure_digest: str,
 ) -> str:
-    """Device-INDEPENDENT checkpoint/work address for one (interval, chunk) (P11 C-2).
+    """Device-independent checkpoint/work address for one (interval, chunk).
 
     The address is the science + structural partition keys: ``scientific_digest`` +
     ``qspace_plan_digest`` + ``source_structure_digest`` + (interval, chunk). It
@@ -86,7 +86,7 @@ def build_scattering_work_unit_digest(
         "qspace_plan_digest": str(qspace_plan_digest),
         "source_structure_digest": str(source_structure_digest),
     }
-    # P11 tripwire: pin the device-INDEPENDENCE invariant immediately before
+    # Device-independence tripwire: pin the device-INDEPENDENCE invariant immediately before
     # hashing. This payload already excludes execution_digest /
     # backend_policy_digest, so this is a no-op today -- it fails loudly only if a
     # future edit folds a device/runtime field into the work-unit identity.
@@ -375,7 +375,7 @@ class ScatteringStageCommitManifest:
 
 
 class ScatteringInvariantError(RuntimeError):
-    """A scattering attempt failed P11 mechanical validation at write time."""
+    """A scattering attempt failed mechanical validation at write time."""
 
 
 class ScatteringNormalizationError(RuntimeError):
@@ -386,7 +386,7 @@ class ScatteringDivergenceError(RuntimeError):
     """Same-work scattering results disagree beyond the numerical tolerance."""
 
 
-# P11 numerical agreement: two attempts/candidates for the SAME work need not be
+# Numerical agreement: two attempts/candidates for the SAME work need not be
 # bit-identical (CPU/GPU and GPU relaunches are non-deterministic), but they MUST
 # agree NUMERICALLY -- a genuine divergence (a real bug, not float noise) fails
 # closed. The tolerance is NOT a magic constant: it is the PREDICTED forward-error
@@ -401,8 +401,8 @@ def _assert_scattering_partials_agree(partials, *, eps: float, context: str) -> 
     """Fail closed unless every same-work partial agrees within the PREDICTED
     forward-error tolerance, evaluated PER FIELD.
 
-    Replaces (does NOT remove) the old exact-``payload_sha256`` equality: bytes may
-    differ across non-deterministic launches/devices, but a real numerical divergence
+    Byte-level ``payload_sha256`` equality is NOT required: bytes may differ
+    across non-deterministic launches/devices, but a real numerical divergence
     is a bug and must not be silently reconciled by deterministic winner selection.
     The tolerance is ``predict_agreement_rtol(eps, M, kappa)`` with ``M`` the
     reciprocal-point summation depth and ``kappa`` = 1 for the average channel and the
@@ -454,7 +454,7 @@ def _expected_point_count_from_grid_shape(grid_shape_nd: np.ndarray) -> int | No
     callers then fall back to self-consistency only, which is documented at the
     call site and reserved for non-production fixtures.
 
-    AXIS NOTE (A6): this REAL-SPACE coverage count (``sum_i prod(grid_shape_nd[i])``)
+    AXIS NOTE: this REAL-SPACE coverage count (``sum_i prod(grid_shape_nd[i])``)
     is DELIBERATELY DISTINCT from reciprocal-space normalization
     (``accepted x multiplicity`` == ``QNormalizationContract.reciprocal_point_count``,
     enforced in write_scattering_attempt against the q_normalization.json sidecar).
@@ -491,14 +491,14 @@ def write_scattering_attempt(
     runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ScatteringAttemptManifest:
     amplitude_len = int(np.asarray(amplitudes_delta).reshape(-1).shape[0])
-    # A4: reconcile the attempt's reciprocal-point count against the interval's
+    # Reconcile the attempt's reciprocal-point count against the interval's
     # q-normalization contract (the SIDECAR authority, q_normalization.json). The
     # contract's reciprocal_point_count is accepted x multiplicity -- exactly what
     # contribution_reciprocal_points equals today -- so this passes on agreeing data and
     # fails closed on a genuine mismatch. If the sidecar/contract is ABSENT (older runs
     # predating the feature) we SKIP the assertion for back-compatibility. This is a
     # reciprocal-space-normalization check, distinct from the real-space coverage gate
-    # (C-3b) below.
+    # below.
     _norm_contract = load_q_normalization_contract(
         output_dir, str(run_digest), int(interval_id)
     )
@@ -518,14 +518,14 @@ def write_scattering_attempt(
         # point_ids by index. They are NOT the coverage authority -- coverage is
         # validated against the partition's expected set resolved just below.
         point_ids = np.arange(amplitude_len, dtype=np.int64)
-    # P11 C-3b: resolve the AUTHORITATIVE expected coverage set, in precedence order:
+    # Coverage validation: resolve the AUTHORITATIVE expected coverage set, in precedence order:
     #   1. an explicit ``expected_point_count`` (e.g. a future partition-plan count);
     #   2. caller-declared ``point_ids`` -- when a caller passes real ids it is
     #      asserting that exact coverage set, so we validate against it directly;
     #   3. otherwise (the PRODUCTION path, which omits point_ids) the count DECLARED
     #      by the grid geometry: sum_i prod(grid_shape_nd[i]) -- the same geometry
     #      downstream accumulation reshapes into. This closes the self-validation
-    #      loop the review flagged: a worker that omits ids and truncates/over-
+    #      loop the validation rule guards against: a worker that omits ids and truncates/over-
     #      produces amplitudes relative to its declared grid now fails closed here
     #      instead of self-validating against arange(len(amplitudes)).
     if expected_point_count is None and not point_ids_explicit:
@@ -563,7 +563,7 @@ def write_scattering_attempt(
             "failed invariant validation: "
             + "; ".join(f"{finding.name}: {finding.detail}" for finding in _invalid)
         )
-    # P11 C-2: the work-unit (checkpoint) address is device-INDEPENDENT.
+    # Device-independent identity: the work-unit (checkpoint) address is device-INDEPENDENT.
     # execution_digest/backend_policy_digest are still received and recorded on the
     # attempt manifest as metadata, but NOT folded into the address.
     work_unit_digest = build_scattering_work_unit_digest(
@@ -684,7 +684,7 @@ def load_scattering_attempt_partial(
 
 
 def _attempt_identity_tuple(manifest: ScatteringAttemptManifest) -> tuple[str, ...]:
-    # P11 C-2: identity is DEVICE-INDEPENDENT. execution_digest /
+    # Device-independent identity: execution_digest / execution_digest /
     # backend_policy_digest (which encode the backend) are deliberately EXCLUDED so a
     # CPU attempt and a GPU attempt for the same science/partition share one identity
     # and are treated as the same work -- their (non-bit-identical) results are then
@@ -763,7 +763,7 @@ def _select_attempts_by_interval(
             raise RuntimeError(
                 f"Conflicting scattering attempt identity for interval {int(interval_id)}."
             )
-        # P11: bitwise equality is REPLACED (not removed) by a numerical agreement
+        # Bitwise equality is REPLACED (not removed) by a numerical agreement
         # gate. Same-work retries (e.g. non-deterministic GPU relaunches) may
         # differ in bytes but MUST agree within tolerance; a genuine divergence
         # fails closed rather than being silently reconciled by winner selection.
@@ -786,7 +786,7 @@ def _candidate_id(
     chunk_id: int,
     selected_attempts: tuple[ScatteringAttemptManifest, ...],
 ) -> str:
-    # P11 address-based identity: the candidate is addressed by its chunk and the
+    # Address-based identity: the candidate is addressed by its chunk and the
     # DEVICE-INDEPENDENT work-unit digests of its selected intervals -- NOT by payload
     # bytes. payload_sha256 stays on each attempt manifest and is verified at load time
     # for disk integrity, but it is NOT part of commit identity, so a CPU-written and a
@@ -1033,7 +1033,7 @@ def promote_scattering_chunk_commit_by_scan(
         raise RuntimeError(
             f"No valid scattering commit candidates for chunk {int(chunk_id)}: {detail}"
         )
-    # P11: valid candidates need NOT share output bytes. Each was built by
+    # Valid candidates need NOT share output bytes. Each was built by
     # _select_attempts_by_interval, which already fails closed unless every
     # same-work attempt AGREES numerically within tolerance and then picks a
     # deterministic winner -- so any two valid candidates here are built from

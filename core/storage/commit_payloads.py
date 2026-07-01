@@ -1,21 +1,15 @@
 """Shared low-level helpers for scattering and residual-field commit payloads.
 
-These four private helpers were previously duplicated verbatim (modulo error-
-message strings) in core/scattering/commit.py and core/residual_field/commit.py.
-They are lifted here so both modules import from one place.
+Both ``core/scattering/commit.py`` and ``core/residual_field/commit.py`` import
+these four private helpers from here so the logic lives in one place.
 
 Rules that MUST be preserved:
-- ``_payload_digest`` must produce BYTE-IDENTICAL ``payload_sha256`` values to
-  the originals.  The only semantic change is that the caller now supplies
-  ``schema`` explicitly instead of having the function read it from
-  ``attrs["schema"]`` (scattering) or receive it as a parameter (residual).
-  Both callers already had the value in scope; scattering now passes
-  ``str(attrs["schema"])`` and residual continues to pass its named param.
+- ``_payload_digest`` must produce BYTE-IDENTICAL ``payload_sha256`` values for a
+  given payload. The caller supplies ``schema`` explicitly: scattering passes
+  ``str(attrs["schema"])`` and residual passes its named ``schema`` param.
 - ``_read_payload``, ``_resolve_runtime_provenance``, and ``_payload_datasets``
-  were byte-for-byte identical between the two modules (the only difference was
-  error-message wording in ``_payload_datasets``).  The scattering wording is
-  used here; residual field previously had slightly different strings but the
-  *behaviour* was identical.
+  behave identically for both callers; the ``_payload_datasets`` error-message
+  wording used here is the shared wording.
 """
 
 from __future__ import annotations

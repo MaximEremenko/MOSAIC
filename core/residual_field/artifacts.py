@@ -42,8 +42,8 @@ from core.runtime import chunk_mutex
 from core.storage.database_manager import create_db_manager_for_thread
 
 # ---------------------------------------------------------------------------
-# Re-exports from extracted modules (all public names remain importable from
-# core.residual_field.artifacts for backward compatibility).
+# Re-exports from extracted modules so all public names remain importable from
+# core.residual_field.artifacts.
 # ---------------------------------------------------------------------------
 from core.residual_field.manifest_io import (  # noqa: E402
     _GENERATION_FILENAME_RE,

@@ -524,7 +524,7 @@ class ResidualFieldPartialResult:
     """
     Artifact-oriented residual-field seam result.
 
-    This stays metadata-first in Phase 1B so later extraction can choose the final
+    This stays metadata-first so later extraction can choose the final
     ndarray/reducer shape without changing the seam identity.
     """
 
@@ -591,7 +591,7 @@ RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS = MergeInvariantSpec(
     ),
     deterministic_serialization_boundary=(
         "the residual-field seam is serialized through artifact manifests and current HDF5 "
-        "chunk artifacts; in-memory arrays are Phase 4 accumulation helpers only"
+        "chunk artifacts; in-memory arrays are accumulation helpers only"
     ),
     duplicate_handling=(
         "duplicate contributing interval ids and duplicate output artifact keys are forbidden "
@@ -645,7 +645,7 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
     if len(set(source_keys)) != len(source_keys):
         raise ValueError("Residual-field work units must not contain duplicate source artifact keys.")
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
-        raise ValueError("Residual-field Phase 6 assumes NO_OP replay semantics.")
+        raise ValueError("Residual-field work units require NO_OP replay semantics.")
     identity_values = (
         work_unit.run_digest,
         work_unit.partition_plan_digest,

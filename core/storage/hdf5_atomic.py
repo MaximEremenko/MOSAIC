@@ -3,8 +3,8 @@
 This is a storage primitive shared by every Map-Reduce stage that writes
 immutable payloads (scattering, residual field). It lives in ``core.storage``
 so stage modules do not have to import each other's private helpers, which
-previously created a ``scattering.artifacts`` <-> ``scattering.commit`` import
-cycle and a cross-stage dependency from ``residual_field.commit`` into
+would create a ``scattering.artifacts`` <-> ``scattering.commit`` import cycle
+and a cross-stage dependency from ``residual_field.commit`` into
 ``scattering.artifacts``.
 
 The write protocol matches the manifest write protocol in

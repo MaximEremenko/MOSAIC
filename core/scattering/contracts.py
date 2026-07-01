@@ -372,7 +372,7 @@ def validate_scattering_work_unit(work_unit: ScatteringWorkUnit) -> None:
                 "Chunk-scoped scattering work units must include interval and chunk artifact identities."
             )
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
-        raise ValueError("Scattering Phase 6 assumes NO_OP replay semantics.")
+        raise ValueError("Scattering work units require NO_OP replay semantics.")
     identity_fields = (
         work_unit.scientific_digest,
         work_unit.execution_digest,

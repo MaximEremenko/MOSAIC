@@ -60,9 +60,9 @@ def direct_dft_type3(
 
     Notes
     -----
-    The arithmetic mirrors the previous inline adapter code exactly
-    (``np.exp(1j * isign * phase) @ coeffs``) so the output is byte-identical.
-    The caller is responsible for all dtype/contiguity marshalling.
+    The arithmetic is a direct evaluation of
+    ``np.exp(1j * isign * phase) @ coeffs``. The caller is responsible for all
+    dtype/contiguity marshalling.
     """
     n_targets = int(targets.shape[0])
     out = np.zeros(n_targets, dtype=np.complex128)

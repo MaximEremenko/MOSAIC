@@ -117,16 +117,15 @@ def _cleanup_scattering_chunk(
         skipped.append(f"scattering chunk {chunk_id}: retained candidates after validation error: {exc}")
         return
 
-    # P11/W2.3 ADDRESS-BASED GC: the durable chunk commit already names the
+    # Address-based cleanup: the durable chunk commit already names the
     # winning candidate (``selected.candidate_id``). Identity is address-based --
     # ``candidate_id`` is derived from the chunk plus the device-independent
     # work-unit addresses of its selected attempts, NOT from payload bytes -- and
     # per-attempt byte integrity is verified separately at load (validation above).
     # So any OTHER valid candidate is SUPERSEDED and safe to delete REGARDLESS of
-    # payload bytes. (This replaces the pre-P11 bitwise gate that retained ALL
-    # candidates whenever their payload_sha256 differed; genuinely divergent /
-    # invalid candidates are rejected upstream by the agreement gate before
-    # cleanup, and validation errors above still skip/retain.)
+    # payload bytes. Genuinely divergent / invalid candidates are rejected
+    # upstream by the agreement gate before cleanup, and validation errors above
+    # still skip/retain.
     for candidate in valid_candidates:
         if candidate.candidate_id == selected.candidate_id:
             continue
@@ -210,16 +209,15 @@ def _cleanup_residual_chunk(
         skipped.append(f"residual chunk {chunk_id}: retained candidates after validation error: {exc}")
         return
 
-    # P11/W2.3 ADDRESS-BASED GC: the durable chunk commit already names the
+    # Address-based cleanup: the durable chunk commit already names the
     # winning candidate (``selected.candidate_id``). Identity is address-based --
     # ``candidate_id`` is derived from the chunk plus the device-independent
     # work-unit addresses of its selected attempts, NOT from payload bytes -- and
     # per-attempt byte integrity is verified separately at load (validation above).
     # So any OTHER valid candidate is SUPERSEDED and safe to delete REGARDLESS of
-    # payload bytes. (This replaces the pre-P11 bitwise gate that retained ALL
-    # candidates whenever their payload_sha256 differed; genuinely divergent /
-    # invalid candidates are rejected upstream by the agreement gate before
-    # cleanup, and validation errors above still skip/retain.)
+    # payload bytes. Genuinely divergent / invalid candidates are rejected
+    # upstream by the agreement gate before cleanup, and validation errors above
+    # still skip/retain.
     for candidate in valid_candidates:
         if candidate.candidate_id == selected.candidate_id:
             continue

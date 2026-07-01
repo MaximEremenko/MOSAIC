@@ -1,7 +1,7 @@
-"""Stage-2 replacement expected-metadata cluster.
+"""Replacement expected-metadata helpers.
 
 Functions for normalising, digesting, building, writing, and loading
-the stage-2 replacement expected-coverage manifest.  This module has no
+the replacement expected-coverage manifest.  This module has no
 dependency on ``core.residual_field.artifacts`` — it imports only from
 ``core.residual_field.manifest_io``, ``core.residual_field.contracts``, and
 ``core.contracts``.

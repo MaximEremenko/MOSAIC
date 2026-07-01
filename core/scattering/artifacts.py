@@ -286,7 +286,7 @@ def mark_empty_interval_precomputed(
     When a reciprocal-space mask eliminates all Q-points in a subvolume,
     no ``.npz`` artifact is written.  This function marks the interval as
     precomputed **and** marks every ``(interval, chunk)`` pair as saved so
-    that downstream stages (Stage-2 chunk accumulation and residual-field)
+    that downstream consumers (chunk accumulation and residual-field)
     do not attempt to load the non-existent artifact file.
     """
     if db_path is None:

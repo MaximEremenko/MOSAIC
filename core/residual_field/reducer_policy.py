@@ -119,7 +119,7 @@ class ResidualFieldReducerRuntimeState:
 # Protocol
 # ---------------------------------------------------------------------------
 
-# The reducer interface is segregated into capability facets (A2). Each facet is a
+# The reducer interface is segregated into capability facets. Each facet is a
 # small structural Protocol; ``ResidualFieldReducerBackend`` is their composition, so
 # the runtime contract is UNCHANGED (the union of methods is identical) while callers
 # and type-checkers can depend on the narrow capability they actually use. The

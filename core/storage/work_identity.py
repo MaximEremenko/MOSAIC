@@ -1,4 +1,4 @@
-"""Shared device-independence tripwire for durable work-unit identity (P11).
+"""Shared device-independence tripwire for durable work-unit identity .
 
 Durable work-unit identity (the checkpoint/work-unit digest and the attempt
 identity tuple) MUST be DEVICE-INDEPENDENT: a CPU-computed unit and a

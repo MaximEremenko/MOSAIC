@@ -64,9 +64,9 @@ def build_residual_work_unit_digest(
     source_replacement_digest: str | None,
     expected_output_digest: str,
 ) -> str:
-    """Device-INDEPENDENT residual checkpoint/work address (P11 C-4).
+    """Device-independent residual checkpoint/work address.
 
-    Mirrors the scattering C-2 change: the address is the run + structural partition
+    Mirrors the scattering work-unit identity rule: the address is the run + structural partition
     keys (chunk, partition, point range, interval ids), the parameter / partition-
     plan digests, the upstream source-commit identities, and the *structural*
     ``expected_output_digest`` (the planned output SHAPE -- counts/intervals/params --
@@ -94,7 +94,7 @@ def build_residual_work_unit_digest(
         ),
         "expected_output_digest": str(expected_output_digest),
     }
-    # P11 tripwire: pin the device-INDEPENDENCE invariant immediately before
+    # Device-independence tripwire: pin the device-INDEPENDENCE invariant immediately before
     # hashing. This payload already excludes backend_policy_digest, so this is a
     # no-op today -- it fails loudly only if a future edit folds a device/runtime
     # field into the residual work-unit identity.
@@ -447,7 +447,7 @@ def write_residual_attempt(
     runtime_provenance: Mapping[str, Any] | None = None,
 ) -> ResidualAttemptManifest:
     normalized_interval_ids = tuple(sorted(int(item) for item in interval_ids))
-    # P11 C-4: device-INDEPENDENT checkpoint address. backend_policy_digest is still
+    # Device-independent checkpoint address. backend_policy_digest is still
     # received and recorded on the manifest as metadata, but NOT folded into the
     # address (so CPU and GPU partitions share one checkpoint).
     work_unit_digest = build_residual_work_unit_digest(
@@ -575,7 +575,7 @@ def load_residual_attempt_payload(
 
 
 def _identity_tuple(manifest: ResidualAttemptManifest) -> tuple[Any, ...]:
-    # P11 C-4: DEVICE-INDEPENDENT identity. backend_policy_digest (which carries the
+    # Device-independent identity. backend_policy_digest (which carries the
     # backend kind) is deliberately EXCLUDED so a CPU attempt and a GPU attempt for
     # the same partition share one identity and are reconciled by the numerical
     # agreement gate, not rejected as "conflicting".
@@ -609,7 +609,7 @@ class ResidualDivergenceError(RuntimeError):
     """Same-work residual results disagree beyond the numerical tolerance."""
 
 
-# P11 (mirror of the scattering gate): same-work residual retries -- a
+# Mirror of the scattering gate: same-work residual retries -- a
 # non-deterministic GPU relaunch, or a CPU vs GPU attempt for the same partition --
 # need not be bit-identical but MUST agree NUMERICALLY. The tolerance is the PREDICTED
 # forward-error bound rtol = S*(eps + M*u)*kappa (core/storage/agreement.py), tied to
@@ -627,8 +627,8 @@ def _assert_residual_partials_agree(
     """Fail closed unless every same-work residual payload agrees within the PREDICTED
     forward-error tolerance, evaluated PER FIELD.
 
-    Replaces (does NOT remove) the old exact-``payload_sha256`` equality: bytes may
-    differ across non-deterministic launches / devices, but a real numerical
+    Byte-level ``payload_sha256`` equality is NOT required: bytes may differ
+    across non-deterministic launches / devices, but a real numerical
     divergence must not be silently reconciled by deterministic winner selection. The
     tolerance is ``predict_agreement_rtol(eps, M, kappa)`` with ``M`` the
     reciprocal-point summation depth and ``kappa`` = 1 for the average channel and the
@@ -675,7 +675,7 @@ def _select_attempts_by_partition(
             raise RuntimeError(
                 f"Residual commit candidate missing attempts for partition {partition_id}."
             )
-        # P11: bitwise payload equality is REPLACED (not removed) by the PREDICTED
+        # Bitwise payload equality is REPLACED (not removed) by the PREDICTED
         # numerical agreement gate. Same-work retries (non-deterministic GPU
         # relaunches, or a CPU vs GPU attempt) may differ in bytes but MUST agree
         # within the predicted tolerance; a genuine divergence fails closed.
@@ -699,7 +699,7 @@ def _candidate_id(
     chunk_id: int,
     selected_attempts: tuple[ResidualAttemptManifest, ...],
 ) -> str:
-    # P11 address-based identity: the candidate is addressed by its chunk and the
+    # Address-based identity: the candidate is addressed by its chunk and the
     # DEVICE-INDEPENDENT work-unit digests of its selected partitions -- NOT by
     # payload bytes. payload_sha256 stays on each attempt manifest and is verified at
     # load time (load_residual_attempt_payload) for disk integrity, but it is NOT part
@@ -1017,7 +1017,7 @@ def promote_residual_chunk_commit_by_scan(
         raise RuntimeError(
             f"No valid residual commit candidates for chunk {int(chunk_id)}: {detail}"
         )
-    # P11: the old cross-candidate bitwise payload_sha256 equality is REMOVED.
+    # Cross-candidate bitwise payload_sha256 equality is NOT required.
     # Attempt-level numerical agreement (_select_attempts_by_partition) already
     # guarantees that the candidates for this chunk are numerically consistent, so a
     # deterministic winner (lowest candidate_id) is canonical; bytes need not match

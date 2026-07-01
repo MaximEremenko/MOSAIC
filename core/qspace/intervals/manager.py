@@ -190,10 +190,10 @@ class ReciprocalSpaceIntervalManager:
 
         The string is produced by ``_interval_to_str`` (i.e. ``str(interval)``)
         where ``interval`` is a mapping of range name -> (start, end) floats.
-        This previously used ``eval()``, which would execute arbitrary code
-        embedded in an HDF5 attribute. ``ast.literal_eval`` parses only Python
-        literal structures (dicts, tuples, numbers, strings) and rejects any
-        expression that would call functions, reference names, or run code.
+        Parsing uses ``ast.literal_eval``, which parses only Python literal
+        structures (dicts, tuples, numbers, strings) and rejects any expression
+        that would call functions, reference names, or run code -- unlike
+        ``eval``, which would execute arbitrary code embedded in an HDF5 attribute.
 
         Args:
             interval_str: String representation of an interval dictionary

@@ -8,11 +8,11 @@ from typing import Mapping
 def _normalize_expected_by_chunk(
     raw: object,
 ) -> dict[int, tuple[int, ...]]:
-    """Coerce a stage-2 ``expected_by_chunk`` payload to ``{int: tuple[int, ...]}``.
+    """Coerce an expected-by-chunk payload to ``{int: tuple[int, ...]}``.
 
-    Mirrors the tolerant shape the live dict carried: chunk ids and interval
-    ids are coerced to ``int`` and interval collections to a tuple. A non-mapping
-    value (the historical ``{}`` default) yields an empty mapping.
+    Tolerant of shape: chunk ids and interval ids are coerced to ``int`` and
+    interval collections to a tuple. A non-mapping value (such as a ``{}``
+    default) yields an empty mapping.
     """
     if not isinstance(raw, Mapping):
         return {}
@@ -27,7 +27,7 @@ def _normalize_expected_by_chunk(
 
 
 class CompletionStatus(str, Enum):
-    """Minimal artifact lifecycle states for Phase 1B scaffolding."""
+    """Minimal artifact lifecycle states for staged artifacts."""
 
     PLANNED = "planned"
     MATERIALIZED = "materialized"
@@ -109,35 +109,34 @@ class ArtifactManifestAssessment:
 class ScatteringHandoff:
     """Typed scattering -> residual-field inter-stage handoff.
 
-    Replaces the historical ``scattering_parameters: dict[str, object]`` that
-    flowed from :meth:`core.scattering.stage.ScatteringStage.execute` into
-    :meth:`core.residual_field.stage.ResidualFieldStage.execute`. The residual
-    stage only ever read a handful of stringly-typed keys off that dict; those
-    keys are the fields below.
+    Carries the handful of stringly-typed keys that flow from
+    :meth:`core.scattering.stage.ScatteringStage.execute` into
+    :meth:`core.residual_field.stage.ResidualFieldStage.execute`; those keys are
+    the fields below.
 
-    A one-release mapping bridge is preserved: :meth:`from_mapping` tolerates a
-    plain ``dict`` (or ``None``) exactly as the old ``.get()`` defaults did, and
-    :meth:`to_mapping` reproduces the read-relevant key shape so any external
-    caller still consuming a mapping keeps working.
+    A mapping bridge is provided for callers that exchange a plain dict:
+    :meth:`from_mapping` tolerates a plain ``dict`` (or ``None``) via ``.get()``
+    defaults, and :meth:`to_mapping` reproduces the read-relevant key shape so a
+    caller consuming a mapping keeps working.
     """
 
     scattering_run_digest: str | None = None
     source_scattering_commit_digest: str | None = None
     residual_parameter_digest: str | None = None
-    # Legacy alias the residual stage falls back to when ``scattering_run_digest``
+    # Alias the residual stage falls back to when ``scattering_run_digest``
     # is absent (residual_field/stage.py read of ``run_digest``).
     run_digest: str | None = None
-    # ``None`` means the ``stage2_replacement_expected_by_chunk`` key was absent
+    # ``None`` means replacement expected coverage was absent
     # from the source mapping; a mapping (even empty) means it was present. This
     # presence distinction drives the residual stage's expected-metadata branch.
     stage2_replacement_expected_by_chunk: dict[int, tuple[int, ...]] | None = None
-    # ``True`` when the originating handoff carried no payload at all (the old
-    # ``not scattering_parameters`` empty-dict / ``None`` case).
+    # ``True`` when the originating handoff carried no payload at all (an empty
+    # or ``None`` source mapping).
     is_empty: bool = field(default=False)
 
     @property
     def has_stage2_replacement_expected(self) -> bool:
-        """Whether the source carried a ``stage2_replacement_expected_by_chunk`` key."""
+        """Whether replacement expected coverage was supplied."""
         return self.stage2_replacement_expected_by_chunk is not None
 
     def expected_by_chunk(self) -> dict[int, tuple[int, ...]]:
@@ -147,9 +146,9 @@ class ScatteringHandoff:
         return dict(self.stage2_replacement_expected_by_chunk)
 
     def to_mapping(self) -> dict[str, object]:
-        """Reproduce the read-relevant dict shape the live handoff carried.
+        """Reproduce the read-relevant dict shape for mapping consumers.
 
-        Only keys that were actually present in the source are emitted, so a
+        Only keys that are actually present in the source are emitted, so a
         round-trip through :meth:`from_mapping` preserves key presence (and the
         ``is_empty`` flag) for the residual stage's membership checks.
         """
@@ -176,9 +175,9 @@ class ScatteringHandoff:
     ) -> "ScatteringHandoff":
         """Build a handoff from a mapping, tolerant of missing keys.
 
-        Mirrors the residual stage's historical ``.get()`` defaults: absent keys
-        become ``None`` (and the stage-2 expected key stays ``None`` to record
-        its absence). An empty or ``None`` payload yields ``is_empty=True``.
+        Absent keys become ``None`` (and expected replacement coverage stays
+        ``None`` to record its absence), matching ``.get()`` default semantics.
+        An empty or ``None`` payload yields ``is_empty=True``.
         """
         if payload is None or not payload:
             return cls(is_empty=True)

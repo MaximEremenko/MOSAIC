@@ -90,9 +90,9 @@ def build_run_digest(
 ) -> str:
     """Derive the path-layout run digest from an ``execution_digest``.
 
-    NOTE (P11): ``execution_digest`` is device-bound (it includes ``backend``),
-    so this run digest separates CPU and GPU runs into different trees. P11
-    re-anchors the run/checkpoint identity onto the device-independent
+    NOTE: ``execution_digest`` is device-bound (it includes ``backend``),
+    so this run digest separates CPU and GPU runs into different trees. The current
+    identity model re-anchors the run/checkpoint identity onto the device-independent
     :func:`build_run_identity_digest`; this function is retained for callers and
     tests that still address the device-bound layout during the migration.
     """
@@ -114,10 +114,10 @@ def build_run_identity_digest(
     domain: str = "mosaic.run_identity.v1",
     length: int = 32,
 ) -> str:
-    """Device-INDEPENDENT run / checkpoint identity (P11).
+    """Device-INDEPENDENT run / checkpoint identity .
 
     Unlike :func:`build_execution_digest`, this deliberately EXCLUDES the
-    ``backend`` (cpu/cuda) and any device-bound policy. Under P11 a durable
+    ``backend`` (cpu/cuda) and any device-bound policy. Under a durable
     checkpoint is addressed by the *science* plus the *numerical contract*
     (eps/dtype/pre-sum/reducer) — never by the device that computed it — so a CPU
     run and a GPU run of the same science share the same run tree and the same

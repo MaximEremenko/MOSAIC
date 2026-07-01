@@ -275,7 +275,7 @@ def _commit_stage2_replacement_attempts(
                 raise RuntimeError(
                     f"Missing stage-2 replacement attempt for chunk {chunk_id} partition {partition_id}."
                 )
-            # P11: do NOT enforce bitwise payload_sha256 equality here. Same-work
+            # do NOT enforce bitwise payload_sha256 equality here. Same-work
             # attempts (a non-deterministic GPU relaunch, or a CPU vs GPU attempt for
             # the same partition science) may differ in bytes; their NUMERICAL
             # agreement is reconciled by the predicted-tolerance gate inside
@@ -283,8 +283,7 @@ def _commit_stage2_replacement_attempts(
             # _assert_residual_partials_agree), which fails closed on a real
             # divergence. point_ids and reciprocal_point_count are STRUCTURAL
             # (input-addressed) and identical across valid attempts, so any
-            # representative is safe to read them from. The old exact-hash gate was
-            # the last residual of the pre-P11 bitwise model on the stage-2 path.
+            # representative is safe to read them from.
             selected = sorted(candidates, key=lambda item: (item.attempt_id, item.payload_path))[0]
             datasets, _attrs = load_residual_attempt_payload(selected, output_dir=output_dir)
             expected_partitions[int(partition_id)] = tuple(

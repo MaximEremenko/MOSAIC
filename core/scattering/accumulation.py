@@ -122,8 +122,8 @@ def apply_scattering_partial_result(
         # positive-half interval. It must NOT also double reciprocal_point_count:
         # partial_result.reciprocal_point_count is already the multiplicity-applied
         # (accepted x multiplicity) count from the q-normalization contract, so the
-        # half-space weight is baked in. The previous ``* 2`` double-counted it -- apply
-        # the count exactly ONCE, matching the live merge_scattering_partial_results
+        # half-space weight is baked in, so apply the count exactly ONCE (a ``* 2``
+        # here would double-count), matching the merge_scattering_partial_results
         # path (plain addition of reciprocal_point_count).
         delta = delta + np.conj(delta)
         average_delta = average_delta + np.conj(average_delta)

@@ -17,7 +17,7 @@ from typing import Any, Iterable
 # Release evidence bundle layout
 # ---------------------------------------------------------------------------
 #
-# ``final_plan.md`` section 13 defines an explicit, auditable bundle layout::
+# The release evidence bundle uses an explicit, auditable layout::
 #
 #     release_evidence/<version>/
 #       commit.txt

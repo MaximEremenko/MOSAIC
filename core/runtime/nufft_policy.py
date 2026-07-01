@@ -44,8 +44,8 @@ _COMPLEX128_ALIASES = {
 # silently fall back to CPU, so the realized device is unknown until execution
 # completes.  We represent that as the sentinel ``"pending"`` backend, which
 # carries a conservative recorded identity of ``cpu`` (see ``backend``) so that
-# CPU bytes can never be mis-recorded under a ``cuda`` identity if Phase C has
-# not yet stamped the realized device.  Phase C MUST call
+# CPU bytes can never be mis-recorded under a ``cuda`` identity if the realized device has
+# not yet been stamped the realized device.  the post-execution path MUST call
 # ``with_realized_backend(...)`` with the device that actually ran before the
 # identity is committed; only then may a ``cuda`` identity appear for a
 # fallback-eligible run.
@@ -83,7 +83,7 @@ class NufftExecutionSettings:
 
         Device-bound when known (``cpu``/``cuda``).  For a still-``pending``
         fallback-eligible run we record the conservative ``cpu`` so CPU bytes
-        are never recorded under ``cuda`` before Phase C confirms the realized
+        are never recorded under ``cuda`` before post-execution stamping confirms the realized
         device via :meth:`with_realized_backend`.
         """
         if self.backend_state == "cuda":
@@ -91,7 +91,7 @@ class NufftExecutionSettings:
         return "cpu"
 
     def with_realized_backend(self, realized: RealizedBackend) -> "NufftExecutionSettings":
-        """Stamp the device that actually executed the work (Phase C seam).
+        """Stamp the device that actually executed the work (realized-device seam).
 
         Only meaningful for a ``pending`` (fallback-eligible) resolution.  For
         an already device-bound resolution the realized device must match the
@@ -252,7 +252,7 @@ def resolve_nufft_execution_settings(
     # device identity at resolve time.  ``allow-fallback`` resolves to
     # ``pending`` because the wrapper may silently fall back to CPU; the
     # realized device must be stamped post-execution via
-    # ``with_realized_backend`` (Phase C) before identity is committed.
+    # ``with_realized_backend`` before identity is committed.
     if policy == "auto":
         backend_state: _BackendState = "cpu"
         execution_policy: NufftExecutionPolicy = "cpu-only"
@@ -271,7 +271,7 @@ def resolve_nufft_execution_settings(
         # Fallback-eligible: attempt GPU but DO NOT bind a ``cuda`` identity.
         # The wrapper may fall back to CPU; the realized device is unknown
         # until execution completes.  Recorded backend stays the conservative
-        # ``cpu`` until Phase C confirms the realized device.
+        # ``cpu`` until post-execution stamping confirms the realized device.
         backend_state = "pending"
         execution_policy = "allow-fallback"
         attempt_gpu = True

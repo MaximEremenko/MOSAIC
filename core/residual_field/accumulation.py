@@ -275,7 +275,7 @@ def validate_materialized_residual_field_state(
             "Residual-field metadata reciprocal_point_count must match the payload."
         )
     if state.metadata.residual_values is None or state.metadata.residual_average_values is None:
-        raise ValueError("Residual-field metadata must materialize residual arrays in Phase 6.")
+        raise ValueError("Residual-field metadata must materialize residual arrays.")
     if not np.array_equal(state.metadata.residual_values, state.payload.amplitudes_delta):
         raise ValueError("Residual-field metadata residual_values must match payload amplitudes_delta.")
     if not np.array_equal(

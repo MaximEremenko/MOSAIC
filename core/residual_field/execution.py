@@ -298,7 +298,7 @@ def _runtime_provenance_for_residual(
 
 
 def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
-    # P11 C-4: device-independent checkpoint address (backend policy is metadata,
+    # Device-independent checkpoint address (backend policy is metadata,
     # not identity) so CPU and GPU residual work units share one address.
     return build_residual_work_unit_digest(
         run_digest=str(work_unit.run_digest),
@@ -1452,7 +1452,7 @@ def run_residual_field_stage(
                 _harvest_finished_nonblocking(bump, pbar=pbar)
                 _apply_memory_backpressure(bump, pbar=pbar)
                 while len(flying) >= max_inflight:
-                    # T2: drain ONE completion then break so the outer
+                    # Drain ONE completion then break so the outer
                     # submit-loop can enqueue the next work_unit immediately.
                     # The snapshot is rebuilt on the next `while` iteration
                     # if we are still at the cap.

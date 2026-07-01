@@ -190,10 +190,10 @@ class ResidualFieldStage:
         *,
         scattering_parameters: ScatteringHandoff | Mapping[str, object] | None = None,
     ) -> ScatteringHandoff | Mapping[str, object]:
-        # One-release bridge: accept either the typed handoff or a plain mapping
-        # (or None) and normalise to a ScatteringHandoff for typed reads. The
-        # original argument is returned unchanged so the existing pass-through
-        # contract with workflow/service.py (and direct callers) is preserved.
+        # Accept either the typed handoff or a plain mapping (or None) and
+        # normalise to a ScatteringHandoff for typed reads. The original argument
+        # is returned unchanged so the pass-through contract with
+        # workflow/service.py (and direct callers) is preserved.
         original = scattering_parameters
         handoff = (
             scattering_parameters

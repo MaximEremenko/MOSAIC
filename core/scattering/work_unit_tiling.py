@@ -1,4 +1,4 @@
-"""Byte-budgeted tiling plans for scattering work units (additive, default-off).
+"""Byte-budgeted tiling plans for scattering work units (optional by default).
 
 A scattering ``(interval, chunk)`` work unit emits one durable amplitude pair per
 real-space sample and consumes one reciprocal q-row per accepted q-point. Two

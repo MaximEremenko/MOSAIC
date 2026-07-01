@@ -208,7 +208,7 @@ def _runtime_provenance_for_scattering(
 
 
 def _scattering_work_unit_digest(work_unit: ScatteringWorkUnit) -> str:
-    # P11 C-2: device-independent checkpoint address (execution/backend policy are
+    # Device-independent checkpoint address (execution/backend policy are
     # metadata, not identity) so CPU and GPU work units share one address.
     return build_scattering_work_unit_digest(
         interval_id=int(work_unit.interval_id),
@@ -1114,7 +1114,7 @@ def run_interval_chunk_execution(
                 _submit(work_unit)
                 _harvest_finished_nonblocking(bump)
                 while len(flying) >= max_inflight:
-                    # T2: drain ONE completion then break so the outer
+                    # Drain ONE completion then break so the outer
                     # submit-loop can enqueue the next work_unit immediately.
                     drained_one = False
                     for future, result in yield_futures_with_results(list(flying), client):

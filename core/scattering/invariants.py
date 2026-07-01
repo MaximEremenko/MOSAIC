@@ -1,23 +1,21 @@
 """Scientific-invariant validation for scattering partial results.
 
-This module is the **Phase A (additive, safe)** deliverable of the P11
-device-agnostic durable-identity design
-(`implementation_stages/p11_device_agnostic_identity.md`).
+This module implements scientific-invariant validation for scattering partials.
 
 The motivation is that exact output-byte identity cannot be used to decide
 whether a scattering result is correct: CPU and GPU NUFFT/FFT pipelines agree
 only to rel-L2 ~5.7e-14 and GPU spread reductions are not even self-reproducible.
-P11 therefore replaces byte/tolerance twin comparison with *scientific-invariant
+The validation layer replaces byte/tolerance twin comparison with *scientific-invariant
 validation*: a result may be promoted to a durable checkpoint only if it passes a
 documented set of invariants. Structural/integer fields are validated by **exact**
 equality (no tolerance); only the **float amplitudes** are validated by bounded
 invariants.
 
 This module is intentionally pure and side-effect free, and is **not** wired into
-any commit path here (that is P11 Phase C). Each check returns a structured
+any commit path here. Each check returns a structured
 ``InvariantFinding`` so callers can log, aggregate, or fail-closed as they see fit.
 
-Scope of authorship (scientist directive)
+Scope of authored checks
 ------------------------------------------
 Half-space conjugate-symmetry is the crown jewel of the method; its correctness
 is **not** authored here. This module implements ONLY mechanically-objective,
@@ -31,9 +29,9 @@ The amplitude-norm ratio, half-space symmetry, and imag/real-ratio checks are
 **non-gating advisory** (:func:`validate_norm_sanity`,
 :func:`validate_half_space_symmetry`, :func:`validate_imag_real_ratio`) -- the
 norm because "too large but finite" is a scientific judgment, the half-space
-checks per scientist directive.
+checks by design.
 They never hard-pass/fail and never call reconstruction math. Half-space
-correctness remains enforced by the frozen P0.0 baseline regression
+correctness remains enforced by the frozen synthetic baseline regression
 (``tests/unit/scattering/test_synthetic_half_space_imag_regression.py``) and the
 ``core/scattering/half_space.py`` reconstruction contract; the symmetry invariant
 itself is to be defined by the scientist.
@@ -68,7 +66,7 @@ from core.scattering.contracts import ScatteringPartialResult
 #: uninitialised amplitudes. See :func:`validate_norm_sanity`.
 DEFAULT_NORM_MAX_RATIO: float = 1e6
 
-#: Expected amplitude dtype for committed scattering results (P11 records the
+#: Expected amplitude dtype for committed scattering results. The manifest records the
 #: realized dtype as metadata, but the in-memory contract is complex128).
 EXPECTED_AMPLITUDE_DTYPE = np.dtype(np.complex128)
 
@@ -137,7 +135,7 @@ def validate_shape_and_dtype(
 
     Shape alignment is an **exact** structural check (the contract requires
     ``amplitudes_*.shape == point_ids.shape``). The dtype defaults to
-    ``complex128``, the in-memory amplitude contract; P11 records the realized
+    ``complex128``, the in-memory amplitude contract; records the realized
     backend dtype separately as metadata.
     """
 
@@ -170,7 +168,7 @@ def validate_point_coverage(
 ) -> InvariantFinding:
     """``point_ids`` EXACTLY equal the expected partition set.
 
-    Coverage is a structural identity check: P11 requires that a committed chunk
+    Coverage is a structural identity check: a committed chunk must
     covers exactly the partition's expected point ids -- no missing, no extra,
     no duplicates -- compared by **set equality** with **no tolerance**.
     Ordering is not required to match (amplitudes are aligned positionally to
@@ -234,7 +232,7 @@ def validate_imag_real_ratio(
 
     Half-space correctness is enforced elsewhere:
 
-    * the frozen P0.0 baseline regression
+    * the frozen synthetic baseline regression
       (``tests/unit/scattering/test_synthetic_half_space_imag_regression.py``,
       threshold ``positive_half_imag_over_real`` in the
       ``synthetic_half_space_v1`` baseline), and
@@ -250,7 +248,7 @@ def validate_imag_real_ratio(
         ok=True,
         detail=(
             "ADVISORY -- not gated; half-space imag/real ratio is enforced by the "
-            "frozen P0.0 baseline regression and the half_space.py reconstruction "
+            "frozen synthetic baseline regression and the half_space.py reconstruction "
             "contract. Imag/real invariant to be defined by the scientist."
         ),
     )
@@ -267,7 +265,7 @@ def validate_half_space_symmetry(
     crown jewel of the method; its correctness must be defined by the scientist,
     not derived from a cold start. This check ALWAYS returns ``ok=True`` and
     NEVER calls reconstruction math. Half-space correctness is enforced by the
-    frozen P0.0 baseline regression and the ``half_space.py`` reconstruction
+    frozen synthetic baseline regression and the ``half_space.py`` reconstruction
     contract.
 
     ``half_space_role`` is accepted and ignored for call-signature stability.
@@ -278,7 +276,7 @@ def validate_half_space_symmetry(
         ok=True,
         detail=(
             "ADVISORY -- not gated; half-space correctness is enforced by the "
-            "frozen P0.0 baseline regression and the half_space.py reconstruction "
+            "frozen synthetic baseline regression and the half_space.py reconstruction "
             "contract. Symmetry invariant to be defined by the scientist."
         ),
     )
@@ -340,11 +338,11 @@ def validate_scattering_result(
     norm_max_ratio: float = DEFAULT_NORM_MAX_RATIO,
     expected_dtype: np.dtype = EXPECTED_AMPLITUDE_DTYPE,
 ) -> list[InvariantFinding]:
-    """Run the P11 invariant set over a scattering partial result.
+    """Run the invariant set over a scattering partial result.
 
     Returns one :class:`InvariantFinding` per check, in a stable order, so
     callers can fail-closed on the HARD GATES and log every outcome. This
-    function performs **no** side effects and **no** commit wiring (P11 Phase C).
+    function performs **no** side effects and **no** commit wiring.
 
     Hard gates (mechanically objective; ``ok=False`` means reject):
 
@@ -359,7 +357,7 @@ def validate_scattering_result(
       finite" is a scientific judgment, not a mechanical fact)
     * :func:`validate_imag_real_ratio`
     * :func:`validate_half_space_symmetry`  (half-space correctness is the
-      scientist's to author, enforced separately by the frozen P0.0 baseline
+      scientist's to author, enforced separately by the frozen synthetic baseline
       regression and the ``half_space.py`` reconstruction contract)
 
     ``is_valid`` (``all(f.ok)``) is decided entirely by the three hard gates.

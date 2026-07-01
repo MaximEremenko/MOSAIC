@@ -396,7 +396,7 @@ def run_scattering_interval_task(
     )
     if interval_task is None:
         # Mask eliminated all Q-points in this interval.  Mark it as
-        # precomputed so that downstream stages (Stage-2 and
+        # precomputed so that downstream consumers (chunk accumulation and
         # residual-field) do not attempt to load a non-existent interval artifact.
         if db_path is not None:
             mark_empty_interval_precomputed(

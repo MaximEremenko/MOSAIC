@@ -1001,7 +1001,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                 ),
                 point_start=accumulator.point_start,
                 point_stop=accumulator.point_stop,
-                # T6: complex128 residuals are incompressible; zlib adds
+                # complex128 residuals are incompressible; zlib adds
                 # single-threaded CPU latency with <5% size reduction.
                 compress=False,
             )
