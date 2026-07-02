@@ -101,7 +101,7 @@ def test_nufft_gpu_failure_classifier_and_invalid_policy():
         normalize_nufft_policy("sometimes-gpu")
 
 
-def test_resolved_execution_settings_make_auto_concrete_cpu():
+def test_resolved_execution_settings_auto_attempts_gpu_with_cpu_fallback():
     settings = resolve_nufft_execution_settings(
         "auto",
         eps=1e-9,
@@ -110,9 +110,15 @@ def test_resolved_execution_settings_make_auto_concrete_cpu():
     )
 
     assert settings.requested_policy == "auto"
-    assert settings.execution_policy == "cpu-only"
+    # ``auto`` now attempts GPU first but ALWAYS permits a silent CPU fallback:
+    # the wrapper probes the device at execution time and runs on CPU when the
+    # GPU is unavailable/exhausted, so this stays safe on CPU-only hosts. The
+    # execution-policy label stays ``auto`` (not a strict GPU policy) so no hard
+    # admission gate or ``gpu`` task-resource is imposed, and the recorded
+    # identity stays the conservative ``cpu`` until a realized device is stamped.
+    assert settings.execution_policy == "auto"
     assert settings.backend == "cpu"
-    assert settings.execute_kwargs == {"prefer_cpu": True, "gpu_only": False}
+    assert settings.execute_kwargs == {"prefer_cpu": False, "gpu_only": False}
     assert settings.identity_payload()["eps"] == 1e-9
 
 

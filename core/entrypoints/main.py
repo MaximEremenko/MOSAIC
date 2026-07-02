@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from multiprocessing import freeze_support
 from pathlib import Path
@@ -25,6 +26,24 @@ from core.runtime import (
 )
 
 
+def _runtime_requests_gpu(runtime_info: dict) -> bool:
+    for key in (
+        "nufft_policy",
+        "nufft_execution_policy",
+        "scattering_nufft_policy",
+        "residual_nufft_policy",
+    ):
+        raw = runtime_info.get(key)
+        if raw is None:
+            continue
+        if str(raw).strip().lower().replace("_", "-") in {
+            "gpu-required",
+            "allow-fallback",
+        }:
+            return True
+    return False
+
+
 def main(
     run_file: str = "run_parameters.json",
     *,
@@ -38,6 +57,8 @@ def main(
     set_log_dir_for_run(run_dir)
 
     runtime_info = workflow_parameters.runtime_info.to_mapping()
+    if _runtime_requests_gpu(runtime_info):
+        os.environ.setdefault("MOSAIC_DASK_GPU_RESOURCE", "1")
     progress_cfg = runtime_info.get("progress") or {}
     if not isinstance(progress_cfg, dict):
         progress_cfg = {}

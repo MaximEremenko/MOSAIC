@@ -88,6 +88,7 @@ from core.workflow.stage2_replacement import (
     _stage2_replacement_batch_size,
     _stage2_replacement_enabled,
     _stage2_replacement_max_inflight,
+    _stage2_pair_execution_enabled,
     _stage2_replacement_source_scattering_commit_digest,
 )
 
@@ -1321,7 +1322,7 @@ def run_scattering_stage(
                 nufft_settings=_nufft_execution_settings(parameters),
             )
             parameters["stage2_replacement_expected_by_chunk"] = expected_by_chunk
-        else:
+        elif _stage2_pair_execution_enabled(parameters):
             stage2_work_units = build_scattering_interval_chunk_work_units(
                 list(pending_interval_chunk_pairs),
                 dimension=int(len(supercell)),
@@ -1340,6 +1341,11 @@ def run_scattering_stage(
                 nufft_resources=nufft_resources,
                 nufft_settings=_nufft_execution_settings(parameters),
                 transient_interval_payloads=parameters.get("transient_interval_payloads"),
+            )
+        else:
+            logger.info(
+                "Scattering Stage-2 pair execution skipped; residual-field stage "
+                "will consume precomputed interval artifacts."
             )
     logger.info("Completed scattering interval precompute stage")
     return {

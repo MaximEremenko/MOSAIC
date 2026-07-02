@@ -87,6 +87,98 @@ def _same_q_grid_presum_enabled() -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _concat_cross_grid_sources_enabled() -> bool:
+    """Concatenate ALL intervals' q-points (within a half-space role) into a single
+    inverse type-3 transform, instead of one transform per distinct q_grid.
+
+    An inverse type-3 NUFFT accepts arbitrary (non-grid) source points, and the
+    transform is linear, so concatenating N intervals' (q, weight) pairs and
+    transforming once is mathematically identical (to NUFFT eps) to transforming
+    each interval separately and summing. The single call pays the expensive
+    real-space (target) evaluation ONCE instead of once per interval, which is the
+    dominant cost. Grouping stays per half-space role because the conjugate
+    reconstruction differs by role.
+    """
+    raw = os.getenv("MOSAIC_RESIDUAL_CONCAT_SOURCES")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _residual_concat_fine_grid_budget_bytes() -> int:
+    """Max cuFINUFFT type-3 fine grid a single concatenated source group may
+    imply, before it is split into more groups. Concatenating *every* interval is
+    a big win when the combined reciprocal extent stays small (2D / small cells),
+    but for large cells + wide hkl the combined q-extent explodes the fine grid
+    (``nf_i ~ real_extent_i * recip_extent_i``): 87 intervals over a 15^3 cell
+    become a ~0.2 TiB grid that no longer fits any GPU. Bounding each group by
+    this budget keeps every transform GPU-sized while still folding as many
+    intervals together as safely possible. Override with
+    ``MOSAIC_RESIDUAL_CONCAT_FINE_GRID_BUDGET`` (bytes)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_CONCAT_FINE_GRID_BUDGET")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 4 << 30
+
+
+def _type3_fine_grid_from_spreads(real_spread: np.ndarray, q_spread: np.ndarray) -> int:
+    """Fine-grid bytes from coordinate spreads (mirrors the wrapper's model)."""
+    upsampfac = 2.0
+    nf = np.ceil((upsampfac / np.pi) * np.asarray(real_spread) * np.asarray(q_spread)) + 32.0
+    nf = np.ceil(nf / 16.0) * 16.0
+    return int(np.prod(nf)) * 16
+
+
+def _budget_bounded_concat_subgroups(
+    role_tasks: list[IntervalTask],
+    *,
+    rifft_grid: np.ndarray,
+    budget_bytes: int,
+) -> list[list[IntervalTask]]:
+    """Greedily pack same-role intervals into concat sub-groups whose combined
+    type-3 fine grid stays within ``budget_bytes``.
+
+    Intervals are visited in reciprocal-space order so spatially adjacent
+    subvolumes fold together (their combined q-extent grows slowly). The exact
+    same (q, weight) points are transformed and summed regardless of grouping --
+    only *how many* fold into each GPU transform changes -- so the result is
+    unchanged to NUFFT eps."""
+    if len(role_tasks) <= 1:
+        return [list(role_tasks)]
+    grid = np.asarray(rifft_grid, dtype=np.float64)
+    real_spread = grid.max(axis=0) - grid.min(axis=0)
+
+    def _q_bounds(task: IntervalTask):
+        g = np.asarray(task.q_grid, dtype=np.float64)
+        return g.min(axis=0), g.max(axis=0)
+
+    ordered = sorted(
+        role_tasks,
+        key=lambda t: tuple(float(v) for v in _q_bounds(t)[0]),
+    )
+    groups: list[list[IntervalTask]] = []
+    current: list[IntervalTask] = []
+    cur_min = cur_max = None
+    for task in ordered:
+        q_min, q_max = _q_bounds(task)
+        new_min = q_min if cur_min is None else np.minimum(cur_min, q_min)
+        new_max = q_max if cur_max is None else np.maximum(cur_max, q_max)
+        fine = _type3_fine_grid_from_spreads(real_spread, new_max - new_min)
+        if current and fine > budget_bytes:
+            groups.append(current)
+            current = [task]
+            cur_min, cur_max = q_min, q_max
+        else:
+            current.append(task)
+            cur_min, cur_max = new_min, new_max
+    if current:
+        groups.append(current)
+    return groups
+
+
 def _riff_payload_cache_enabled() -> bool:
     raw = os.getenv("MOSAIC_RESIDUAL_RIFFT_PAYLOAD_CACHE")
     if raw is None:
@@ -386,53 +478,109 @@ def compute_residual_field_interval_chunk_arrays(
     nufft_gpu_only: bool = False,
 ) -> ResidualChunkComputeResult:
     ordered_interval_tasks = sorted(interval_tasks, key=_interval_task_sort_key)
+    concat_sources = _concat_cross_grid_sources_enabled()
     grouped_interval_tasks: dict[tuple, list[IntervalTask]] = {}
     contribution_reciprocal_points = 0
     for interval_task in ordered_interval_tasks:
-        grouped_interval_tasks.setdefault(
-            (
+        # When concatenating, all intervals sharing a half-space role fold into ONE
+        # inverse transform regardless of their (distinct) q_grids; otherwise keep the
+        # legacy per-q_grid grouping that the pre-sum / same-grid stacking requires.
+        group_key = (
+            (str(interval_task.half_space_role),)
+            if concat_sources
+            else (
                 _q_grid_signature(
                     interval_task.q_grid,
                     getattr(interval_task, "q_grid_digest", None),
                 ),
                 interval_task.half_space_role,
-            ),
-            [],
-        ).append(interval_task)
+            )
+        )
+        grouped_interval_tasks.setdefault(group_key, []).append(interval_task)
         contribution_reciprocal_points += scattering_contribution_point_count(interval_task)
     if not grouped_interval_tasks:
         raise ValueError("Residual-field batch task produced no interval contributions.")
 
     amplitudes_delta = None
     amplitudes_average = None
-    use_presum = _same_q_grid_presum_enabled()
+    use_presum = _same_q_grid_presum_enabled() and not concat_sources
     ordered_groups = [
         grouped_interval_tasks[key]
-        for key in sorted(grouped_interval_tasks, key=lambda item: (str(item[1]), item[0]))
+        for key in sorted(grouped_interval_tasks, key=str)
     ]
+    if concat_sources:
+        # Split each half-space role's concatenation into fine-grid-bounded
+        # sub-groups so no single transform blows past a GPU-sized fine grid on
+        # large-cell / wide-hkl runs (the result is summed across sub-groups, so
+        # it is identical to one giant concat to NUFFT eps).
+        budget = _residual_concat_fine_grid_budget_bytes()
+        ordered_groups = [
+            subgroup
+            for group in ordered_groups
+            for subgroup in _budget_bounded_concat_subgroups(
+                group, rifft_grid=rifft_grid, budget_bytes=budget
+            )
+        ]
     for grouped_tasks in ordered_groups:
         grouped_tasks = sorted(grouped_tasks, key=_interval_task_sort_key)
-        reference_q_grid = grouped_tasks[0].q_grid
-        if use_presum:
-            inverse_weights = _pre_sum_same_q_grid_weights(
-                grouped_tasks,
-                reference_q_grid=reference_q_grid,
+        if concat_sources:
+            # One type-3 over the concatenation of every interval's q-points. The
+            # transform is linear so this equals summing per-interval transforms
+            # (to NUFFT eps) but pays the target-side cost only once.
+            for task in grouped_tasks:
+                q_len = int(np.asarray(task.q_grid).shape[0])
+                if int(np.asarray(task.q_amp).reshape(-1).shape[0]) != q_len:
+                    raise ValueError(
+                        "Residual-field interval q_amp length does not match q_grid: "
+                        f"interval={int(task.irecip_id)} "
+                        f"q_amp={int(np.asarray(task.q_amp).reshape(-1).shape[0])} q_grid={q_len}"
+                    )
+                if int(np.asarray(task.q_amp_av).reshape(-1).shape[0]) != q_len:
+                    raise ValueError(
+                        "Residual-field interval q_amp_av length does not match q_grid: "
+                        f"interval={int(task.irecip_id)} "
+                        f"q_amp_av={int(np.asarray(task.q_amp_av).reshape(-1).shape[0])} q_grid={q_len}"
+                    )
+            reference_q_grid = np.concatenate(
+                [np.asarray(task.q_grid) for task in grouped_tasks], axis=0
             )
+            delta = np.concatenate(
+                [
+                    np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
+                    - np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
+                    for task in grouped_tasks
+                ]
+            )
+            average = np.concatenate(
+                [
+                    np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
+                    for task in grouped_tasks
+                ]
+            )
+            inverse_weights = np.stack([delta, average], axis=0)
+            del delta, average
         else:
-            _validate_same_q_grid_weight_shapes(
-                grouped_tasks,
-                reference_q_grid=reference_q_grid,
-            )
-            stacked_weights = []
-            for interval_task in grouped_tasks:
-                stacked_weights.extend(
-                    [
-                        interval_task.q_amp - interval_task.q_amp_av,
-                        interval_task.q_amp_av,
-                    ]
+            reference_q_grid = grouped_tasks[0].q_grid
+            if use_presum:
+                inverse_weights = _pre_sum_same_q_grid_weights(
+                    grouped_tasks,
+                    reference_q_grid=reference_q_grid,
                 )
-            inverse_weights = np.stack(stacked_weights, axis=0)
-            del stacked_weights
+            else:
+                _validate_same_q_grid_weight_shapes(
+                    grouped_tasks,
+                    reference_q_grid=reference_q_grid,
+                )
+                stacked_weights = []
+                for interval_task in grouped_tasks:
+                    stacked_weights.extend(
+                        [
+                            interval_task.q_amp - interval_task.q_amp_av,
+                            interval_task.q_amp_av,
+                        ]
+                    )
+                inverse_weights = np.stack(stacked_weights, axis=0)
+                del stacked_weights
         inverse_outputs = _call_inverse_super_batch(
             q_coords=reference_q_grid,
             weights=inverse_weights,
@@ -443,10 +591,10 @@ def compute_residual_field_interval_chunk_arrays(
         )
         del inverse_weights
         inverse_outputs = np.asarray(inverse_outputs, dtype=np.complex128)
-        if use_presum:
+        if concat_sources or use_presum:
             if inverse_outputs.shape[0] != 2:
                 raise ValueError(
-                    "Residual-field same-q-grid inverse expected two output transforms; "
+                    "Residual-field inverse expected two output transforms; "
                     f"got {inverse_outputs.shape[0]}"
                 )
             grouped_delta = inverse_outputs[0]

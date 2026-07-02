@@ -129,6 +129,17 @@ def _configured_thread_override() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _visible_device_tokens(report: GPUWorkerReport) -> tuple[str, ...]:
+    visible = str(report.cuda_visible_devices or "").strip()
+    if not visible:
+        # WSL/local CUDA commonly leaves CUDA_VISIBLE_DEVICES unset while one
+        # process owns the default visible GPU. Treat that as one all-visible
+        # token so a single worker is accepted and multiple workers on the same
+        # host are still rejected below.
+        return ("<all-visible>",)
+    return tuple(token.strip() for token in visible.split(",") if token.strip())
+
+
 def require_gpu_admission(
     client,
     *,
@@ -156,8 +167,6 @@ def require_gpu_admission(
     failures: list[str] = []
     visible_tokens: dict[tuple[str, str], str] = {}
     for report in reports:
-        if not report.cuda_visible_devices:
-            failures.append(f"{report.address}: CUDA_VISIBLE_DEVICES is not set")
         if (
             report.nthreads is not None
             and report.nthreads != 1
@@ -172,10 +181,7 @@ def require_gpu_admission(
                 f"{report.address}: cuFINUFFT probe failed"
                 + (f" ({report.error})" if report.error else "")
             )
-        for token in str(report.cuda_visible_devices or "").split(","):
-            token = token.strip()
-            if not token:
-                continue
+        for token in _visible_device_tokens(report):
             key = (report.host, token)
             if key in visible_tokens and not allow_multi_worker_per_gpu:
                 failures.append(

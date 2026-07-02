@@ -63,6 +63,20 @@ _PLAN_CACHE: "dict[tuple, tuple]" = {}
 _PLAN_CACHE_ORDER: list = []
 _PLAN_CACHE_LOCK = threading.Lock()
 
+# Concurrency-aware GPU admission. Worker threads sharing one process (the
+# default Dask ``processes=False`` layout) all target the same card, so the VRAM
+# is *partitioned* by the number of GPU worker threads rather than serialized:
+#   * 1 thread  -> it is admitted alone and budgeted the whole card (full VRAM).
+#   * N threads -> up to N run concurrently, each budgeted ~1/N of the card, so
+#     their fine grids sum to <= the card and none races another into OOM.
+# The per-transform budget (VRAM/N) feeds the fine-grid tiler, which splits each
+# transform to fit its share and keeps everything on the GPU. Separate worker
+# *processes* (each its own CUDA context) coordinate through this only within a
+# process; across processes the per-share budget still bounds each one.
+_GPU_ADMIT_COND = threading.Condition()
+_gpu_inflight = 0                 # GPU transforms currently in flight (live share count)
+_gpu_reserved = 0                 # VRAM bytes currently reserved by in-flight tiles
+
 
 def _free_cupy_pool_blocks() -> None:
     """Best-effort: return CuPy pool blocks to the device. Used after a
@@ -401,6 +415,74 @@ def _free_mem_bytes() -> int:
     return int(free)
 
 
+def _total_mem_bytes() -> int:
+    """Total VRAM in bytes (0 if GPU unavailable)."""
+    if not _GPU_AVAILABLE:
+        return 0
+    with cp.cuda.Device(0):
+        _, total = cp.cuda.runtime.memGetInfo()
+    return int(total)
+
+
+def _pool_reservable_bytes() -> int:
+    """VRAM the tiler may hand out across all concurrent transforms *right now*.
+
+    Based on live free VRAM plus what our own in-flight tiles already hold, so
+    the pool reflects the real card minus anything external (another process, a
+    notebook) is using -- we only ever promise VRAM we can actually provide."""
+    live = _free_mem_bytes() + _gpu_reserved
+    if live <= 0:
+        live = _total_mem_bytes()
+    return int(live * _gpu_vram_headroom_frac())
+
+
+def _transform_enter() -> None:
+    """Register a GPU transform as in-flight (raises the live sharing count)."""
+    global _gpu_inflight
+    with _GPU_ADMIT_COND:
+        _gpu_inflight += 1
+        _GPU_ADMIT_COND.notify_all()
+
+
+def _transform_exit() -> None:
+    global _gpu_inflight
+    with _GPU_ADMIT_COND:
+        _gpu_inflight = max(0, _gpu_inflight - 1)
+        _GPU_ADMIT_COND.notify_all()
+
+
+def _current_tile_budget() -> int:
+    """VRAM a single tile may claim *right now*: an equal share of the reservable
+    pool among the transforms currently in flight. Re-read per tile, so it tracks
+    workers arriving/leaving dynamically -- a lone worker gets the whole pool; the
+    moment a sibling starts, both converge to half on their next tile."""
+    with _GPU_ADMIT_COND:
+        active = max(1, _gpu_inflight)
+        pool = _pool_reservable_bytes()
+    return max(pool // active, _MIN_TILE_BUDGET_BYTES)
+
+
+def _reserve_tile(nbytes: int) -> None:
+    """Reserve ``nbytes`` of VRAM from the shared pool, blocking until it fits.
+
+    Guarantees the sum of live tile reservations never exceeds the pool, so
+    concurrent transforms cannot race each other into an out-of-memory. A tile is
+    always admitted when nothing else is reserved (progress guarantee), even if
+    it is momentarily larger than the pool."""
+    global _gpu_reserved
+    with _GPU_ADMIT_COND:
+        while _gpu_reserved > 0 and _gpu_reserved + nbytes > _pool_reservable_bytes():
+            _GPU_ADMIT_COND.wait()
+        _gpu_reserved += nbytes
+
+
+def _release_tile(nbytes: int) -> None:
+    global _gpu_reserved
+    with _GPU_ADMIT_COND:
+        _gpu_reserved = max(0, _gpu_reserved - nbytes)
+        _GPU_ADMIT_COND.notify_all()
+
+
 def free_gpu_memory() -> None:
     """Best-effort release of CuPy memory pools when GPU support is active."""
     if not _GPU_AVAILABLE or cp is None:
@@ -472,6 +554,151 @@ def _estimate_grid_bytes(real: np.ndarray, recip: np.ndarray) -> int:
     xyz = np.abs(np.vstack((real, recip))).max(axis=0)
     nf = ((2 * np.ceil(xyz) + 2 + 15) // 16) * 16
     return int(nf.prod()) * 16          # 16 B per complex128
+
+
+# cuFINUFFT type-3 upsampling factor (sigma) used to size the internal fine grid.
+_TYPE3_UPSAMPFAC = 2.0
+
+# cuFINUFFT allocates more than just the fine grid: a cuFFT workspace (~1x the
+# grid) plus spread/sort scratch. Measured peak residency is ~2.2-2.5x the bare
+# fine grid, so tiling budgets the fine grid times this factor to avoid OOM.
+_TYPE3_RESIDENCY_FACTOR = 2.5
+
+
+def fine_grid_bytes_type3(real: np.ndarray, recip: np.ndarray) -> int:
+    """Estimate the cuFINUFFT type-3 *fine grid* residency (complex128).
+
+    A type-3 transform builds an intermediate uniform grid whose per-axis size
+    scales as the **product of the coordinate spreads** on that axis:
+    ``nf_i ~ sigma * spread_real_i * spread_recip_i / pi`` plus spread padding
+    (``spread = max - min``). That grid is allocated by cuFINUFFT via raw
+    ``cudaMalloc``, bypassing the CuPy pool budget, so it must be sized directly.
+
+    The **spread** (not per-axis ``max``) is the load-bearing quantity: it is
+    what shrinks when the source q-points (or targets) are split into spatial
+    tiles, which is exactly how :func:`_type3_inverse_gpu_tiled` keeps each GPU
+    sub-transform inside VRAM. Concatenating every interval's q-points into one
+    transform makes the recip spread the *entire* reciprocal range (~66) and the
+    real spread the full supercell (~27) -> nf ~1170/axis -> ~22 GiB; tiling the
+    sources restores the small per-tile spreads (and small grids) of the
+    per-interval regime while keeping the batched GPU launch.
+    """
+    real = np.asarray(real)
+    recip = np.asarray(recip)
+    if real.ndim != 2 or recip.ndim != 2 or real.shape[1] != recip.shape[1] or len(real) == 0 or len(recip) == 0:
+        return _estimate_grid_bytes(real, recip)
+    x_spread = real.max(axis=0) - real.min(axis=0)
+    s_spread = recip.max(axis=0) - recip.min(axis=0)
+    nf = np.ceil((_TYPE3_UPSAMPFAC / np.pi) * x_spread * s_spread) + 32.0
+    nf = np.ceil(nf / 16.0) * 16.0
+    return int(np.prod(nf)) * 16          # 16 B per complex128
+
+
+def _gpu_vram_headroom_frac() -> float:
+    """Fraction of *free* VRAM one type-3 GPU sub-transform's fine grid may
+    claim. Sub-transforms larger than this are split (tiled) so they stay on the
+    GPU. Keeps margin for cuFINUFFT work arrays / fragmentation. Override with
+    ``MOSAIC_NUFFT_GPU_VRAM_HEADROOM`` (0 < frac <= 1)."""
+    raw = os.getenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM")
+    if raw is None or str(raw).strip() == "":
+        return 0.85
+    try:
+        frac = float(raw)
+    except (TypeError, ValueError):
+        return 0.85
+    if not (0.0 < frac <= 1.0):
+        return 0.85
+    return frac
+
+
+# Hard ceiling on tiling recursion depth (2**depth tiles) -- a runaway guard far
+# above any real workload; termination normally comes from the fine-grid budget.
+_MAX_TILE_DEPTH = 24
+
+# Floor on the per-tile fine-grid budget. Prevents pathological over-splitting
+# into thousands of tiny transforms when free VRAM is momentarily scarce (e.g.
+# a second worker holds the card); a ~1 GiB fine grid is already an efficient
+# GPU transform. If a tile this size still will not fit, the leaf executor's own
+# OOM handling is the final backstop.
+_MIN_TILE_BUDGET_BYTES = 1 << 30
+
+
+def _type3_inverse_gpu_tiled(
+    *,
+    real_coords: np.ndarray,
+    q_coords: np.ndarray,
+    weights_arr: np.ndarray,
+    eps: float,
+    leaf,
+    budget_bytes: int,
+) -> np.ndarray:
+    """Split a type-3 inverse transform along the widest coordinate spread until
+    each leaf's fine grid fits ``budget_bytes``, run every leaf on the GPU, and
+    recombine exactly into a single preallocated output.
+
+    The type-3 inverse is linear in the sources, so splitting the q-points into
+    spatial groups and **summing** the per-group results is exact; splitting the
+    real-space targets partitions the output. Splitting along the axis of largest
+    spread shrinks the fine grid (``nf_i ~ spread_real_i * spread_recip_i``), so a
+    handful of splits turns one VRAM-busting transform into several GPU-sized ones
+    -- no CPU fallback.
+
+    Results accumulate **in place** into one ``(n_trans, n_targets)`` buffer, so
+    host memory stays at ~one output plus one live tile regardless of the split
+    depth (a tree-of-sums would instead hold O(depth) full-size arrays -- fatal
+    for the 10^8-target 3D cases). ``leaf(q_sub, w_sub, real_sub) ->
+    (n_trans, len(real_sub))`` runs one GPU-sized sub-transform (host result).
+    """
+    n_trans = int(weights_arr.shape[0])
+    out = np.zeros((n_trans, int(len(real_coords))), dtype=np.complex128)
+    target_index = np.arange(int(len(real_coords)))
+
+    def _accumulate(tgt_idx, real_sub, q_sub, w_sub, depth):
+        budget = int(budget_bytes() if callable(budget_bytes) else budget_bytes)
+        residency = int(fine_grid_bytes_type3(real_sub, q_sub) * _TYPE3_RESIDENCY_FACTOR)
+        if (residency <= budget or depth >= _MAX_TILE_DEPTH
+                or (len(q_sub) <= 1 and len(real_sub) <= 1)):
+            out[:, tgt_idx] += leaf(q_sub, w_sub, real_sub)
+            return
+
+        s_spread = q_sub.max(axis=0) - q_sub.min(axis=0)
+        x_spread = real_sub.max(axis=0) - real_sub.min(axis=0)
+        split_source = (
+            (float(s_spread.max()) >= float(x_spread.max()) and len(q_sub) > 1)
+            or len(real_sub) <= 1
+        )
+
+        if split_source and len(q_sub) > 1:
+            ax = int(np.argmax(s_spread))
+            coord = q_sub[:, ax]
+            pivot = float(np.median(coord))
+            lo = coord < pivot
+            if not lo.any() or lo.all():          # ties defeat the median split
+                lo = coord <= pivot
+            if lo.any() and not lo.all():
+                # Both source halves accumulate into the SAME targets (exact sum).
+                _accumulate(tgt_idx, real_sub, q_sub[lo], w_sub[:, lo], depth + 1)
+                _accumulate(tgt_idx, real_sub, q_sub[~lo], w_sub[:, ~lo], depth + 1)
+                return
+
+        if len(real_sub) > 1:
+            ax = int(np.argmax(x_spread))
+            coord = real_sub[:, ax]
+            pivot = float(np.median(coord))
+            lo = coord < pivot
+            if not lo.any() or lo.all():
+                lo = coord <= pivot
+            if lo.any() and not lo.all():
+                # Disjoint target slices -> map through the running target index.
+                _accumulate(tgt_idx[lo], real_sub[lo], q_sub, w_sub, depth + 1)
+                _accumulate(tgt_idx[~lo], real_sub[~lo], q_sub, w_sub, depth + 1)
+                return
+
+        # Could not split further (both sides degenerate); run as-is.
+        out[:, tgt_idx] += leaf(q_sub, w_sub, real_sub)
+
+    _accumulate(target_index, real_coords, q_coords, weights_arr, 0)
+    return out
 
 
 def _estimate_launch_bytes(real: np.ndarray, recip: np.ndarray) -> int:
@@ -936,16 +1163,13 @@ def execute_inverse_cunufft_super_batch(
         width = total_trans
     else:
         width = max(1, min(int(max_batch_width), total_trans))
-    outputs: list[np.ndarray] = []
-    start = 0
-    while start < total_trans:
-        end = min(start + width, total_trans)
-        batch_weights = weights_arr[start:end]
-        try:
-            batch_result = _execute_inverse_cunufft_batch(
-                q_coords=q_coords,
-                weights_arr=batch_weights,
-                real_coords=real_coords,
+
+    def _leaf(q_sub, w_sub, real_sub):
+        return np.asarray(
+            _execute_inverse_cunufft_batch(
+                q_coords=q_sub,
+                weights_arr=w_sub,
+                real_coords=real_sub,
                 eps=eps,
                 mem_frac=mem_frac,
                 min_chunk=min_chunk,
@@ -954,6 +1178,51 @@ def execute_inverse_cunufft_super_batch(
                 gpu_only=gpu_only,
                 device_out=False,
             )
+        )
+
+    def _reserved_leaf(q_sub, w_sub, real_sub):
+        # Reserve this tile's VRAM from the shared pool so concurrent transforms
+        # pack the card without over-committing; release as soon as it is done.
+        tile_bytes = int(fine_grid_bytes_type3(real_sub, q_sub) * _TYPE3_RESIDENCY_FACTOR)
+        _reserve_tile(tile_bytes)
+        try:
+            return _leaf(q_sub, w_sub, real_sub)
+        finally:
+            _release_tile(tile_bytes)
+
+    # Tile the type-3 fine grid to fit VRAM and keep the work on the GPU (no
+    # silent CPU fallback): the transform is linear, so splitting the q-sources
+    # (sum) or real targets (partition) into spatial tiles is exact. Only when a
+    # GPU is actually the execution target -- a CPU run gains nothing from tiling.
+    use_gpu = _GPU_AVAILABLE and not _CPU_ONLY and not prefer_cpu
+    real_arr = np.asarray(real_coords, dtype=np.float64)
+    q_arr = np.asarray(q_coords, dtype=np.float64)
+
+    outputs: list[np.ndarray] = []
+    start = 0
+    while start < total_trans:
+        end = min(start + width, total_trans)
+        batch_weights = weights_arr[start:end]
+        try:
+            if use_gpu:
+                # Transforms run concurrently and share VRAM dynamically: each
+                # tile claims an equal live share of the free pool (whole card
+                # when alone, 1/N when N are in flight) and reserves it so the
+                # concurrent set never over-commits. All work stays on the GPU.
+                _transform_enter()
+                try:
+                    batch_result = _type3_inverse_gpu_tiled(
+                        real_coords=real_arr,
+                        q_coords=q_arr,
+                        weights_arr=batch_weights,
+                        eps=eps,
+                        leaf=_reserved_leaf,
+                        budget_bytes=_current_tile_budget,
+                    )
+                finally:
+                    _transform_exit()
+            else:
+                batch_result = _leaf(q_coords, batch_weights, real_coords)
             outputs.append(np.asarray(batch_result))
             start = end
         except Exception as exc:
@@ -1096,6 +1365,7 @@ def _execute_inverse_cunufft_batch(
     resident_coords = np.asarray(q_coords, dtype=np.float64)
     target_coords = np.asarray(real_coords, dtype=np.float64)
     n_trans = int(weights_arr.shape[0])
+
     telemetry = _begin_telemetry(
         mode="inverse-batch",
         n_sources=int(len(resident_coords)),

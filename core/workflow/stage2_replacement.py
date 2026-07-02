@@ -61,6 +61,31 @@ def _stage2_replacement_enabled(parameters: Dict[str, Any]) -> bool:
     return bool(enabled)
 
 
+def _stage2_pair_execution_enabled(parameters: Dict[str, Any]) -> bool:
+    runtime_info = _runtime_info(parameters)
+    mode = runtime_info.get("scattering_stage2_mode")
+    if mode is None:
+        mode = runtime_info.get("stage2_mode")
+    if mode is not None:
+        normalized = str(mode).strip().lower().replace("-", "_")
+        return normalized in {
+            "legacy",
+            "pair",
+            "pairs",
+            "chunk",
+            "chunks",
+            "scattering",
+            "scattering_pairs",
+            "scattering_chunks",
+        }
+    enabled = runtime_info.get("scattering_stage2_pair_execution")
+    if enabled is None:
+        enabled = os.getenv("MOSAIC_SCATTERING_STAGE2_PAIR_EXECUTION")
+    if isinstance(enabled, str):
+        return enabled.strip().lower() in {"1", "true", "yes", "on", "legacy"}
+    return bool(enabled)
+
+
 def _stage2_replacement_batch_size(parameters: Dict[str, Any]) -> int:
     runtime_info = _runtime_info(parameters)
     value = runtime_info.get(

@@ -19,7 +19,10 @@ import numpy as np
 from core.residual_field.artifacts import load_stage2_replacement_expected_metadata
 from core.residual_field.commit import write_residual_attempt
 from core.scattering.execution import _resolve_scattering_interval_artifact_policy
-from core.workflow.stage2_replacement import run_stage2_replacement_execution
+from core.workflow.stage2_replacement import (
+    _stage2_pair_execution_enabled,
+    run_stage2_replacement_execution,
+)
 from core.scattering.planning import ScatteringWorkIdentity
 from core.storage.attempt_store import stage_commit_path
 from core.storage.database_manager import DatabaseManager
@@ -71,6 +74,30 @@ def test_stage2_replacement_forces_durable_interval_transport():
             client=None,
         )
         == "required_transport"
+    )
+
+
+def test_stage2_pair_execution_is_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("MOSAIC_SCATTERING_STAGE2_PAIR_EXECUTION", raising=False)
+
+    assert _stage2_pair_execution_enabled({"runtime_info": {}}) is False
+    assert (
+        _stage2_pair_execution_enabled(
+            {"runtime_info": {"scattering_stage2_mode": "replacement"}}
+        )
+        is False
+    )
+    assert (
+        _stage2_pair_execution_enabled(
+            {"runtime_info": {"scattering_stage2_mode": "legacy"}}
+        )
+        is True
+    )
+    assert (
+        _stage2_pair_execution_enabled(
+            {"runtime_info": {"scattering_stage2_pair_execution": True}}
+        )
+        is True
     )
 
 

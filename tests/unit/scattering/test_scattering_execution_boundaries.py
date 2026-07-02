@@ -10,6 +10,7 @@ from core.scattering.accumulation import (
     build_scattering_partial_result_from_payloads,
     materialize_scattering_payload,
 )
+from core.scattering import execution as scattering_execution
 from core.scattering.artifacts import (
     ScatteringArtifactStore,
     persist_precomputed_interval_artifact,
@@ -22,6 +23,7 @@ from core.scattering.contracts import (
 from core.scattering.execution import run_interval_precompute
 from core.scattering.kernels import IntervalTask
 from core.scattering.planning import (
+    ScatteringWorkIdentity,
     build_scattering_interval_chunk_work_units,
     build_scattering_interval_lookup,
     build_scattering_precompute_work_units,
@@ -732,6 +734,107 @@ def test_execution_durable_precompute_scatter_shared_inputs_once_and_keeps_requi
     first_submit_kwargs = client.submit_calls[0][2]
     assert isinstance(first_submit_kwargs["B_"], _ScatterRef)
     assert isinstance(first_submit_kwargs["original_coords"], _ScatterRef)
+
+
+def test_run_scattering_stage_default_leaves_pairs_for_residual_stage(
+    monkeypatch,
+    tmp_path,
+):
+    identity = ScatteringWorkIdentity(
+        run_digest="run123",
+        scientific_digest="1" * 64,
+        execution_digest="2" * 64,
+        qspace_plan_digest="3" * 64,
+        backend_policy_digest="4" * 64,
+        source_structure_digest="5" * 64,
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        scattering_execution,
+        "_current_scattering_identity",
+        lambda **kwargs: identity,
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "profile_output_filesystem",
+        lambda *args, **kwargs: SimpleNamespace(capability_digest="cap"),
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "_runtime_provenance_for_scattering",
+        lambda **kwargs: {},
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "build_scattering_execution_plan",
+        lambda **kwargs: SimpleNamespace(
+            interval_work_units=(
+                ScatteringWorkUnit.precompute_interval(
+                    interval_id=1,
+                    dimension=1,
+                    output_dir=str(tmp_path),
+                ),
+            ),
+            total_reciprocal_points=11,
+        ),
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "rebuild_sqlite_cache_from_manifests",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "pending_scattering_interval_chunks",
+        lambda snapshot, pairs: list(pairs),
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "run_interval_precompute",
+        lambda *args, **kwargs: calls.append("precompute") or [],
+    )
+    monkeypatch.setattr(
+        scattering_execution,
+        "run_interval_chunk_execution",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy Stage-2 pair execution should be opt-in")
+        ),
+    )
+
+    db_manager = SimpleNamespace(get_interval_chunks=lambda: [(1, 3)])
+    result = scattering_execution.run_scattering_stage(
+        parameters={
+            "reciprocal_space_intervals": [{"id": 1, "h_range": (0.0, 1.0)}],
+            "point_data_list": [
+                {
+                    "central_point_id": 10,
+                    "coordinates": [0.0],
+                    "dist_from_atom_center": [0.0],
+                    "step_in_frac": [0.0],
+                    "chunk_id": 3,
+                    "grid_amplitude_initialized": 1,
+                }
+            ],
+            "original_coords": np.array([[0.0]]),
+            "cells_origin": np.array([[0.0]]),
+            "elements": np.array(["El"], dtype=object),
+            "vectors": np.array([[1.0]]),
+            "supercell": np.array([1.0]),
+            "runtime_info": {},
+            "residual_parameter_digest": "abc123",
+        },
+        FormFactorFactoryProducer=SimpleNamespace(),
+        MaskStrategy=None,
+        MaskStrategyParameters={},
+        db_manager=db_manager,
+        output_dir=str(tmp_path),
+        point_data_processor=None,
+        client=None,
+    )
+
+    assert calls == ["precompute"]
+    assert result["stage2_replacement_expected_by_chunk"] == {}
 
 
 def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path):

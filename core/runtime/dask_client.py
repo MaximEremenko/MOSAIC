@@ -72,6 +72,47 @@ def _build_job_extra(log_dir: Path) -> list[str]:
     return extras
 
 
+def _gpu_resource_slots(backend: str | None) -> int:
+    """Declare local GPU task capacity when the runtime asked for GPU work.
+
+    This is deliberately a scheduler-resource declaration only; GPU admission
+    still probes each worker before any GPU NUFFT task is accepted.
+    """
+    raw = os.getenv("MOSAIC_DASK_GPU_RESOURCE")
+    if raw is not None and str(raw).strip() != "":
+        text = str(raw).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return 1
+        if text in {"0", "false", "no", "off"}:
+            return 0
+        try:
+            return max(0, int(text))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid MOSAIC_DASK_GPU_RESOURCE=%r; not declaring GPU slots",
+                raw,
+            )
+            return 0
+
+    if str(backend or "").strip().lower() == "cuda-local":
+        return 1
+
+    try:
+        if int(os.getenv("GPUS_PER_JOB", "0")) > 0:
+            return 1
+    except ValueError:
+        pass
+
+    visible = os.getenv("CUDA_VISIBLE_DEVICES")
+    if visible is not None and visible.strip() and visible.strip().lower() not in {
+        "-1",
+        "none",
+        "nodevfiles",
+    }:
+        return 1
+    return 0
+
+
 def default_log_dir(base_dir: str | Path | None = None) -> Path:
     if os.getenv("MOSAIC_LOG_DIR"):
         return Path(os.environ["MOSAIC_LOG_DIR"]).expanduser()
@@ -124,6 +165,11 @@ def get_client() -> Client:
 
     processes = _env_bool("DASK_PROCESSES")
 
+    resources = {"nufft": nufft_slots_per_worker}
+    gpu_slots = _gpu_resource_slots(configured_backend)
+    if gpu_slots > 0:
+        resources["gpu"] = gpu_slots
+
     _CLIENT = ensure_dask_client(
         backend=configured_backend,
         max_workers=int(os.getenv("DASK_MAX_WORKERS", "4")),
@@ -133,7 +179,7 @@ def get_client() -> Client:
         worker_dashboard=bool(int(os.getenv("DASK_WORKER_DASHBOARD", "0"))),
         python=os.getenv("DASK_PYTHON", sys.executable),
         scheduler_options={"host": os.getenv("DASK_SCHEDULER_HOST", "0.0.0.0")},
-        resources={"nufft": nufft_slots_per_worker},
+        resources=resources,
         **extra,                         # ← only present for job‑queue back‑ends
     )
     return _CLIENT

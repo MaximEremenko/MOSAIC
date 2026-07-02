@@ -71,12 +71,51 @@ def test_gpu_admission_accepts_pinned_single_thread_worker(monkeypatch):
     assert report.workers[0].cuda_visible_devices == "0"
 
 
+def test_gpu_admission_accepts_single_local_worker_without_cuda_visible_devices(monkeypatch):
+    monkeypatch.setattr(
+        "core.runtime.gpu_admission._worker_reports",
+        lambda client: (_worker(cuda_visible_devices=None),),
+    )
+
+    report = require_gpu_admission(
+        FakeClient({"worker-a": {"resources": {"gpu": 1, "nufft": 1}}}),
+        policy="gpu-required",
+        required_gpu_tasks=1,
+    )
+
+    assert report.gpu_required is True
+    assert report.resource_slots == 1
+    assert report.workers[0].cuda_visible_devices is None
+
+
 def test_gpu_admission_rejects_duplicate_visible_device(monkeypatch):
     monkeypatch.setattr(
         "core.runtime.gpu_admission._worker_reports",
         lambda client: (
             _worker(address="worker-a", cuda_visible_devices="0"),
             _worker(address="worker-b", cuda_visible_devices="0"),
+        ),
+    )
+
+    with pytest.raises(GPUAdmissionError, match="also visible"):
+        require_gpu_admission(
+            FakeClient(
+                {
+                    "worker-a": {"resources": {"gpu": 1, "nufft": 1}},
+                    "worker-b": {"resources": {"gpu": 1, "nufft": 1}},
+                }
+            ),
+            policy="gpu-required",
+            required_gpu_tasks=1,
+        )
+
+
+def test_gpu_admission_rejects_duplicate_all_visible_local_workers(monkeypatch):
+    monkeypatch.setattr(
+        "core.runtime.gpu_admission._worker_reports",
+        lambda client: (
+            _worker(address="worker-a", cuda_visible_devices=None),
+            _worker(address="worker-b", cuda_visible_devices=None),
         ),
     )
 

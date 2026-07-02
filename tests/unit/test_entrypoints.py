@@ -83,3 +83,11 @@ def test_cleanup_cli_invokes_cleanup_report(monkeypatch, tmp_path, capsys):
     assert payload["removed_paths"] == ["removed.tmp"]
     assert payload["retained_paths"] == ["kept.tmp"]
     assert payload["skipped_reasons"] == ["active public run is retained"]
+
+
+def test_runtime_requests_gpu_for_gpu_nufft_policy():
+    from core.entrypoints.main import _runtime_requests_gpu
+
+    assert _runtime_requests_gpu({"nufft_policy": "gpu-required"}) is True
+    assert _runtime_requests_gpu({"scattering_nufft_policy": "allow_fallback"}) is True
+    assert _runtime_requests_gpu({"nufft_policy": "cpu-only"}) is False

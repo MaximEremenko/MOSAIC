@@ -15,6 +15,7 @@ from core.scattering.kernels import (
     reciprocal_space_points_counter,
     to_interval_dict,
 )
+from core.scattering.contracts import build_interval_artifact_ref
 from core.runtime import (
     DEFAULT_TASK_RETRIES,
     is_sync_client,
@@ -632,6 +633,88 @@ def _finalize_residual_field_chunks(
             )
 
 
+def _drop_mask_emptied_interval_chunks(
+    interval_chunk_pairs,
+    *,
+    output_dir,
+    transient_interval_payloads,
+    logger,
+):
+    """Drop (interval, chunk) pairs whose interval produced no scattering output.
+
+    A reciprocal-space mask can eliminate every Q-point in a subvolume (e.g. a
+    half-integer superlattice mask empties the entire l=0 plane).  Such intervals
+    have no precomputed ``interval_<id>.hdf5`` artifact and no transient in-memory
+    payload; their residual-field contribution is exactly zero.  The scattering
+    stage marks them complete, but ``rebuild_sqlite_cache_from_manifests`` resets
+    every interval-chunk to unsaved and only re-marks intervals that have a
+    manifest, so mask-emptied intervals resurface here and would otherwise make
+    the residual stage try to open files that were never written.
+
+    A genuine scattering failure aborts Stage-1 before the residual stage runs,
+    so at this point "no artifact and no payload" unambiguously means the mask
+    emptied the interval -- skipping it is correct, not lossy.
+    """
+    payloads = transient_interval_payloads or {}
+    available: dict[int, bool] = {}
+
+    def _has_payload(interval_id: int) -> bool:
+        cached = available.get(interval_id)
+        if cached is not None:
+            return cached
+        present = int(interval_id) in payloads
+        if not present:
+            artifact_path = build_interval_artifact_ref(output_dir, int(interval_id)).path
+            present = artifact_path is not None and os.path.exists(artifact_path)
+        available[interval_id] = present
+        return present
+
+    kept = [
+        (interval_id, chunk_id)
+        for interval_id, chunk_id in interval_chunk_pairs
+        if _has_payload(int(interval_id))
+    ]
+    dropped_intervals = sorted(
+        {int(interval_id) for interval_id, _ in interval_chunk_pairs}
+        - {int(interval_id) for interval_id, _ in kept}
+    )
+    if dropped_intervals:
+        logger.info(
+            "Residual-field: skipping %d mask-emptied interval(s) with no scattering "
+            "output (zero contribution): %s%s",
+            len(dropped_intervals),
+            dropped_intervals[:20],
+            " ..." if len(dropped_intervals) > 20 else "",
+        )
+    return kept
+
+
+def _adaptive_residual_intervals_per_shard(
+    *,
+    artifacts,
+    structure,
+    source_budget: int,
+) -> int:
+    intervals = list(artifacts.padded_intervals)
+    n_intervals = max(1, len(intervals))
+    # The residual inverse concatenates the actual q_grid rows as source points.
+    # Those rows are multiplicity-free; half-space conjugate reconstruction is
+    # applied after the inverse.  Using multiplicity-folded dense counts here
+    # overestimates source memory and splits batches unnecessarily.
+    total_source_points = sum(
+        int(
+            reciprocal_space_points_counter(
+                to_interval_dict(interval),
+                structure.supercell,
+                include_multiplicity=False,
+            )
+        )
+        for interval in intervals
+    )
+    avg_source_points = max(1, int(total_source_points) // n_intervals)
+    return max(1, min(n_intervals, int(source_budget) // avg_source_points))
+
+
 def run_residual_field_stage(
     *,
     workflow_parameters,
@@ -649,11 +732,34 @@ def run_residual_field_stage(
         client=client,
     )
     register_cleanup_plugin(client, is_sync_client=is_sync_client)
-    max_intervals_per_shard = int(
-        workflow_parameters.runtime_info.get(
-            "residual_shard_batch_size",
-            DEFAULT_RESIDUAL_INTERVALS_PER_SHARD,
-        )
+    _env_shard = os.getenv("MOSAIC_RESIDUAL_INTERVALS_PER_SHARD")
+    _configured_shard = workflow_parameters.runtime_info.get("residual_shard_batch_size")
+    if _env_shard is not None:
+        max_intervals_per_shard = max(1, int(_env_shard))
+    elif _configured_shard is not None:
+        max_intervals_per_shard = max(1, int(_configured_shard))
+    else:
+        # Adaptive default: fold as many intervals as possible into ONE shard so the
+        # inverse transform is issued as FEW, LARGE GPU calls (concat source-batching,
+        # high GPU utilisation) instead of one tiny task per interval. Bound the fold by
+        # a source-point budget so wide-hkl 3D keeps the concatenated q-list -- and hence
+        # the type-3 fine grid -- within VRAM. 2D folds all intervals; huge 3D caps.
+        try:
+            _budget = int(os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET", str(30_000_000)))
+            max_intervals_per_shard = _adaptive_residual_intervals_per_shard(
+                artifacts=artifacts,
+                structure=structure,
+                source_budget=_budget,
+            )
+        except Exception:
+            logger.debug("Adaptive residual shard sizing failed; using default.", exc_info=True)
+            max_intervals_per_shard = DEFAULT_RESIDUAL_INTERVALS_PER_SHARD
+    logger.info(
+        "Residual-field interval shard size | max_intervals_per_shard=%d "
+        "(env=%s, config=%s)",
+        max_intervals_per_shard,
+        _env_shard,
+        _configured_shard,
     )
     scratch_root = resolve_worker_scratch_root(
         preferred=(
@@ -745,6 +851,12 @@ def run_residual_field_stage(
         artifacts.db_manager.get_interval_chunks()
         if hasattr(artifacts.db_manager, "get_interval_chunks")
         else artifacts.db_manager.get_unsaved_interval_chunks()
+    )
+    all_interval_chunk_pairs = _drop_mask_emptied_interval_chunks(
+        all_interval_chunk_pairs,
+        output_dir=artifacts.output_dir,
+        transient_interval_payloads=getattr(artifacts, "transient_interval_payloads", {}) or {},
+        logger=logger,
     )
     initial_work_units = build_residual_field_work_units(
         all_interval_chunk_pairs,

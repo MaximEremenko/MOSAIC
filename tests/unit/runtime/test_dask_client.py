@@ -39,6 +39,9 @@ def test_get_client_defaults_nufft_supply_to_one(monkeypatch, tmp_path):
     monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("DASK_THREADS_PER_WORKER", "4")
     monkeypatch.delenv("MOSAIC_NUFFT_SLOTS_PER_WORKER", raising=False)
+    monkeypatch.delenv("MOSAIC_DASK_GPU_RESOURCE", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("GPUS_PER_JOB", "0")
     dask_client._CLIENT = None
     try:
         dask_client.get_client()
@@ -103,6 +106,9 @@ def test_get_client_allows_explicit_nufft_supply_override(monkeypatch, tmp_path)
     monkeypatch.setattr(dask_client, "ensure_dask_client", fake_ensure)
     monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("MOSAIC_NUFFT_SLOTS_PER_WORKER", "2")
+    monkeypatch.delenv("MOSAIC_DASK_GPU_RESOURCE", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("GPUS_PER_JOB", "0")
     dask_client._CLIENT = None
     try:
         dask_client.get_client()
@@ -110,3 +116,24 @@ def test_get_client_allows_explicit_nufft_supply_override(monkeypatch, tmp_path)
         dask_client._CLIENT = None
 
     assert captured["resources"] == {"nufft": 2}
+
+
+def test_get_client_declares_gpu_resource_when_requested(monkeypatch, tmp_path):
+    import core.runtime.dask_client as dask_client
+
+    captured = {}
+
+    def fake_ensure(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(dask_client, "ensure_dask_client", fake_ensure)
+    monkeypatch.setenv("MOSAIC_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("MOSAIC_DASK_GPU_RESOURCE", "1")
+    dask_client._CLIENT = None
+    try:
+        dask_client.get_client()
+    finally:
+        dask_client._CLIENT = None
+
+    assert captured["resources"] == {"nufft": 1, "gpu": 1}

@@ -126,6 +126,12 @@ class NufftExecutionSettings:
 
     @property
     def gpu_only(self) -> bool:
+        # ``auto`` attempts GPU first but ALWAYS permits a silent CPU fallback:
+        # it is safe on CPU-only hosts and self-regulates under VRAM pressure.
+        # Only the explicit strict policies (``gpu-required``/``allow-fallback``)
+        # forbid the wrapper from falling back to CPU.
+        if self.execution_policy == "auto":
+            return False
         return self.attempt_gpu
 
     @property
@@ -254,9 +260,19 @@ def resolve_nufft_execution_settings(
     # realized device must be stamped post-execution via
     # ``with_realized_backend`` before identity is committed.
     if policy == "auto":
+        # Default policy: attempt GPU when one is present, with a silent CPU
+        # fallback. The wrapper probes cuFINUFFT/CUDA at execution time and
+        # transparently runs on CPU when the GPU is unavailable or VRAM is
+        # exhausted, so this is safe on CPU-only hosts. The execution-policy
+        # label stays ``auto`` (not ``gpu-required``) so it neither triggers a
+        # hard GPU-admission gate nor requests a ``gpu`` task-resource that
+        # would strand tasks on CPU-only workers; ``gpu_only`` is forced False
+        # for ``auto`` so fallback is always permitted. The recorded identity
+        # stays the conservative ``cpu`` (backend_state) since the realized
+        # device is not bound until execution.
         backend_state: _BackendState = "cpu"
-        execution_policy: NufftExecutionPolicy = "cpu-only"
-        attempt_gpu = False
+        execution_policy: NufftExecutionPolicy = "auto"
+        attempt_gpu = True
     elif policy == "cpu-only":
         backend_state = "cpu"
         execution_policy = "cpu-only"

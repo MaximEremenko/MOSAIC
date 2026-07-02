@@ -25,6 +25,7 @@ from core.residual_field.planning import (
     partition_residual_field_work_units,
 )
 from core.residual_field.execution import (
+    _adaptive_residual_intervals_per_shard,
     _build_task_reducer_backend,
     _cap_async_max_inflight,
     _cluster_host_memory_pressure,
@@ -66,6 +67,33 @@ class _CapturingReducerBackend:
 
 class _StopAfterIntervalPayloadScatter(RuntimeError):
     pass
+
+
+def test_adaptive_residual_shard_sizing_uses_multiplicity_free_source_counts():
+    artifacts = SimpleNamespace(
+        padded_intervals=[
+            {
+                "h_range": (0.0, 5.0),
+                "k_range": (0.0, 5.0),
+                "l_range": (0.125, 5.0),
+            },
+            {
+                "h_range": (5.125, 10.0),
+                "k_range": (0.0, 5.0),
+                "l_range": (0.125, 5.0),
+            },
+        ]
+    )
+    structure = SimpleNamespace(supercell=np.array([8, 8, 8]))
+
+    assert (
+        _adaptive_residual_intervals_per_shard(
+            artifacts=artifacts,
+            structure=structure,
+            source_budget=150_000,
+        )
+        == 2
+    )
 
 
 def _write_interval_hdf5(
@@ -3858,6 +3886,7 @@ def test_residual_field_interval_chunk_task_slices_partition_atoms_for_owner_loc
 
 
 def test_residual_field_interval_chunk_task_uses_super_batch_for_same_geometry(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOSAIC_RESIDUAL_CONCAT_SOURCES", "0")
     monkeypatch.delenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", raising=False)
     interval_path_1 = tmp_path / "interval_1.hdf5"
     interval_path_2 = tmp_path / "interval_2.hdf5"
@@ -3939,6 +3968,7 @@ def test_residual_field_interval_chunk_task_can_disable_same_q_grid_presum(monke
     )
     submitted_weights = []
 
+    monkeypatch.setenv("MOSAIC_RESIDUAL_CONCAT_SOURCES", "0")
     monkeypatch.setenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", "0")
     monkeypatch.setattr(
         "core.residual_field.tasks.build_rifft_grid_for_chunk",
@@ -4005,6 +4035,7 @@ def test_residual_field_interval_chunk_task_sorts_intervals_and_threads_nufft_se
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setenv("MOSAIC_RESIDUAL_CONCAT_SOURCES", "0")
     monkeypatch.setenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", "0")
     atoms = np.array(
         [([0.0], [0.1], [0.05])],
@@ -4090,6 +4121,7 @@ def test_residual_field_interval_chunk_task_sorts_intervals_and_threads_nufft_se
 
 
 def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOSAIC_RESIDUAL_CONCAT_SOURCES", "0")
     interval_path_1 = tmp_path / "interval_1.hdf5"
     interval_path_2 = tmp_path / "interval_2.hdf5"
     _write_interval_hdf5(
@@ -4163,10 +4195,95 @@ def test_residual_field_interval_chunk_task_groups_mixed_q_grid_batches(monkeypa
     np.testing.assert_allclose(captured["amplitudes_average"], np.array([6.0 + 0.0j]))
 
 
+def test_residual_field_interval_chunk_task_concat_merges_mixed_q_grids(monkeypatch, tmp_path):
+    # Default (concat) path: intervals with DIFFERENT q_grids fold into ONE inverse
+    # transform over the concatenated sources, instead of one call per q_grid. The
+    # transform is linear so this equals summing per-interval inverses.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_CONCAT_SOURCES", "1")
+    atoms = np.array(
+        [([0.0], [0.1], [0.05])],
+        dtype=[
+            ("coordinates", object),
+            ("dist_from_atom_center", object),
+            ("step_in_frac", object),
+        ],
+    )
+    calls = []
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.build_rifft_grid_for_chunk",
+        lambda chunk_data: (
+            np.array([[0.0], [1.0]], dtype=np.float64),
+            np.array([[2]], dtype=np.int64),
+        ),
+    )
+
+    def fake_super_batch(**kwargs):
+        calls.append(
+            (
+                np.asarray(kwargs["q_coords"]).copy(),
+                np.asarray(kwargs["weights"], dtype=np.complex128).copy(),
+            )
+        )
+        # Return the weights unchanged so captured amplitudes equal the concatenated rows.
+        return np.asarray(kwargs["weights"], dtype=np.complex128)
+
+    monkeypatch.setattr(
+        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
+        fake_super_batch,
+    )
+    reducer_backend = _CapturingReducerBackend("manifest")
+
+    result = run_residual_field_interval_chunk_task(
+        ResidualFieldWorkUnit.interval_chunk_batch(
+            interval_ids=(1, 2),
+            chunk_id=3,
+            parameter_digest="abc123",
+            output_dir=str(tmp_path),
+        ),
+        (
+            IntervalTask(
+                1,
+                "All",
+                np.array([[0.0]], dtype=np.float64),
+                np.array([2.0 + 0.0j]),
+                np.array([1.0 + 0.0j]),
+            ),
+            IntervalTask(
+                2,
+                "All",
+                np.array([[1.0]], dtype=np.float64),
+                np.array([5.0 + 0.0j]),
+                np.array([2.0 + 0.0j]),
+            ),
+        ),
+        atoms,
+        total_reciprocal_points=11,
+        output_dir=str(tmp_path),
+        reducer_backend=reducer_backend,
+        quiet_logs=True,
+    )
+
+    assert result == "manifest"
+    # Exactly ONE inverse call, over the concatenation of both distinct q_grids.
+    assert len(calls) == 1
+    q_coords, weights = calls[0]
+    np.testing.assert_allclose(q_coords, np.array([[0.0], [1.0]], dtype=np.float64))
+    # row 0 = delta (q_amp - q_amp_av) concatenated; row 1 = q_amp_av concatenated
+    np.testing.assert_allclose(
+        weights,
+        np.array([[1.0 + 0.0j, 3.0 + 0.0j], [1.0 + 0.0j, 2.0 + 0.0j]], dtype=np.complex128),
+    )
+    captured = reducer_backend.calls[0]
+    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([1.0 + 0.0j, 3.0 + 0.0j]))
+    np.testing.assert_allclose(captured["amplitudes_average"], np.array([1.0 + 0.0j, 2.0 + 0.0j]))
+
+
 def test_residual_field_interval_chunk_task_pre_sum_matches_linear_inverse(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setenv("MOSAIC_RESIDUAL_CONCAT_SOURCES", "0")
     monkeypatch.setenv("MOSAIC_RESIDUAL_SAME_Q_GRID_PRESUM", "1")
     atoms = np.array(
         [([0.0], [0.1], [0.05])],

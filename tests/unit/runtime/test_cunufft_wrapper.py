@@ -950,3 +950,128 @@ def test_inverse_batch_matches_cpu_reference_with_current_gpu_spreadinterponly()
         gpu_only=True,
     )
     np.testing.assert_allclose(result, expected, rtol=1e-9, atol=1e-9)
+
+
+def test_fine_grid_bytes_type3_shrinks_when_sources_are_split():
+    # Fine grid scales with the *spread* (max-min) of source and target coords,
+    # so splitting the q-sources by position must reduce the estimate -- that is
+    # what lets the tiler bound each GPU sub-transform.
+    rng = np.random.RandomState(0)
+    real = rng.uniform(0.0, 27.0, size=(4096, 3))
+    recip = rng.uniform(-33.0, 33.0, size=(8192, 3))
+    full = cunufft_wrapper.fine_grid_bytes_type3(real, recip)
+    ax = int(np.argmax(recip.max(0) - recip.min(0)))
+    half = recip[recip[:, ax] < np.median(recip[:, ax])]
+    assert cunufft_wrapper.fine_grid_bytes_type3(real, half) < full
+    # A single q-point has zero recip spread -> negligible grid.
+    assert cunufft_wrapper.fine_grid_bytes_type3(real, recip[:1]) < full // 10
+
+
+def test_type3_inverse_tiled_recombines_exactly():
+    # The tiler must reproduce the un-tiled type-3 inverse regardless of how many
+    # source/target splits it takes. Use an exact DFT leaf (no GPU) so the test
+    # is deterministic and isolates the split/sum/place bookkeeping.
+    rng = np.random.RandomState(1)
+    dim = 2
+    q = rng.uniform(-20.0, 20.0, size=(200, dim))
+    real = rng.uniform(0.0, 15.0, size=(150, dim))
+    n_trans = 3
+    weights = (rng.standard_normal((n_trans, len(q)))
+               + 1j * rng.standard_normal((n_trans, len(q)))).astype(np.complex128)
+
+    def _exact_leaf(q_sub, w_sub, real_sub):
+        # out[t,k] = sum_j w[t,j] exp(-i real_k . q_j)   (isign = -1)
+        phase = np.exp(-1j * (real_sub @ q_sub.T))       # (Ntgt, Nsrc)
+        return w_sub @ phase.T                            # (n_trans, Ntgt)
+
+    reference = _exact_leaf(q, weights, real)
+    # Force many tiles by using a tiny budget.
+    tiled = cunufft_wrapper._type3_inverse_gpu_tiled(
+        real_coords=real,
+        q_coords=q,
+        weights_arr=weights,
+        eps=1e-12,
+        leaf=_exact_leaf,
+        budget_bytes=1,           # forces recursive splitting to the base case
+    )
+    assert tiled.shape == reference.shape
+    np.testing.assert_allclose(tiled, reference, rtol=1e-10, atol=1e-9)
+
+
+def test_current_tile_budget_scales_with_inflight(monkeypatch):
+    # Budget per tile is an equal live share of the pool: whole pool alone,
+    # halves the moment a second transform is in flight, etc.
+    monkeypatch.setattr(cunufft_wrapper, "_pool_reservable_bytes", lambda: 24 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_inflight", 0, raising=False)
+    cunufft_wrapper._transform_enter()
+    try:
+        alone = cunufft_wrapper._current_tile_budget()
+        cunufft_wrapper._transform_enter()
+        try:
+            shared = cunufft_wrapper._current_tile_budget()
+        finally:
+            cunufft_wrapper._transform_exit()
+    finally:
+        cunufft_wrapper._transform_exit()
+    assert alone == 24 << 30
+    assert shared == 12 << 30
+
+
+def test_reserve_tile_never_exceeds_pool_and_releases(monkeypatch):
+    monkeypatch.setattr(cunufft_wrapper, "_pool_reservable_bytes", lambda: 10 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0, raising=False)
+    cunufft_wrapper._reserve_tile(6 << 30)
+    assert cunufft_wrapper._gpu_reserved == 6 << 30
+    cunufft_wrapper._release_tile(6 << 30)
+    assert cunufft_wrapper._gpu_reserved == 0
+
+
+def test_concurrent_tiled_transforms_are_exact_and_deadlock_free(monkeypatch):
+    # Two threads drive the tiler through the shared reservation pool at once,
+    # each forced to split heavily (tiny pool). Results must stay exact and the
+    # run must finish (no deadlock).
+    import threading
+
+    monkeypatch.setattr(cunufft_wrapper, "_pool_reservable_bytes", lambda: 4 << 20)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_inflight", 0, raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0, raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_MIN_TILE_BUDGET_BYTES", 1)
+
+    rng = np.random.RandomState(2)
+    dim = 2
+    q = rng.uniform(-15.0, 15.0, size=(160, dim))
+    real = rng.uniform(0.0, 12.0, size=(120, dim))
+    weights = (rng.standard_normal((2, len(q)))
+               + 1j * rng.standard_normal((2, len(q)))).astype(np.complex128)
+
+    def _exact_leaf(q_sub, w_sub, real_sub):
+        tile = int(cunufft_wrapper.fine_grid_bytes_type3(real_sub, q_sub)
+                   * cunufft_wrapper._TYPE3_RESIDENCY_FACTOR)
+        cunufft_wrapper._reserve_tile(tile)
+        try:
+            return w_sub @ np.exp(-1j * (real_sub @ q_sub.T)).T
+        finally:
+            cunufft_wrapper._release_tile(tile)
+
+    reference = weights @ np.exp(-1j * (real @ q.T)).T
+    results: dict[int, np.ndarray] = {}
+
+    def _run(idx):
+        cunufft_wrapper._transform_enter()
+        try:
+            results[idx] = cunufft_wrapper._type3_inverse_gpu_tiled(
+                real_coords=real, q_coords=q, weights_arr=weights, eps=1e-12,
+                leaf=_exact_leaf, budget_bytes=cunufft_wrapper._current_tile_budget,
+            )
+        finally:
+            cunufft_wrapper._transform_exit()
+
+    threads = [threading.Thread(target=_run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "tiled transform deadlocked"
+    for idx in range(2):
+        np.testing.assert_allclose(results[idx], reference, rtol=1e-10, atol=1e-9)
+    assert cunufft_wrapper._gpu_reserved == 0
