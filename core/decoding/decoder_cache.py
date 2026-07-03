@@ -162,6 +162,54 @@ def resolve_current_residual_source_identity(
     return source_identity
 
 
+def resolve_local_residual_source_identity(*, output_dir: str | Path) -> dict | None:
+    """Source identity for the local (loose-file) residual layout.
+
+    The local_restartable reducer materialises the residual as loose
+    ``residual_chunk_*`` artifacts and writes no run-scoped
+    ``residual_field/stage_commit.json``, so the manifest-based resolver cannot
+    describe it -- ``decoder.source='current'`` would always fail for local
+    runs. Build the identity from the loose artifacts instead: content hashes
+    of the small per-chunk metadata files plus (size, mtime) of the large
+    amplitude payloads, so any residual recompute changes the identity and
+    invalidates the trained decoder cache (the staleness semantics the
+    manifest path provides). Returns ``None`` when no loose residual chunks
+    exist."""
+    from core.storage.fingerprint import file_sha256
+
+    output_root = Path(output_dir)
+    amplitude_files = sorted(output_root.glob("residual_chunk_*_amplitudes.hdf5"))
+    if not amplitude_files:
+        return None
+    payload_hashes = []
+    for artifact in sorted(output_root.glob("residual_chunk_*")):
+        if not artifact.is_file():
+            continue
+        stat = artifact.stat()
+        entry = {
+            "name": artifact.name,
+            "nbytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+        if stat.st_size <= (8 << 20):
+            entry["file_sha256"] = file_sha256(artifact)
+        payload_hashes.append(entry)
+    source_identity = {
+        "schema": "mosaic.decoder.local_residual_source",
+        "schema_version": 1,
+        "run_digest": digest_dict(
+            {"payload_hashes": payload_hashes},
+            domain="mosaic.decoder.local_residual_source.v1",
+        ),
+        "residual_payload_hashes": payload_hashes,
+    }
+    source_identity["source_identity_digest"] = digest_dict(
+        source_identity,
+        domain="mosaic.decoder.local_residual_source.v1",
+    )
+    return source_identity
+
+
 def _require_residual_public_source_fields(source_identity: dict) -> None:
     if not isinstance(source_identity.get("residual_stage_digest"), str):
         raise RuntimeError("public_manifest.json is missing residual_stage_digest source identity.")

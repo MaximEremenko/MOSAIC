@@ -139,7 +139,11 @@ def test_current_source_service_validates_stage_commit_before_cache_lookup(tmp_p
         decoder_source_provenance=None,
     )
 
-    with pytest.raises(RuntimeError, match="Loose residual chunk"):
+    # Local (loose-file) residual layouts are now valid 'current' sources: the
+    # identity derives from the residual_chunk_* content, so the stale plain-path
+    # cache is NOT addressed (different identity-hashed name) and the service
+    # proceeds to training -- which requires real residual artifacts.
+    with pytest.raises(RuntimeError, match="residual-field saver"):
         service.prepare(
             processor=processor,
             workflow_parameters=SimpleNamespace(),

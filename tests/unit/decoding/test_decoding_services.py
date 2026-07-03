@@ -636,7 +636,11 @@ def test_decoder_source_service_current_mode_rejects_loose_decoder_cache(tmp_pat
         decoder_source_provenance=None,
     )
 
-    with pytest.raises(RuntimeError, match="requires residual_run_digest"):
+    # Local (loose-file) residual layouts are now valid 'current' sources: the
+    # loose residual provides the identity, the stale plain-path cache is not
+    # addressed (identity-hashed name), and preparation proceeds to training --
+    # which requires real residual artifacts.
+    with pytest.raises(RuntimeError, match="residual-field saver"):
         service.prepare(
             processor=processor,
             workflow_parameters=SimpleNamespace(),
@@ -723,21 +727,27 @@ def test_decoder_source_service_current_mode_fresh_start_rejects_missing_stage_i
         },
     )
 
-    with pytest.raises(RuntimeError, match="requires residual_run_digest"):
-        service.prepare(
-            processor=processor,
-            workflow_parameters=SimpleNamespace(),
-            structure=SimpleNamespace(),
-            artifacts=SimpleNamespace(
-                output_dir=str(output_dir),
-                saver=SimpleNamespace(),
-                db_manager=SimpleNamespace(
-                    get_pending_chunk_ids=lambda: [0],
-                    get_point_data_for_chunk=lambda chunk_id: [point_row],
-                ),
+    # Local (loose-file) residual layouts are now valid 'current' sources:
+    # the loose residual provides the source identity, fresh_start forces a
+    # retrain, and preparation succeeds using the (mocked) training payload.
+    provenance = service.prepare(
+        processor=processor,
+        workflow_parameters=SimpleNamespace(),
+        structure=SimpleNamespace(),
+        artifacts=SimpleNamespace(
+            output_dir=str(output_dir),
+            saver=SimpleNamespace(),
+            db_manager=SimpleNamespace(
+                get_pending_chunk_ids=lambda: [0],
+                get_point_data_for_chunk=lambda chunk_id: [point_row],
             ),
-            client=None,
-        )
+        ),
+        client=None,
+    )
+    assert provenance is not None
+    assert processor._decoder_M is not None
+    # the stale plain-path cache must not have been reused
+    assert not np.allclose(processor._decoder_M, cached_decoder)
 
 
 def test_decoder_source_service_compute_mode_reuses_valid_full_decoder(tmp_path, monkeypatch):

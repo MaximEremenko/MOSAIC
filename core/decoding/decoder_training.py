@@ -16,10 +16,13 @@ from core.decoding.decoder_cache import (
     build_decoder_cache_path,
     load_decoder_cache,
     resolve_current_residual_source_identity,
+    resolve_local_residual_source_identity,
     resolve_public_residual_source_identity,
     save_decoder_provenance,
     save_decoder_cache,
 )
+from core.residual_field.commit import RESIDUAL_FIELD_STAGE
+from core.storage.attempt_store import stage_commit_path
 from core.decoding.commit import DecoderCommitManifest, decoder_commit_path, write_decoder_commit
 from core.decoding.payloads import build_decoding_payload
 from core.decoding.displacement_inputs import (
@@ -122,9 +125,34 @@ def load_required_decoder(cache_path: str, logger):
 
 def _resolve_decoder_cache_path(cache_path: str, parameters: dict) -> str:
     path = Path(cache_path)
-    if path.is_dir():
-        return build_decoder_cache_path(parameters, str(path))
-    return str(path)
+    if not path.is_dir():
+        return str(cache_path)
+    candidate = Path(build_decoder_cache_path(parameters, str(path)))
+    if candidate.is_file():
+        return str(candidate)
+    # The plain parameter-hashed name misses decoders that were saved under a
+    # source-identity-hashed name (decoder.source='current' runs). The producing
+    # run records the exact artifact in decoder_source_provenance.json, so a
+    # consumer run (decoder.source='cache' pointing at that directory) resolves
+    # through the provenance instead of failing after the full pipeline ran.
+    provenance_path = path / "decoder_source_provenance.json"
+    if provenance_path.is_file():
+        try:
+            import json
+
+            recorded = json.loads(provenance_path.read_text(encoding="utf-8")).get(
+                "decoder_cache_path"
+            )
+        except (OSError, ValueError):
+            recorded = None
+        if recorded:
+            recorded_path = Path(recorded)
+            if recorded_path.is_file():
+                return str(recorded_path)
+            dir_relative = path / recorded_path.name
+            if dir_relative.is_file():
+                return str(dir_relative)
+    return str(candidate)
 
 
 def _current_residual_run_digest(parameters: dict) -> str | None:
@@ -723,15 +751,31 @@ class DisplacementDecoderSourceService:
             family_semantics = "current-public-residual-family"
         else:
             run_digest = _current_residual_run_digest(processor.parameters)
-            if run_digest is None:
-                raise RuntimeError(
-                    "processing.decoder.source='current' requires residual_run_digest "
-                    "or residual_field_run_digest before cache lookup."
+            manifest_available = run_digest is not None and stage_commit_path(
+                Path(output_dir), str(run_digest), RESIDUAL_FIELD_STAGE
+            ).exists()
+            if manifest_available:
+                source_identity = resolve_current_residual_source_identity(
+                    output_dir=output_dir,
+                    run_digest=run_digest,
                 )
-            source_identity = resolve_current_residual_source_identity(
-                output_dir=output_dir,
-                run_digest=run_digest,
-            )
+            else:
+                # Local (loose-file) residual layout: no run-scoped stage_commit
+                # manifests exist, so derive the source identity from the loose
+                # residual_chunk_* artifacts themselves. Any residual recompute
+                # changes the identity, preserving decoder-cache staleness
+                # semantics.
+                source_identity = resolve_local_residual_source_identity(
+                    output_dir=output_dir
+                )
+                if source_identity is None:
+                    raise RuntimeError(
+                        "processing.decoder.source='current' requires either a "
+                        "residual_field stage_commit manifest (with "
+                        "residual_run_digest) or local residual_chunk_* "
+                        "artifacts in the output directory."
+                    )
+                run_digest = str(source_identity["run_digest"])
             single_semantics = "current-residual"
             family_semantics = "current-residual-family"
         cache_identity = _build_current_decoder_cache_identity(
