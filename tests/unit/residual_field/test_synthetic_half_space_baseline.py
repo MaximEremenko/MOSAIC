@@ -2,8 +2,24 @@ from __future__ import annotations
 
 import numpy as np
 
+import pytest
+
 from core.residual_field.contracts import ResidualFieldWorkUnit
-from core.residual_field.tasks import run_residual_field_interval_chunk_task
+from core.residual_field.tasks import (
+    clear_residual_lattice_cache,
+    run_residual_field_interval_chunk_task,
+)
+
+
+@pytest.fixture(autouse=True)
+def _pin_type3_paths(monkeypatch):
+    """These baseline tests mock the type-3 entry points with canned values;
+    the lattice scatter+type-2 path would divert their synthetic on-lattice
+    q-grids, so pin it off here (mirrors test_residual_field_boundaries)."""
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "0")
+    clear_residual_lattice_cache()
+    yield
+    clear_residual_lattice_cache()
 from core.scattering.half_space import (
     HALF_SPACE_ROLE_POSITIVE_HALF,
     HALF_SPACE_ROLE_ZERO_PLANE,

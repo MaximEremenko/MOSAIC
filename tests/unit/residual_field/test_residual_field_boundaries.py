@@ -42,11 +42,24 @@ from core.residual_field.contracts import (
 from core.residual_field.stage import ResidualFieldStage
 from core.residual_field.tasks import (
     build_residual_rifft_payload,
+    clear_residual_lattice_cache,
     run_residual_field_interval_chunk_task,
 )
 from core.scattering.accumulation import HALF_SPACE_ROLE_FULL, HALF_SPACE_ROLE_POSITIVE_HALF
 from core.scattering.kernels import IntervalTask
 from core.storage.database_manager import DatabaseManager
+
+
+@pytest.fixture(autouse=True)
+def _pin_type3_paths(monkeypatch):
+    """These tests exercise the legacy type-3 machinery (several mock the
+    type-3 entry points with canned values). The lattice scatter+type-2 path
+    would divert their synthetic on-lattice q-grids, so pin it off here;
+    dedicated lattice tests re-enable it explicitly."""
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "0")
+    clear_residual_lattice_cache()
+    yield
+    clear_residual_lattice_cache()
 
 
 class _CapturingReducerBackend:
@@ -4436,3 +4449,145 @@ def test_residual_field_interval_chunk_task_rejects_mismatched_q_weight_lengths(
             reducer_backend=_CapturingReducerBackend("manifest"),
             quiet_logs=True,
         )
+
+
+def _lattice_interval_tasks(rng, n_intervals=4, role="positive_half"):
+    dq = np.array([0.21, 0.21, 0.207])
+    origin = np.array([-4.2, -4.2, 0.207])
+    tasks = []
+    for i in range(n_intervals):
+        idx = rng.randint(0, 30, size=(200, 3))
+        q = origin + idx * dq
+        amp = (rng.standard_normal(200) + 1j * rng.standard_normal(200)).astype(np.complex128)
+        av = (rng.standard_normal(200) + 1j * rng.standard_normal(200)).astype(np.complex128)
+        tasks.append(IntervalTask(i + 1, "O", q, amp, av, None, role, 2))
+    return tasks
+
+
+def test_lattice_path_matches_type3_and_falls_back(monkeypatch):
+    from core.residual_field.tasks import compute_residual_field_interval_chunk_arrays
+
+    rng = np.random.RandomState(7)
+    rifft_grid = rng.uniform(0.0, 20.0, size=(400, 3))
+    grid_shape_nd = np.tile(np.array([[4, 5, 20]]), (1, 1))
+    tasks = _lattice_interval_tasks(rng)
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "0")
+    ref = compute_residual_field_interval_chunk_arrays(
+        tasks, rifft_grid=rifft_grid, grid_shape_nd=grid_shape_nd, nufft_eps=1e-12
+    )
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "1")
+    sink: dict = {}
+    lat = compute_residual_field_interval_chunk_arrays(
+        tasks,
+        rifft_grid=rifft_grid,
+        grid_shape_nd=grid_shape_nd,
+        nufft_eps=1e-12,
+        lattice_sink=sink,
+    )
+    scale = np.abs(ref.amplitudes_delta).max()
+    assert np.abs(lat.amplitudes_delta - ref.amplitudes_delta).max() / scale < 1e-9
+    scale_av = np.abs(ref.amplitudes_average).max()
+    assert np.abs(lat.amplitudes_average - ref.amplitudes_average).max() / scale_av < 1e-9
+    assert lat.contribution_reciprocal_points == ref.contribution_reciprocal_points
+    # sink captured reusable grids for the task-level cache
+    assert sink.get("groups") and sink.get("contribution") == ref.contribution_reciprocal_points
+
+    # non-lattice q silently falls back to the identical type-3 path
+    weird = [
+        IntervalTask(
+            9,
+            "O",
+            rng.uniform(-4.0, 4.0, size=(300, 3)),
+            (rng.standard_normal(300) + 1j * rng.standard_normal(300)).astype(np.complex128),
+            (rng.standard_normal(300) + 1j * rng.standard_normal(300)).astype(np.complex128),
+            None,
+            HALF_SPACE_ROLE_FULL,
+            1,
+        )
+    ]
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "0")
+    ref_w = compute_residual_field_interval_chunk_arrays(
+        weird, rifft_grid=rifft_grid, grid_shape_nd=grid_shape_nd, nufft_eps=1e-12
+    )
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "1")
+    lat_w = compute_residual_field_interval_chunk_arrays(
+        weird, rifft_grid=rifft_grid, grid_shape_nd=grid_shape_nd, nufft_eps=1e-12
+    )
+    np.testing.assert_allclose(lat_w.amplitudes_delta, ref_w.amplitudes_delta, rtol=1e-12, atol=1e-12)
+
+
+def test_lattice_cache_entry_reused_across_work_units(monkeypatch):
+    from core.residual_field import tasks as tasks_mod
+
+    rng = np.random.RandomState(11)
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "1")
+    clear_residual_lattice_cache()
+    tasks = _lattice_interval_tasks(rng, n_intervals=3)
+    rifft_grid = rng.uniform(0.0, 20.0, size=(300, 3))
+    grid_shape_nd = np.tile(np.array([[3, 10, 10]]), (1, 1))
+    sink: dict = {}
+    ref = tasks_mod.compute_residual_field_interval_chunk_arrays(
+        tasks,
+        rifft_grid=rifft_grid,
+        grid_shape_nd=grid_shape_nd,
+        nufft_eps=1e-12,
+        lattice_sink=sink,
+    )
+    key = ("digest", (1, 2, 3))
+    tasks_mod._lattice_cache_store(
+        key, {"groups": sink["groups"], "contribution": sink["contribution"]}
+    )
+    entry = tasks_mod._lattice_cache_get(key)
+    assert entry is not None
+    out = tasks_mod._compute_from_lattice_entry(
+        entry,
+        rifft_grid=rifft_grid,
+        grid_shape_nd=grid_shape_nd,
+        point_start=0,
+        nufft_eps=1e-12,
+        nufft_prefer_cpu=False,
+        nufft_gpu_only=False,
+    )
+    scale = np.abs(ref.amplitudes_delta).max()
+    assert np.abs(out.amplitudes_delta - ref.amplitudes_delta).max() / scale < 1e-12
+    assert out.contribution_reciprocal_points == ref.contribution_reciprocal_points
+    clear_residual_lattice_cache()
+
+
+def test_lattice_disk_spill_matches_ram_grid(monkeypatch, tmp_path):
+    """Small-RAM hosts take the SAME lattice path: a grid over the host budget
+    spills to a disk-backed memmap (bit-identical results, zero RAM-cache
+    accounting) instead of falling back to type-3."""
+    from core.residual_field import tasks as tasks_mod
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "1")
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_SCRATCH", str(tmp_path))
+    rng = np.random.RandomState(5)
+    dq = np.array([0.21, 0.21, 0.207])
+    origin = np.array([-4.2, -4.2, 0.207])
+    tasks = []
+    for i in range(4):
+        idx = rng.randint(0, 60, size=(400, 3))      # ~61^3 grid > 1 MiB floor
+        q = origin + idx * dq
+        amp = (rng.standard_normal(400) + 1j * rng.standard_normal(400)).astype(np.complex128)
+        av = (rng.standard_normal(400) + 1j * rng.standard_normal(400)).astype(np.complex128)
+        tasks.append(IntervalTask(i + 1, "O", q, amp, av, None, "positive_half", 2))
+    rifft = rng.uniform(0.0, 20.0, size=(300, 3))
+    shape_nd = np.tile(np.array([[3, 10, 10]]), (1, 1))
+
+    ram_entry = tasks_mod._build_lattice_entry_from_inputs(tasks)
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(1 << 20))
+    spill_entry = tasks_mod._build_lattice_entry_from_inputs(tasks)
+    monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET")
+
+    assert spill_entry is not None
+    assert isinstance(spill_entry["groups"][0][2], np.memmap)
+    assert tasks_mod._lattice_entry_bytes(spill_entry) == 0   # disk, not RAM cache
+
+    kwargs = dict(rifft_grid=rifft, grid_shape_nd=shape_nd, point_start=0,
+                  nufft_eps=1e-12, nufft_prefer_cpu=False, nufft_gpu_only=False)
+    ram = tasks_mod._compute_from_lattice_entry(ram_entry, **kwargs)
+    spill = tasks_mod._compute_from_lattice_entry(spill_entry, **kwargs)
+    np.testing.assert_array_equal(spill.amplitudes_delta, ram.amplitudes_delta)
+    np.testing.assert_array_equal(spill.amplitudes_average, ram.amplitudes_average)

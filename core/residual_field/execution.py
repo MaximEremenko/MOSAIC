@@ -68,6 +68,7 @@ from core.residual_field.planning import (
     partition_residual_field_work_units,
 )
 from core.residual_field.tasks import (
+    _residual_lattice_fft_enabled,
     build_residual_rifft_payload,
     clear_residual_rifft_payload_cache,
     run_residual_field_interval_chunk_task,
@@ -745,12 +746,20 @@ def run_residual_field_stage(
         # a source-point budget so wide-hkl 3D keeps the concatenated q-list -- and hence
         # the type-3 fine grid -- within VRAM. 2D folds all intervals; huge 3D caps.
         try:
-            _budget = int(os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET", str(30_000_000)))
-            max_intervals_per_shard = _adaptive_residual_intervals_per_shard(
-                artifacts=artifacts,
-                structure=structure,
-                source_budget=_budget,
-            )
+            if _residual_lattice_fft_enabled():
+                # Lattice (scatter+type-2) path: one shard covering every
+                # interval means ONE scattered coefficient grid, cached and
+                # reused by all (chunk, partition) work units. The type-3
+                # source-point budget is irrelevant -- lattice memory is set by
+                # the grid dims, not the point count.
+                max_intervals_per_shard = max(1, len(list(artifacts.padded_intervals)))
+            else:
+                _budget = int(os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET", str(30_000_000)))
+                max_intervals_per_shard = _adaptive_residual_intervals_per_shard(
+                    artifacts=artifacts,
+                    structure=structure,
+                    source_budget=_budget,
+                )
         except Exception:
             logger.debug("Adaptive residual shard sizing failed; using default.", exc_info=True)
             max_intervals_per_shard = DEFAULT_RESIDUAL_INTERVALS_PER_SHARD

@@ -1233,6 +1233,411 @@ def execute_inverse_cunufft_super_batch(
     return np.concatenate(outputs, axis=0)
 
 
+###############################################################################
+#  Lattice (scatter + type-2) inverse path                                    #
+#                                                                             #
+#  MOSAIC's reciprocal-space points sit on a uniform per-axis lattice (h,k,l  #
+#  at integer multiples of 1/N_cell); masks select a SUBSET of lattice sites  #
+#  but never move points off the lattice. The inverse transform               #
+#      F(r) = sum_q v(q) exp(-i r.q)                                          #
+#  is therefore a type-2 NUFFT from a dense coefficient grid (masked-out      #
+#  sites simply stay zero) instead of a type-3 over scattered points. This    #
+#  removes the type-3 fine-grid blow-up entirely: cost is set by the mode     #
+#  grid dimensions, not by (real extent x reciprocal extent). Measured on     #
+#  hkl32: 27x per transform, ~42 min vs 14-31 h end-to-end.                   #
+###############################################################################
+
+
+def lattice_host_budget_bytes() -> int:
+    """Host-RAM budget for a dense lattice coefficient grid.
+
+    Env ``MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET`` wins; the default scales with
+    the machine -- 55% of physical RAM (floor 8 GiB, cap 96 GiB) -- so large
+    grids (hkl40: ~31 GiB) take the fast lattice path on capable nodes while
+    small boxes fall back to type-3 rather than swapping."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        total = 0
+    if total <= 0:
+        return 24 << 30
+    return int(min(max(int(total * 0.55), 8 << 30), 96 << 30))
+
+
+def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
+                 host_budget_bytes: int | None = None, n_trans: int = 2):
+    """Snap scattered q-points onto a uniform per-axis lattice.
+
+    Returns a meta dict ``{origin, dq, dims, snap_dev}`` when every point lies
+    on a common per-axis lattice (within ``snap_tol`` of a step) AND the dense
+    coefficient grid fits ``host_budget_bytes``; otherwise ``None`` (caller
+    falls back to type-3). Degenerate axes (a single plane, e.g. the l=0
+    zero-plane role, or a 2D projection) get ``dq=0`` and one mode."""
+    q = np.asarray(q_coords, dtype=np.float64)
+    if q.ndim != 2 or len(q) == 0 or q.shape[1] not in (1, 2, 3):
+        return None
+    if host_budget_bytes is None:
+        host_budget_bytes = lattice_host_budget_bytes()
+    dim = q.shape[1]
+    origin = np.zeros(dim)
+    dq = np.zeros(dim)
+    dims = np.zeros(dim, dtype=np.int64)
+    idx = np.zeros(q.shape, dtype=np.int64)
+    snap_dev = 0.0
+    for ax in range(dim):
+        col = q[:, ax]
+        span = float(col.max() - col.min())
+        if span <= 1e-12:                      # degenerate axis: one plane
+            origin[ax] = float(col[0]); dq[ax] = 0.0; dims[ax] = 1
+            continue
+        u = np.unique(np.round(col, 9))
+        gaps = np.diff(u)
+        gaps = gaps[gaps > max(1e-9, span * 1e-6)]   # ignore float-noise micro-gaps
+        if gaps.size == 0:
+            return None
+        step = float(gaps.min())
+        n_axis = int(round(span / step)) + 1
+        if n_axis > (1 << 20):                 # non-lattice data snaps to absurd dims
+            return None
+        origin[ax] = float(col.min()); dq[ax] = step; dims[ax] = n_axis
+        ratio = (col - origin[ax]) / step
+        ax_idx = np.round(ratio).astype(np.int64)
+        dev = float(np.abs(ratio - ax_idx).max())
+        if dev > snap_tol or ax_idx.min() < 0 or ax_idx.max() >= n_axis:
+            return None
+        snap_dev = max(snap_dev, dev)
+        idx[:, ax] = ax_idx
+    grid_bytes = int(np.prod(dims)) * 16 * max(1, int(n_trans))
+    if grid_bytes > host_budget_bytes:
+        return None
+    return {
+        "origin": origin, "dq": dq, "dims": tuple(int(v) for v in dims),
+        "snap_dev": snap_dev, "flat_index": np.ravel_multi_index(tuple(idx.T), tuple(int(v) for v in dims)),
+    }
+
+
+def scatter_on_lattice(meta: dict, weights: np.ndarray) -> np.ndarray:
+    """Scatter-ADD weight rows onto the dense lattice grid (duplicates sum,
+    matching type-3 linearity exactly). Returns ``(n_trans, *dims)``."""
+    weights = np.asarray(weights, dtype=np.complex128)
+    if weights.ndim == 1:
+        weights = weights[np.newaxis, :]
+    dims = meta["dims"]
+    flat = meta["flat_index"]
+    grids = np.zeros((weights.shape[0], int(np.prod(dims))), dtype=np.complex128)
+    for row in range(weights.shape[0]):
+        np.add.at(grids[row], flat, weights[row])
+    return grids.reshape((weights.shape[0],) + tuple(dims))
+
+
+def _next_fft_size(n: int) -> int:
+    return max(2, int(2 * n))                  # upsampled fine-grid axis estimate
+
+
+def execute_type2_on_lattice(
+    meta: dict,
+    grids: np.ndarray,
+    real_coords: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    prefer_cpu: bool = False,
+    gpu_only: bool = False,
+) -> np.ndarray:
+    """Evaluate ``F(r) = sum_m grid[m] exp(-i r.(origin + m*dq))`` at arbitrary
+    targets via type-2 NUFFT, mode-slabbed along the FIRST axis. Exact to NUFFT
+    eps.
+
+    Memory discipline (the failure modes this design closes):
+      * Slabs are taken along axis 0 of each transform row, so every slab is a
+        contiguous VIEW of the cached grid -- zero host memcpy per work unit.
+      * Uploads (slab + coords + result) live in the CuPy POOL, which the
+        pipeline caps at ~2.4 GiB/worker; slab length is sized against the
+        pool's actual free capacity, not free VRAM (sizing against VRAM is what
+        OOM-crashed the first hkl32 integration run).
+      * The cuFINUFFT fine grid is raw cudaMalloc OUTSIDE the pool; it is sized
+        against the dynamically shared VRAM tile budget.
+      * Rows run as separate n_trans=1 calls (halves the fine grid; the phase
+        vector is shared per slab), and any residual OOM halves the slab length
+        and retries instead of failing the work unit."""
+    tgt = np.asarray(real_coords, dtype=np.float64)
+    grids = np.asarray(grids, dtype=np.complex128)
+    dims = meta["dims"]
+    dq = np.asarray(meta["dq"], dtype=np.float64)
+    origin = np.asarray(meta["origin"], dtype=np.float64)
+    dim = len(dims)
+    n_trans = int(grids.shape[0])
+    n_tgt = int(len(tgt))
+    out = np.zeros((n_trans, n_tgt), dtype=np.complex128)
+    if n_tgt == 0 or int(np.prod(dims)) == 0:
+        return out
+
+    use_gpu = (
+        not (_CPU_ONLY or prefer_cpu) and _GPU_AVAILABLE and cp is not None
+    )
+    if use_gpu:
+        try:
+            _ensure_gpu_kernels()
+        except ImportError:
+            use_gpu = False
+    if not use_gpu and gpu_only:
+        raise RuntimeError("GPU execution forced but unavailable for lattice type-2.")
+
+    # wrapped type-2 coordinates; degenerate axes (dq=0) map to x=0 (single mode)
+    x = ((tgt * dq[None, :] + np.pi) % (2.0 * np.pi)) - np.pi
+    centers = [d // 2 for d in dims]
+    row_bytes_per_len = 16 * int(np.prod(dims[1:])) if dim > 1 else 16
+    fine_other = 1
+    for a in range(1, dim):
+        fine_other *= _next_fft_size(dims[a])
+
+    def _pool_free_bytes() -> int:
+        try:
+            pool = cp.get_default_memory_pool()
+            limit = int(pool.get_limit() or 0)
+            if limit > 0:
+                return max(0, limit - int(pool.used_bytes()))
+        except Exception:
+            pass
+        return _free_mem_bytes()
+
+    def _slab_len_now() -> int:
+        # pool side: slab upload + coords + per-call result must fit the pool
+        fixed = 24 * n_tgt + 16 * n_tgt * 2
+        pool_room = max(64 << 20, int(_pool_free_bytes() * 0.5) - fixed)
+        len_pool = pool_room // max(1, row_bytes_per_len)
+        # fine-grid side (raw cudaMalloc): sized from the shared VRAM budget
+        fine_budget = _current_tile_budget() if use_gpu else int(
+            os.getenv("MOSAIC_RESIDUAL_LATTICE_CPU_FINE_BUDGET", str(8 << 30))
+        )
+        len_fine = int(fine_budget // max(1.0, 16 * 2 * fine_other * 1.35))
+        return max(1, min(int(dims[0]), int(len_pool), len_fine))
+
+    if use_gpu:
+        _transform_enter()
+    try:
+        if use_gpu:
+            d_x = [cp.asarray(np.ascontiguousarray(x[:, a])) for a in range(dim)]
+            fn = {1: cufinufft_nufft1d2, 2: cufinufft_nufft2d2, 3: cufinufft_nufft3d2}[dim]
+        else:
+            import finufft
+            fn = {1: finufft.nufft1d2, 2: finufft.nufft2d2, 3: finufft.nufft3d2}[dim]
+            d_x = [np.ascontiguousarray(x[:, a]) for a in range(dim)]
+        oom_errors = (
+            (cp.cuda.memory.OutOfMemoryError,) if use_gpu else tuple()
+        )
+        slab_len = _slab_len_now()
+        a0 = 0
+        while a0 < int(dims[0]):
+            a1 = min(a0 + slab_len, int(dims[0]))
+            c = list(centers)
+            c[0] = a0 + (a1 - a0) // 2
+            q_c = origin + np.asarray(c, dtype=np.float64) * dq
+            phase = np.exp(-1j * (tgt @ q_c))
+            try:
+                row_results = []
+                for row in range(n_trans):
+                    sub = grids[row, a0:a1]        # contiguous view, no copy
+                    if use_gpu:
+                        d_sub = cp.asarray(sub)
+                        o = cp.asnumpy(fn(*d_x, d_sub, isign=-1, eps=eps))
+                        del d_sub
+                    else:
+                        o = fn(*d_x, sub, isign=-1, eps=eps)
+                    row_results.append(np.asarray(o, dtype=np.complex128).reshape(n_tgt))
+                # commit only after the whole slab succeeded, so an OOM retry
+                # (smaller slab) never double-counts a partially applied slab
+                for row, o in enumerate(row_results):
+                    out[row] += o * phase
+            except oom_errors as exc:
+                if slab_len <= 1:
+                    raise
+                slab_len = max(1, slab_len // 2)
+                free_gpu_memory()
+                logger.debug(
+                    "lattice type-2 slab OOM; halving slab_len to %d (%s)",
+                    slab_len,
+                    exc,
+                )
+                continue
+            a0 = a1
+        if use_gpu:
+            _free_cupy_pool_blocks()
+    finally:
+        if use_gpu:
+            _transform_exit()
+    return out
+
+
+def _lazy_cufinufft(name):
+    import cufinufft
+    return getattr(cufinufft, name)
+
+
+def cufinufft_nufft1d2(*args, **kwargs):
+    return _lazy_cufinufft("nufft1d2")(*args, **kwargs)
+
+
+def cufinufft_nufft2d2(*args, **kwargs):
+    return _lazy_cufinufft("nufft2d2")(*args, **kwargs)
+
+
+def cufinufft_nufft3d2(*args, **kwargs):
+    return _lazy_cufinufft("nufft3d2")(*args, **kwargs)
+
+
+def execute_lattice_type2_batch(
+    q_coords: np.ndarray,
+    weights: np.ndarray,
+    real_coords: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    prefer_cpu: bool = False,
+    gpu_only: bool = False,
+):
+    """Convenience: plan + scatter + type-2. Returns ``None`` when the q-points
+    are not lattice-eligible (caller falls back to the type-3 path)."""
+    weights = np.asarray(weights, dtype=np.complex128)
+    if weights.ndim == 1:
+        weights = weights[np.newaxis, :]
+    meta = plan_lattice(q_coords, n_trans=int(weights.shape[0]))
+    if meta is None:
+        return None
+    grids = scatter_on_lattice(meta, weights)
+    return execute_type2_on_lattice(
+        meta, grids, real_coords, eps=eps, prefer_cpu=prefer_cpu, gpu_only=gpu_only
+    )
+
+
+def _local_window_inverse_cpu(q, weights, offsets, centers, eps):
+    n_rows, n_q = weights.shape
+    n_atoms = int(len(centers))
+    n_win = int(len(offsets))
+    out = np.empty((n_rows, n_atoms * n_win), dtype=np.complex128)
+    per_atom = max(1, n_rows * n_q * 16)
+    atom_tile = max(1, min(n_atoms, (256 << 20) // per_atom))
+    for a0 in range(0, n_atoms, atom_tile):
+        a1 = min(a0 + atom_tile, n_atoms)
+        phase = np.exp(-1j * (centers[a0:a1] @ q.T))                 # (na, n_q)
+        w_mat = (weights[:, None, :] * phase[None, :, :]).reshape(n_rows * (a1 - a0), n_q)
+        field = execute_inverse_cunufft_super_batch(q, w_mat, offsets, eps=eps, prefer_cpu=True)
+        out[:, a0 * n_win : a1 * n_win] = np.asarray(field).reshape(
+            n_rows, (a1 - a0) * n_win
+        )
+    return out
+
+
+def execute_local_window_inverse(
+    q_coords: np.ndarray,
+    weights: np.ndarray,
+    offsets: np.ndarray,
+    centers: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    prefer_cpu: bool = False,
+    gpu_only: bool = False,
+) -> np.ndarray:
+    """Inverse type-3 in local window coordinates, batched over atoms.
+
+    ``field(center_a + delta_j) = sum_q [w(q) exp(-i center_a.q)] exp(-i delta_j.q)``.
+
+    Because every atom shares the same q-sources and window-target grid, the
+    cuFINUFFT plan and ``setpts`` are built **once** and only the per-atom weight
+    matrix changes between executes. The centre phase and weight matrix are formed
+    on the GPU, so the O(n_atoms x n_q) intermediate never crosses PCIe -- only the
+    result (n_rows x n_atoms x n_win) is copied back. Returns ``(n_rows,
+    n_atoms*n_win)`` in atom-major order, identical to the global transform to
+    NUFFT eps. The fine grid depends on the *window* extent (~1 A), not the
+    supercell, which is what makes large-cell 3D tractable on the GPU."""
+    q = np.asarray(q_coords, dtype=np.float64)
+    offsets = np.asarray(offsets, dtype=np.float64)
+    centers = np.asarray(centers, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.complex128)
+    if weights.ndim == 1:
+        weights = weights[np.newaxis, :]
+    n_rows, n_q = weights.shape
+    n_atoms = int(len(centers))
+    n_win = int(len(offsets))
+    dim = int(q.shape[1])
+    out = np.empty((n_rows, n_atoms * n_win), dtype=np.complex128)
+    if n_atoms == 0 or n_win == 0:
+        return out
+
+    use_gpu = not (_CPU_ONLY or prefer_cpu) and _GPU_AVAILABLE
+    if use_gpu:
+        try:
+            _ensure_gpu_kernels()
+        except ImportError:
+            use_gpu = False
+    if not use_gpu:
+        if gpu_only:
+            raise RuntimeError("GPU execution forced but unavailable for local-window inverse.")
+        return _local_window_inverse_cpu(q, weights, offsets, centers, eps)
+
+    import cufinufft  # type: ignore
+
+    d_q = _as_device(q)
+    d_off = _as_device(offsets)
+    d_centers = _as_device(centers)
+    d_w = _as_device(weights)
+    q_cols = [_contig(d_q[:, i]) for i in range(dim)]
+    off_cols = [_contig(d_off[:, i]) for i in range(dim)]
+
+    # Atom-tile so the on-device weight matrix (n_rows*tile, n_q) + phase fit VRAM.
+    def _build(n_trans):
+        plan = cufinufft.Plan(
+            3, dim, n_trans=int(n_trans), eps=eps, isign=-1, dtype="complex128",
+            **_build_gpu_launch_kwargs(gpu_maxsubprobsize=_subprob_order(dim, int(n_trans))[0]),
+        )
+        _set_type3_points(plan, dim=dim, source_cols=q_cols, target_cols=off_cols)
+        return plan
+
+    # Size the atom tile so the on-device working set -- the (n_atoms x n_q) centre
+    # phase, its float matmul temporary, and the (n_rows*na x n_q) weight matrix --
+    # fits the CuPy pool (a few GiB, NOT total VRAM; cuFINUFFT plan scratch lives
+    # outside the pool). Retry with a smaller tile on OOM.
+    workset_per_atom = max(1, n_q * (40 + 16 * n_rows))
+    budget = int(os.getenv("MOSAIC_RESIDUAL_LOCAL_WORKSET_BYTES", str(384 << 20)))
+    atom_tile = max(1, min(n_atoms, budget // workset_per_atom))
+    while True:
+        full_plan = _build(n_rows * atom_tile) if atom_tile <= n_atoms else None
+        try:
+            for a0 in range(0, n_atoms, atom_tile):
+                a1 = min(a0 + atom_tile, n_atoms)
+                na = a1 - a0
+                d_phase = cp.exp(-1j * (d_centers[a0:a1] @ d_q.T))       # (na, n_q)
+                d_w_mat = _contig(
+                    (d_w[:, None, :] * d_phase[None, :, :]).reshape(n_rows * na, n_q)
+                )
+                if na == atom_tile and full_plan is not None:
+                    d_field = full_plan.execute(d_w_mat)
+                else:
+                    tail_plan = _build(n_rows * na)
+                    try:
+                        d_field = tail_plan.execute(d_w_mat)
+                    finally:
+                        _destroy_plan_quietly(tail_plan)
+                field = cp.asnumpy(cp.ascontiguousarray(d_field)).reshape(n_rows, na, n_win)
+                out[:, a0 * n_win : a1 * n_win] = field.reshape(n_rows, na * n_win)
+                del d_phase, d_w_mat, d_field
+            break
+        except cp.cuda.memory.OutOfMemoryError:
+            if atom_tile <= 1:
+                raise
+            atom_tile = max(1, atom_tile // 2)
+            free_gpu_memory()
+        finally:
+            if full_plan is not None:
+                _destroy_plan_quietly(full_plan)
+            _free_cupy_pool_blocks()
+    return out
+
+
 def execute_inverse_cunufft_batch_materialize_once(
     q_coords: np.ndarray,
     weights: np.ndarray,

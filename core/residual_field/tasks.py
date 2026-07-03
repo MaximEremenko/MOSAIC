@@ -34,6 +34,9 @@ from core.residual_field.contracts import (
 )
 from core.adapters.cunufft_wrapper import (
     execute_inverse_cunufft_super_batch,
+    execute_local_window_inverse,
+    execute_type2_on_lattice,
+    lattice_host_budget_bytes,
 )
 from core.residual_field.commit import write_residual_attempt
 from core.runtime import handle_worker_gpu_failure, task_progress_enabled
@@ -130,6 +133,49 @@ def _type3_fine_grid_from_spreads(real_spread: np.ndarray, q_spread: np.ndarray)
     nf = np.ceil((upsampfac / np.pi) * np.asarray(real_spread) * np.asarray(q_spread)) + 32.0
     nf = np.ceil(nf / 16.0) * 16.0
     return int(np.prod(nf)) * 16
+
+
+def _concat_global_fine_grid_max_bytes() -> int:
+    """Above this whole-work-unit fine grid, concatenation is auto-disabled.
+
+    Concatenating every interval is a large speed win when the combined fine grid
+    stays modest (2D / small 3D cells), but for large cells + wide hkl the
+    combined target x source extent makes the *global* fine grid enormous (hkl32:
+    ~0.2 TiB). It then only survives via heavy per-group tiling, which inflates
+    host memory and drives the run into the OOM-killer. Past this threshold the
+    per-interval path (small independent grids, bounded memory) is the safe
+    choice. Override with ``MOSAIC_RESIDUAL_CONCAT_MAX_GLOBAL_FINE_GRID`` (bytes)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_CONCAT_MAX_GLOBAL_FINE_GRID")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 48 << 30
+
+
+def _concat_global_fine_grid_bytes(
+    rifft_grid: np.ndarray, interval_tasks: Sequence[IntervalTask]
+) -> int:
+    """Fine grid a single transform over ALL targets and ALL concatenated q would
+    imply -- the worst case the concat path builds toward before sub-grouping."""
+    grid = np.asarray(rifft_grid, dtype=np.float64)
+    if grid.ndim != 2 or len(grid) == 0 or not interval_tasks:
+        return 0
+    real_spread = grid.max(axis=0) - grid.min(axis=0)
+    q_min = None
+    q_max = None
+    for task in interval_tasks:
+        g = np.asarray(task.q_grid, dtype=np.float64)
+        if g.ndim != 2 or len(g) == 0:
+            continue
+        gmin = g.min(axis=0)
+        gmax = g.max(axis=0)
+        q_min = gmin if q_min is None else np.minimum(q_min, gmin)
+        q_max = gmax if q_max is None else np.maximum(q_max, gmax)
+    if q_min is None:
+        return 0
+    return _type3_fine_grid_from_spreads(real_spread, q_max - q_min)
 
 
 def _budget_bounded_concat_subgroups(
@@ -467,6 +513,509 @@ def _call_inverse_super_batch(
     return execute_inverse_cunufft_super_batch(**kwargs)
 
 
+def _residual_lattice_fft_enabled() -> bool:
+    """Evaluate the residual inverse via scatter + type-2 on the reciprocal
+    LATTICE instead of type-3 over scattered points.
+
+    MOSAIC's q-points sit on a uniform per-axis lattice (h,k,l at multiples of
+    1/N_cell); masks select a subset of lattice sites but never move points off
+    it. Scattering the (masked) values onto the dense coefficient grid and
+    running one type-2 per half-space role is identical to the summed type-3
+    (to NUFFT eps; measured floor ~5e-6 set by float noise in the *stored* q
+    coordinates) and removes the type-3 fine-grid blow-up entirely -- measured
+    27x per transform on hkl32-scale shards. Eligibility is checked per work
+    unit (lattice snap + memory budget); ineligible data falls back to type-3
+    automatically."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_FFT")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Cache of scattered lattice grids keyed by (parameter_digest, interval_ids).
+# The grids depend only on the intervals' (q, amplitude) data, NOT on the
+# chunk/partition, so every work unit of the same interval shard reuses ONE
+# scatter (hkl32: 140 work units -> 1 scatter of 539M points instead of 140
+# re-loads of ~38 GB each). Guarded by build-events so concurrent worker
+# threads wait for the first build instead of duplicating it.
+_LATTICE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_LATTICE_CACHE_BYTES = 0
+_LATTICE_CACHE_LOCK = threading.Lock()
+_LATTICE_CACHE_BUILDING: dict[tuple, threading.Event] = {}
+_LATTICE_EMPTY_Q = np.empty((0, 3))
+
+
+def _lattice_cache_max_bytes() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES")
+    try:
+        return int(raw) if raw else 24 << 30
+    except (TypeError, ValueError):
+        return 24 << 30
+
+
+def _lattice_entry_bytes(entry: dict) -> int:
+    groups = entry.get("groups")
+    if not groups:
+        return 0
+    # Disk-backed (memmap) grids do not consume the RAM cache budget -- their
+    # pages live in the evictable OS page cache / on disk.
+    return int(
+        sum(
+            grids.nbytes
+            for _role, _meta, grids in groups
+            if not isinstance(grids, np.memmap)
+        )
+    )
+
+
+def _lattice_cache_get(key: tuple) -> dict | None:
+    with _LATTICE_CACHE_LOCK:
+        entry = _LATTICE_CACHE.get(key)
+        if entry is not None:
+            _LATTICE_CACHE.move_to_end(key)
+        return entry
+
+
+def _lattice_cache_store(key: tuple, entry: dict) -> None:
+    global _LATTICE_CACHE_BYTES
+    nbytes = _lattice_entry_bytes(entry)
+    if nbytes > _lattice_cache_max_bytes():
+        return
+    with _LATTICE_CACHE_LOCK:
+        old = _LATTICE_CACHE.pop(key, None)
+        if old is not None:
+            _LATTICE_CACHE_BYTES -= _lattice_entry_bytes(old)
+        _LATTICE_CACHE[key] = entry
+        _LATTICE_CACHE_BYTES += nbytes
+        while _LATTICE_CACHE_BYTES > _lattice_cache_max_bytes() and len(_LATTICE_CACHE) > 1:
+            _k, victim = _LATTICE_CACHE.popitem(last=False)
+            _LATTICE_CACHE_BYTES -= _lattice_entry_bytes(victim)
+
+
+def clear_residual_lattice_cache() -> None:
+    global _LATTICE_CACHE_BYTES
+    with _LATTICE_CACHE_LOCK:
+        _LATTICE_CACHE.clear()
+        _LATTICE_CACHE_BYTES = 0
+
+
+def _lattice_scratch_dir() -> str:
+    import tempfile
+
+    return os.getenv("MOSAIC_RESIDUAL_LATTICE_SCRATCH") or tempfile.gettempdir()
+
+
+def _lattice_disk_spill_allowed(nbytes: int) -> bool:
+    """May a grid too large for the host-RAM budget spill to a disk-backed
+    memmap instead of falling back to type-3?
+
+    Small-RAM machines get the SAME fast lattice path as large ones: the
+    transform consumes the grid as contiguous row-slabs, so a memmap streams
+    from disk on small boxes while the OS page cache makes it RAM-speed on
+    large ones. Requires enough free scratch space (1.25x safety); disable with
+    ``MOSAIC_RESIDUAL_LATTICE_DISK_SPILL=0``."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_DISK_SPILL")
+    if raw is not None and raw.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        import shutil
+
+        free = shutil.disk_usage(_lattice_scratch_dir()).free
+    except OSError:
+        return False
+    return nbytes * 1.25 < free
+
+
+def _allocate_lattice_grids(shape: tuple, *, in_ram: bool) -> np.ndarray:
+    """Zero-initialised grid storage: plain ndarray within the RAM budget, else
+    an anonymous disk-backed memmap (file unlinked immediately, so it can never
+    leak; space is reclaimed when the cache entry is garbage-collected)."""
+    if in_ram:
+        return np.zeros(shape, dtype=np.complex128)
+    import tempfile
+
+    fd, path = tempfile.mkstemp(prefix="mosaic_lattice_", suffix=".grid", dir=_lattice_scratch_dir())
+    try:
+        grid = np.memmap(path, dtype=np.complex128, mode="w+", shape=shape)
+    finally:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    logger.info(
+        "Residual-field lattice grid spilled to disk-backed memmap (%.1f GiB) "
+        "in %s -- small-RAM host taking the same lattice path.",
+        int(np.prod(shape)) * 16 / (1 << 30),
+        _lattice_scratch_dir(),
+    )
+    return grid
+
+
+def _infer_axis_steps(q: np.ndarray) -> np.ndarray:
+    """Per-axis lattice step candidates; 0 marks a degenerate (single-plane) axis."""
+    steps = np.zeros(q.shape[1])
+    for ax in range(q.shape[1]):
+        col = q[:, ax]
+        span = float(col.max() - col.min())
+        if span <= 1e-12:
+            continue
+        u = np.unique(np.round(col, 9))
+        gaps = np.diff(u)
+        gaps = gaps[gaps > max(1e-9, span * 1e-6)]
+        steps[ax] = float(gaps.min()) if gaps.size else 0.0
+    return steps
+
+
+def _refine_axis_steps(q: np.ndarray, dq: np.ndarray, origin: np.ndarray) -> np.ndarray:
+    """Least-squares refinement of the per-axis lattice step.
+
+    The min-gap estimate carries the float noise of a single pair of points, so
+    the index error grows linearly across the lattice (projected 2D data:
+    ~2.5e-5 of a step by index ~1600). Fitting the step to ALL of one
+    interval's points averages that noise down by ~sqrt(n), which directly
+    reduces the phase-error floor of the lattice transform."""
+    refined = dq.copy()
+    for ax in range(q.shape[1]):
+        if dq[ax] <= 0:
+            continue
+        rel = q[:, ax] - origin[ax]
+        idx = np.round(rel / dq[ax])
+        denom = float(np.dot(idx, idx))
+        if denom <= 0:
+            continue
+        step = float(np.dot(idx, rel)) / denom
+        if step > 0 and abs(step - dq[ax]) < 0.1 * dq[ax]:
+            refined[ax] = step
+    return refined
+
+
+def _build_lattice_groups_streaming(
+    ordered_groups: "list[list[IntervalTask]]",
+    *,
+    snap_tol: float = 0.05,
+) -> list | None:
+    """Two-pass streaming build of per-role lattice grids.
+
+    Pass 1 infers per-axis steps and global bounds; pass 2 scatter-adds each
+    interval's [delta, average] weights into the dense grid. Never concatenates
+    the raw points (hkl32: 539M points would need ~30 GB transient). Returns
+    ``[(role, meta, grids)]`` or ``None`` if any point fails the lattice snap or
+    the grid exceeds the host budget (caller falls back to type-3)."""
+    host_budget = lattice_host_budget_bytes()
+    result = []
+    for grouped_tasks in ordered_groups:
+        role = str(grouped_tasks[0].half_space_role)
+        dq = None
+        qmin = None
+        qmax = None
+        for task in grouped_tasks:
+            q = np.asarray(task.q_grid, dtype=np.float64)
+            if q.ndim != 2 or q.shape[1] not in (1, 2, 3) or len(q) == 0:
+                return None
+            steps = _infer_axis_steps(q)
+            if dq is None:
+                dq = steps
+            else:
+                # take the finest nonzero step seen on each axis
+                both = (dq > 0) & (steps > 0)
+                dq = np.where(both, np.minimum(dq, steps), np.maximum(dq, steps))
+            lo, hi = q.min(0), q.max(0)
+            qmin = lo if qmin is None else np.minimum(qmin, lo)
+            qmax = hi if qmax is None else np.maximum(qmax, hi)
+        dq = _refine_axis_steps(
+            np.asarray(grouped_tasks[0].q_grid, dtype=np.float64), dq, qmin
+        )
+        dims = np.ones(len(dq), dtype=np.int64)
+        active = dq > 0
+        dims[active] = np.round((qmax[active] - qmin[active]) / dq[active]).astype(np.int64) + 1
+        if np.any(dims > (1 << 20)):
+            return None
+        grid_points = int(np.prod(dims))
+        if grid_points * 16 * 2 > host_budget:
+            return None
+        dims_t = tuple(int(v) for v in dims)
+        grids = np.zeros((2, grid_points), dtype=np.complex128)
+        for task in grouped_tasks:
+            q = np.asarray(task.q_grid, dtype=np.float64)
+            amp = np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
+            av = np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
+            if amp.shape[0] != len(q) or av.shape[0] != len(q):
+                return None
+            idx = np.zeros(q.shape, dtype=np.int64)
+            for ax in range(len(dq)):
+                if dq[ax] <= 0:
+                    if np.abs(q[:, ax] - qmin[ax]).max() > 1e-9:
+                        return None
+                    continue
+                ratio = (q[:, ax] - qmin[ax]) / dq[ax]
+                ax_idx = np.round(ratio).astype(np.int64)
+                if np.abs(ratio - ax_idx).max() > snap_tol:
+                    return None
+                if ax_idx.min() < 0 or ax_idx.max() >= dims_t[ax]:
+                    return None
+                idx[:, ax] = ax_idx
+            flat = np.ravel_multi_index(tuple(idx.T), dims_t)
+            np.add.at(grids[0], flat, amp - av)
+            np.add.at(grids[1], flat, av)
+        meta = {"origin": qmin.copy(), "dq": dq.copy(), "dims": dims_t, "snap_dev": 0.0}
+        result.append((role, meta, grids.reshape((2,) + dims_t)))
+    return result
+
+
+def _execute_lattice_groups(
+    groups: list,
+    *,
+    rifft_grid: np.ndarray,
+    nufft_eps: float,
+    nufft_prefer_cpu: bool,
+    nufft_gpu_only: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    amplitudes_delta = None
+    amplitudes_average = None
+    for role, meta, grids in groups:
+        outs = execute_type2_on_lattice(
+            meta,
+            grids,
+            rifft_grid,
+            eps=nufft_eps,
+            prefer_cpu=nufft_prefer_cpu,
+            gpu_only=nufft_gpu_only,
+        )
+        d = apply_half_space_conjugate_reconstruction(outs[0], _LATTICE_EMPTY_Q, role)
+        a = apply_half_space_conjugate_reconstruction(outs[1], _LATTICE_EMPTY_Q, role)
+        amplitudes_delta = d if amplitudes_delta is None else amplitudes_delta + d
+        amplitudes_average = a if amplitudes_average is None else amplitudes_average + a
+    return amplitudes_delta, amplitudes_average
+
+
+def _build_lattice_entry_from_inputs(
+    loaded_interval_inputs,
+    *,
+    snap_tol: float = 0.05,
+) -> dict | None:
+    """Streaming (two-pass over files) lattice build straight from interval
+    inputs: load -> extract bounds/role -> discard, then load -> scatter ->
+    discard. Peak memory is the grids plus ONE interval payload, never the whole
+    payload list (hkl32: ~17 GiB instead of ~55 GiB). Returns the cache entry or
+    ``None`` when the data is lattice-ineligible."""
+    host_budget = lattice_host_budget_bytes()
+
+    def _load(interval_input):
+        if isinstance(interval_input, IntervalTask):
+            return interval_input
+        return load_interval_task_payload(interval_input)
+
+    per_role: dict[str, dict] = {}
+    contribution = 0
+    for interval_input in loaded_interval_inputs:
+        task = _load(interval_input)
+        q = np.asarray(task.q_grid, dtype=np.float64)
+        if q.ndim != 2 or q.shape[1] not in (1, 2, 3) or len(q) == 0:
+            return None
+        n_q = len(q)
+        if (
+            int(np.asarray(task.q_amp).reshape(-1).shape[0]) != n_q
+            or int(np.asarray(task.q_amp_av).reshape(-1).shape[0]) != n_q
+        ):
+            return None
+        contribution += scattering_contribution_point_count(task)
+        role = str(task.half_space_role)
+        steps = _infer_axis_steps(q)
+        lo, hi = q.min(0), q.max(0)
+        state = per_role.get(role)
+        if state is None:
+            per_role[role] = {"dq": steps, "qmin": lo, "qmax": hi, "sample_q": q.copy()}
+        else:
+            dq = state["dq"]
+            both = (dq > 0) & (steps > 0)
+            state["dq"] = np.where(both, np.minimum(dq, steps), np.maximum(dq, steps))
+            state["qmin"] = np.minimum(state["qmin"], lo)
+            state["qmax"] = np.maximum(state["qmax"], hi)
+        del task, q
+    if not per_role:
+        return None
+    total_grid_bytes = 0
+    for role, state in per_role.items():
+        # LSQ-refine the step against one representative interval so index
+        # errors do not accumulate across the lattice (see _refine_axis_steps).
+        state["dq"] = _refine_axis_steps(
+            state.pop("sample_q"), state["dq"], state["qmin"]
+        )
+        dq = state["dq"]
+        dims = np.ones(len(dq), dtype=np.int64)
+        active = dq > 0
+        dims[active] = (
+            np.round((state["qmax"][active] - state["qmin"][active]) / dq[active]).astype(np.int64)
+            + 1
+        )
+        if np.any(dims > (1 << 20)):
+            return None
+        state["dims"] = tuple(int(v) for v in dims)
+        total_grid_bytes += int(np.prod(dims)) * 16 * 2
+    if total_grid_bytes > host_budget and not _lattice_disk_spill_allowed(total_grid_bytes):
+        return None
+    for state in per_role.values():
+        # Allocate with the final shape so a disk-spilled grid stays an
+        # np.memmap instance (reshaping later would demote it to a plain
+        # ndarray view and the cache would mis-count its bytes as RAM).
+        state["grids"] = _allocate_lattice_grids(
+            (2,) + state["dims"],
+            in_ram=total_grid_bytes <= host_budget,
+        )
+    for interval_input in loaded_interval_inputs:
+        task = _load(interval_input)
+        role = str(task.half_space_role)
+        state = per_role[role]
+        q = np.asarray(task.q_grid, dtype=np.float64)
+        dq = state["dq"]
+        dims_t = state["dims"]
+        idx = np.zeros(q.shape, dtype=np.int64)
+        for ax in range(len(dq)):
+            if dq[ax] <= 0:
+                if np.abs(q[:, ax] - state["qmin"][ax]).max() > 1e-9:
+                    return None
+                continue
+            ratio = (q[:, ax] - state["qmin"][ax]) / dq[ax]
+            ax_idx = np.round(ratio).astype(np.int64)
+            if np.abs(ratio - ax_idx).max() > snap_tol:
+                return None
+            if ax_idx.min() < 0 or ax_idx.max() >= dims_t[ax]:
+                return None
+            idx[:, ax] = ax_idx
+        flat = np.ravel_multi_index(tuple(idx.T), dims_t)
+        amp = np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
+        av = np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
+        flat_rows = state["grids"].reshape(2, -1)     # view; grids object keeps its type
+        np.add.at(flat_rows[0], flat, amp - av)
+        np.add.at(flat_rows[1], flat, av)
+        del task, q, idx, flat, amp, av, flat_rows
+    groups = []
+    for role in sorted(per_role):
+        state = per_role[role]
+        meta = {
+            "origin": state["qmin"].copy(),
+            "dq": state["dq"].copy(),
+            "dims": state["dims"],
+            "snap_dev": 0.0,
+        }
+        groups.append((role, meta, state["grids"]))
+    return {"groups": groups, "contribution": int(contribution)}
+
+
+def _compute_from_lattice_entry(
+    entry: dict,
+    *,
+    rifft_grid: np.ndarray,
+    grid_shape_nd: np.ndarray,
+    point_start: int,
+    nufft_eps: float,
+    nufft_prefer_cpu: bool,
+    nufft_gpu_only: bool,
+) -> ResidualChunkComputeResult:
+    """Run the residual transform from cached lattice grids (no interval loads)."""
+    amplitudes_delta, amplitudes_average = _execute_lattice_groups(
+        entry["groups"],
+        rifft_grid=rifft_grid,
+        nufft_eps=nufft_eps,
+        nufft_prefer_cpu=nufft_prefer_cpu,
+        nufft_gpu_only=nufft_gpu_only,
+    )
+    point_ids = int(point_start or 0) + np.arange(
+        amplitudes_delta.shape[0], dtype=np.int64
+    )
+    return ResidualChunkComputeResult(
+        grid_shape_nd=grid_shape_nd,
+        contribution_reciprocal_points=int(entry["contribution"]),
+        amplitudes_delta=amplitudes_delta,
+        amplitudes_average=amplitudes_average,
+        point_ids=point_ids,
+    )
+
+
+def _residual_local_window_enabled() -> bool:
+    """Evaluate the residual field in LOCAL window coordinates.
+
+    Each target is ``center_atom + delta`` where the window offsets ``delta`` are
+    identical across atoms (small, ~1 Angstrom extent). Factoring the per-atom
+    centre phase out of ``exp(-i (center+delta).q)`` turns the transform into one
+    batched inverse over the shared window grid, whose type-3 fine grid depends on
+    the *window* extent, not the supercell extent. That collapses the
+    ``(supercell x hkl)^3`` fine-grid blow-up of large 3D cells (hkl32: 0.2 TiB ->
+    ~8 MiB) while giving an identical field to NUFFT eps. Off by default until the
+    end-to-end result is validated against the global path on the target run."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LOCAL_WINDOW")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _local_window_phase_budget_bytes() -> int:
+    """Cap on the per-tile ``(n_atoms x n_q)`` centre-phase matrix (bytes)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LOCAL_PHASE_BUDGET")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 512 << 20
+
+
+def _reconstruct_window_centers_offsets(
+    rifft_grid: np.ndarray,
+    grid_shape_nd: np.ndarray,
+):
+    """Recover ``(centers, shared_offsets)`` from an atom-major rifft grid.
+
+    Returns ``None`` when the windows are not uniform across atoms (different
+    shape or non-shared offsets), in which case the caller keeps the global
+    transform. Relies on ``_generate_grid`` building ``pts = offsets + center``
+    with ``offsets`` independent of the centre, and ``_process_chunk`` stacking
+    per-atom windows in order (both verified in core.scattering.grid)."""
+    grid = np.asarray(rifft_grid, dtype=np.float64)
+    shapes = np.asarray(grid_shape_nd)
+    if grid.ndim != 2 or shapes.ndim != 2 or len(shapes) == 0:
+        return None
+    if not bool(np.all(shapes == shapes[0])):
+        return None
+    window = int(np.prod(shapes[0]))
+    n_atoms = int(len(shapes))
+    if window <= 0 or len(grid) != n_atoms * window:
+        return None
+    blocks = grid.reshape(n_atoms, window, grid.shape[1])
+    centers = blocks.mean(axis=1)
+    offsets = blocks[0] - centers[0]
+    # Offsets must genuinely be shared across atoms for the factorisation to hold.
+    if not np.allclose(blocks, centers[:, None, :] + offsets[None, :, :], rtol=0, atol=1e-6):
+        return None
+    return centers, offsets
+
+
+def _local_window_inverse(
+    q_coords: np.ndarray,
+    weights: np.ndarray,
+    centers: np.ndarray,
+    offsets: np.ndarray,
+    *,
+    eps: float,
+    prefer_cpu: bool,
+    gpu_only: bool,
+) -> np.ndarray:
+    """Local-window inverse type-3, batched over atoms (see
+    :func:`core.adapters.cunufft_wrapper.execute_local_window_inverse`). Returns
+    ``(n_rows, n_atoms*n_win)`` in atom-major order, identical to the global
+    ``_call_inverse_super_batch`` output to NUFFT eps."""
+    return execute_local_window_inverse(
+        q_coords,
+        weights,
+        offsets,
+        centers,
+        eps=eps,
+        prefer_cpu=prefer_cpu,
+        gpu_only=gpu_only,
+    )
+
+
 def compute_residual_field_interval_chunk_arrays(
     interval_tasks: Sequence[IntervalTask],
     *,
@@ -476,9 +1025,30 @@ def compute_residual_field_interval_chunk_arrays(
     nufft_eps: float = 1e-12,
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
+    lattice_sink: dict | None = None,
+    lattice_enabled: bool | None = None,
 ) -> ResidualChunkComputeResult:
     ordered_interval_tasks = sorted(interval_tasks, key=_interval_task_sort_key)
     concat_sources = _concat_cross_grid_sources_enabled()
+    if lattice_enabled is None:
+        lattice_enabled = _residual_lattice_fft_enabled()
+    if concat_sources and not lattice_enabled:
+        # Auto-disable concat for large-cell / wide-hkl work units, where the
+        # whole-work-unit type-3 fine grid is enormous and the concat path
+        # drives host memory into the OOM-killer. Only relevant when the
+        # lattice (scatter+type-2) path is off -- the lattice path has no
+        # type-3 fine grid, and when it turns out ineligible at build time the
+        # same guard is re-applied before the type-3 fallback below.
+        global_fine = _concat_global_fine_grid_bytes(rifft_grid, ordered_interval_tasks)
+        if global_fine > _concat_global_fine_grid_max_bytes():
+            concat_sources = False
+            logger.info(
+                "Residual-field: disabling source concat for this work unit "
+                "(whole-unit fine grid ~%.1f GiB > %.1f GiB cap); using the "
+                "memory-safe per-interval path.",
+                global_fine / (1 << 30),
+                _concat_global_fine_grid_max_bytes() / (1 << 30),
+            )
     grouped_interval_tasks: dict[tuple, list[IntervalTask]] = {}
     contribution_reciprocal_points = 0
     for interval_task in ordered_interval_tasks:
@@ -508,11 +1078,62 @@ def compute_residual_field_interval_chunk_arrays(
         grouped_interval_tasks[key]
         for key in sorted(grouped_interval_tasks, key=str)
     ]
-    if concat_sources:
-        # Split each half-space role's concatenation into fine-grid-bounded
-        # sub-groups so no single transform blows past a GPU-sized fine grid on
-        # large-cell / wide-hkl runs (the result is summed across sub-groups, so
-        # it is identical to one giant concat to NUFFT eps).
+    # When enabled, evaluate the field in local window coordinates (identical
+    # result, tiny fine grid). Reconstruct the shared centres/offsets once;
+    # None -> non-uniform windows -> keep the global transform.
+    local_window = (
+        _reconstruct_window_centers_offsets(rifft_grid, grid_shape_nd)
+        if _residual_local_window_enabled()
+        else None
+    )
+    if concat_sources and local_window is None and lattice_enabled:
+        # Lattice path: scatter each role's (masked) q-values onto the dense
+        # reciprocal lattice and run ONE type-2 per role. Identical to the
+        # summed type-3 to NUFFT eps; no type-3 fine grid, so no budget split.
+        lattice_groups = _build_lattice_groups_streaming(
+            [sorted(group, key=_interval_task_sort_key) for group in ordered_groups]
+        )
+        if lattice_groups is not None:
+            amplitudes_delta, amplitudes_average = _execute_lattice_groups(
+                lattice_groups,
+                rifft_grid=rifft_grid,
+                nufft_eps=nufft_eps,
+                nufft_prefer_cpu=nufft_prefer_cpu,
+                nufft_gpu_only=nufft_gpu_only,
+            )
+            if lattice_sink is not None:
+                lattice_sink["groups"] = lattice_groups
+                lattice_sink["contribution"] = contribution_reciprocal_points
+            ordered_groups = []          # transform done; skip the type-3 loop
+        else:
+            logger.info(
+                "Residual-field lattice path ineligible for this work unit; "
+                "falling back to type-3."
+            )
+            # Re-apply the large-problem concat guard for the type-3 fallback.
+            global_fine = _concat_global_fine_grid_bytes(rifft_grid, ordered_interval_tasks)
+            if global_fine > _concat_global_fine_grid_max_bytes():
+                concat_sources = False
+                use_presum = _same_q_grid_presum_enabled()
+                regrouped: dict[tuple, list[IntervalTask]] = {}
+                for interval_task in ordered_interval_tasks:
+                    key = (
+                        _q_grid_signature(
+                            interval_task.q_grid,
+                            getattr(interval_task, "q_grid_digest", None),
+                        ),
+                        interval_task.half_space_role,
+                    )
+                    regrouped.setdefault(key, []).append(interval_task)
+                ordered_groups = [regrouped[key] for key in sorted(regrouped, key=str)]
+    if concat_sources and local_window is None and ordered_groups:
+        # Global path only: split each half-space role's concatenation into
+        # fine-grid-bounded sub-groups so no single transform blows past a
+        # GPU-sized fine grid on large-cell / wide-hkl runs (summed across
+        # sub-groups -> identical to one giant concat to NUFFT eps). The local
+        # path's fine grid is set by the window extent, not the supercell, so it
+        # needs no such split -- concatenating every interval minimises the number
+        # of batched transforms.
         budget = _residual_concat_fine_grid_budget_bytes()
         ordered_groups = [
             subgroup
@@ -581,14 +1202,25 @@ def compute_residual_field_interval_chunk_arrays(
                     )
                 inverse_weights = np.stack(stacked_weights, axis=0)
                 del stacked_weights
-        inverse_outputs = _call_inverse_super_batch(
-            q_coords=reference_q_grid,
-            weights=inverse_weights,
-            real_coords=rifft_grid,
-            eps=nufft_eps,
-            prefer_cpu=nufft_prefer_cpu,
-            gpu_only=nufft_gpu_only,
-        )
+        if local_window is not None:
+            inverse_outputs = _local_window_inverse(
+                reference_q_grid,
+                inverse_weights,
+                local_window[0],
+                local_window[1],
+                eps=nufft_eps,
+                prefer_cpu=nufft_prefer_cpu,
+                gpu_only=nufft_gpu_only,
+            )
+        else:
+            inverse_outputs = _call_inverse_super_batch(
+                q_coords=reference_q_grid,
+                weights=inverse_weights,
+                real_coords=rifft_grid,
+                eps=nufft_eps,
+                prefer_cpu=nufft_prefer_cpu,
+                gpu_only=nufft_gpu_only,
+            )
         del inverse_weights
         inverse_outputs = np.asarray(inverse_outputs, dtype=np.complex128)
         if concat_sources or use_presum:
@@ -719,24 +1351,82 @@ def run_residual_field_interval_chunk_task(
                 ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a",
                 int(rifft_grid.shape[0]),
             )
-        interval_tasks = sorted(
-            [
-                interval_input
-                if isinstance(interval_input, IntervalTask)
-                else load_interval_task_payload(interval_input)
-                for interval_input in loaded_interval_inputs
-            ],
-            key=_interval_task_sort_key,
+        # Lattice grid cache: the scattered coefficient grids depend only on the
+        # interval data, not on the chunk/partition, so every work unit of the
+        # same interval shard reuses one scatter and SKIPS re-loading the
+        # interval payloads (hkl32: 140 work units x ~38 GB of interval reads
+        # otherwise). Concurrent threads wait on the first build via an event.
+        lattice_key = (
+            (str(work_unit.parameter_digest), tuple(int(i) for i in interval_ids))
+            if interval_ids and _residual_lattice_fft_enabled()
+            else None
         )
-        compute_result = compute_residual_field_interval_chunk_arrays(
-            interval_tasks,
-            rifft_grid=rifft_grid,
-            grid_shape_nd=grid_shape_nd,
-            point_start=int(work_unit.point_start or 0),
-            nufft_eps=nufft_eps,
-            nufft_prefer_cpu=nufft_prefer_cpu,
-            nufft_gpu_only=nufft_gpu_only,
-        )
+        cached_entry = None
+        lattice_builder = False
+        build_event = None
+        if lattice_key is not None:
+            cached_entry = _lattice_cache_get(lattice_key)
+            if cached_entry is None:
+                with _LATTICE_CACHE_LOCK:
+                    build_event = _LATTICE_CACHE_BUILDING.get(lattice_key)
+                    if build_event is None:
+                        build_event = threading.Event()
+                        _LATTICE_CACHE_BUILDING[lattice_key] = build_event
+                        lattice_builder = True
+                if not lattice_builder:
+                    build_event.wait(timeout=3600)
+                    cached_entry = _lattice_cache_get(lattice_key)
+        try:
+            if cached_entry is None and lattice_builder:
+                # Streaming build straight from the interval files: peak memory
+                # is the grids + ONE payload, never the full payload list. The
+                # result -- or a negative marker for lattice-ineligible data --
+                # is cached for every later work unit of this shard.
+                built_entry = _build_lattice_entry_from_inputs(loaded_interval_inputs)
+                _lattice_cache_store(
+                    lattice_key,
+                    built_entry
+                    if built_entry is not None
+                    else {"groups": None, "contribution": 0},
+                )
+                cached_entry = built_entry
+            if cached_entry is not None and cached_entry.get("groups"):
+                compute_result = _compute_from_lattice_entry(
+                    cached_entry,
+                    rifft_grid=rifft_grid,
+                    grid_shape_nd=grid_shape_nd,
+                    point_start=int(work_unit.point_start or 0),
+                    nufft_eps=nufft_eps,
+                    nufft_prefer_cpu=nufft_prefer_cpu,
+                    nufft_gpu_only=nufft_gpu_only,
+                )
+            else:
+                interval_tasks = sorted(
+                    [
+                        interval_input
+                        if isinstance(interval_input, IntervalTask)
+                        else load_interval_task_payload(interval_input)
+                        for interval_input in loaded_interval_inputs
+                    ],
+                    key=_interval_task_sort_key,
+                )
+                compute_result = compute_residual_field_interval_chunk_arrays(
+                    interval_tasks,
+                    rifft_grid=rifft_grid,
+                    grid_shape_nd=grid_shape_nd,
+                    point_start=int(work_unit.point_start or 0),
+                    nufft_eps=nufft_eps,
+                    nufft_prefer_cpu=nufft_prefer_cpu,
+                    nufft_gpu_only=nufft_gpu_only,
+                    # A cached negative marker means this data already proved
+                    # lattice-ineligible -- skip re-attempting it in compute.
+                    lattice_enabled=False if lattice_key is not None else None,
+                )
+        finally:
+            if lattice_builder:
+                with _LATTICE_CACHE_LOCK:
+                    _LATTICE_CACHE_BUILDING.pop(lattice_key, None)
+                build_event.set()
         grid_shape_nd = compute_result.grid_shape_nd
         contribution_reciprocal_points = compute_result.contribution_reciprocal_points
         amplitudes_delta = compute_result.amplitudes_delta
