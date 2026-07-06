@@ -15,9 +15,11 @@ from core.decoding.decoder_cache import (
     build_decoder_cache_identity,
     build_decoder_cache_path,
     load_decoder_cache,
+    load_decoder_cache_source_identity,
     resolve_current_residual_source_identity,
     resolve_local_residual_source_identity,
     resolve_public_residual_source_identity,
+    save_decoder_cache_source_identity,
     save_decoder_provenance,
     save_decoder_cache,
 )
@@ -121,6 +123,61 @@ def load_required_decoder(cache_path: str, logger):
             "use processing.decoder.source='compute' or 'current'."
         )
     return decoder, feature_dim
+
+
+def _compute_decoder_cache_matches_residual_source(
+    cache_path: str,
+    *,
+    source_dir,
+    logger,
+) -> bool:
+    """Decide whether a compute-mode decoder cache may be reused.
+
+    The cache filename encodes only the configuration hash, so it can outlive
+    the residual artifacts it was trained on (a residual recompute in the same
+    compute directory keeps the same name). Reuse is allowed only when the
+    recorded residual-source identity matches the artifacts currently on disk.
+    When no residual artifacts exist to compare against (the compute directory
+    was cleaned down to the cache), the identity is unverifiable and the cache
+    is trusted as before.
+    """
+    current_identity = resolve_local_residual_source_identity(output_dir=source_dir)
+    if current_identity is None:
+        # The compute directory was cleaned down to the cache: nothing left to
+        # verify against, and the cache filename encodes only geometry and
+        # hyperparameters -- NOT the input structure data. If the input data
+        # changed since training, this decoder is silently wrong.
+        logger.warning(
+            "Compute-mode decoder cache at '%s' cannot be verified: no residual "
+            "artifacts remain in '%s'. Reusing it. If the input structure or "
+            "data files changed since this decoder was trained, set "
+            "processing.decoder.fresh_start=true (or delete the cache) to force "
+            "retraining.",
+            cache_path,
+            source_dir,
+        )
+        return True
+    recorded_identity = load_decoder_cache_source_identity(cache_path)
+    if recorded_identity is None:
+        logger.warning(
+            "Compute-mode decoder cache at '%s' has no recorded residual-source "
+            "identity; retraining from the residual artifacts in '%s' to rule "
+            "out a stale decoder.",
+            cache_path,
+            source_dir,
+        )
+        return False
+    if recorded_identity.get("source_identity_digest") != current_identity.get(
+        "source_identity_digest"
+    ):
+        logger.warning(
+            "Compute-mode decoder cache at '%s' was trained from residual "
+            "artifacts that no longer match '%s'; retraining.",
+            cache_path,
+            source_dir,
+        )
+        return False
+    return True
 
 
 def _resolve_decoder_cache_path(cache_path: str, parameters: dict) -> str:
@@ -889,6 +946,11 @@ class DisplacementDecoderSourceService:
             policy.assignment == "single"
             and not force_decoder_fresh
             and Path(cache_path).is_file()
+            and _compute_decoder_cache_matches_residual_source(
+                cache_path,
+                source_dir=compute_processed_dir,
+                logger=logger,
+            )
         ):
             decoder, feature_dim = load_required_decoder(cache_path, logger)
             _set_prepared_decoder_from_source(
@@ -959,7 +1021,7 @@ class DisplacementDecoderSourceService:
                 decoding_parameters,
             )
 
-            return self._train_decoder_from_existing_artifacts(
+            trained_cache_path, provenance = self._train_decoder_from_existing_artifacts(
                 target_processor=processor,
                 training_processor=training_processor,
                 policy=policy,
@@ -973,6 +1035,17 @@ class DisplacementDecoderSourceService:
                 logger=logger,
                 label="full/unmasked decoder-source run",
             )
+            if trained_cache_path is not None:
+                trained_identity = resolve_local_residual_source_identity(
+                    output_dir=compute_processed_dir,
+                )
+                if trained_identity is not None:
+                    save_decoder_cache_source_identity(
+                        trained_cache_path,
+                        trained_identity,
+                        logger,
+                    )
+            return trained_cache_path, provenance
         finally:
             if compute_artifacts is not None:
                 compute_artifacts.close()

@@ -182,6 +182,7 @@ def resolve_local_residual_source_identity(*, output_dir: str | Path) -> dict | 
     if not amplitude_files:
         return None
     payload_hashes = []
+    digest_entries = []
     for artifact in sorted(output_root.glob("residual_chunk_*")):
         if not artifact.is_file():
             continue
@@ -191,20 +192,32 @@ def resolve_local_residual_source_identity(*, output_dir: str | Path) -> dict | 
             "nbytes": int(stat.st_size),
             "mtime_ns": int(stat.st_mtime_ns),
         }
+        # Digest material: content hash when we have one; (size, mtime) only
+        # for the large amplitude payloads where hashing is too expensive.
+        # Folding mtime into the digest of sha256-verified files would turn a
+        # timestamp-only change (cp without -p, rsync without -t, archive
+        # restore) into hours of spurious unmasked-pipeline recompute.
+        digest_entry = {"name": entry["name"], "nbytes": entry["nbytes"]}
         if stat.st_size <= (8 << 20):
-            entry["file_sha256"] = file_sha256(artifact)
+            sha = file_sha256(artifact)
+            entry["file_sha256"] = sha
+            digest_entry["file_sha256"] = sha
+        else:
+            digest_entry["mtime_ns"] = entry["mtime_ns"]
         payload_hashes.append(entry)
-    source_identity = {
+        digest_entries.append(digest_entry)
+    digest_material = {
         "schema": "mosaic.decoder.local_residual_source",
-        "schema_version": 1,
+        "schema_version": 2,
         "run_digest": digest_dict(
-            {"payload_hashes": payload_hashes},
+            {"payload_hashes": digest_entries},
             domain="mosaic.decoder.local_residual_source.v1",
         ),
-        "residual_payload_hashes": payload_hashes,
     }
+    source_identity = dict(digest_material)
+    source_identity["residual_payload_hashes"] = payload_hashes
     source_identity["source_identity_digest"] = digest_dict(
-        source_identity,
+        digest_material,
         domain="mosaic.decoder.local_residual_source.v1",
     )
     return source_identity
@@ -314,6 +327,55 @@ def save_decoder_cache(cache_path: str, decoder_M, feature_dim: int, logger) -> 
         temp_path.unlink(missing_ok=True)
         logger.warning("Failed to save decoder M to '%s': %s", short_path(path), exc)
         raise
+
+
+def decoder_cache_source_identity_path(cache_path: str) -> Path:
+    return Path(str(cache_path) + ".source_identity.json")
+
+
+def save_decoder_cache_source_identity(
+    cache_path: str,
+    source_identity: dict,
+    logger,
+) -> None:
+    """Record the residual-source identity a decoder cache was trained from.
+
+    The compute-mode decoder cache filename encodes only the configuration
+    hash, so a cache can silently outlive the residual artifacts it was
+    trained on. The sidecar written here lets the reuse path verify the
+    residual content is unchanged before trusting the cache."""
+    path = decoder_cache_source_identity_path(cache_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        temp_path = Path(temp_name)
+        temp_path.write_text(
+            json.dumps(source_identity, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+    except Exception as exc:
+        logger.warning(
+            "Failed to save decoder cache source identity to '%s': %s",
+            short_path(path),
+            exc,
+        )
+
+
+def load_decoder_cache_source_identity(cache_path: str) -> dict | None:
+    path = decoder_cache_source_identity_path(cache_path)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def save_decoder_provenance(output_dir: str, provenance: dict, logger) -> None:
