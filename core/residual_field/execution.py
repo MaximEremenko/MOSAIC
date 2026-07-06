@@ -343,6 +343,82 @@ def _residual_attempt_digests_for_chunk(
 
 
 
+def _expected_partition_family_for_chunk(
+    planned_work_units: list[ResidualFieldWorkUnit],
+    *,
+    chunk_id: int,
+) -> tuple[tuple[int | None, int | None, int | None], ...]:
+    """The plan's (partition_id, point_start, point_stop) family for a chunk.
+
+    Passed to finalize so the snapshot family is checked against the plan --
+    the only source of truth that can see a missing tail partition.
+    """
+    family: dict[int | None, tuple[int | None, int | None]] = {}
+    for work_unit in planned_work_units:
+        if int(work_unit.chunk_id) != int(chunk_id):
+            continue
+        family[work_unit.partition_id] = (
+            None if work_unit.point_start is None else int(work_unit.point_start),
+            None if work_unit.point_stop is None else int(work_unit.point_stop),
+        )
+    return tuple(
+        (partition_id, start, stop)
+        for partition_id, (start, stop) in sorted(
+            family.items(),
+            key=lambda item: (-1 if item[0] is None else int(item[0])),
+        )
+    )
+
+
+def _invalidate_incompatible_local_checkpoints(
+    *,
+    planned_work_units: list[ResidualFieldWorkUnit],
+    reducer_backend: ResidualFieldReducerBackend,
+    output_dir: str,
+) -> None:
+    """Drop on-disk checkpoints whose partition layout no longer matches the plan.
+
+    Without this, snapshots surviving a crash across a code/configuration change
+    (different partition count or atom ranges) stay referenced by the progress
+    manifest and are concatenated at finalize, silently corrupting the chunk.
+    """
+    invalidate = getattr(
+        reducer_backend, "invalidate_incompatible_local_checkpoints", None
+    )
+    if not callable(invalidate):
+        return
+    expected_by_chunk: dict[tuple[int, str], dict[int | None, dict[str, object]]] = {}
+    for work_unit in planned_work_units:
+        key = (int(work_unit.chunk_id), str(work_unit.parameter_digest))
+        target = expected_by_chunk.setdefault(key, {}).setdefault(
+            work_unit.partition_id,
+            {
+                "point_start": (
+                    None if work_unit.point_start is None else int(work_unit.point_start)
+                ),
+                "point_stop": (
+                    None if work_unit.point_stop is None else int(work_unit.point_stop)
+                ),
+                "interval_batches": [],
+            },
+        )
+        target["interval_batches"].append(
+            frozenset(
+                int(interval_id)
+                for interval_id in _work_unit_expected_interval_ids(work_unit)
+            )
+        )
+    for (chunk_id, parameter_digest), expected_targets in expected_by_chunk.items():
+        for target in expected_targets.values():
+            target["interval_batches"] = tuple(target["interval_batches"])
+        invalidate(
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+            expected_targets=expected_targets,
+        )
+
+
 def _reconcile_and_filter_local_durable_work_units(
     *,
     work_units: list[ResidualFieldWorkUnit],
@@ -1046,6 +1122,11 @@ def run_residual_field_stage(
                 required_gpu_tasks=(1 if "gpu" in nufft_resources else 0),
             )
     if owner_local_reducer:
+        _invalidate_incompatible_local_checkpoints(
+            planned_work_units=planned_work_units,
+            reducer_backend=task_reducer_backend,
+            output_dir=artifacts.output_dir,
+        )
         work_units = _reconcile_and_filter_local_durable_work_units(
             work_units=work_units,
             reducer_backend=task_reducer_backend,
@@ -1187,6 +1268,10 @@ def run_residual_field_stage(
                     cleanup_policy=cleanup_policy,
                     scratch_root=scratch_root,
                     quiet_logs=False,
+                    expected_partitions=_expected_partition_family_for_chunk(
+                        planned_work_units,
+                        chunk_id=int(chunk_id),
+                    ),
                 )
         else:
             for chunk_id in chunk_ids:
@@ -1673,6 +1758,10 @@ def run_residual_field_stage(
                     cleanup_policy=cleanup_policy,
                     scratch_root=scratch_root,
                     quiet_logs=False,
+                    expected_partitions=_expected_partition_family_for_chunk(
+                        planned_work_units,
+                        chunk_id=int(chunk_id),
+                    ),
                     pure=False,
                     workers=[finalizer_owner],
                     allow_other_workers=False,

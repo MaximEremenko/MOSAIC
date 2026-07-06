@@ -98,6 +98,21 @@ def assemble_durable_generation_chunk_payload(
     scratch_dir,
     chunk_id,
 ) -> dict:
+    if len(sorted_manifests) > 1:
+        interval_sets = {
+            frozenset(int(v) for v in manifest.contributing_interval_ids)
+            for manifest in sorted_manifests
+            if getattr(manifest, "contributing_interval_ids", None) is not None
+        }
+        if len(interval_sets) > 1:
+            sizes = sorted(len(s) for s in interval_sets)
+            raise RuntimeError(
+                "Residual-field generation finalization found partition "
+                f"checkpoints with mismatched interval coverage for chunk="
+                f"{int(chunk_id)} (interval-set sizes {sizes}). At least one "
+                "partition checkpoint is stale or incomplete; clear the durable "
+                "generation checkpoints and re-run to recompute this chunk."
+            )
     # Pass 1: load each snapshot briefly to record shape, then
     # release it. Peak memory = one block at a time.
     # Match np.vstack semantics: 1-D block of shape (k,) counts
@@ -201,6 +216,123 @@ def assemble_durable_generation_chunk_payload(
     return snapshot_payload
 
 
+def validate_local_partition_snapshot_family(
+    snapshot_metadata,
+    *,
+    chunk_id,
+) -> None:
+    """Reject checkpoint families that cannot assemble into a correct chunk.
+
+    Partition snapshots are only safe to concatenate when (a) every partition
+    incorporated the same interval set — partitions split real-space points,
+    so a differing set means at least one partition is missing contributions —
+    and (b) their atom ranges tile ``[0, n_atoms)`` contiguously in assembly
+    (partition-id) order. Stale snapshots surviving from an older partition
+    layout (crash + code/flag change + resume) violate one of these and used
+    to be concatenated silently, publishing a truncated or corrupt chunk.
+    """
+    entries = [
+        (partition_id, metadata)
+        for partition_id, _seq, metadata in snapshot_metadata
+        if metadata is not None
+    ]
+    if len(entries) <= 1:
+        return
+    if any(partition_id is None for partition_id, _metadata in entries):
+        raise RuntimeError(
+            "Residual-field local finalization found a mix of owner-level and "
+            f"partitioned checkpoints for chunk={int(chunk_id)}. The checkpoint "
+            "family is inconsistent (stale snapshots from a different partition "
+            "layout); delete 'residual_checkpoints/' under the output directory "
+            "and re-run to recompute this chunk."
+        )
+    interval_sets = {
+        frozenset(int(v) for v in metadata["incorporated_interval_ids"])
+        for _partition_id, metadata in entries
+    }
+    if len(interval_sets) > 1:
+        sizes = sorted(len(s) for s in interval_sets)
+        raise RuntimeError(
+            "Residual-field local finalization found partition checkpoints with "
+            f"mismatched interval coverage for chunk={int(chunk_id)} "
+            f"(interval-set sizes {sizes}). At least one partition checkpoint is "
+            "stale or incomplete; delete 'residual_checkpoints/' under the output "
+            "directory and re-run to recompute this chunk."
+        )
+    ranges = [
+        (metadata.get("point_start"), metadata.get("point_stop"))
+        for _partition_id, metadata in entries
+    ]
+    if any(start is None or stop is None for start, stop in ranges):
+        logger.warning(
+            "Residual-field local finalization cannot verify partition tiling for "
+            "chunk=%d: legacy checkpoint(s) lack point ranges.",
+            int(chunk_id),
+        )
+        return
+    expected_start = 0
+    for (partition_id, _metadata), (start, stop) in zip(entries, ranges):
+        if int(start) != expected_start or int(stop) <= int(start):
+            raise RuntimeError(
+                "Residual-field local finalization found partition checkpoints "
+                f"that do not tile the chunk for chunk={int(chunk_id)}: partition "
+                f"{partition_id} covers atoms [{start}:{stop}] but assembly "
+                f"expected the next range to start at {expected_start}. Stale "
+                "checkpoints from a different partition layout are present; "
+                "delete 'residual_checkpoints/' under the output directory and "
+                "re-run to recompute this chunk."
+            )
+        expected_start = int(stop)
+
+
+def _require_expected_partition_family(
+    snapshot_metadata,
+    *,
+    expected_partitions,
+    chunk_id,
+) -> None:
+    """Verify the snapshot family matches the plan's partition family exactly.
+
+    The intra-family checks in ``validate_local_partition_snapshot_family``
+    cannot see a missing TAIL partition (a K-of-N family that tiles
+    contiguously from 0 still passes). Only the plan knows the full family, so
+    the finalize paths that run after coverage validation pass it down here.
+    """
+    found_ids = {
+        partition_id for partition_id, _seq, metadata in snapshot_metadata
+        if metadata is not None
+    }
+    expected_map = {
+        (int(partition_id) if partition_id is not None else None): (start, stop)
+        for partition_id, start, stop in expected_partitions
+    }
+    if found_ids != set(expected_map):
+        missing = sorted(str(v) for v in set(expected_map) - found_ids)
+        extra = sorted(str(v) for v in found_ids - set(expected_map))
+        raise RuntimeError(
+            "Residual-field local finalization found a partition-snapshot "
+            f"family that does not match the plan for chunk={int(chunk_id)}: "
+            f"missing partitions {missing}, unexpected partitions {extra}. "
+            "Delete 'residual_checkpoints/' under the output directory and "
+            "re-run to recompute this chunk."
+        )
+    for partition_id, _seq, metadata in snapshot_metadata:
+        if metadata is None:
+            continue
+        snap_start = metadata.get("point_start")
+        snap_stop = metadata.get("point_stop")
+        if snap_start is None and snap_stop is None:
+            continue
+        if (snap_start, snap_stop) != expected_map[partition_id]:
+            raise RuntimeError(
+                "Residual-field local finalization found partition "
+                f"{partition_id} of chunk={int(chunk_id)} covering atoms "
+                f"[{snap_start}:{snap_stop}] where the plan expects "
+                f"{expected_map[partition_id]}. Delete 'residual_checkpoints/' "
+                "under the output directory and re-run to recompute this chunk."
+            )
+
+
 def assemble_local_snapshot_chunk_payload(
     *,
     snapshot_metadata,
@@ -209,6 +341,10 @@ def assemble_local_snapshot_chunk_payload(
     output_dir,
     scratch_dir,
 ) -> dict | None:
+    validate_local_partition_snapshot_family(
+        snapshot_metadata,
+        chunk_id=chunk_id,
+    )
     # Pass 1: load one snapshot at a time to inspect shape, then
     # drop it. This keeps peak finalize RAM near one partition plus
     # the output buffers instead of all partitions at once.
@@ -896,6 +1032,138 @@ class ManifestDrivenResidualFieldReducerBackend:
             return False
         return set(expected_interval_ids).issubset(durable_intervals)
 
+    def invalidate_incompatible_local_checkpoints(
+        self,
+        *,
+        chunk_id: int,
+        parameter_digest: str,
+        output_dir: str,
+        expected_targets: dict[int | None, dict[str, object]],
+    ) -> int:
+        """Drop local checkpoint snapshots that do not fit the current plan.
+
+        After a crash + resume across a code or configuration change, the
+        partition layout or the interval grouping of a chunk can differ from
+        what wrote the on-disk snapshots. Snapshots for partition ids absent
+        from the current plan, whose atom ranges moved, or whose durable
+        interval set is not a union of the current plan's interval batches
+        (the durable-skip filter and the accumulator both reason in whole
+        batches) would otherwise corrupt the resume: stale layouts get
+        concatenated at finalize, and regrouped batches either double-count
+        or strand durable intervals no work unit re-covers. Called once per
+        (chunk, digest) at plan time with ``expected_targets`` mapping each
+        planned partition id to ``{"point_start", "point_stop",
+        "interval_batches"}``. Returns the number of snapshots invalidated.
+        """
+        if not self.uses_local_chunk_accumulator() or self.uses_shared_durable_generations():
+            return 0
+        with chunk_mutex(chunk_id, lock_root=output_dir):
+            progress = self.load_progress_manifest(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            if progress is None or progress.completion_status is CompletionStatus.COMMITTED:
+                return 0
+            retained_keys: list[str] = []
+            retained_interval_ids: set[int] = set()
+            dropped: list[tuple[int | None, int]] = []
+            for key in progress.incorporated_shard_keys:
+                parsed = parse_local_accumulator_snapshot_key(key)
+                if parsed is None:
+                    retained_keys.append(key)
+                    continue
+                parsed_chunk_id, parsed_digest, partition_id, snapshot_seq = parsed
+                if parsed_chunk_id != int(chunk_id) or parsed_digest != str(parameter_digest):
+                    retained_keys.append(key)
+                    continue
+                stale = partition_id not in expected_targets
+                metadata = None
+                if not stale:
+                    metadata = load_local_accumulator_snapshot_metadata(
+                        output_dir,
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        partition_id=partition_id,
+                        snapshot_seq=snapshot_seq,
+                    )
+                    if metadata is None:
+                        stale = True
+                    else:
+                        expected = expected_targets[partition_id]
+                        snap_start = metadata.get("point_start")
+                        snap_stop = metadata.get("point_stop")
+                        expected_start = expected.get("point_start")
+                        expected_stop = expected.get("point_stop")
+                        if (snap_start is not None or snap_stop is not None) and (
+                            snap_start != expected_start or snap_stop != expected_stop
+                        ):
+                            stale = True
+                        elif expected.get("interval_batches") is not None:
+                            durable = set(
+                                int(v) for v in metadata["incorporated_interval_ids"]
+                            )
+                            covered: set[int] = set()
+                            for batch in expected["interval_batches"]:
+                                if set(batch) <= durable:
+                                    covered.update(int(v) for v in batch)
+                            if covered != durable:
+                                stale = True
+                if stale:
+                    dropped.append((partition_id, int(snapshot_seq)))
+                    continue
+                retained_keys.append(key)
+                retained_interval_ids.update(
+                    int(v) for v in metadata["incorporated_interval_ids"]
+                )
+            if not dropped:
+                return 0
+            for partition_id, snapshot_seq in dropped:
+                build_local_accumulator_snapshot_path(
+                    output_dir,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                    partition_id=partition_id,
+                    snapshot_seq=snapshot_seq,
+                ).unlink(missing_ok=True)
+                self._release_local_accumulator(
+                    self._local_accumulator_key(
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        partition_id=partition_id,
+                    )
+                )
+            progress_manifest = _build_residual_field_reducer_progress_manifest(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+                completion_status=CompletionStatus.MATERIALIZED,
+                durable_truth_unit=progress.durable_truth_unit,
+                incorporated_shard_keys=tuple(sorted(retained_keys)),
+                incorporated_interval_ids=tuple(sorted(retained_interval_ids)),
+                reclaimable_shard_keys=(),
+                final_artifacts=build_residual_field_output_artifact_refs(
+                    output_dir,
+                    chunk_id,
+                ),
+                pending_shard_keys=(),
+                pending_interval_ids=(),
+                cleanup_policy=progress.cleanup_policy,
+            )
+            self.write_progress_manifest(progress_manifest)
+        logger.warning(
+            "Residual-field checkpoint invalidation | chunk=%d | dropped %d snapshot(s) "
+            "from a previous partition layout (partitions %s); the affected "
+            "partitions will be recomputed by the current plan.",
+            int(chunk_id),
+            len(dropped),
+            sorted(
+                "owner" if partition_id is None else str(partition_id)
+                for partition_id, _seq in dropped
+            ),
+        )
+        return len(dropped)
+
     def _checkpoint_cadence(self, total_expected_partials: int) -> int:
         # Cadence is pure POLICY (see reducer_helpers); the method stays as a thin
         # delegator so call sites are unchanged.
@@ -1565,7 +1833,18 @@ class ManifestDrivenResidualFieldReducerBackend:
         cleanup_policy: str | bool | None = None,
         scratch_root: str | None = None,
         quiet_logs: bool = False,
+        opportunistic: bool = False,
+        expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
     ) -> ResidualFieldArtifactManifest | None:
+        """Fold committed local snapshots into the final chunk artifact.
+
+        ``opportunistic=True`` marks a caller (startup recovery) that runs
+        BEFORE planning and therefore cannot know the expected partition
+        family: partitioned families are deferred (return ``None``) instead of
+        published or failed, because partition snapshots flush on independent
+        cadences and routinely disagree mid-run. ``expected_partitions`` is
+        the plan's ``(partition_id, point_start, point_stop)`` family for this
+        chunk; when provided, the snapshot family must match it exactly."""
         repaired_manifest = self._repair_progress_final_artifacts(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
@@ -1783,6 +2062,27 @@ class ManifestDrivenResidualFieldReducerBackend:
                 metadata.get("partition_id") not in (None, -1)
                 for _, _, metadata in snapshot_metadata
             )
+            if partitioned and opportunistic:
+                # Startup recovery runs BEFORE planning. Partition snapshots
+                # flush on independent cadences, so a mid-run crash routinely
+                # leaves them with different interval subsets and possibly a
+                # missing tail partition -- states the residual stage recovers
+                # from, but that cannot be validated (or safely published)
+                # without the plan. Defer to the stage.
+                log_fn = logger.debug if quiet_logs else logger.info
+                log_fn(
+                    "Residual-field startup recovery deferring partitioned "
+                    "chunk %d to the residual stage (family completeness is "
+                    "only provable against the plan).",
+                    int(chunk_id),
+                )
+                return None
+            if partitioned and expected_partitions is not None:
+                _require_expected_partition_family(
+                    snapshot_metadata,
+                    expected_partitions=expected_partitions,
+                    chunk_id=chunk_id,
+                )
             if partitioned:
                 scratch_dir = _finalize_scratch_dir(
                     scratch_root,
@@ -2008,6 +2308,7 @@ def finalize_process_local_residual_chunk(
     cleanup_policy: str | bool | None = None,
     scratch_root: str | None = None,
     quiet_logs: bool = False,
+    expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
 ) -> ResidualFieldArtifactManifest | None:
     backend = get_process_local_residual_field_backend(template_backend)
     return backend.finalize_chunk(
@@ -2018,6 +2319,7 @@ def finalize_process_local_residual_chunk(
         cleanup_policy=cleanup_policy,
         scratch_root=scratch_root,
         quiet_logs=quiet_logs,
+        expected_partitions=expected_partitions,
     )
 
 

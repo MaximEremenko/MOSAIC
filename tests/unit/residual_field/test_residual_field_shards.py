@@ -957,49 +957,48 @@ def test_local_backend_finalize_chunk_concatenates_disjoint_partition_snapshots(
     try:
         interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
         backend = build_residual_field_reducer_backend("local_restartable")
-        partial_1 = backend.build_local_partial(
-            ResidualFieldWorkUnit.interval_chunk(
-                interval_id=interval_id_1,
-                chunk_id=3,
-                parameter_digest="abc123",
-                output_dir=str(tmp_path),
-            ).with_partition(partition_id=0, point_start=0, point_stop=1),
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=5,
-            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
-            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
-            point_ids=np.array([0, 1]),
-        )
-        partial_2 = backend.build_local_partial(
-            ResidualFieldWorkUnit.interval_chunk(
-                interval_id=interval_id_2,
-                chunk_id=3,
-                parameter_digest="abc123",
-                output_dir=str(tmp_path),
-            ).with_partition(partition_id=1, point_start=1, point_stop=2),
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=7,
-            amplitudes_delta=np.array([3 + 0j, 4 + 0j]),
-            amplitudes_average=np.array([0.25 + 0j, 0.5 + 0j]),
-            point_ids=np.array([0, 1]),
-        )
-
-        backend.accept_partial(
-            partial_1,
-            output_dir=str(tmp_path),
-            scratch_root=scratch_root,
-            db_path=db.db_path,
-            total_expected_partials=1,
-        )
-        backend.accept_partial(
-            partial_2,
-            output_dir=str(tmp_path),
-            scratch_root=scratch_root,
-            db_path=db.db_path,
-            total_expected_partials=1,
-        )
+        # Partitions split disjoint real-space atom ranges, but every
+        # partition accumulates every interval: finalize refuses to
+        # concatenate partitions with mismatched interval coverage.
+        partition_specs = {0: (0, 1), 1: (1, 2)}
+        interval_payloads = {
+            interval_id_1: {
+                0: (5, np.array([1 + 0j, 2 + 0j]), np.array([0.5 + 0j, 0.75 + 0j])),
+                1: (5, np.array([3 + 0j, 4 + 0j]), np.array([0.25 + 0j, 0.5 + 0j])),
+            },
+            interval_id_2: {
+                0: (7, np.array([10 + 0j, 20 + 0j]), np.array([0.25 + 0j, 0.5 + 0j])),
+                1: (7, np.array([30 + 0j, 40 + 0j]), np.array([0.75 + 0j, 1.0 + 0j])),
+            },
+        }
+        for interval_id, per_partition in interval_payloads.items():
+            for partition_id, (nrec_contrib, delta, average) in per_partition.items():
+                point_start, point_stop = partition_specs[partition_id]
+                partial = backend.build_local_partial(
+                    ResidualFieldWorkUnit.interval_chunk(
+                        interval_id=interval_id,
+                        chunk_id=3,
+                        parameter_digest="abc123",
+                        output_dir=str(tmp_path),
+                    ).with_partition(
+                        partition_id=partition_id,
+                        point_start=point_start,
+                        point_stop=point_stop,
+                    ),
+                    grid_shape_nd=np.array([[2]]),
+                    total_reciprocal_points=11,
+                    contribution_reciprocal_points=nrec_contrib,
+                    amplitudes_delta=delta,
+                    amplitudes_average=average,
+                    point_ids=np.array([0, 1]),
+                )
+                backend.accept_partial(
+                    partial,
+                    output_dir=str(tmp_path),
+                    scratch_root=scratch_root,
+                    db_path=db.db_path,
+                    total_expected_partials=2,
+                )
 
         manifest = backend.finalize_chunk(
             chunk_id=3,
@@ -1014,9 +1013,9 @@ def test_local_backend_finalize_chunk_concatenates_disjoint_partition_snapshots(
         assert manifest is not None
         current, current_av, nrec, shape_nd = store.load_chunk_payloads(3)
         applied = store.load_applied_interval_ids(3)
-        np.testing.assert_allclose(current[:, 1], np.array([1 + 0j, 2 + 0j, 3 + 0j, 4 + 0j]))
-        np.testing.assert_allclose(current_av[:, 1], np.array([0.5 + 0j, 0.75 + 0j, 0.25 + 0j, 0.5 + 0j]))
-        assert nrec == 12
+        np.testing.assert_allclose(current[:, 1], np.array([11 + 0j, 22 + 0j, 33 + 0j, 44 + 0j]))
+        np.testing.assert_allclose(current_av[:, 1], np.array([0.75 + 0j, 1.25 + 0j, 1.0 + 0j, 1.5 + 0j]))
+        assert nrec == 24
         np.testing.assert_allclose(shape_nd, np.array([[2], [2]]))
         assert applied == {interval_id_1, interval_id_2}
         progress = discover_residual_field_reducer_progress_manifest(
@@ -1038,48 +1037,34 @@ def test_local_backend_repairs_db_from_committed_progress_without_snapshots(tmp_
     try:
         interval_id_1, interval_id_2 = _seed_db_for_chunk(db)
         backend = build_residual_field_reducer_backend("local_restartable")
-        partial_1 = backend.build_local_partial(
-            ResidualFieldWorkUnit.interval_chunk(
-                interval_id=interval_id_1,
-                chunk_id=3,
-                parameter_digest="abc123",
-                output_dir=str(tmp_path),
-            ).with_partition(partition_id=0, point_start=0, point_stop=1),
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=5,
-            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
-            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
-            point_ids=np.array([0, 1]),
-        )
-        partial_2 = backend.build_local_partial(
-            ResidualFieldWorkUnit.interval_chunk(
-                interval_id=interval_id_2,
-                chunk_id=3,
-                parameter_digest="abc123",
-                output_dir=str(tmp_path),
-            ).with_partition(partition_id=1, point_start=2, point_stop=3),
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=7,
-            amplitudes_delta=np.array([3 + 0j, 4 + 0j]),
-            amplitudes_average=np.array([0.25 + 0j, 0.5 + 0j]),
-            point_ids=np.array([0, 1]),
-        )
-        backend.accept_partial(
-            partial_1,
-            output_dir=str(tmp_path),
-            scratch_root=scratch_root,
-            db_path=db.db_path,
-            total_expected_partials=1,
-        )
-        backend.accept_partial(
-            partial_2,
-            output_dir=str(tmp_path),
-            scratch_root=scratch_root,
-            db_path=db.db_path,
-            total_expected_partials=1,
-        )
+        partition_specs = {0: (0, 1), 1: (1, 2)}
+        for interval_id, nrec_contrib in ((interval_id_1, 5), (interval_id_2, 7)):
+            for partition_id, (point_start, point_stop) in partition_specs.items():
+                partial = backend.build_local_partial(
+                    ResidualFieldWorkUnit.interval_chunk(
+                        interval_id=interval_id,
+                        chunk_id=3,
+                        parameter_digest="abc123",
+                        output_dir=str(tmp_path),
+                    ).with_partition(
+                        partition_id=partition_id,
+                        point_start=point_start,
+                        point_stop=point_stop,
+                    ),
+                    grid_shape_nd=np.array([[2]]),
+                    total_reciprocal_points=11,
+                    contribution_reciprocal_points=nrec_contrib,
+                    amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
+                    amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
+                    point_ids=np.array([0, 1]),
+                )
+                backend.accept_partial(
+                    partial,
+                    output_dir=str(tmp_path),
+                    scratch_root=scratch_root,
+                    db_path=db.db_path,
+                    total_expected_partials=2,
+                )
         first_manifest = backend.finalize_chunk(
             chunk_id=3,
             parameter_digest="abc123",

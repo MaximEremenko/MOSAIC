@@ -4,14 +4,29 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from core.residual_field.contracts import ResidualFieldWorkUnit
-from core.residual_field.tasks import run_residual_field_interval_chunk_task
+from core.residual_field.tasks import (
+    clear_residual_lattice_cache,
+    run_residual_field_interval_chunk_task,
+)
 from core.scattering.half_space import (
     HALF_SPACE_ROLE_POSITIVE_HALF,
     HALF_SPACE_ROLE_ZERO_PLANE,
 )
 from core.scattering.kernels import IntervalTask
+
+
+@pytest.fixture(autouse=True)
+def _pin_type3_paths(monkeypatch):
+    """These tests mock the type-3 entry point with canned values. The lattice
+    scatter+type-2 path would divert their synthetic on-lattice q-grids, so
+    pin it off here; dedicated lattice tests re-enable it explicitly."""
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "0")
+    clear_residual_lattice_cache()
+    yield
+    clear_residual_lattice_cache()
 
 
 BASELINE_DIR = (

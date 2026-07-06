@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import mmap
 import os
 import tempfile
@@ -9,6 +10,8 @@ from pathlib import Path
 import numpy as np
 
 from core.residual_field.contracts import ResidualFieldWorkUnit
+
+logger = logging.getLogger(__name__)
 
 _LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT = 64 * 1024 * 1024
 
@@ -589,6 +592,27 @@ class LiveLocalAccumulator:
         )
         if self.should_skip_interval_ids(interval_ids):
             return
+        stale_overlap = set(int(v) for v in interval_ids) & self.current_interval_ids
+        if stale_overlap:
+            # A contribution that partially overlaps the accumulated interval
+            # set means the interval grouping changed between the run that
+            # wrote the restored checkpoint and this one. Within one plan,
+            # batches are disjoint, and plan-time checkpoint invalidation
+            # discards checkpoints whose durable set is not a union of the
+            # current plan's batches -- so this state is unreachable in the
+            # orchestrated flow. Adding would double-count the overlap and
+            # resetting could destroy intervals that filtered-out work units
+            # will never re-cover, so fail loudly instead.
+            raise ValueError(
+                "Residual-field local accumulator cannot reconcile a "
+                f"contribution for chunk={self.chunk_id} partition="
+                f"{'owner' if self.partition_id is None else self.partition_id}: "
+                f"{len(stale_overlap)} of its intervals are already accumulated "
+                f"while {len(set(interval_ids) - self.current_interval_ids)} are "
+                "not (interval grouping changed across runs). Delete "
+                "'residual_checkpoints/' under the output directory and re-run "
+                "to recompute this chunk."
+            )
         _chunked_add_complex(self.amplitudes_delta, amplitudes_delta)
         _chunked_add_complex(self.amplitudes_average, amplitudes_average)
         self.reciprocal_point_count += int(contribution_reciprocal_points)

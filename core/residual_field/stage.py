@@ -168,6 +168,10 @@ class ResidualFieldStage:
                 cleanup_policy="off",
                 scratch_root=scratch_root,
                 quiet_logs=True,
+                # Pre-plan recovery: partitioned families whose completeness
+                # cannot be proven are deferred to the residual stage instead
+                # of being published or failed.
+                opportunistic=True,
             )
             if manifest is not None:
                 recovered_chunks.append(int(chunk_id))
