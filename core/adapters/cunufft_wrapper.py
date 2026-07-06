@@ -1271,14 +1271,22 @@ def lattice_host_budget_bytes() -> int:
 
 
 def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
-                 host_budget_bytes: int | None = None, n_trans: int = 2):
+                 host_budget_bytes: int | None = None, n_trans: int = 2,
+                 max_snap_dev: float | None = None):
     """Snap scattered q-points onto a uniform per-axis lattice.
 
     Returns a meta dict ``{origin, dq, dims, snap_dev}`` when every point lies
     on a common per-axis lattice (within ``snap_tol`` of a step) AND the dense
     coefficient grid fits ``host_budget_bytes``; otherwise ``None`` (caller
     falls back to type-3). Degenerate axes (a single plane, e.g. the l=0
-    zero-plane role, or a 2D projection) get ``dq=0`` and one mode."""
+    zero-plane role, or a 2D projection) get ``dq=0`` and one mode.
+
+    ``max_snap_dev`` additionally rejects NEAR-lattice data: truly on-lattice
+    q (exact float64 products) snaps to <=1e-9 of a step after the LSQ
+    refinement, while e.g. a slightly sheared cell produces deviations around
+    1e-6 that ``snap_tol`` would silently accept -- evaluating the transform
+    at the snapped positions then corrupts the result far beyond NUFFT eps.
+    Callers that promise eps-level parity with type-3 must set it."""
     q = np.asarray(q_coords, dtype=np.float64)
     if q.ndim != 2 or len(q) == 0 or q.shape[1] not in (1, 2, 3):
         return None
@@ -1296,7 +1304,14 @@ def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
         if span <= 1e-12:                      # degenerate axis: one plane
             origin[ax] = float(col[0]); dq[ax] = 0.0; dims[ax] = 1
             continue
-        u = np.unique(np.round(col, 9))
+        # The min-gap SEED only needs enough points to observe adjacent
+        # lattice values; the O(n log n) unique/sort on the full column
+        # dominates plan cost for large intervals (Stage-1 calls this per
+        # interval). The LSQ refinement below and the snap validation still
+        # run over ALL points, so a pathological subsample can only cause a
+        # fallback to type-3, never a wrong lattice.
+        seed_col = col if len(col) <= 200_000 else col[:: len(col) // 100_000]
+        u = np.unique(np.round(seed_col, 9))
         gaps = np.diff(u)
         gaps = gaps[gaps > max(1e-9, span * 1e-6)]   # ignore float-noise micro-gaps
         if gaps.size == 0:
@@ -1330,6 +1345,8 @@ def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
         dq[ax] = step; dims[ax] = n_axis
         snap_dev = max(snap_dev, dev)
         idx[:, ax] = ax_idx
+    if max_snap_dev is not None and snap_dev > float(max_snap_dev):
+        return None
     grid_bytes = int(np.prod(dims)) * 16 * max(1, int(n_trans))
     if grid_bytes > host_budget_bytes:
         return None
@@ -1613,6 +1630,316 @@ def execute_lattice_type2_batch(
     return execute_type2_on_lattice(
         meta, grids, real_coords, eps=eps, prefer_cpu=prefer_cpu, gpu_only=gpu_only
     )
+
+
+###############################################################################
+#  Lattice type-1 (forward): nonuniform sources -> uniform lattice box        #
+#                                                                             #
+#  The Stage-1 scattering transform evaluates A(q) = sum_k w_k exp(+i q.r_k)  #
+#  at the q-points of one interval. Those q-points sit on the run's global    #
+#  uniform lattice, so the transform is a type-1 NUFFT onto the interval's    #
+#  mode box. Crucially the wrapped source coordinates x_k = wrap(dq * r_k)    #
+#  depend only on the LATTICE PITCH, not on the interval: one plan + setpts   #
+#  per (source set, box dims, dq) serves every interval of the run, and the   #
+#  interval's box origin enters as a per-call weight phase. The cache below   #
+#  holds those plans; it is bounded, per-process, and must be cleared at the  #
+#  end of the scattering stage (plan scratch is raw cudaMalloc outside the    #
+#  CuPy pool).                                                                #
+###############################################################################
+_TYPE1_PLAN_CACHE: "dict[tuple, _Type1PlanEntry]" = {}
+_TYPE1_PLAN_CACHE_ORDER: list = []
+_TYPE1_PLAN_CACHE_LOCK = threading.Lock()
+
+
+class _Type1PlanEntry:
+    """Leased cache entry.
+
+    Concurrent worker threads can fetch an entry while another thread evicts
+    or clears it (LRU overflow, GPU-OOM cache flush). Destroying the plan in
+    that window would hand a freed cuFINUFFT handle to ``execute`` -- a
+    native use-after-free. Leases make destruction safe: eviction only marks
+    the entry doomed while leases are outstanding, and the LAST release
+    destroys the plan.
+    """
+
+    __slots__ = ("plan", "d_x", "d_r", "lock", "leases", "doomed", "nbytes")
+
+    def __init__(self, plan, d_x, d_r, nbytes=0):
+        self.plan = plan
+        self.d_x = d_x
+        self.d_r = d_r
+        self.lock = threading.Lock()
+        self.leases = 0
+        self.doomed = False
+        self.nbytes = int(nbytes)
+
+
+def _type1_entry_destroy(entry: "_Type1PlanEntry") -> None:
+    with entry.lock:
+        _destroy_plan_quietly(entry.plan)
+        entry.plan = None
+
+
+def _type1_entry_release(entry: "_Type1PlanEntry") -> None:
+    destroy = False
+    with _TYPE1_PLAN_CACHE_LOCK:
+        entry.leases -= 1
+        destroy = entry.doomed and entry.leases <= 0
+    if destroy:
+        _type1_entry_destroy(entry)
+
+
+def _type1_plan_cache_max() -> int:
+    # A run's working set is (source sets) x (distinct interval box shapes):
+    # interior/edge/zero-plane boxes easily produce 40-80 keys, and a cap
+    # below the working set thrashes plan creation per transform. The byte
+    # budget below is the real bound; the count is a backstop.
+    raw = os.getenv("MOSAIC_SCATTERING_TYPE1_PLAN_CACHE_MAX", "256")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 256
+
+
+def _type1_plan_cache_max_bytes() -> int:
+    raw = os.getenv("MOSAIC_SCATTERING_TYPE1_CACHE_MAX_BYTES")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 4 << 30  # fits the ~30%-of-VRAM plan-scratch headroom model
+
+
+def _type1_cache_total_bytes_locked() -> int:
+    return sum(entry.nbytes for entry in _TYPE1_PLAN_CACHE.values())
+
+
+def clear_lattice_type1_plan_cache() -> None:
+    doomed_now: list[_Type1PlanEntry] = []
+    with _TYPE1_PLAN_CACHE_LOCK:
+        for entry in _TYPE1_PLAN_CACHE.values():
+            if entry.leases > 0:
+                entry.doomed = True
+            else:
+                doomed_now.append(entry)
+        _TYPE1_PLAN_CACHE.clear()
+        _TYPE1_PLAN_CACHE_ORDER.clear()
+    for entry in doomed_now:
+        _type1_entry_destroy(entry)
+    _free_cupy_pool_blocks()
+
+
+def _type1_cache_acquire_or_build(key: tuple, builder):
+    """Return ``(entry, cached)`` with one lease taken on ``entry``.
+
+    The caller MUST pair this with ``_type1_entry_release`` (cached entries)
+    or destroy the plan itself (``cached=False``, cache disabled). Leases are
+    taken under the cache lock, so an entry handed out here can never be
+    destroyed underneath its user by eviction or a concurrent clear.
+    """
+    max_entries = _type1_plan_cache_max()
+    if max_entries <= 0:
+        plan, d_x, d_r, nbytes = builder()
+        return _Type1PlanEntry(plan, d_x, d_r, nbytes), False
+    with _TYPE1_PLAN_CACHE_LOCK:
+        entry = _TYPE1_PLAN_CACHE.get(key)
+        if entry is not None:
+            try:
+                _TYPE1_PLAN_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            _TYPE1_PLAN_CACHE_ORDER.append(key)
+            entry.leases += 1
+            return entry, True
+    plan, d_x, d_r, nbytes = builder()
+    entry = _Type1PlanEntry(plan, d_x, d_r, nbytes)
+    victims: list[_Type1PlanEntry] = []
+    max_bytes = _type1_plan_cache_max_bytes()
+    with _TYPE1_PLAN_CACHE_LOCK:
+        existing = _TYPE1_PLAN_CACHE.get(key)
+        if existing is not None:
+            victims.append(entry)  # lost the build race; ours is surplus
+            existing.leases += 1
+            entry = existing
+        else:
+            while _TYPE1_PLAN_CACHE_ORDER and (
+                len(_TYPE1_PLAN_CACHE_ORDER) >= max(1, max_entries)
+                or _type1_cache_total_bytes_locked() + entry.nbytes > max_bytes
+            ):
+                oldest = _TYPE1_PLAN_CACHE_ORDER.pop(0)
+                victim = _TYPE1_PLAN_CACHE.pop(oldest, None)
+                if victim is None:
+                    continue
+                if victim.leases > 0:
+                    victim.doomed = True
+                else:
+                    victims.append(victim)
+            _TYPE1_PLAN_CACHE[key] = entry
+            _TYPE1_PLAN_CACHE_ORDER.append(key)
+            entry.leases += 1
+    for victim in victims:
+        _type1_entry_destroy(victim)
+    return entry, True
+
+
+def _cufinufft_error_is_alloc(exc: Exception) -> bool:
+    """cuFINUFFT raises bare RuntimeErrors when its internal raw cudaMalloc
+    fails ('Error creating plan.', 'Error setting non-uniform points.',
+    'Error executing plan.'); under VRAM pressure they are memory-shaped."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return "plan" in message or "non-uniform points" in message
+
+
+def _type1_gpu_method() -> int:
+    raw = os.getenv("MOSAIC_SCATTERING_TYPE1_GPU_METHOD", "1")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
+def _type1_fine_grid_bytes(dims) -> int:
+    fine = 16 * 2  # complex128, ~2x residency for FFT work
+    for d in dims:
+        fine *= _next_fft_size(int(d))
+    return int(fine)
+
+
+def execute_type1_on_lattice(
+    meta: dict,
+    real_coords: np.ndarray,
+    weights: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    prefer_cpu: bool = False,
+    gpu_only: bool = False,
+) -> np.ndarray | None:
+    """Evaluate ``A(q) = sum_k w_k exp(+i q.r_k)`` at ``meta``'s lattice
+    q-points via type-1 NUFFT. Exact to NUFFT eps and identical in convention
+    to ``execute_cunufft`` (forward, isign=+1).
+
+    ``meta`` comes from ``plan_lattice(q_grid)``; the result is gathered at
+    ``meta['flat_index']`` so it aligns with the caller's stored q order.
+    Returns ``None`` when the transform cannot run here (fine grid beyond the
+    memory budget, or GPU OOM persisting after a cache flush) -- callers fall
+    back to the type-3 path."""
+    r = np.asarray(real_coords, dtype=np.float64)
+    if r.ndim == 1:
+        r = r[:, None]
+    w = np.asarray(weights, dtype=np.complex128).reshape(-1)
+    dims = tuple(int(v) for v in meta["dims"])
+    dq = np.asarray(meta["dq"], dtype=np.float64)
+    origin = np.asarray(meta["origin"], dtype=np.float64)
+    dim = len(dims)
+    flat_index = np.asarray(meta["flat_index"], dtype=np.int64)
+    if r.shape[0] != w.shape[0]:
+        raise ValueError("Lattice type-1 requires one weight per source point.")
+    if flat_index.size == 0:
+        return np.zeros(0, dtype=np.complex128)
+    if r.shape[0] == 0:
+        return np.zeros(flat_index.size, dtype=np.complex128)
+
+    use_gpu = (
+        not (_CPU_ONLY or prefer_cpu) and _GPU_AVAILABLE and cp is not None
+    )
+    if use_gpu:
+        try:
+            _ensure_gpu_kernels()
+        except ImportError:
+            use_gpu = False
+    if not use_gpu and gpu_only:
+        raise RuntimeError("GPU execution forced but unavailable for lattice type-1.")
+
+    fine_budget = (
+        int(_free_mem_bytes() * 0.5)
+        if use_gpu
+        else int(os.getenv("MOSAIC_RESIDUAL_LATTICE_CPU_FINE_BUDGET", str(8 << 30)))
+    )
+    if _type1_fine_grid_bytes(dims) > fine_budget:
+        return None
+
+    q_c = origin + (np.asarray(dims, dtype=np.float64) // 2) * dq
+    x = ((r * dq[None, :] + np.pi) % (2.0 * np.pi)) - np.pi
+
+    if not use_gpu:
+        import finufft
+        fn = {1: finufft.nufft1d1, 2: finufft.nufft2d1, 3: finufft.nufft3d1}[dim]
+        c = w * np.exp(1j * (r @ q_c))
+        f = fn(
+            *[np.ascontiguousarray(x[:, a]) for a in range(dim)],
+            c,
+            dims,
+            isign=+1,
+            eps=eps,
+        )
+        return np.asarray(f, dtype=np.complex128).reshape(-1)[flat_index]
+
+    key = (
+        hashlib.sha256(np.ascontiguousarray(r).view(np.uint8).tobytes()).digest()[:16],
+        dims,
+        dq.tobytes(),
+        float(eps),
+    )
+
+    def _builder():
+        d_x = [cp.asarray(np.ascontiguousarray(x[:, a])) for a in range(dim)]
+        d_r = cp.asarray(r)
+        plan = _lazy_cufinufft("Plan")(
+            1, dims, n_trans=1, eps=eps, isign=+1, dtype="complex128",
+            # Global-memory spreading: the default shared-memory subproblem
+            # method collapses on this shape (moderate point counts, wide
+            # eps=1e-12 kernels, small mode boxes) -- measured 70 ms vs 3.9 ms
+            # per execute at hkl32 interval scale, identical results to 2e-15.
+            gpu_method=_type1_gpu_method(),
+        )
+        plan.setpts(*d_x)
+        nbytes = _type1_fine_grid_bytes(dims) + r.nbytes * 2
+        return plan, d_x, d_r, nbytes
+
+    _transform_enter()
+    try:
+        last_exc = None
+        for attempt in (0, 1):
+            entry = None
+            cached = False
+            try:
+                entry, cached = _type1_cache_acquire_or_build(key, _builder)
+                # only plan.execute needs the entry lock (cuFINUFFT plans are
+                # not thread-safe); the weight phase and the gather are on
+                # private arrays, and keeping them outside lets other worker
+                # threads overlap their host/device prep instead of
+                # serializing whole intervals on the shared per-source plan
+                d_w = cp.asarray(w) * cp.exp(1j * (entry.d_r @ cp.asarray(q_c)))
+                with entry.lock:
+                    d_f = entry.plan.execute(d_w)
+                result = cp.asnumpy(d_f.reshape(-1)[cp.asarray(flat_index)])
+                return result
+            except (cp.cuda.memory.OutOfMemoryError, RuntimeError) as exc:
+                if isinstance(exc, RuntimeError) and not (
+                    isinstance(exc, cp.cuda.memory.OutOfMemoryError)
+                    or _cufinufft_error_is_alloc(exc)
+                ):
+                    raise
+                last_exc = exc
+                clear_lattice_type1_plan_cache()
+                free_gpu_memory()
+            finally:
+                if entry is not None:
+                    if cached:
+                        _type1_entry_release(entry)
+                    else:
+                        _type1_entry_destroy(entry)
+        logger.warning(
+            "lattice type-1 GPU memory failure persists; falling back to "
+            "type-3 for this transform (%s)",
+            last_exc,
+        )
+        return None
+    finally:
+        _transform_exit()
 
 
 def _local_window_inverse_cpu(q, weights, offsets, centers, eps):

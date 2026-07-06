@@ -182,6 +182,28 @@ def _scheduler_kind(client) -> str:
     return "dask"
 
 
+def _clear_worker_type1_plan_caches(client) -> None:
+    """Release the per-process type-1 forward plan caches after Stage-1.
+
+    The plans' fine-grid scratch is raw cudaMalloc outside the CuPy pool, so
+    leaving them alive would pin VRAM through the residual-field stage."""
+    from core.adapters.cunufft_wrapper import clear_lattice_type1_plan_cache
+
+    try:
+        clear_lattice_type1_plan_cache()
+    except Exception:
+        pass
+    if client is None or is_sync_client(client):
+        return
+    run = getattr(client, "run", None)
+    if not callable(run):
+        return
+    try:
+        run(clear_lattice_type1_plan_cache)
+    except Exception:
+        pass
+
+
 def _nufft_execution_policy(parameters: Dict[str, Any]) -> str:
     return _nufft_execution_settings(parameters).execution_policy
 
@@ -1286,25 +1308,32 @@ def run_scattering_stage(
     )
     interval_lookup = build_scattering_interval_lookup(reciprocal_space_intervals)
     with quiet_loggers("core.storage.database_manager", "DatabaseManager"):
-        run_interval_precompute(
-            list(execution_plan.interval_work_units),
-            interval_lookup=interval_lookup,
-            B_=B_,
-            parameters=parameters,
-            unique_elements=unique_elements,
-            mask_params=MaskStrategyParameters,
-            MaskStrategy=MaskStrategy,
-            supercell=supercell,
-            output_dir=output_dir,
-            original_coords=original_coords,
-            cells_origin=cells_origin,
-            elements_arr=elements_arr,
-            charge=charge,
-            ff_factory=FormFactorFactoryProducer,
-            db=db_manager,
-            client=client,
-            transient_interval_payloads=parameters.get("transient_interval_payloads"),
-        )
+        try:
+            run_interval_precompute(
+                list(execution_plan.interval_work_units),
+                interval_lookup=interval_lookup,
+                B_=B_,
+                parameters=parameters,
+                unique_elements=unique_elements,
+                mask_params=MaskStrategyParameters,
+                MaskStrategy=MaskStrategy,
+                supercell=supercell,
+                output_dir=output_dir,
+                original_coords=original_coords,
+                cells_origin=cells_origin,
+                elements_arr=elements_arr,
+                charge=charge,
+                ff_factory=FormFactorFactoryProducer,
+                db=db_manager,
+                client=client,
+                transient_interval_payloads=parameters.get("transient_interval_payloads"),
+            )
+        finally:
+            # The type-1 plans only fill during interval precompute; release
+            # their raw-cudaMalloc scratch BEFORE the stage-2 / residual
+            # inverse transforms run (and on failure paths), or it pins VRAM
+            # their budget models assume is free.
+            _clear_worker_type1_plan_caches(client)
         if _stage2_replacement_enabled(parameters):
             expected_by_chunk = run_stage2_replacement_execution(
                 unsaved_interval_chunks=pending_interval_chunk_pairs,

@@ -40,7 +40,11 @@ def cunufft_cpu(monkeypatch_module):
     from core.adapters import cunufft_wrapper
 
     cunufft_wrapper.set_cpu_only(True)
-    return cunufft_wrapper
+    yield cunufft_wrapper
+    # set_cpu_only(True) flips process-wide globals (_GPU_AVAILABLE, cp);
+    # mp.undo() only restores the env var, so re-probe the GPU backend here
+    # or every later GPU wrapper test in the session fails.
+    cunufft_wrapper.set_cpu_only(False)
 
 
 @pytest.fixture(scope="module")

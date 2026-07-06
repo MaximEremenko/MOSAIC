@@ -29,9 +29,11 @@ from core.scattering.contracts import ScatteringArtifactManifest, ScatteringWork
 from core.scattering.kernels import (
     IntervalTask,
     aggregate_interval_contributions,
+    build_interval_lattice_meta,
     build_rifft_grid_for_chunk,
     compute_interval_coeff_contribution,
     compute_interval_element_contribution,
+    forward_interval_amplitudes,
     generate_q_space_grid_sync,
 )
 from core.adapters.cunufft_wrapper import (
@@ -304,6 +306,10 @@ def compute_scattering_interval_payload(
     if q_grid.size == 0:
         return None
 
+    # One lattice plan serves every forward transform of this interval; the
+    # underlying type-1 plan+setpts are additionally shared ACROSS intervals
+    # (they depend only on the sources and the global lattice pitch).
+    lattice_meta = build_interval_lattice_meta(q_grid)
     contributions: list[tuple] = []
     if use_coeff:
         contributions.append(
@@ -316,9 +322,21 @@ def compute_scattering_interval_payload(
                 nufft_eps=nufft_eps,
                 nufft_prefer_cpu=nufft_prefer_cpu,
                 nufft_gpu_only=nufft_gpu_only,
+                lattice_meta=lattice_meta,
             )
         )
     else:
+        # the average-structure transform is identical for every element:
+        # compute it once per interval instead of once per element
+        shared_q_av = forward_interval_amplitudes(
+            cells_origin,
+            np.ones(original_coords.shape[0]),
+            q_grid,
+            lattice_meta=lattice_meta,
+            nufft_eps=nufft_eps,
+            nufft_prefer_cpu=nufft_prefer_cpu,
+            nufft_gpu_only=nufft_gpu_only,
+        )
         for element in unique_elements:
             contribution = compute_interval_element_contribution(
                 interval,
@@ -332,6 +350,8 @@ def compute_scattering_interval_payload(
                 nufft_eps=nufft_eps,
                 nufft_prefer_cpu=nufft_prefer_cpu,
                 nufft_gpu_only=nufft_gpu_only,
+                lattice_meta=lattice_meta,
+                q_av=shared_q_av,
             )
             if contribution is not None:
                 contributions.append(contribution)

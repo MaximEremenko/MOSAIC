@@ -690,10 +690,18 @@ def _refine_axis_steps(q: np.ndarray, dq: np.ndarray, origin: np.ndarray) -> np.
     return refined
 
 
+# Post-LSQ snap deviation ceiling shared by both lattice builders: truly
+# on-lattice q (exact float64 products) refines to <=1e-9 of a step, while
+# NEAR-lattice data (e.g. a cell sheared by ~1e-7 relative) sits around 1e-6.
+# Snapping the latter silently corrupts the reconstructed field beyond NUFFT
+# eps, so it must fall back to type-3 instead.
+_LATTICE_SNAP_MAX_DEV = 1e-7
+
+
 def _build_lattice_groups_streaming(
     ordered_groups: "list[list[IntervalTask]]",
     *,
-    snap_tol: float = 0.05,
+    snap_tol: float = _LATTICE_SNAP_MAX_DEV,
 ) -> list | None:
     """Two-pass streaming build of per-role lattice grids.
 
@@ -792,7 +800,7 @@ def _execute_lattice_groups(
 def _build_lattice_entry_from_inputs(
     loaded_interval_inputs,
     *,
-    snap_tol: float = 0.05,
+    snap_tol: float = _LATTICE_SNAP_MAX_DEV,
 ) -> dict | None:
     """Streaming (two-pass over files) lattice build straight from interval
     inputs: load -> extract bounds/role -> discard, then load -> scatter ->
