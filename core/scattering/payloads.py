@@ -33,6 +33,7 @@ def build_base_amplitude_parameters(
         "rspace_info": context.workflow_parameters.rspace_info.to_mapping(),
         "runtime_info": context.workflow_parameters.runtime_info.to_mapping(),
         "transient_interval_payloads": context.artifacts.transient_interval_payloads,
+        "streaming_state": getattr(context.artifacts, "streaming_state", None),
         "vectors": context.structure.vectors,
         "supercell": context.structure.supercell,
         "postprocessing_mode": context.postprocessing_mode,

@@ -91,6 +91,10 @@ from core.workflow.stage2_replacement import (
     _stage2_pair_execution_enabled,
     _stage2_replacement_source_scattering_commit_digest,
 )
+from core.scattering.streaming import (
+    StreamingComputeContext,
+    stage2_streaming_enabled,
+)
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -269,7 +273,9 @@ def _current_scattering_identity(
         dtype=nufft_settings.dtype,
         pre_sum_mode=str(runtime_info.get("scattering_pre_sum_mode", "off")),
         reducer_strategy=(
-            "stage2-replacement"
+            "stage2-streaming"
+            if stage2_streaming_enabled(parameters)
+            else "stage2-replacement"
             if _stage2_replacement_enabled(parameters)
             else "attempt-commit"
         ),
@@ -1307,6 +1313,53 @@ def run_scattering_stage(
         all_interval_chunk_pairs,
     )
     interval_lookup = build_scattering_interval_lookup(reciprocal_space_intervals)
+    if stage2_streaming_enabled(parameters):
+        # Streaming (fused stage-1) mode: compute NO interval payloads and
+        # write NO durable interval store here. Publish the compute context;
+        # the residual stage's work units run the stage-1 kernels themselves,
+        # fold into worker-local subchunk accumulators, and discard the
+        # amplitudes. Set runtime_info.save_scattering_interval_artifacts to
+        # additionally persist inspection copies (not implemented in
+        # streaming mode yet -- artifacts would not be consumed).
+        streaming_sink = parameters.get("streaming_state")
+        if not isinstance(streaming_sink, dict):
+            raise RuntimeError(
+                "Streaming stage-2 mode requires the workflow artifacts "
+                "streaming_state sink in the scattering parameters."
+            )
+        streaming_nufft = _nufft_execution_settings(parameters)
+        streaming_sink["compute_context"] = StreamingComputeContext(
+            cache_token=str(work_identity.run_digest),
+            interval_lookup=dict(interval_lookup),
+            B_=B_,
+            mask_params=MaskStrategyParameters,
+            MaskStrategy=MaskStrategy,
+            supercell=supercell,
+            original_coords=original_coords,
+            cells_origin=cells_origin,
+            elements_arr=elements_arr,
+            charge=charge,
+            use_coeff=("coeff" in parameters),
+            coeff_val=parameters.get("coeff"),
+            unique_elements=tuple(str(element) for element in unique_elements),
+            ff_factory=FormFactorFactoryProducer,
+            nufft_eps=float(streaming_nufft.eps),
+            nufft_prefer_cpu=bool(streaming_nufft.prefer_cpu),
+            nufft_gpu_only=bool(streaming_nufft.gpu_only),
+        )
+        logger.info(
+            "Scattering stage-1/stage-2 skipped (streaming mode): %d interval(s) "
+            "will be computed inside residual work units; no durable interval "
+            "store will be written.",
+            len(interval_lookup),
+        )
+        return {
+            "scattering_run_digest": work_identity.run_digest,
+            "source_scattering_commit_digest": _stage2_replacement_source_scattering_commit_digest(
+                work_identity
+            ),
+            "stage2_replacement_expected_by_chunk": {},
+        }
     with quiet_loggers("core.storage.database_manager", "DatabaseManager"):
         try:
             run_interval_precompute(

@@ -127,6 +127,15 @@ def _clear_worker_rifft_payload_caches(client) -> None:
         clear_residual_rifft_payload_cache()
     except Exception:
         pass
+    # Streaming (fused stage-1) mode additionally leaves per-process
+    # scattering payload memos behind; they are stage-scoped scratch and must
+    # not outlive the residual stage.
+    try:
+        from core.scattering.streaming import clear_streaming_payload_memo
+
+        clear_streaming_payload_memo()
+    except Exception:
+        pass
     if client is None or is_sync_client(client):
         return
     run = getattr(client, "run", None)
@@ -134,6 +143,12 @@ def _clear_worker_rifft_payload_caches(client) -> None:
         return
     try:
         run(clear_residual_rifft_payload_cache)
+    except Exception:
+        pass
+    try:
+        from core.scattering.streaming import clear_streaming_payload_memo
+
+        run(clear_streaming_payload_memo)
     except Exception:
         pass
 

@@ -189,6 +189,11 @@ def load_local_accumulator_snapshot(
                 if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
                 else None
             ),
+            "accumulator_axis": (
+                str(np.asarray(data["accumulator_axis"]).ravel()[0])
+                if "accumulator_axis" in data
+                else "points"
+            ),
         }
 
 
@@ -244,6 +249,15 @@ def load_local_accumulator_snapshot_metadata(
                 if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
                 else None
             ),
+            # Which axis this accumulator partitions the chunk on. "points":
+            # legacy atom-range partitions, concatenated at finalize.
+            # "intervals": streaming subchunks (full point range, partial
+            # interval set), summed at finalize. Families must never mix.
+            "accumulator_axis": (
+                str(np.asarray(data["accumulator_axis"]).ravel()[0])
+                if "accumulator_axis" in data
+                else "points"
+            ),
         }
 
 
@@ -268,6 +282,7 @@ def write_local_accumulator_snapshot(
     checkpoint_cadence_batches: int = 0,
     point_start: int | None = None,
     point_stop: int | None = None,
+    accumulator_axis: str = "points",
     compress: bool = False,
 ) -> Path:
     snapshot_path = build_local_accumulator_snapshot_path(
@@ -308,6 +323,7 @@ def write_local_accumulator_snapshot(
             checkpoint_cadence_batches=np.array([int(checkpoint_cadence_batches)], dtype=np.int64),
             point_start=np.array([-1 if point_start is None else int(point_start)], dtype=np.int64),
             point_stop=np.array([-1 if point_stop is None else int(point_stop)], dtype=np.int64),
+            accumulator_axis=np.array([str(accumulator_axis)]),
         )
     Path(handle.name).replace(snapshot_path)
     return snapshot_path
@@ -386,6 +402,7 @@ class LiveLocalAccumulator:
         live_dir: Path | None = None,
         point_start: int | None = None,
         point_stop: int | None = None,
+        accumulator_axis: str = "points",
     ) -> None:
         self.chunk_id = int(chunk_id)
         self.parameter_digest = str(parameter_digest)
@@ -393,6 +410,7 @@ class LiveLocalAccumulator:
         self.point_ids = np.asarray(point_ids, dtype=np.int64).reshape(-1)
         self.point_start = int(point_start) if point_start is not None else None
         self.point_stop = int(point_stop) if point_stop is not None else None
+        self.accumulator_axis = str(accumulator_axis)
         self.grid_shape_nd = np.asarray(grid_shape_nd, dtype=np.int64)
         self.total_reciprocal_points = int(total_reciprocal_points)
         self.reciprocal_point_count = int(reciprocal_point_count)
@@ -491,6 +509,7 @@ class LiveLocalAccumulator:
             live_dir=live_dir,
             point_start=getattr(work_unit, "point_start", None),
             point_stop=getattr(work_unit, "point_stop", None),
+            accumulator_axis=getattr(work_unit, "partition_axis", "points"),
         )
 
     @classmethod
@@ -545,6 +564,7 @@ class LiveLocalAccumulator:
             live_dir=live_dir,
             point_start=int(snapshot["point_start"]) if snapshot.get("point_start") is not None else None,
             point_stop=int(snapshot["point_stop"]) if snapshot.get("point_stop") is not None else None,
+            accumulator_axis=str(snapshot.get("accumulator_axis", "points")),
         )
 
     def should_skip_partial(self, partial: ResidualFieldLocalAccumulatorPartial) -> bool:
@@ -653,6 +673,14 @@ class LiveLocalAccumulator:
             raise ValueError("Local accumulator partial parameter digest mismatch.")
         if work_unit.partition_id != self.partition_id:
             raise ValueError("Local accumulator partial partition_id mismatch.")
+        if getattr(work_unit, "partition_axis", "points") != self.accumulator_axis:
+            raise ValueError(
+                "Local accumulator partial partition_axis mismatch: accumulator "
+                f"is {self.accumulator_axis!r}, contribution is "
+                f"{getattr(work_unit, 'partition_axis', 'points')!r}. A points-axis "
+                "and an intervals-axis (subchunk) layout are irreconcilable; "
+                "delete 'residual_checkpoints/' under the output directory."
+            )
         if not np.array_equal(self.point_ids, point_ids_arr):
             raise ValueError("Local accumulator partial point_ids mismatch.")
         if not np.array_equal(self.grid_shape_nd, grid_shape_nd_arr):

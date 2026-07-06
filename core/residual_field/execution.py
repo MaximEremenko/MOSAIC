@@ -370,6 +370,61 @@ def _expected_partition_family_for_chunk(
     )
 
 
+def _streaming_subchunk_slot_count(workflow_parameters, client) -> int:
+    """Number of subchunk slots per chunk in streaming mode.
+
+    Defaults to one slot per live worker so every worker can fold batches
+    concurrently; ``runtime_info.residual_streaming_subchunks`` overrides.
+    Sync execution gets one slot (a single accumulator per chunk)."""
+    raw = workflow_parameters.runtime_info.get("residual_streaming_subchunks")
+    if raw is not None:
+        return max(1, int(raw))
+    if client is None or is_sync_client(client):
+        return 1
+    return max(1, len(_current_worker_addresses(client)))
+
+
+def _streaming_slot_owner_map(
+    target_keys,
+    worker_addresses: list[str],
+) -> dict[tuple[int, int | None], str]:
+    """Owner assignment keyed by subchunk SLOT alone for streaming targets.
+
+    Streaming target keys are (chunk_id, slot) where the slot is
+    content-addressed from the batch's interval ids, so the same batch hashes
+    to the same slot for EVERY chunk. Keying ownership by slot (instead of
+    round-robin over enumeration order) therefore lands every chunk's fold of
+    a given batch on one worker — the worker whose payload memo computed that
+    batch's stage-1 payloads once — so the compute is reused for all chunks
+    instead of being repeated on whichever worker enumeration happened to
+    pick (payload memo locality)."""
+    return {
+        target_key: worker_addresses[int(target_key[1]) % len(worker_addresses)]
+        for target_key in target_keys
+    }
+
+
+def _sort_streaming_work_units_batch_major(
+    work_units: list[ResidualFieldWorkUnit],
+) -> list[ResidualFieldWorkUnit]:
+    """Batch-major submission order for streaming work units.
+
+    Sorts by (interval batch, chunk) so the SAME batch's units for different
+    chunks are adjacent: the batch's stage-1 payloads are computed once, all
+    chunks fold them, and only then does the next batch start. Combined with
+    the capped per-worker payload memo this is the all-in-RAM constraint —
+    the 1 GiB memo only ever needs the CURRENT batch, never more than one
+    batch's payloads at a time. Chunk-major (plan) order would instead touch
+    every batch once per chunk and thrash the memo."""
+    return sorted(
+        work_units,
+        key=lambda work_unit: (
+            _work_unit_expected_interval_ids(work_unit),
+            int(work_unit.chunk_id),
+        ),
+    )
+
+
 def _invalidate_incompatible_local_checkpoints(
     *,
     planned_work_units: list[ResidualFieldWorkUnit],
@@ -399,6 +454,11 @@ def _invalidate_incompatible_local_checkpoints(
                 "point_stop": (
                     None if work_unit.point_stop is None else int(work_unit.point_stop)
                 ),
+                # Snapshots from the OTHER partition axis must be dropped, not
+                # reconciled: a points-axis checkpoint surviving into a
+                # streaming (intervals-axis) plan, or vice versa, describes a
+                # different decomposition of the same chunk.
+                "partition_axis": getattr(work_unit, "partition_axis", "points"),
                 "interval_batches": [],
             },
         )
@@ -932,17 +992,35 @@ def run_residual_field_stage(
         distributed_owner_local_reducer=distributed_owner_local_reducer,
     )
     cleanup_policy = _residual_attempt_cleanup_policy(workflow_parameters)
+    streaming_context = (getattr(artifacts, "streaming_state", None) or {}).get(
+        "compute_context"
+    )
+    if streaming_context is not None and (
+        not owner_local_reducer
+        or reducer_backend.layout.kind != "local_restartable"
+    ):
+        raise RuntimeError(
+            "Streaming stage-2 mode requires the local_restartable owner-local "
+            "reducer: its amplitudes exist only inside worker accumulators, and "
+            "the durable_shared generation checkpoints carry no interval-axis "
+            "(subchunk) semantics. Disable streaming or switch the reducer "
+            "backend."
+        )
     all_interval_chunk_pairs = list(
         artifacts.db_manager.get_interval_chunks()
         if hasattr(artifacts.db_manager, "get_interval_chunks")
         else artifacts.db_manager.get_unsaved_interval_chunks()
     )
-    all_interval_chunk_pairs = _drop_mask_emptied_interval_chunks(
-        all_interval_chunk_pairs,
-        output_dir=artifacts.output_dir,
-        transient_interval_payloads=getattr(artifacts, "transient_interval_payloads", {}) or {},
-        logger=logger,
-    )
+    if streaming_context is None:
+        all_interval_chunk_pairs = _drop_mask_emptied_interval_chunks(
+            all_interval_chunk_pairs,
+            output_dir=artifacts.output_dir,
+            transient_interval_payloads=getattr(artifacts, "transient_interval_payloads", {}) or {},
+            logger=logger,
+        )
+    # else: streaming mode has no interval artifacts or payload dict to probe;
+    # mask-emptiness is discovered inside the work unit, which folds an exact
+    # zero and still records the interval as incorporated.
     initial_work_units = build_residual_field_work_units(
         all_interval_chunk_pairs,
         parameters=workflow_parameters,
@@ -996,7 +1074,37 @@ def run_residual_field_stage(
         force_partition=not owner_local_reducer,
     )
 
-    if owner_local_reducer and client is not None and not is_sync_client(client) and work_units:
+    if streaming_context is not None and work_units:
+        # Streaming subchunks: partition on the INTERVAL axis instead of the
+        # atom axis. Every batch unit covers its chunk's full point range and
+        # is routed to a content-addressed slot; each slot's accumulator sums
+        # a disjoint interval subset, and finalize merges slots by summation
+        # (validated by the disjoint-union family checks).
+        from core.scattering.streaming import streaming_slot_for_batch
+
+        point_counts_by_chunk: dict[int, int] = {}
+        for point_data in point_data_list:
+            chunk_key = int(point_data["chunk_id"])
+            point_counts_by_chunk[chunk_key] = point_counts_by_chunk.get(chunk_key, 0) + 1
+        n_slots = _streaming_subchunk_slot_count(workflow_parameters, client)
+        work_units = [
+            work_unit.with_subchunk(
+                subchunk_id=streaming_slot_for_batch(
+                    _work_unit_expected_interval_ids(work_unit), n_slots
+                ),
+                point_count=point_counts_by_chunk[int(work_unit.chunk_id)],
+            )
+            for work_unit in work_units
+        ]
+        logger.info(
+            "Residual-field streaming mode: %d batch unit(s) across %d "
+            "subchunk slot(s); interval payloads computed in-task, no "
+            "durable interval store.",
+            len(work_units),
+            n_slots,
+        )
+
+    if streaming_context is None and owner_local_reducer and client is not None and not is_sync_client(client) and work_units:
         point_rows_by_chunk = {
             int(chunk_id): [
                 point_data
@@ -1135,7 +1243,16 @@ def run_residual_field_stage(
     reuse_rifft_payload = _residual_rifft_payload_reuse_enabled(workflow_parameters)
     if reuse_rifft_payload:
         planned_work_units = _sort_work_units_by_target(planned_work_units)
-        work_units = _sort_work_units_by_target(work_units)
+        # Streaming keeps batch-major submission order (below) instead of the
+        # target-major re-sort; planned_work_units ordering is untouched — it
+        # feeds finalize/invalidation expectations, not submission.
+        if streaming_context is None:
+            work_units = _sort_work_units_by_target(work_units)
+    if streaming_context is not None:
+        # Batch-major ordering means the 1 GiB payload memo only ever needs
+        # the CURRENT batch (the all-in-RAM constraint): every chunk folds a
+        # batch before the next batch's stage-1 payloads are computed.
+        work_units = _sort_streaming_work_units_batch_major(work_units)
 
     total_tasks = len(work_units)
     if total_tasks == 0 and not (owner_local_reducer and planned_work_units):
@@ -1192,7 +1309,9 @@ def run_residual_field_stage(
                         current_rifft_target = target_key
                 manifest = run_residual_field_interval_chunk_task(
                     work_unit,
-                    _interval_inputs_for_work_unit(
+                    ()
+                    if streaming_context is not None
+                    else _interval_inputs_for_work_unit(
                         work_unit,
                         transient_interval_payloads=transient_interval_payloads,
                     ),
@@ -1205,6 +1324,7 @@ def run_residual_field_stage(
                     total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
                     owner_local_reducer=owner_local_reducer,
                     quiet_logs=False,
+                    streaming_compute_context=streaming_context,
                     rifft_payload=current_rifft_payload if reuse_rifft_payload else None,
                     runtime_provenance=runtime_provenance,
                     nufft_eps=nufft_settings.eps,
@@ -1272,6 +1392,9 @@ def run_residual_field_stage(
                         planned_work_units,
                         chunk_id=int(chunk_id),
                     ),
+                    expected_interval_ids=expected_interval_ids_by_chunk.get(
+                        int(chunk_id)
+                    ),
                 )
         else:
             for chunk_id in chunk_ids:
@@ -1333,13 +1456,32 @@ def run_residual_field_stage(
         chunk_id: client.scatter(rec[rec.chunk_id == chunk_id], broadcast=False, hash=False)
         for chunk_id in chunk_ids
     }
+    # Streaming mode: the scattering compute context (structure arrays, mask
+    # strategy, form factors) ships to every worker exactly once.
+    streaming_context_future = (
+        client.scatter(streaming_context, broadcast=True, hash=False)
+        if streaming_context is not None
+        else None
+    )
     worker_addresses = _current_worker_addresses(client)
     owner_local_target_units = planned_work_units if owner_local_reducer else work_units
+    # Streaming: ownership keyed by SLOT alone (partition_id is never None for
+    # streaming units) — the same batch content hashes to the same slot for
+    # every chunk, so slot-keyed ownership makes each batch's stage-1 compute
+    # land on one worker and be reused for all chunks (payload memo locality).
+    # Non-streaming keeps the byte-identical round-robin by enumeration index.
     target_owners = (
-        {
-            target_key: worker_addresses[index % len(worker_addresses)]
-            for index, target_key in enumerate(_unique_reducer_target_keys(owner_local_target_units))
-        }
+        (
+            _streaming_slot_owner_map(
+                _unique_reducer_target_keys(owner_local_target_units),
+                worker_addresses,
+            )
+            if streaming_context is not None
+            else {
+                target_key: worker_addresses[index % len(worker_addresses)]
+                for index, target_key in enumerate(_unique_reducer_target_keys(owner_local_target_units))
+            }
+        )
         if owner_local_reducer and worker_addresses
         else {}
     )
@@ -1453,6 +1595,8 @@ def run_residual_field_stage(
             nufft_prefer_cpu=nufft_settings.prefer_cpu,
             nufft_gpu_only=nufft_settings.gpu_only,
         )
+        if streaming_context_future is not None:
+            submit_kwargs["streaming_compute_context"] = streaming_context_future
         if reuse_rifft_payload:
             submit_kwargs["rifft_payload"] = _target_rifft_payload_future(
                 work_unit,
@@ -1464,7 +1608,9 @@ def run_residual_field_stage(
         future = client.submit(
             run_residual_field_interval_chunk_task,
             work_unit,
-            _interval_inputs_for_work_unit(
+            ()
+            if streaming_context_future is not None
+            else _interval_inputs_for_work_unit(
                 work_unit,
                 transient_interval_payloads=transient_interval_payloads,
             ),
@@ -1761,6 +1907,9 @@ def run_residual_field_stage(
                     expected_partitions=_expected_partition_family_for_chunk(
                         planned_work_units,
                         chunk_id=int(chunk_id),
+                    ),
+                    expected_interval_ids=expected_interval_ids_by_chunk.get(
+                        int(chunk_id)
                     ),
                     pure=False,
                     workers=[finalizer_owner],

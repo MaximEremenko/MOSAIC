@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
@@ -24,18 +26,42 @@ from core.adapters.cunufft_wrapper import (
 logger = logging.getLogger(__name__)
 
 
-def _scattering_lattice_enabled() -> bool:
-    """Forward transforms via type-1 onto the interval's lattice box, opt-in
-    (``MOSAIC_SCATTERING_LATTICE_FFT=1``).
+# Streaming-mode default for the lattice type-1 forward path. A ContextVar
+# (not a module global, not an os.environ mutation) so the streaming compute
+# loop can scope it with set/reset: concurrent worker threads and test
+# ordering never observe leaked state.
+_STREAMING_LATTICE_DEFAULT: ContextVar[bool] = ContextVar(
+    "_STREAMING_LATTICE_DEFAULT", default=False
+)
 
-    The transform itself is 3-18x faster than per-interval type-3 (GM
-    spreading, plan+setpts shared across intervals), but measured end-to-end
-    at hkl32 scale Stage-1 is bound by interval IO and host-side work, and
-    the per-interval lattice planning adds to that critical path: 455 s vs
-    387 s for type-3 with the shared-q_av dedup. Off by default until the
-    stage is compute-bound (bigger structures, process-based workers, or
-    lighter interval transport)."""
-    return os.getenv("MOSAIC_SCATTERING_LATTICE_FFT", "0") == "1"
+
+@contextmanager
+def streaming_lattice_default(enabled: bool = True):
+    """Scope the streaming default of the lattice forward path (set -> reset)."""
+    token = _STREAMING_LATTICE_DEFAULT.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _STREAMING_LATTICE_DEFAULT.reset(token)
+
+
+def _scattering_lattice_enabled() -> bool:
+    """Forward transforms via type-1 onto the interval's lattice box.
+
+    An EXPLICIT ``MOSAIC_SCATTERING_LATTICE_FFT`` value always wins: ``1``
+    opts in, ``0`` (or anything else) opts out — including inside streaming.
+    When the env is unset, the default is OFF except while executing a
+    streaming payload computation (see :func:`streaming_lattice_default`),
+    where it is ON: streaming stage-1 runs in-task with no interval IO, so
+    the stage is compute-bound and the 3-18x faster type-1 transform (GM
+    spreading, plan+setpts shared across intervals) pays off. Durable mode
+    measured IO-bound end-to-end at hkl32 scale — 455 s (lattice) vs 387 s
+    (type-3 with the shared-q_av dedup) — hence default OFF outside
+    streaming."""
+    explicit = os.getenv("MOSAIC_SCATTERING_LATTICE_FFT")
+    if explicit is not None:
+        return explicit == "1"
+    return bool(_STREAMING_LATTICE_DEFAULT.get())
 
 
 # Post-LSQ snap deviation ceiling for the forward path: truly on-lattice q

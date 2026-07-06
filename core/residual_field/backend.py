@@ -333,6 +333,122 @@ def _require_expected_partition_family(
             )
 
 
+def validate_interval_partitioned_snapshot_family(
+    snapshot_metadata,
+    *,
+    chunk_id,
+) -> None:
+    """Reject subchunk (interval-partitioned) families that cannot merge into
+    a correct chunk.
+
+    Subchunks are the transpose of atom partitions: each covers the chunk's
+    FULL real-space extent but only a SUBSET of the hkl intervals, and the
+    final chunk is their elementwise sum. That sum is only correct when
+    (a) the incorporated interval sets are pairwise disjoint — an interval
+    folded into two subchunks is double-counted in the merge, silently
+    corrupting every amplitude it touches — and (b) every subchunk covers the
+    same point range. Note the deliberate inversion of
+    ``validate_local_partition_snapshot_family``: there, differing interval
+    sets are the corruption signal; here, differing (disjoint) interval sets
+    are the design and OVERLAP is the corruption signal.
+    """
+    entries = [
+        (subchunk_id, metadata)
+        for subchunk_id, _seq, metadata in snapshot_metadata
+        if metadata is not None
+    ]
+    if not entries:
+        return
+    if len(entries) > 1 and any(
+        subchunk_id is None for subchunk_id, _metadata in entries
+    ):
+        raise RuntimeError(
+            "Residual-field streaming finalization found a mix of owner-level "
+            f"and subchunk checkpoints for chunk={int(chunk_id)}. The "
+            "checkpoint family is inconsistent (stale snapshots from a "
+            "different reducer layout); delete 'residual_checkpoints/' under "
+            "the output directory and re-run to recompute this chunk."
+        )
+    seen: dict[int, object] = {}
+    for subchunk_id, metadata in entries:
+        interval_ids = [
+            int(v) for v in metadata.get("incorporated_interval_ids") or ()
+        ]
+        interval_set = set(interval_ids)
+        if len(interval_set) != len(interval_ids):
+            raise RuntimeError(
+                "Residual-field streaming finalization found subchunk "
+                f"{subchunk_id} of chunk={int(chunk_id)} listing duplicate "
+                "interval ids in one checkpoint. The checkpoint is corrupt; "
+                "delete 'residual_checkpoints/' under the output directory "
+                "and re-run to recompute this chunk."
+            )
+        for interval_id in interval_set:
+            if interval_id in seen:
+                raise RuntimeError(
+                    "Residual-field streaming finalization found interval "
+                    f"{interval_id} of chunk={int(chunk_id)} incorporated by "
+                    f"both subchunk {seen[interval_id]} and subchunk "
+                    f"{subchunk_id}. Summing them would double-count that "
+                    "interval's contribution; delete 'residual_checkpoints/' "
+                    "under the output directory and re-run to recompute this "
+                    "chunk."
+                )
+            seen[interval_id] = subchunk_id
+    ranges = {
+        (
+            None if metadata.get("point_start") is None else int(metadata["point_start"]),
+            None if metadata.get("point_stop") is None else int(metadata["point_stop"]),
+        )
+        for _subchunk_id, metadata in entries
+    }
+    if len(ranges) > 1:
+        raise RuntimeError(
+            "Residual-field streaming finalization found subchunk checkpoints "
+            f"with differing point ranges for chunk={int(chunk_id)} "
+            f"({sorted(ranges)}). Every subchunk must cover the chunk's full "
+            "extent; stale checkpoints from a different layout are present. "
+            "Delete 'residual_checkpoints/' under the output directory and "
+            "re-run to recompute this chunk."
+        )
+
+
+def _require_expected_interval_coverage(
+    snapshot_metadata,
+    *,
+    expected_interval_ids,
+    chunk_id,
+) -> None:
+    """Verify the subchunk family's interval union matches the plan exactly.
+
+    Disjointness (``validate_interval_partitioned_snapshot_family``) cannot
+    see a missing interval — a K-of-N union is still disjoint. Only the plan
+    knows the full interval set, so finalize passes it down here. Unknown ids
+    are rejected too: they mean snapshots from an older interval plan
+    survived, and their contributions would not correspond to any current
+    interval."""
+    union: set[int] = set()
+    for _subchunk_id, _seq, metadata in snapshot_metadata:
+        if metadata is None:
+            continue
+        union.update(
+            int(v) for v in metadata.get("incorporated_interval_ids") or ()
+        )
+    expected = {int(v) for v in expected_interval_ids}
+    if union == expected:
+        return
+    missing = sorted(expected - union)
+    extra = sorted(union - expected)
+    raise RuntimeError(
+        "Residual-field streaming finalization found subchunk checkpoints "
+        f"whose interval union does not match the plan for chunk={int(chunk_id)}: "
+        f"{len(missing)} missing interval(s){' (e.g. ' + ', '.join(str(v) for v in missing[:5]) + ')' if missing else ''}, "
+        f"{len(extra)} unknown interval(s){' (e.g. ' + ', '.join(str(v) for v in extra[:5]) + ')' if extra else ''}. "
+        "Delete 'residual_checkpoints/' under the output directory and re-run "
+        "to recompute this chunk."
+    )
+
+
 def assemble_local_snapshot_chunk_payload(
     *,
     snapshot_metadata,
@@ -477,6 +593,120 @@ def assemble_local_snapshot_chunk_payload(
         "incorporated_interval_ids": tuple(sorted(applied_set)),
     }
     return snapshot_payload
+
+
+def assemble_interval_partitioned_chunk_payload(
+    *,
+    snapshot_metadata,
+    chunk_id,
+    parameter_digest,
+    output_dir,
+    scratch_dir,
+    expected_interval_ids=None,
+) -> dict | None:
+    """Merge a subchunk (interval-partitioned) snapshot family by SUMMATION.
+
+    The transpose of ``assemble_local_snapshot_chunk_payload``: every subchunk
+    snapshot covers the chunk's full point range with contributions from a
+    disjoint interval subset, so the chunk field is their elementwise sum and
+    the incorporated set is their union. Snapshots are loaded one at a time;
+    peak finalize RAM is the output buffers plus one snapshot. Family safety
+    (disjointness, identical extents) is validated first, and when the plan's
+    interval set is provided the union must match it exactly -- a K-of-N
+    union is still disjoint, so disjointness alone cannot see a missing
+    subchunk's intervals."""
+    validate_interval_partitioned_snapshot_family(
+        snapshot_metadata,
+        chunk_id=chunk_id,
+    )
+    if expected_interval_ids is not None:
+        _require_expected_interval_coverage(
+            snapshot_metadata,
+            expected_interval_ids=expected_interval_ids,
+            chunk_id=chunk_id,
+        )
+    final_point_ids = None
+    final_delta = None
+    final_average = None
+    final_grid_shape_nd = None
+    total_reciprocal_points: int | None = None
+    reciprocal_point_count = 0
+    applied_set: set[int] = set()
+    n_points: int | None = None
+    loaded_any = False
+    for partition_id, snapshot_seq, _metadata in snapshot_metadata:
+        snapshot = load_local_accumulator_snapshot(
+            output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            partition_id=partition_id,
+            snapshot_seq=snapshot_seq,
+        )
+        if snapshot is None:
+            # Unlike the concatenating assembler, a listed-but-unreadable
+            # snapshot cannot be skipped here: its intervals passed the
+            # coverage check on metadata, so dropping its payload would
+            # silently publish a chunk missing those contributions.
+            raise RuntimeError(
+                "Residual-field streaming finalization lost a subchunk "
+                f"snapshot during publish: chunk={int(chunk_id)} "
+                f"subchunk={partition_id} seq={int(snapshot_seq)}."
+            )
+        delta_block = np.asarray(
+            snapshot["amplitudes_delta"], dtype=np.complex128
+        ).reshape(-1)
+        average_block = np.asarray(
+            snapshot["amplitudes_average"], dtype=np.complex128
+        ).reshape(-1)
+        if final_delta is None:
+            n_points = int(delta_block.shape[0])
+            final_delta = _allocate_finalize_output(
+                shape=(n_points,), dtype=np.complex128,
+                scratch_dir=scratch_dir, name="delta",
+            )
+            final_average = _allocate_finalize_output(
+                shape=(n_points,), dtype=np.complex128,
+                scratch_dir=scratch_dir, name="average",
+            )
+            final_delta[:] = delta_block
+            final_average[:] = average_block
+            final_point_ids = np.arange(n_points, dtype=np.int64)
+            grid_block = np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
+            final_grid_shape_nd = (
+                grid_block.reshape(1, -1) if grid_block.ndim == 1 else grid_block
+            )
+        else:
+            if int(delta_block.shape[0]) != n_points:
+                raise RuntimeError(
+                    "Residual-field streaming finalization found subchunk "
+                    f"snapshots of different lengths for chunk={int(chunk_id)} "
+                    f"({int(delta_block.shape[0])} vs {n_points}). Stale "
+                    "checkpoints from a different layout are present; delete "
+                    "'residual_checkpoints/' under the output directory and "
+                    "re-run to recompute this chunk."
+                )
+            final_delta += delta_block
+            final_average += average_block
+        reciprocal_point_count += int(snapshot["reciprocal_point_count"])
+        if total_reciprocal_points is None:
+            total_reciprocal_points = int(snapshot["total_reciprocal_points"])
+        applied_set.update(
+            int(interval_id)
+            for interval_id in snapshot["incorporated_interval_ids"]
+        )
+        loaded_any = True
+        del snapshot, delta_block, average_block
+    if not loaded_any:
+        return None
+    return {
+        "point_ids": final_point_ids,
+        "grid_shape_nd": final_grid_shape_nd,
+        "amplitudes_delta": final_delta,
+        "amplitudes_average": final_average,
+        "reciprocal_point_count": int(reciprocal_point_count),
+        "total_reciprocal_points": int(total_reciprocal_points or 0),
+        "incorporated_interval_ids": tuple(sorted(applied_set)),
+    }
 
 
 class ManifestDrivenResidualFieldReducerBackend:
@@ -1095,7 +1325,18 @@ class ManifestDrivenResidualFieldReducerBackend:
                         snap_stop = metadata.get("point_stop")
                         expected_start = expected.get("point_start")
                         expected_stop = expected.get("point_stop")
-                        if (snap_start is not None or snap_stop is not None) and (
+                        expected_axis = expected.get("partition_axis")
+                        if (
+                            expected_axis is not None
+                            and str(metadata.get("accumulator_axis", "points"))
+                            != str(expected_axis)
+                        ):
+                            # A points-axis snapshot in an intervals-axis plan
+                            # (or vice versa) describes a different chunk
+                            # decomposition; reconciling it would either
+                            # double-count or truncate at merge.
+                            stale = True
+                        elif (snap_start is not None or snap_stop is not None) and (
                             snap_start != expected_start or snap_stop != expected_stop
                         ):
                             stale = True
@@ -1164,12 +1405,18 @@ class ManifestDrivenResidualFieldReducerBackend:
         )
         return len(dropped)
 
-    def _checkpoint_cadence(self, total_expected_partials: int) -> int:
+    def _checkpoint_cadence(
+        self,
+        total_expected_partials: int,
+        *,
+        partition_axis: str | None = None,
+    ) -> int:
         # Cadence is pure POLICY (see reducer_helpers); the method stays as a thin
         # delegator so call sites are unchanged.
         return _checkpoint_cadence_policy(
             total_expected_partials,
             uses_shared_durable_generations=self.uses_shared_durable_generations(),
+            partition_axis=partition_axis,
         )
 
     def _live_trim_cadence(self, checkpoint_cadence: int) -> int:
@@ -1327,6 +1574,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                 checkpoint_cadence_batches=int(accumulator.checkpoint_cadence_batches),
                 point_start=accumulator.point_start,
                 point_stop=accumulator.point_stop,
+                accumulator_axis=getattr(accumulator, "accumulator_axis", "points"),
             )
             accumulator.record_checkpoint_metrics(
                 bytes_written=int(local_snapshot_path.stat().st_size),
@@ -1535,7 +1783,10 @@ class ManifestDrivenResidualFieldReducerBackend:
             after = tuple(sorted(accumulator.current_interval_ids))
             if before == after:
                 return
-            snapshot_every = self._checkpoint_cadence(total_expected_partials)
+            snapshot_every = self._checkpoint_cadence(
+                total_expected_partials,
+                partition_axis=getattr(work_unit, "partition_axis", None),
+            )
             accumulator.checkpoint_cadence_batches = int(snapshot_every)
             flushed = False
             if accumulator.accepted_since_snapshot >= snapshot_every:
@@ -1835,6 +2086,7 @@ class ManifestDrivenResidualFieldReducerBackend:
         quiet_logs: bool = False,
         opportunistic: bool = False,
         expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
+        expected_interval_ids: tuple[int, ...] | None = None,
     ) -> ResidualFieldArtifactManifest | None:
         """Fold committed local snapshots into the final chunk artifact.
 
@@ -1844,7 +2096,10 @@ class ManifestDrivenResidualFieldReducerBackend:
         published or failed, because partition snapshots flush on independent
         cadences and routinely disagree mid-run. ``expected_partitions`` is
         the plan's ``(partition_id, point_start, point_stop)`` family for this
-        chunk; when provided, the snapshot family must match it exactly."""
+        chunk; when provided, the snapshot family must match it exactly.
+        ``expected_interval_ids`` is the plan's full interval set for this
+        chunk; interval-partitioned (subchunk) families must union to it
+        exactly before their snapshots are summed."""
         repaired_manifest = self._repair_progress_final_artifacts(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
@@ -2062,6 +2317,20 @@ class ManifestDrivenResidualFieldReducerBackend:
                 metadata.get("partition_id") not in (None, -1)
                 for _, _, metadata in snapshot_metadata
             )
+            family_axes = {
+                str(metadata.get("accumulator_axis", "points"))
+                for _, _, metadata in snapshot_metadata
+            }
+            if len(family_axes) > 1:
+                raise RuntimeError(
+                    "Residual-field local finalization found checkpoints from "
+                    f"BOTH partition axes for chunk={int(chunk_id)} "
+                    f"({sorted(family_axes)}). A points-axis and an "
+                    "intervals-axis (subchunk) layout are irreconcilable; "
+                    "delete 'residual_checkpoints/' under the output "
+                    "directory and re-run to recompute this chunk."
+                )
+            family_axis = family_axes.pop() if family_axes else "points"
             if partitioned and opportunistic:
                 # Startup recovery runs BEFORE planning. Partition snapshots
                 # flush on independent cadences, so a mid-run crash routinely
@@ -2089,13 +2358,23 @@ class ManifestDrivenResidualFieldReducerBackend:
                     chunk_id=chunk_id,
                     parameter_digest=parameter_digest,
                 )
-                snapshot_payload = assemble_local_snapshot_chunk_payload(
-                    snapshot_metadata=snapshot_metadata,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    output_dir=output_dir,
-                    scratch_dir=scratch_dir,
-                )
+                if family_axis == "intervals":
+                    snapshot_payload = assemble_interval_partitioned_chunk_payload(
+                        snapshot_metadata=snapshot_metadata,
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        output_dir=output_dir,
+                        scratch_dir=scratch_dir,
+                        expected_interval_ids=expected_interval_ids,
+                    )
+                else:
+                    snapshot_payload = assemble_local_snapshot_chunk_payload(
+                        snapshot_metadata=snapshot_metadata,
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        output_dir=output_dir,
+                        scratch_dir=scratch_dir,
+                    )
                 if snapshot_payload is None:
                     return None
                 applied_set = set(
@@ -2309,6 +2588,7 @@ def finalize_process_local_residual_chunk(
     scratch_root: str | None = None,
     quiet_logs: bool = False,
     expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
+    expected_interval_ids: tuple[int, ...] | None = None,
 ) -> ResidualFieldArtifactManifest | None:
     backend = get_process_local_residual_field_backend(template_backend)
     return backend.finalize_chunk(
@@ -2320,6 +2600,7 @@ def finalize_process_local_residual_chunk(
         scratch_root=scratch_root,
         quiet_logs=quiet_logs,
         expected_partitions=expected_partitions,
+        expected_interval_ids=expected_interval_ids,
     )
 
 

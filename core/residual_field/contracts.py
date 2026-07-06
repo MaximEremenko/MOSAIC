@@ -282,6 +282,12 @@ class ResidualFieldWorkUnit:
     partition_id: int | None = None
     point_start: int | None = None
     point_stop: int | None = None
+    # Which axis partition_id splits the chunk on. "points": legacy atom-range
+    # partitions (disjoint point ranges, every partition folds every interval;
+    # finalize concatenates). "intervals": streaming subchunks (every subchunk
+    # covers the FULL point range but folds a disjoint interval subset;
+    # finalize sums). The two axes must never mix within one chunk family.
+    partition_axis: str = "points"
     run_digest: str | None = None
     partition_plan_digest: str | None = None
     source_scattering_commit_digest: str | None = None
@@ -483,6 +489,37 @@ class ResidualFieldWorkUnit:
             point_stop=int(point_stop),
         )
 
+    def with_subchunk(
+        self,
+        *,
+        subchunk_id: int,
+        point_count: int,
+    ) -> "ResidualFieldWorkUnit":
+        """Assign this batch unit to a streaming subchunk slot.
+
+        A subchunk is the interval-axis transpose of a partition: it covers
+        the chunk's full point range ``[0, point_count)`` and accumulates only
+        the interval batches routed to its slot. The slot id reuses the
+        ``partition_id`` field (and therefore the existing snapshot naming,
+        ownership affinity, and progress-manifest machinery) with
+        ``partition_axis='intervals'`` marking the changed merge semantics."""
+        token = f"subchunk-{int(subchunk_id)}:points-0-{int(point_count)}"
+        return replace(
+            self,
+            artifact_key=f"{self.artifact_key}:{token}",
+            retry=RetryIdempotencySemantics(
+                failure_unit=self.retry.failure_unit,
+                retry_unit=self.retry.retry_unit,
+                idempotency_key=f"{self.retry.idempotency_key}:{token}",
+                replay_disposition=self.retry.replay_disposition,
+                crash_recovery_rule=self.retry.crash_recovery_rule,
+            ),
+            partition_id=int(subchunk_id),
+            point_start=0,
+            point_stop=int(point_count),
+            partition_axis="intervals",
+        )
+
 
 @dataclass(frozen=True)
 class ResidualFieldAccumulatorStatus:
@@ -681,6 +718,22 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
             raise ValueError("partition_id must be non-negative.")
         if int(work_unit.point_start) < 0 or int(work_unit.point_stop) <= int(work_unit.point_start):
             raise ValueError("Partition point range must satisfy 0 <= point_start < point_stop.")
+    if work_unit.partition_axis not in ("points", "intervals"):
+        raise ValueError(
+            "partition_axis must be 'points' or 'intervals'; got "
+            f"{work_unit.partition_axis!r}."
+        )
+    if work_unit.partition_axis == "intervals":
+        if work_unit.partition_id is None:
+            raise ValueError(
+                "Interval-axis (subchunk) residual-field work units require a "
+                "partition_id slot."
+            )
+        if int(work_unit.point_start or 0) != 0:
+            raise ValueError(
+                "Interval-axis (subchunk) residual-field work units must cover "
+                "the chunk's full point range (point_start == 0)."
+            )
 
 
 def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -> None:

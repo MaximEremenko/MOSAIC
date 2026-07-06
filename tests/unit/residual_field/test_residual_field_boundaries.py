@@ -4591,3 +4591,105 @@ def test_lattice_disk_spill_matches_ram_grid(monkeypatch, tmp_path):
     spill = tasks_mod._compute_from_lattice_entry(spill_entry, **kwargs)
     np.testing.assert_array_equal(spill.amplitudes_delta, ram.amplitudes_delta)
     np.testing.assert_array_equal(spill.amplitudes_average, ram.amplitudes_average)
+
+
+def test_lattice_ram_admission_availability_gate(monkeypatch):
+    """The RAM admission must consult MemAvailable, not just the static host
+    budget: hkl40's ~32 GiB grid passed the 55%-of-physical gate on a 62 GiB
+    box and drove the run into the OOM-killer (SIGKILL -- uncatchable, so the
+    decision has to be right a priori)."""
+    from core.residual_field import tasks as tasks_mod
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
+    monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", raising=False)
+    monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION", raising=False)
+
+    # 10 GiB grid, 12 GiB available, default fraction 0.5 -> 6 GiB allowance
+    monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 12 << 30)
+    assert not tasks_mod._lattice_grids_fit_in_ram(10 << 30)
+    # 40 GiB available -> 20 GiB allowance -> RAM is fine
+    monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 40 << 30)
+    assert tasks_mod._lattice_grids_fit_in_ram(10 << 30)
+    # unknown availability (non-Linux): legacy static-budget behaviour
+    monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: None)
+    assert tasks_mod._lattice_grids_fit_in_ram(10 << 30)
+    # static budget still binds regardless of availability
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(1 << 30))
+    assert not tasks_mod._lattice_grids_fit_in_ram(10 << 30)
+
+
+def test_lattice_ram_admission_counts_live_grids(monkeypatch):
+    """np.zeros pages are lazy, so MemAvailable cannot see a grid another
+    thread just admitted; the live-grid counter must close that window and
+    release on garbage collection."""
+    import gc
+
+    from core.residual_field import tasks as tasks_mod
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
+    monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION", raising=False)
+    with tasks_mod._LATTICE_LIVE_RAM_LOCK:
+        baseline = tasks_mod._LATTICE_LIVE_RAM_BYTES
+
+    grid = tasks_mod._allocate_lattice_grids((2, 10 << 20), in_ram=True)
+    grid_bytes = int(grid.nbytes)
+    ask = 100 << 20
+    # allowance sits between ask and ask+live -> rejected only due to the
+    # live counter
+    monkeypatch.setattr(
+        tasks_mod,
+        "_mem_available_bytes",
+        lambda: 2 * (baseline + grid_bytes + (ask // 2)),
+    )
+    assert not tasks_mod._lattice_grids_fit_in_ram(ask)
+    del grid
+    gc.collect()
+    with tasks_mod._LATTICE_LIVE_RAM_LOCK:
+        assert tasks_mod._LATTICE_LIVE_RAM_BYTES == baseline
+    assert tasks_mod._lattice_grids_fit_in_ram(ask)
+
+
+def test_lattice_ram_admission_prefers_shareable_spill(monkeypatch):
+    """An in-RAM grid bigger than the lattice entry cache cannot be cached, so
+    every chunk would rebuild it while waiter threads fall back to
+    materialising full payload lists; such grids must take the (cacheable)
+    memmap path instead."""
+    from core.residual_field import tasks as tasks_mod
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
+    monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 64 << 30)
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", str(1 << 20))
+    assert not tasks_mod._lattice_grids_fit_in_ram(2 << 20)
+    # cache disabled entirely -> criterion does not apply
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", "0")
+    assert tasks_mod._lattice_grids_fit_in_ram(2 << 20)
+
+
+def test_streaming_builder_spills_when_availability_tight(monkeypatch, tmp_path):
+    """Regression: _build_lattice_groups_streaming used to allocate plain
+    np.zeros with only a per-role static-budget check, bypassing the spill
+    allocator entirely. It must share the entry builder's admission and
+    produce bit-identical results from a memmap grid."""
+    from core.residual_field import tasks as tasks_mod
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "1")
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_SCRATCH", str(tmp_path))
+    rng = np.random.RandomState(23)
+    groups = [_lattice_interval_tasks(rng, n_intervals=3)]
+    rifft = rng.uniform(0.0, 20.0, size=(200, 3))
+
+    ram_groups = tasks_mod._build_lattice_groups_streaming(groups)
+    assert ram_groups is not None
+    assert not isinstance(ram_groups[0][2], np.memmap)
+
+    monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 1 << 20)
+    spill_groups = tasks_mod._build_lattice_groups_streaming(groups)
+    assert spill_groups is not None
+    assert isinstance(spill_groups[0][2], np.memmap)
+
+    kwargs = dict(rifft_grid=rifft, nufft_eps=1e-12,
+                  nufft_prefer_cpu=False, nufft_gpu_only=False)
+    ram_d, ram_a = tasks_mod._execute_lattice_groups(ram_groups, **kwargs)
+    sp_d, sp_a = tasks_mod._execute_lattice_groups(spill_groups, **kwargs)
+    np.testing.assert_array_equal(sp_d, ram_d)
+    np.testing.assert_array_equal(sp_a, ram_a)

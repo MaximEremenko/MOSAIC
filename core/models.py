@@ -607,6 +607,12 @@ class ReciprocalSpaceArtifacts:
     compact_intervals: list[dict[str, Any]]
     padded_intervals: list[dict[str, Any]]
     transient_interval_payloads: dict[int, Any] = field(default_factory=dict)
+    # Scattering -> residual handoff for streaming (fused stage-1) mode: the
+    # scattering stage deposits a StreamingComputeContext under
+    # "compute_context" and the residual stage's work units compute their
+    # interval payloads in-task from it. Same mutable-sink pattern as
+    # transient_interval_payloads.
+    streaming_state: dict[str, Any] = field(default_factory=dict)
 
     def close(self) -> None:
         close = getattr(self.db_manager, "close", None)

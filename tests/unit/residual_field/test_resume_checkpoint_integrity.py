@@ -616,3 +616,380 @@ class TestFinalizeChunkRecoverySemantics:
                 quiet_logs=True,
                 expected_partitions=((0, 0, 12), (1, 12, 20)),
             )
+
+
+class TestValidateIntervalPartitionedSnapshotFamily:
+    """Subchunk (interval-partitioned) families: the streaming reducer's
+    transpose of atom partitions. Disjoint interval sets over an identical
+    point range merge by summation; OVERLAP is the corruption signal here
+    (an interval folded into two subchunks would be double-counted)."""
+
+    def test_accepts_disjoint_sets_same_range(self):
+        from core.residual_field.backend import (
+            validate_interval_partitioned_snapshot_family,
+        )
+
+        family = _family(
+            [
+                (0, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 2)}),
+                (1, {"point_start": 0, "point_stop": 30, "interval_ids": (3, 5)}),
+                (2, {"point_start": 0, "point_stop": 30, "interval_ids": (4,)}),
+            ]
+        )
+        validate_interval_partitioned_snapshot_family(family, chunk_id=CHUNK_ID)
+
+    def test_rejects_overlapping_interval_sets(self):
+        from core.residual_field.backend import (
+            validate_interval_partitioned_snapshot_family,
+        )
+
+        family = _family(
+            [
+                (0, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 2)}),
+                (1, {"point_start": 0, "point_stop": 30, "interval_ids": (2, 3)}),
+            ]
+        )
+        with pytest.raises(RuntimeError, match="double-count"):
+            validate_interval_partitioned_snapshot_family(family, chunk_id=CHUNK_ID)
+
+    def test_rejects_differing_point_ranges(self):
+        from core.residual_field.backend import (
+            validate_interval_partitioned_snapshot_family,
+        )
+
+        family = _family(
+            [
+                (0, {"point_start": 0, "point_stop": 30, "interval_ids": (1,)}),
+                (1, {"point_start": 0, "point_stop": 20, "interval_ids": (2,)}),
+            ]
+        )
+        with pytest.raises(RuntimeError, match="full extent"):
+            validate_interval_partitioned_snapshot_family(family, chunk_id=CHUNK_ID)
+
+    def test_rejects_mixed_owner_and_subchunk(self):
+        from core.residual_field.backend import (
+            validate_interval_partitioned_snapshot_family,
+        )
+
+        family = _family(
+            [
+                (None, {"point_start": 0, "point_stop": 30, "interval_ids": (1,)}),
+                (1, {"point_start": 0, "point_stop": 30, "interval_ids": (2,)}),
+            ]
+        )
+        with pytest.raises(RuntimeError, match="mix of owner-level and subchunk"):
+            validate_interval_partitioned_snapshot_family(family, chunk_id=CHUNK_ID)
+
+    def test_rejects_duplicate_ids_within_one_snapshot(self):
+        from core.residual_field.backend import (
+            validate_interval_partitioned_snapshot_family,
+        )
+
+        family = _family(
+            [(0, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 1, 2)})]
+        )
+        with pytest.raises(RuntimeError, match="duplicate interval ids"):
+            validate_interval_partitioned_snapshot_family(family, chunk_id=CHUNK_ID)
+
+    def test_single_and_empty_families_pass(self):
+        from core.residual_field.backend import (
+            validate_interval_partitioned_snapshot_family,
+        )
+
+        validate_interval_partitioned_snapshot_family([], chunk_id=CHUNK_ID)
+        family = _family(
+            [(None, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 2)})]
+        )
+        validate_interval_partitioned_snapshot_family(family, chunk_id=CHUNK_ID)
+
+
+class TestRequireExpectedIntervalCoverage:
+    def test_exact_union_passes(self):
+        from core.residual_field.backend import _require_expected_interval_coverage
+
+        family = _family(
+            [
+                (0, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 2)}),
+                (1, {"point_start": 0, "point_stop": 30, "interval_ids": (3,)}),
+            ]
+        )
+        _require_expected_interval_coverage(
+            family, expected_interval_ids=(1, 2, 3), chunk_id=CHUNK_ID
+        )
+
+    def test_missing_interval_rejected(self):
+        from core.residual_field.backend import _require_expected_interval_coverage
+
+        family = _family(
+            [(0, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 2)})]
+        )
+        with pytest.raises(RuntimeError, match="1 missing interval"):
+            _require_expected_interval_coverage(
+                family, expected_interval_ids=(1, 2, 3), chunk_id=CHUNK_ID
+            )
+
+    def test_unknown_interval_from_old_plan_rejected(self):
+        from core.residual_field.backend import _require_expected_interval_coverage
+
+        family = _family(
+            [(0, {"point_start": 0, "point_stop": 30, "interval_ids": (1, 2, 99)})]
+        )
+        with pytest.raises(RuntimeError, match="1 unknown interval"):
+            _require_expected_interval_coverage(
+                family, expected_interval_ids=(1, 2), chunk_id=CHUNK_ID
+            )
+
+
+def _write_subchunk_snapshot(
+    output_dir,
+    *,
+    subchunk_id,
+    snapshot_seq,
+    n_points,
+    interval_ids,
+    fill=1.0,
+):
+    write_local_accumulator_snapshot(
+        str(output_dir),
+        chunk_id=CHUNK_ID,
+        parameter_digest=DIGEST,
+        partition_id=subchunk_id,
+        snapshot_seq=snapshot_seq,
+        point_ids=np.arange(n_points, dtype=np.int64),
+        grid_shape_nd=np.array([[4, 4, 4]], dtype=np.int64),
+        amplitudes_delta=np.full(n_points, fill, dtype=np.complex128),
+        amplitudes_average=np.full(n_points, fill * 1j, dtype=np.complex128),
+        reciprocal_point_count=10,
+        total_reciprocal_points=100,
+        incorporated_interval_ids=tuple(interval_ids),
+        storage_mode="ram",
+        point_start=0,
+        point_stop=n_points,
+        accumulator_axis="intervals",
+    )
+
+
+def _subchunk_metadata(subchunk_id, interval_ids, n_points=20):
+    meta = _metadata(
+        partition_id=subchunk_id,
+        point_start=0,
+        point_stop=n_points,
+        interval_ids=interval_ids,
+    )
+    meta["accumulator_axis"] = "intervals"
+    return meta
+
+
+class TestAssembleIntervalPartitionedChunkPayload:
+    def test_sums_disjoint_subchunks(self, tmp_path):
+        from core.residual_field.backend import (
+            assemble_interval_partitioned_chunk_payload,
+        )
+
+        _write_subchunk_snapshot(
+            tmp_path, subchunk_id=0, snapshot_seq=1, n_points=20,
+            interval_ids=(1, 3), fill=1.0,
+        )
+        _write_subchunk_snapshot(
+            tmp_path, subchunk_id=1, snapshot_seq=2, n_points=20,
+            interval_ids=(2,), fill=2.5,
+        )
+        family = [
+            (0, 1, _subchunk_metadata(0, (1, 3))),
+            (1, 2, _subchunk_metadata(1, (2,))),
+        ]
+        payload = assemble_interval_partitioned_chunk_payload(
+            snapshot_metadata=family,
+            chunk_id=CHUNK_ID,
+            parameter_digest=DIGEST,
+            output_dir=str(tmp_path),
+            scratch_dir=None,
+            expected_interval_ids=(1, 2, 3),
+        )
+        assert payload is not None
+        assert np.array_equal(
+            np.asarray(payload["point_ids"]), np.arange(20, dtype=np.int64)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(payload["amplitudes_delta"]),
+            np.full(20, 3.5, dtype=np.complex128),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(payload["amplitudes_average"]),
+            np.full(20, 3.5j, dtype=np.complex128),
+        )
+        assert payload["incorporated_interval_ids"] == (1, 2, 3)
+        assert payload["reciprocal_point_count"] == 20  # summed contributions
+
+    def test_refuses_incomplete_union(self, tmp_path):
+        from core.residual_field.backend import (
+            assemble_interval_partitioned_chunk_payload,
+        )
+
+        _write_subchunk_snapshot(
+            tmp_path, subchunk_id=0, snapshot_seq=1, n_points=20,
+            interval_ids=(1, 3),
+        )
+        family = [(0, 1, _subchunk_metadata(0, (1, 3)))]
+        with pytest.raises(RuntimeError, match="missing interval"):
+            assemble_interval_partitioned_chunk_payload(
+                snapshot_metadata=family,
+                chunk_id=CHUNK_ID,
+                parameter_digest=DIGEST,
+                output_dir=str(tmp_path),
+                scratch_dir=None,
+                expected_interval_ids=(1, 2, 3),
+            )
+
+    def test_refuses_lost_snapshot_payload(self, tmp_path):
+        from core.residual_field.backend import (
+            assemble_interval_partitioned_chunk_payload,
+        )
+
+        # metadata listed but no NPZ on disk: summing without it would
+        # silently publish a chunk missing those intervals' contributions
+        family = [(0, 1, _subchunk_metadata(0, (1, 2, 3)))]
+        with pytest.raises(RuntimeError, match="lost a subchunk"):
+            assemble_interval_partitioned_chunk_payload(
+                snapshot_metadata=family,
+                chunk_id=CHUNK_ID,
+                parameter_digest=DIGEST,
+                output_dir=str(tmp_path),
+                scratch_dir=None,
+                expected_interval_ids=(1, 2, 3),
+            )
+
+
+class TestAxisAwareInvalidation:
+    def test_points_axis_snapshot_dropped_by_intervals_plan(self, tmp_path):
+        backend = _make_backend()
+        _write_snapshot(
+            tmp_path, partition_id=0, snapshot_seq=2,
+            n_points=20, point_start=0, point_stop=20,
+        )
+        _write_progress_manifest(
+            backend, tmp_path, [_snapshot_key(0, 2)], (1, 2, 3)
+        )
+        target = _target(0, 20)
+        target["partition_axis"] = "intervals"   # plan is now streaming
+        dropped = backend.invalidate_incompatible_local_checkpoints(
+            chunk_id=CHUNK_ID,
+            parameter_digest=DIGEST,
+            output_dir=str(tmp_path),
+            expected_targets={0: target},
+        )
+        assert dropped == 1
+
+    def test_matching_axis_snapshot_kept(self, tmp_path):
+        backend = _make_backend()
+        _write_subchunk_snapshot(
+            tmp_path, subchunk_id=0, snapshot_seq=2, n_points=20,
+            interval_ids=(1, 2, 3),
+        )
+        _write_progress_manifest(
+            backend, tmp_path, [_snapshot_key(0, 2)], (1, 2, 3)
+        )
+        target = _target(0, 20)
+        target["partition_axis"] = "intervals"
+        dropped = backend.invalidate_incompatible_local_checkpoints(
+            chunk_id=CHUNK_ID,
+            parameter_digest=DIGEST,
+            output_dir=str(tmp_path),
+            expected_targets={0: target},
+        )
+        assert dropped == 0
+
+
+class TestFinalizeMixedAxisFamily:
+    def test_mixed_axis_family_raises(self, tmp_path):
+        backend = _make_backend()
+        _write_snapshot(
+            tmp_path, partition_id=0, snapshot_seq=1,
+            n_points=8, point_start=0, point_stop=8,
+        )
+        _write_subchunk_snapshot(
+            tmp_path, subchunk_id=1, snapshot_seq=1, n_points=8,
+            interval_ids=(4, 5),
+        )
+        _write_progress_manifest(
+            backend, tmp_path,
+            [_snapshot_key(0, 1), _snapshot_key(1, 1)],
+            (1, 2, 3, 4, 5),
+        )
+        with pytest.raises(RuntimeError, match="BOTH partition axes"):
+            backend.finalize_chunk(
+                chunk_id=CHUNK_ID,
+                parameter_digest=DIGEST,
+                output_dir=str(tmp_path),
+                db_path=str(tmp_path / "db.sqlite"),
+                scratch_root=str(tmp_path / "scratch"),
+            )
+
+
+class TestCheckpointCadencePolicy:
+    """MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES override + default formula."""
+
+    def test_env_override_wins_outright(self, monkeypatch):
+        from core.residual_field.reducer_helpers import checkpoint_cadence
+
+        monkeypatch.setenv("MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", "7")
+        assert checkpoint_cadence(1000, uses_shared_durable_generations=False) == 7
+        assert checkpoint_cadence(1000, uses_shared_durable_generations=True) == 7
+        # wins over the legacy shared-durable env too
+        monkeypatch.setenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE", "3")
+        assert checkpoint_cadence(1000, uses_shared_durable_generations=True) == 7
+        # and over the intervals-axis floor
+        assert (
+            checkpoint_cadence(
+                1000,
+                uses_shared_durable_generations=False,
+                partition_axis="intervals",
+            )
+            == 7
+        )
+
+    def test_env_override_clamped_to_one(self, monkeypatch):
+        from core.residual_field.reducer_helpers import checkpoint_cadence
+
+        monkeypatch.setenv("MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", "0")
+        assert checkpoint_cadence(1000, uses_shared_durable_generations=False) == 1
+
+    def test_default_formula_unchanged_when_unset(self, monkeypatch):
+        from core.residual_field.reducer_helpers import checkpoint_cadence
+
+        monkeypatch.delenv(
+            "MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", raising=False
+        )
+        monkeypatch.delenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE", raising=False)
+        assert checkpoint_cadence(0, uses_shared_durable_generations=False) == 1
+        assert checkpoint_cadence(3, uses_shared_durable_generations=False) == 1
+        assert checkpoint_cadence(40, uses_shared_durable_generations=False) == 10
+        # legacy shared-durable env still honored when the new knob is unset
+        monkeypatch.setenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE", "5")
+        assert checkpoint_cadence(40, uses_shared_durable_generations=True) == 5
+        assert checkpoint_cadence(40, uses_shared_durable_generations=False) == 10
+
+    def test_intervals_axis_floor_is_two(self, monkeypatch):
+        from core.residual_field.reducer_helpers import checkpoint_cadence
+
+        monkeypatch.delenv(
+            "MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", raising=False
+        )
+        assert (
+            checkpoint_cadence(
+                3, uses_shared_durable_generations=False, partition_axis="intervals"
+            )
+            == 2
+        )
+        assert (
+            checkpoint_cadence(
+                40, uses_shared_durable_generations=False, partition_axis="intervals"
+            )
+            == 10
+        )
+        assert (
+            checkpoint_cadence(
+                3, uses_shared_durable_generations=False, partition_axis="points"
+            )
+            == 1
+        )

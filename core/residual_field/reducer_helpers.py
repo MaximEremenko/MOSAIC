@@ -124,18 +124,32 @@ def checkpoint_cadence(
     total_expected_partials: int,
     *,
     uses_shared_durable_generations: bool,
+    partition_axis: str | None = None,
 ) -> int:
     """Durable-snapshot cadence (every N accepted partials). Pure POLICY, not state.
 
-    For shared-durable generations an env override is honored; otherwise a quarter of
-    the expected partials, floored at 1. Lifted verbatim from the reducer backend so
-    the cadence policy lives beside the other stateless reducer helpers.
+    Cadence is the number of accepted batches between durable snapshots per
+    accumulator target: larger values mean fewer disk writes (NFS-friendly)
+    but more recompute after a crash.
+
+    ``MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES``, when set to a positive
+    integer, wins outright (clamped to >= 1). Otherwise, for shared-durable
+    generations the legacy env override is honored; otherwise a quarter of
+    the expected partials, floored at 1 — floored at 2 on the streaming
+    "intervals" partition axis, where snapshots are pure crash insurance and
+    per-batch writes double the IO for no coverage gain. Lifted verbatim from
+    the reducer backend so the cadence policy lives beside the other
+    stateless reducer helpers.
     """
+    override = os.getenv("MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES")
+    if override is not None and str(override).strip():
+        return max(int(override), 1)
     if uses_shared_durable_generations:
         override = os.getenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE")
         if override is not None and str(override).strip():
             return max(int(override), 1)
-    return max(int(total_expected_partials) // 4, 1)
+    floor = 2 if str(partition_axis or "").strip().lower() == "intervals" else 1
+    return max(int(total_expected_partials) // 4, floor)
 
 
 def live_trim_cadence(checkpoint_cadence_value: int) -> int:

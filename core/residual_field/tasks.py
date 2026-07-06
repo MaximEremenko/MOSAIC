@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass
 import inspect
@@ -576,6 +577,14 @@ def _lattice_cache_get(key: tuple) -> dict | None:
         return entry
 
 
+def _lattice_cache_max_entries() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_ENTRIES")
+    try:
+        return max(1, int(raw)) if raw else 8
+    except (TypeError, ValueError):
+        return 8
+
+
 def _lattice_cache_store(key: tuple, entry: dict) -> None:
     global _LATTICE_CACHE_BYTES
     nbytes = _lattice_entry_bytes(entry)
@@ -587,7 +596,14 @@ def _lattice_cache_store(key: tuple, entry: dict) -> None:
             _LATTICE_CACHE_BYTES -= _lattice_entry_bytes(old)
         _LATTICE_CACHE[key] = entry
         _LATTICE_CACHE_BYTES += nbytes
-        while _LATTICE_CACHE_BYTES > _lattice_cache_max_bytes() and len(_LATTICE_CACHE) > 1:
+        # Spilled (memmap) entries cost 0 RAM but hold unlinked-file DISK
+        # space until evicted, so the byte budget alone would never evict
+        # them and distinct keys could fill the scratch filesystem; the
+        # entry-count cap bounds that.
+        while (
+            _LATTICE_CACHE_BYTES > _lattice_cache_max_bytes()
+            or len(_LATTICE_CACHE) > _lattice_cache_max_entries()
+        ) and len(_LATTICE_CACHE) > 1:
             _k, victim = _LATTICE_CACHE.popitem(last=False)
             _LATTICE_CACHE_BYTES -= _lattice_entry_bytes(victim)
 
@@ -603,6 +619,93 @@ def _lattice_scratch_dir() -> str:
     import tempfile
 
     return os.getenv("MOSAIC_RESIDUAL_LATTICE_SCRATCH") or tempfile.gettempdir()
+
+
+# In-RAM dense lattice grids currently alive in this process. MemAvailable
+# cannot see a grid whose pages have not been touched yet (np.zeros is lazy),
+# so concurrent builds admitted back-to-back would each look at the same
+# "available" number; this counter closes that window. Decremented by a
+# weakref finalizer when the grid is garbage-collected.
+_LATTICE_LIVE_RAM_BYTES = 0
+_LATTICE_LIVE_RAM_LOCK = threading.Lock()
+
+
+def _track_live_lattice_ram(grid: np.ndarray) -> None:
+    global _LATTICE_LIVE_RAM_BYTES
+    nbytes = int(grid.nbytes)
+
+    def _release(n: int = nbytes) -> None:
+        global _LATTICE_LIVE_RAM_BYTES
+        with _LATTICE_LIVE_RAM_LOCK:
+            _LATTICE_LIVE_RAM_BYTES -= n
+
+    with _LATTICE_LIVE_RAM_LOCK:
+        _LATTICE_LIVE_RAM_BYTES += nbytes
+    weakref.finalize(grid, _release)
+
+
+def _mem_available_bytes() -> int | None:
+    """Linux MemAvailable (reclaimable-aware); None where /proc is absent."""
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _lattice_ram_admission_fraction() -> float:
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return min(1.0, max(0.05, float(raw)))
+        except (TypeError, ValueError):
+            pass
+    return 0.5
+
+
+def _lattice_grids_fit_in_ram(total_grid_bytes: int) -> bool:
+    """RAM admission for a work unit's dense lattice grids (all roles, both
+    transforms).
+
+    Three criteria, all required:
+    - the static host budget (``lattice_host_budget_bytes``);
+    - a fraction (default 0.5, ``MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION``) of
+      MemAvailable *right now*, plus this process's already-live in-RAM grids.
+      The static budget alone admitted hkl40's ~32 GiB grid on a 62 GiB box,
+      where the rest of the pipeline pushed RSS past the ceiling and the
+      OOM-killer SIGKILLed the run -- no exception, so no fallback could fire.
+      The admission must therefore be right *a priori*;
+    - the lattice entry cache budget (when caching is enabled): an in-RAM
+      grid bigger than the cache cannot be stored, so every chunk would
+      rebuild it -- and concurrent waiter threads that find no cached entry
+      fall back to materialising the full interval payload list. A spilled
+      memmap grid is exempt from the cache's RAM budget, making it shareable
+      across all chunks, so oversized grids prefer the spill path.
+
+    Rejection here does not lose the lattice path: callers fall through to
+    the disk-backed memmap allocation, and only to type-3 when spill is
+    disallowed too. Non-Linux hosts (no MemAvailable) keep the static-budget
+    behaviour."""
+    if total_grid_bytes > lattice_host_budget_bytes():
+        return False
+    cache_max = _lattice_cache_max_bytes()
+    if cache_max > 0 and total_grid_bytes > cache_max:
+        return False
+    available = _mem_available_bytes()
+    if available is None:
+        return True
+    with _LATTICE_LIVE_RAM_LOCK:
+        live = _LATTICE_LIVE_RAM_BYTES
+    # Cached grids' pages are resident, so MemAvailable already reflects
+    # them; counting them in `live` as well would double-charge and starve
+    # every later admission for as long as they sit in the cache. `live`
+    # must only cover grids MemAvailable cannot see yet (allocated but
+    # untouched pages).
+    live = max(0, live - int(_LATTICE_CACHE_BYTES))
+    return total_grid_bytes + live <= available * _lattice_ram_admission_fraction()
 
 
 def _lattice_disk_spill_allowed(nbytes: int) -> bool:
@@ -627,11 +730,14 @@ def _lattice_disk_spill_allowed(nbytes: int) -> bool:
 
 
 def _allocate_lattice_grids(shape: tuple, *, in_ram: bool) -> np.ndarray:
-    """Zero-initialised grid storage: plain ndarray within the RAM budget, else
-    an anonymous disk-backed memmap (file unlinked immediately, so it can never
-    leak; space is reclaimed when the cache entry is garbage-collected)."""
+    """Zero-initialised grid storage: plain ndarray within the RAM admission
+    (budget AND currently-available memory -- see ``_lattice_grids_fit_in_ram``),
+    else an anonymous disk-backed memmap (file unlinked immediately, so it can
+    never leak; space is reclaimed when the cache entry is garbage-collected)."""
     if in_ram:
-        return np.zeros(shape, dtype=np.complex128)
+        grid = np.zeros(shape, dtype=np.complex128)
+        _track_live_lattice_ram(grid)
+        return grid
     import tempfile
 
     fd, path = tempfile.mkstemp(prefix="mosaic_lattice_", suffix=".grid", dir=_lattice_scratch_dir())
@@ -697,78 +803,34 @@ def _refine_axis_steps(q: np.ndarray, dq: np.ndarray, origin: np.ndarray) -> np.
 # eps, so it must fall back to type-3 instead.
 _LATTICE_SNAP_MAX_DEV = 1e-7
 
+# Sentinel distinguishing "no safe storage right now" (RAM tight AND scratch
+# full: retry later, do not cache) from "geometrically lattice-ineligible"
+# (None: cache the negative marker for the shard).
+_LATTICE_RESOURCE_DENIED = "lattice-resource-denied"
+
 
 def _build_lattice_groups_streaming(
     ordered_groups: "list[list[IntervalTask]]",
     *,
     snap_tol: float = _LATTICE_SNAP_MAX_DEV,
 ) -> list | None:
-    """Two-pass streaming build of per-role lattice grids.
+    """Per-role lattice grids from already-loaded interval tasks.
 
-    Pass 1 infers per-axis steps and global bounds; pass 2 scatter-adds each
-    interval's [delta, average] weights into the dense grid. Never concatenates
-    the raw points (hkl32: 539M points would need ~30 GB transient). Returns
-    ``[(role, meta, grids)]`` or ``None`` if any point fails the lattice snap or
-    the grid exceeds the host budget (caller falls back to type-3)."""
-    host_budget = lattice_host_budget_bytes()
-    result = []
-    for grouped_tasks in ordered_groups:
-        role = str(grouped_tasks[0].half_space_role)
-        dq = None
-        qmin = None
-        qmax = None
-        for task in grouped_tasks:
-            q = np.asarray(task.q_grid, dtype=np.float64)
-            if q.ndim != 2 or q.shape[1] not in (1, 2, 3) or len(q) == 0:
-                return None
-            steps = _infer_axis_steps(q)
-            if dq is None:
-                dq = steps
-            else:
-                # take the finest nonzero step seen on each axis
-                both = (dq > 0) & (steps > 0)
-                dq = np.where(both, np.minimum(dq, steps), np.maximum(dq, steps))
-            lo, hi = q.min(0), q.max(0)
-            qmin = lo if qmin is None else np.minimum(qmin, lo)
-            qmax = hi if qmax is None else np.maximum(qmax, hi)
-        dq = _refine_axis_steps(
-            np.asarray(grouped_tasks[0].q_grid, dtype=np.float64), dq, qmin
-        )
-        dims = np.ones(len(dq), dtype=np.int64)
-        active = dq > 0
-        dims[active] = np.round((qmax[active] - qmin[active]) / dq[active]).astype(np.int64) + 1
-        if np.any(dims > (1 << 20)):
-            return None
-        grid_points = int(np.prod(dims))
-        if grid_points * 16 * 2 > host_budget:
-            return None
-        dims_t = tuple(int(v) for v in dims)
-        grids = np.zeros((2, grid_points), dtype=np.complex128)
-        for task in grouped_tasks:
-            q = np.asarray(task.q_grid, dtype=np.float64)
-            amp = np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
-            av = np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
-            if amp.shape[0] != len(q) or av.shape[0] != len(q):
-                return None
-            idx = np.zeros(q.shape, dtype=np.int64)
-            for ax in range(len(dq)):
-                if dq[ax] <= 0:
-                    if np.abs(q[:, ax] - qmin[ax]).max() > 1e-9:
-                        return None
-                    continue
-                ratio = (q[:, ax] - qmin[ax]) / dq[ax]
-                ax_idx = np.round(ratio).astype(np.int64)
-                if np.abs(ratio - ax_idx).max() > snap_tol:
-                    return None
-                if ax_idx.min() < 0 or ax_idx.max() >= dims_t[ax]:
-                    return None
-                idx[:, ax] = ax_idx
-            flat = np.ravel_multi_index(tuple(idx.T), dims_t)
-            np.add.at(grids[0], flat, amp - av)
-            np.add.at(grids[1], flat, av)
-        meta = {"origin": qmin.copy(), "dq": dq.copy(), "dims": dims_t, "snap_dev": 0.0}
-        result.append((role, meta, grids.reshape((2,) + dims_t)))
-    return result
+    Thin wrapper over ``_build_lattice_entry_from_inputs`` so that BOTH lattice
+    builders share one allocation policy: total-across-roles accounting, the
+    availability-aware RAM admission, and the disk-spill fallback. (This
+    builder previously allocated plain in-RAM grids with only a per-role
+    static-budget check, which is how an hkl40-scale work unit could pass the
+    gate and drive the host into the OOM-killer.) Returns ``[(role, meta,
+    grids)]`` or ``None`` when the data is lattice-ineligible or no safe
+    storage exists (caller falls back to type-3)."""
+    tasks = [task for group in ordered_groups for task in group]
+    if not tasks:
+        return None
+    entry = _build_lattice_entry_from_inputs(tasks, snap_tol=snap_tol)
+    if entry is None or entry == _LATTICE_RESOURCE_DENIED:
+        return None
+    return entry["groups"]
 
 
 def _execute_lattice_groups(
@@ -807,7 +869,6 @@ def _build_lattice_entry_from_inputs(
     discard. Peak memory is the grids plus ONE interval payload, never the whole
     payload list (hkl32: ~17 GiB instead of ~55 GiB). Returns the cache entry or
     ``None`` when the data is lattice-ineligible."""
-    host_budget = lattice_host_budget_bytes()
 
     def _load(interval_input):
         if isinstance(interval_input, IntervalTask):
@@ -861,15 +922,19 @@ def _build_lattice_entry_from_inputs(
             return None
         state["dims"] = tuple(int(v) for v in dims)
         total_grid_bytes += int(np.prod(dims)) * 16 * 2
-    if total_grid_bytes > host_budget and not _lattice_disk_spill_allowed(total_grid_bytes):
-        return None
+    in_ram = _lattice_grids_fit_in_ram(total_grid_bytes)
+    if not in_ram and not _lattice_disk_spill_allowed(total_grid_bytes):
+        # Resource denial (RAM tight AND scratch full) is TRANSIENT: it must
+        # not be cached as a lattice-ineligible negative marker, or one bad
+        # moment degrades every later work unit of the shard to type-3.
+        return _LATTICE_RESOURCE_DENIED
     for state in per_role.values():
         # Allocate with the final shape so a disk-spilled grid stays an
         # np.memmap instance (reshaping later would demote it to a plain
         # ndarray view and the cache would mis-count its bytes as RAM).
         state["grids"] = _allocate_lattice_grids(
             (2,) + state["dims"],
-            in_ram=total_grid_bytes <= host_budget,
+            in_ram=in_ram,
         )
     for interval_input in loaded_interval_inputs:
         task = _load(interval_input)
@@ -1294,6 +1359,7 @@ def run_residual_field_interval_chunk_task(
     nufft_eps: float = 1e-12,
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
+    streaming_compute_context=None,
 ) -> ResidualFieldShardManifest | ResidualFieldAccumulatorStatus | None:
     _ensure_worker_logging()
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
@@ -1302,9 +1368,19 @@ def run_residual_field_interval_chunk_task(
         resolved_backend = reducer_backend or build_residual_field_reducer_backend(
             "local_restartable"
         )
-        loaded_interval_inputs = _normalize_interval_inputs(interval_paths)
-        if not loaded_interval_inputs:
-            raise ValueError("Residual-field batch task requires at least one interval artifact path.")
+        if streaming_compute_context is not None:
+            # Fused stage-1: this task computes its batch's scattering
+            # payloads itself (after the durable-skip check below), so no
+            # interval inputs arrive from the caller.
+            if not owner_local_reducer:
+                raise ValueError(
+                    "Streaming residual work units require the owner-local reducer."
+                )
+            loaded_interval_inputs = ()
+        else:
+            loaded_interval_inputs = _normalize_interval_inputs(interval_paths)
+            if not loaded_interval_inputs:
+                raise ValueError("Residual-field batch task requires at least one interval artifact path.")
         if owner_local_reducer:
             if scratch_root is None or db_path is None or total_expected_partials is None:
                 raise ValueError(
@@ -1351,6 +1427,48 @@ def run_residual_field_interval_chunk_task(
             )
         else:
             rifft_grid, grid_shape_nd = _normalize_rifft_payload(rifft_payload)
+        if streaming_compute_context is not None:
+            from core.scattering.streaming import compute_streamed_interval_tasks
+
+            loaded_interval_inputs = compute_streamed_interval_tasks(
+                interval_ids,
+                streaming_compute_context,
+                nufft_eps=nufft_eps,
+                nufft_prefer_cpu=nufft_prefer_cpu,
+                nufft_gpu_only=nufft_gpu_only,
+            )
+            if not loaded_interval_inputs:
+                # Every interval in this batch is mask-empty: its exact
+                # contribution is zero, but the accumulator must still record
+                # the batch as incorporated or finalize's coverage check
+                # would (correctly) refuse to publish the chunk.
+                n_points = int(rifft_grid.shape[0])
+                zeros_delta = np.zeros(n_points, dtype=np.complex128)
+                zeros_average = np.zeros(n_points, dtype=np.complex128)
+                worker_backend.accept_local_contribution(
+                    work_unit,
+                    grid_shape_nd=grid_shape_nd,
+                    total_reciprocal_points=total_reciprocal_points,
+                    contribution_reciprocal_points=0,
+                    amplitudes_delta=zeros_delta,
+                    amplitudes_average=zeros_average,
+                    point_ids=int(work_unit.point_start or 0)
+                    + np.arange(n_points, dtype=np.int64),
+                    output_dir=output_dir,
+                    scratch_root=scratch_root,
+                    db_path=db_path,
+                    total_expected_partials=total_expected_partials,
+                    cleanup_policy="off",
+                )
+                return ResidualFieldAccumulatorStatus(
+                    artifact_key=work_unit.artifact_key,
+                    chunk_id=work_unit.chunk_id,
+                    parameter_digest=work_unit.parameter_digest,
+                    interval_ids=work_unit.interval_ids,
+                    partition_id=work_unit.partition_id,
+                    contribution_reciprocal_point_count=0,
+                    total_reciprocal_points=total_reciprocal_points,
+                )
         if show_progress:
             logger.debug(
                 "Residual batch start | chunk=%d | partition=%s | intervals=%s | rifft_points=%d",
@@ -1391,12 +1509,17 @@ def run_residual_field_interval_chunk_task(
                 # result -- or a negative marker for lattice-ineligible data --
                 # is cached for every later work unit of this shard.
                 built_entry = _build_lattice_entry_from_inputs(loaded_interval_inputs)
-                _lattice_cache_store(
-                    lattice_key,
-                    built_entry
-                    if built_entry is not None
-                    else {"groups": None, "contribution": 0},
-                )
+                if built_entry == _LATTICE_RESOURCE_DENIED:
+                    # Transient storage denial: fall back to type-3 for THIS
+                    # work unit only; later work units retry the build.
+                    built_entry = None
+                else:
+                    _lattice_cache_store(
+                        lattice_key,
+                        built_entry
+                        if built_entry is not None
+                        else {"groups": None, "contribution": 0},
+                    )
                 cached_entry = built_entry
             if cached_entry is not None and cached_entry.get("groups"):
                 compute_result = _compute_from_lattice_entry(
