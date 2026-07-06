@@ -1305,12 +1305,29 @@ def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
         n_axis = int(round(span / step)) + 1
         if n_axis > (1 << 20):                 # non-lattice data snaps to absurd dims
             return None
-        origin[ax] = float(col.min()); dq[ax] = step; dims[ax] = n_axis
+        origin[ax] = float(col.min())
         ratio = (col - origin[ax]) / step
         ax_idx = np.round(ratio).astype(np.int64)
         dev = float(np.abs(ratio - ax_idx).max())
         if dev > snap_tol or ax_idx.min() < 0 or ax_idx.max() >= n_axis:
             return None
+        # LSQ step refinement: the min-gap estimate carries the float noise of
+        # a single gap, which accumulates linearly with the lattice index and
+        # sets the reconstruction floor. Regressing col ~ origin + idx*step
+        # over all points cancels it (same as the residual-task builder).
+        num = float(np.dot(ax_idx, col - origin[ax]))
+        den = float(np.dot(ax_idx, ax_idx))
+        if den > 0.0:
+            refined = num / den
+            if refined > 0.0 and abs(refined - step) < 0.1 * step:
+                step = refined
+                n_axis = int(round(span / step)) + 1
+                ratio = (col - origin[ax]) / step
+                ax_idx = np.round(ratio).astype(np.int64)
+                dev = float(np.abs(ratio - ax_idx).max())
+                if dev > snap_tol or ax_idx.min() < 0 or ax_idx.max() >= n_axis:
+                    return None
+        dq[ax] = step; dims[ax] = n_axis
         snap_dev = max(snap_dev, dev)
         idx[:, ax] = ax_idx
     grid_bytes = int(np.prod(dims)) * 16 * max(1, int(n_trans))
@@ -1364,7 +1381,16 @@ def execute_type2_on_lattice(
         against the dynamically shared VRAM tile budget.
       * Rows run as separate n_trans=1 calls (halves the fine grid; the phase
         vector is shared per slab), and any residual OOM halves the slab length
-        and retries instead of failing the work unit."""
+        and retries instead of failing the work unit.
+
+    Throughput discipline (GPU):
+      * One explicit cuFINUFFT plan per slab shape, reused across slabs and
+        rows -- ``setpts`` (which sorts all targets) runs once per plan, not
+        once per (slab x row) as the simple interface would.
+      * Phase multiply and accumulation happen on the device; the result
+        crosses PCIe once at the end instead of once per (slab x row). If the
+        fixed device buffers do not fit the pool, the call falls back to
+        per-slab host accumulation transparently."""
     tgt = np.asarray(real_coords, dtype=np.float64)
     grids = np.asarray(grids, dtype=np.complex128)
     dims = meta["dims"]
@@ -1406,9 +1432,12 @@ def execute_type2_on_lattice(
             pass
         return _free_mem_bytes()
 
-    def _slab_len_now() -> int:
+    def _slab_len_now(device_accum: bool) -> int:
         # pool side: slab upload + coords + per-call result must fit the pool
         fixed = 24 * n_tgt + 16 * n_tgt * 2
+        if device_accum:
+            # d_tgt + d_phase + d_out + per-slab row temporaries
+            fixed += 24 * n_tgt + 16 * n_tgt + 16 * n_tgt * n_trans * 2
         pool_room = max(64 << 20, int(_pool_free_bytes() * 0.5) - fixed)
         len_pool = pool_room // max(1, row_bytes_per_len)
         # fine-grid side (raw cudaMalloc): sized from the shared VRAM budget
@@ -1418,46 +1447,113 @@ def execute_type2_on_lattice(
         len_fine = int(fine_budget // max(1.0, 16 * 2 * fine_other * 1.35))
         return max(1, min(int(dims[0]), int(len_pool), len_fine))
 
+    def _is_cufinufft_alloc_failure(exc: Exception) -> bool:
+        # cuFINUFFT raises bare RuntimeErrors when its internal raw cudaMalloc
+        # fails: 'Error creating plan.' (fine grid), 'Error setting
+        # non-uniform points.' (bin-sort scratch, sized by n_tgt), 'Error
+        # executing plan.'. All are memory-shaped under VRAM pressure; treat
+        # them like a pool OOM so the slab backoff can recover instead of
+        # failing the work unit.
+        if not isinstance(exc, RuntimeError):
+            return False
+        message = str(exc).lower()
+        return "plan" in message or "non-uniform points" in message
+
     if use_gpu:
         _transform_enter()
+    plans: dict[tuple[int, ...], object] = {}
     try:
         if use_gpu:
             d_x = [cp.asarray(np.ascontiguousarray(x[:, a])) for a in range(dim)]
-            fn = {1: cufinufft_nufft1d2, 2: cufinufft_nufft2d2, 3: cufinufft_nufft3d2}[dim]
+            plan_cls = _lazy_cufinufft("Plan")
+
+            def _plan_for(n_modes: tuple[int, ...]):
+                plan = plans.get(n_modes)
+                if plan is None:
+                    plan = plan_cls(
+                        2, n_modes, n_trans=1, eps=eps, isign=-1, dtype="complex128"
+                    )
+                    plan.setpts(*d_x)
+                    plans[n_modes] = plan
+                return plan
         else:
             import finufft
             fn = {1: finufft.nufft1d2, 2: finufft.nufft2d2, 3: finufft.nufft3d2}[dim]
             d_x = [np.ascontiguousarray(x[:, a]) for a in range(dim)]
         oom_errors = (
-            (cp.cuda.memory.OutOfMemoryError,) if use_gpu else tuple()
+            (cp.cuda.memory.OutOfMemoryError, RuntimeError) if use_gpu else tuple()
         )
-        slab_len = _slab_len_now()
+        d_tgt = d_out = None
+        device_accum = False
+        if use_gpu:
+            try:
+                d_tgt = cp.asarray(tgt)
+                d_out = cp.zeros((n_trans, n_tgt), dtype=cp.complex128)
+                device_accum = True
+            except cp.cuda.memory.OutOfMemoryError:
+                d_tgt = d_out = None
+                free_gpu_memory()
+        slab_len = _slab_len_now(device_accum)
         a0 = 0
         while a0 < int(dims[0]):
             a1 = min(a0 + slab_len, int(dims[0]))
             c = list(centers)
             c[0] = a0 + (a1 - a0) // 2
             q_c = origin + np.asarray(c, dtype=np.float64) * dq
-            phase = np.exp(-1j * (tgt @ q_c))
+            plan = d_sub = d_o = d_phase = row_results = None
             try:
-                row_results = []
-                for row in range(n_trans):
-                    sub = grids[row, a0:a1]        # contiguous view, no copy
-                    if use_gpu:
+                if use_gpu:
+                    plan = _plan_for(tuple(int(v) for v in (a1 - a0,) + tuple(dims[1:])))
+                    row_results = []
+                    for row in range(n_trans):
+                        sub = grids[row, a0:a1]    # contiguous view, no copy
                         d_sub = cp.asarray(sub)
-                        o = cp.asnumpy(fn(*d_x, d_sub, isign=-1, eps=eps))
-                        del d_sub
+                        row_results.append(plan.execute(d_sub).reshape(n_tgt))
+                        d_sub = None
+                    # commit only after the whole slab succeeded, so an OOM
+                    # retry (smaller slab) never double-counts a partial slab
+                    if device_accum:
+                        d_phase = cp.exp(-1j * (d_tgt @ cp.asarray(q_c)))
+                        # in-place ops only from here on -- nothing below
+                        # allocates, so an OOM cannot land BETWEEN row
+                        # commits (which would double-count this slab's
+                        # already-committed rows on the retry)
+                        for d_o in row_results:
+                            d_o *= d_phase
+                        for row, d_o in enumerate(row_results):
+                            d_out[row] += d_o
+                        d_phase = None
                     else:
+                        phase = np.exp(-1j * (tgt @ q_c))
+                        host_rows = [cp.asnumpy(d_o) for d_o in row_results]
+                        for row, o in enumerate(host_rows):
+                            out[row] += o * phase
+                    row_results = None
+                else:
+                    phase = np.exp(-1j * (tgt @ q_c))
+                    row_results = []
+                    for row in range(n_trans):
+                        sub = grids[row, a0:a1]
                         o = fn(*d_x, sub, isign=-1, eps=eps)
-                    row_results.append(np.asarray(o, dtype=np.complex128).reshape(n_tgt))
-                # commit only after the whole slab succeeded, so an OOM retry
-                # (smaller slab) never double-counts a partially applied slab
-                for row, o in enumerate(row_results):
-                    out[row] += o * phase
+                        row_results.append(
+                            np.asarray(o, dtype=np.complex128).reshape(n_tgt)
+                        )
+                    for row, o in enumerate(row_results):
+                        out[row] += o * phase
             except oom_errors as exc:
+                if use_gpu and isinstance(exc, RuntimeError) and not (
+                    isinstance(exc, cp.cuda.memory.OutOfMemoryError)
+                    or _is_cufinufft_alloc_failure(exc)
+                ):
+                    raise
                 if slab_len <= 1:
                     raise
                 slab_len = max(1, slab_len // 2)
+                # drop every reference to the failed attempt BEFORE freeing:
+                # these locals would otherwise pin the old fine grid and row
+                # buffers through the retry's (smaller) allocations
+                plan = d_sub = d_o = d_phase = row_results = None
+                plans.clear()
                 free_gpu_memory()
                 logger.debug(
                     "lattice type-2 slab OOM; halving slab_len to %d (%s)",
@@ -1467,8 +1563,13 @@ def execute_type2_on_lattice(
                 continue
             a0 = a1
         if use_gpu:
+            if device_accum:
+                out = cp.asnumpy(d_out)
+                d_out = d_tgt = None
+            plans.clear()
             _free_cupy_pool_blocks()
     finally:
+        plans.clear()
         if use_gpu:
             _transform_exit()
     return out
