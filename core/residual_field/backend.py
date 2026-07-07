@@ -765,6 +765,7 @@ class ManifestDrivenResidualFieldReducerBackend:
         output_dir: str,
         db_path: str,
         cleanup_policy: str | bool | None,
+        scratch_root: str | None = None,
     ) -> ResidualFieldArtifactManifest | None:
         progress = self.load_progress_manifest(
             output_dir=output_dir,
@@ -841,6 +842,14 @@ class ManifestDrivenResidualFieldReducerBackend:
             chunk_id=chunk_id,
             interval_ids=incorporated_interval_ids,
         )
+        if resolved_cleanup_policy == "delete_reclaimable":
+            self.cleanup_reclaimable_shards(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+                db_path=db_path,
+                scratch_root=scratch_root,
+            )
         return manifest
 
     def uses_local_chunk_accumulator(self) -> bool:
@@ -2122,6 +2131,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             output_dir=output_dir,
             db_path=db_path,
             cleanup_policy=cleanup_policy,
+            scratch_root=scratch_root,
         )
         if repaired_manifest is not None:
             return repaired_manifest

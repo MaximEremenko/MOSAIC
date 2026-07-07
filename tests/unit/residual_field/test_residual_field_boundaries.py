@@ -1096,15 +1096,6 @@ def test_committed_generation_restart_updates_cleanup_policy_and_deletes_reclaim
         )
         assert progress_after_repair is not None
         assert progress_after_repair.cleanup_policy == "delete_reclaimable"
-
-        deleted = backend.cleanup_reclaimable_shards(
-            output_dir=str(tmp_path),
-            chunk_id=3,
-            parameter_digest=parameter_digest,
-            db_path=db.db_path,
-        )
-
-        assert deleted == (generation_manifest.artifact_key,)
         assert all(not Path(path).exists() for path in generation_paths)
     finally:
         db.close()
