@@ -1,11 +1,13 @@
 import logging
 import pickle
+from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
 import numpy as np
 import pytest
 
+from core.contracts import CompletionStatus
 from core.runtime import configure_progress
 from core.residual_field.backend import (
     ResidualFieldLocalAccumulatorPartial,
@@ -14,6 +16,10 @@ from core.residual_field.backend import (
 )
 from core.residual_field.artifacts import (
     ResidualFieldArtifactStore,
+    _build_residual_field_reducer_progress_manifest,
+    build_residual_field_output_artifact_refs,
+    discover_residual_field_reducer_progress_manifest,
+    persist_residual_field_generation_checkpoint,
     persist_residual_field_interval_chunk_result,
 )
 from core.residual_field.loader import load_chunk_residual_field_and_grid
@@ -1002,6 +1008,104 @@ def test_residual_field_artifacts_preserve_current_saved_and_applied_semantics(t
         np.testing.assert_allclose(current[:, 1], np.array([1 + 0j, 2 + 0j]))
         np.testing.assert_allclose(current_av[:, 1], np.array([0.5 + 0j, 0.75 + 0j]))
         assert nrec == 5
+    finally:
+        db.close()
+
+
+def test_committed_generation_restart_updates_cleanup_policy_and_deletes_reclaimable(
+    tmp_path,
+):
+    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
+    store = ResidualFieldArtifactStore(str(tmp_path))
+    try:
+        interval_1, interval_2 = db.insert_reciprocal_space_interval_batch(
+            [{"h_range": (0.0, 1.0)}, {"h_range": (1.0, 2.0)}]
+        )
+        db.insert_interval_chunk_status_batch(
+            [(interval_1, 3, 0), (interval_2, 3, 0)]
+        )
+        backend = build_residual_field_reducer_backend(
+            "durable_shared_restartable"
+        )
+        parameter_digest = "a8c0af52d1dd"
+        generation_manifest = persist_residual_field_generation_checkpoint(
+            chunk_id=3,
+            parameter_digest=parameter_digest,
+            partition_id=None,
+            generation_seq=2,
+            incorporated_interval_ids=(interval_1, interval_2),
+            grid_shape_nd=np.array([[1]], dtype=np.int64),
+            reciprocal_point_count=2,
+            total_reciprocal_points=2,
+            amplitudes_delta=np.array([4.0 + 0.0j], dtype=np.complex128),
+            amplitudes_average=np.array([2.0 + 0.0j], dtype=np.complex128),
+            point_ids=np.array([0], dtype=np.int64),
+            output_dir=str(tmp_path),
+            shard_storage_root=str(tmp_path),
+            quiet_logs=True,
+        )
+        generation_paths = [
+            artifact.path
+            for artifact in generation_manifest.artifacts
+            if artifact.path is not None
+        ]
+        assert generation_paths
+        assert all(Path(path).exists() for path in generation_paths)
+
+        store.ensure_grid_shape(3, np.array([[1]], dtype=np.int64))
+        store.ensure_total_reciprocal_points(3, 2)
+        store.save_chunk_payload_components(
+            3,
+            point_ids=np.array([0], dtype=np.int64),
+            amplitudes_delta=np.array([4.0 + 0.0j], dtype=np.complex128),
+            amplitudes_average=np.array([2.0 + 0.0j], dtype=np.complex128),
+            reciprocal_point_count=2,
+        )
+        store.save_applied_interval_ids(3, {interval_1, interval_2})
+        backend.write_progress_manifest(
+            _build_residual_field_reducer_progress_manifest(
+                output_dir=str(tmp_path),
+                chunk_id=3,
+                parameter_digest=parameter_digest,
+                completion_status=CompletionStatus.COMMITTED,
+                durable_truth_unit="committed_local_snapshot_generation",
+                incorporated_shard_keys=(generation_manifest.artifact_key,),
+                incorporated_interval_ids=(interval_1, interval_2),
+                reclaimable_shard_keys=(generation_manifest.artifact_key,),
+                final_artifacts=build_residual_field_output_artifact_refs(
+                    str(tmp_path), 3
+                ),
+                pending_shard_keys=(),
+                pending_interval_ids=(),
+                cleanup_policy="off",
+            )
+        )
+
+        repaired = backend.finalize_chunk(
+            chunk_id=3,
+            parameter_digest=parameter_digest,
+            output_dir=str(tmp_path),
+            db_path=db.db_path,
+            cleanup_policy="delete_reclaimable",
+        )
+        assert repaired is not None
+        progress_after_repair = discover_residual_field_reducer_progress_manifest(
+            output_dir=str(tmp_path),
+            chunk_id=3,
+            parameter_digest=parameter_digest,
+        )
+        assert progress_after_repair is not None
+        assert progress_after_repair.cleanup_policy == "delete_reclaimable"
+
+        deleted = backend.cleanup_reclaimable_shards(
+            output_dir=str(tmp_path),
+            chunk_id=3,
+            parameter_digest=parameter_digest,
+            db_path=db.db_path,
+        )
+
+        assert deleted == (generation_manifest.artifact_key,)
+        assert all(not Path(path).exists() for path in generation_paths)
     finally:
         db.close()
 

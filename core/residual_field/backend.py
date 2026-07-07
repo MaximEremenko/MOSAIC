@@ -32,6 +32,7 @@ from core.residual_field.artifacts import (
     reduce_residual_field_shards_for_chunk,
     summarize_residual_field_generation_metrics,
     write_residual_field_reducer_progress_manifest,
+    _normalize_residual_shard_cleanup_policy,
 )
 from core.residual_field.local_accumulator import (
     LiveLocalAccumulator,
@@ -799,7 +800,26 @@ class ManifestDrivenResidualFieldReducerBackend:
         if not set(incorporated_interval_ids).issubset(applied_interval_ids):
             return None
 
-        if progress.completion_status is not CompletionStatus.COMMITTED:
+        resolved_cleanup_policy = _normalize_residual_shard_cleanup_policy(
+            cleanup_policy
+            if cleanup_policy is not None
+            else progress.cleanup_policy
+        )
+        reclaimable_shard_keys = (
+            progress.reclaimable_shard_keys
+            if progress.reclaimable_shard_keys
+            else progress.incorporated_shard_keys
+        )
+        needs_progress_rewrite = (
+            progress.completion_status is not CompletionStatus.COMMITTED
+            or progress.cleanup_policy != resolved_cleanup_policy
+            or (
+                resolved_cleanup_policy == "delete_reclaimable"
+                and bool(progress.incorporated_shard_keys)
+                and not progress.reclaimable_shard_keys
+            )
+        )
+        if needs_progress_rewrite:
             committed_progress = _build_residual_field_reducer_progress_manifest(
                 output_dir=output_dir,
                 chunk_id=chunk_id,
@@ -808,15 +828,11 @@ class ManifestDrivenResidualFieldReducerBackend:
                 durable_truth_unit=progress.durable_truth_unit,
                 incorporated_shard_keys=progress.incorporated_shard_keys,
                 incorporated_interval_ids=incorporated_interval_ids,
-                reclaimable_shard_keys=(
-                    progress.reclaimable_shard_keys
-                    if progress.reclaimable_shard_keys
-                    else progress.incorporated_shard_keys
-                ),
+                reclaimable_shard_keys=reclaimable_shard_keys,
                 final_artifacts=manifest.artifacts,
                 pending_shard_keys=(),
                 pending_interval_ids=(),
-                cleanup_policy=str(cleanup_policy or progress.cleanup_policy or "off"),
+                cleanup_policy=resolved_cleanup_policy,
             )
             self.write_progress_manifest(committed_progress)
 
