@@ -7,6 +7,7 @@ None of these import from core.residual_field.execution.
 from __future__ import annotations
 
 import logging
+import os
 
 from core.runtime import is_sync_client
 from core.residual_field.backend import is_same_node_local_client
@@ -69,6 +70,12 @@ def _cap_async_max_inflight(
     if capacity_info is None:
         return requested
     nufft_slots, worker_count = capacity_info
+    raw_factor = os.getenv("MOSAIC_RESIDUAL_PREFETCH_FACTOR")
+    if raw_factor is not None and str(raw_factor).strip() != "":
+        try:
+            prefetch_factor = int(raw_factor)
+        except (TypeError, ValueError):
+            pass
     factor = max(1, min(8, int(prefetch_factor)))
     capacity = max(1, int(nufft_slots) * int(factor))
     capped = min(requested, capacity)

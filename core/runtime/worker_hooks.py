@@ -234,12 +234,33 @@ def is_gpu_runtime_error(error: Exception | str) -> bool:
     )
 
 
+def _is_pool_capacity_error(error: Exception) -> bool:
+    """CuPy POOL-cap OOM: the task's working set exceeded the per-worker pool
+    limit. The device is healthy — the kernel paths self-heal by re-tiling —
+    so demoting the worker to CPU-only turns one oversized work unit into a
+    permanent ~40x slowdown for the rest of the run (hkl40 streaming: 1 h on
+    GPU became a 21 h CPU ETA). Only the pool OOM is exempt; genuine
+    runtime/driver faults (illegal memory access, device-side assert, driver
+    shutting down) still demote."""
+    if type(error).__name__ == "OutOfMemoryError" and "cupy" in type(error).__module__:
+        return True
+    return "limit set to" in str(error)
+
+
 def handle_worker_gpu_failure(
     error: Exception,
     *,
     logger: logging.Logger,
 ) -> bool:
     if not is_gpu_runtime_error(error):
+        free_gpu_memory()
+        return False
+    if _is_pool_capacity_error(error):
+        logger.warning(
+            "CuPy pool-cap OOM treated as workload sizing, not GPU failure; "
+            "worker stays GPU-enabled: %s",
+            error,
+        )
         free_gpu_memory()
         return False
 

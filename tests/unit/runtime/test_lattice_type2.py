@@ -7,11 +7,14 @@ masked (sparse) occupancy, and degenerate axes.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
 from core.adapters.cunufft_wrapper import (
     execute_lattice_type2_batch,
+    execute_type2_on_lattice,
     plan_lattice,
     scatter_on_lattice,
 )
@@ -121,3 +124,50 @@ def test_plan_lattice_rejects_grid_beyond_host_budget():
     # dims (2, 2, 2) -> 8 modes x 16 B x n_trans=2 = 256 B > 100 B budget
     meta = plan_lattice(q, host_budget_bytes=100)
     assert meta is None
+
+
+def test_lattice_type2_gpu_tiles_targets_when_pool_cap_is_small(caplog):
+    """Streaming subchunks carry the chunk's FULL point range, so n_tgt is
+    points x rifft-grid (hkl40: 2.1e8 targets = ~5 GiB of coordinates against
+    a 2.4 GiB pool cap). The target axis must therefore be tiled: this pins a
+    pool cap small enough that one monolithic upload cannot fit, and requires
+    (a) the tiling branch actually engages and (b) the tiled GPU result stays
+    at parity with the untiled CPU reference."""
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("cufinufft")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("no CUDA device")
+    except Exception:
+        pytest.skip("CUDA runtime unavailable")
+
+    rng = np.random.default_rng(7)
+    step = 2 * np.pi / 24
+    idx = rng.integers(-30, 31, size=(4000, 3))
+    idx = np.unique(idx, axis=0)
+    q = idx.astype(np.float64) * step
+    w = (
+        rng.standard_normal((2, len(q))) + 1j * rng.standard_normal((2, len(q)))
+    ).astype(np.complex128)
+    meta = plan_lattice(q, n_trans=2)
+    assert meta is not None
+    grids = scatter_on_lattice(meta, w)
+    tgt = rng.uniform(0.0, 25.0, size=(600_000, 3))
+
+    ref = execute_type2_on_lattice(meta, grids, tgt, eps=1e-11, prefer_cpu=True)
+
+    pool = cp.get_default_memory_pool()
+    old_limit = int(pool.get_limit() or 0)
+    pool.free_all_blocks()
+    # 600k targets x 128 B/target needs ~77 MiB in flight; a 64 MiB cap forces
+    # >=2 tiles while each tile (~41 MiB peak) still fits.
+    pool.set_limit(size=64 << 20)
+    try:
+        with caplog.at_level(logging.INFO, logger="core.adapters.cunufft_wrapper"):
+            out = execute_type2_on_lattice(meta, grids, tgt, eps=1e-11, gpu_only=True)
+    finally:
+        pool.set_limit(size=old_limit)
+        pool.free_all_blocks()
+
+    assert any("target tiles" in record.message for record in caplog.records)
+    assert np.abs(out - ref).max() / np.abs(ref).max() < 1e-8

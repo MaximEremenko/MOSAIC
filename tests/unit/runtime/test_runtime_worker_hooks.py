@@ -53,6 +53,53 @@ def test_handle_worker_gpu_failure_on_non_gpu_error_only_cleans_up(monkeypatch):
     assert calls == ["freed"]
 
 
+def test_handle_worker_gpu_failure_pool_cap_oom_does_not_demote(monkeypatch):
+    """A CuPy POOL-cap OOM is a workload-sizing error, not a sick device; the
+    kernel paths re-tile and retry. Demoting here is what turned the first
+    hkl40 streaming run into a 21 h CPU crawl."""
+    calls = []
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.free_gpu_memory",
+        lambda: calls.append("freed"),
+    )
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.set_cpu_only",
+        lambda flag=True: calls.append(("cpu_only", flag)),
+    )
+
+    err = RuntimeError(
+        "Out of memory allocating 1,693,802,496 bytes (allocated so far: "
+        "1,693,802,496 bytes, limit set to: 2,576,311,910 bytes)."
+    )
+    handled = handle_worker_gpu_failure(
+        err, logger=SimpleNamespace(warning=lambda *args, **kwargs: None)
+    )
+
+    assert handled is False
+    assert ("cpu_only", True) not in calls
+    assert "freed" in calls
+
+
+def test_handle_worker_gpu_failure_device_fault_still_demotes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.free_gpu_memory",
+        lambda: calls.append("freed"),
+    )
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.set_cpu_only",
+        lambda flag=True: calls.append(("cpu_only", flag)),
+    )
+
+    err = RuntimeError("CUDA error: an illegal memory access was encountered")
+    handled = handle_worker_gpu_failure(
+        err, logger=SimpleNamespace(warning=lambda *args, **kwargs: None)
+    )
+
+    assert handled is True
+    assert ("cpu_only", True) in calls
+
+
 def test_final_cleanup_also_cleans_process_local_reducers(monkeypatch):
     calls = []
 

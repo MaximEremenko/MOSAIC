@@ -40,11 +40,37 @@ def _format_progress_bar(count: int, total: int, *, width: int = 20) -> str:
     return f"[{'#' * filled}{'.' * (width - filled)}]"
 
 
+def _compress_interval_ids(interval_ids, *, max_runs: int = 4) -> str:
+    """Render interval ids as contiguous ranges: ``1-293 (n=293)``.
+
+    Shard-folded work units carry hundreds of consecutive ids; joining them
+    verbatim floods every progress/failure line with ~1.5k characters and
+    buries the progress bar in notebooks."""
+    ids = sorted({int(interval_id) for interval_id in interval_ids})
+    runs: list[tuple[int, int]] = []
+    start = prev = ids[0]
+    for value in ids[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        runs.append((start, prev))
+        start = prev = value
+    runs.append((start, prev))
+    parts = [f"{a}-{b}" if b > a else f"{a}" for a, b in runs[:max_runs]]
+    if len(runs) > max_runs:
+        parts.append(f"+{len(runs) - max_runs} more runs")
+    return f"{','.join(parts)} (n={len(ids)})"
+
+
 def _work_unit_interval_label(work_unit: ResidualFieldWorkUnit) -> str:
     interval_ids = work_unit.interval_ids or (
         (work_unit.interval_id,) if work_unit.interval_id is not None else ()
     )
-    return ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a"
+    if not interval_ids:
+        return "n/a"
+    if len(interval_ids) <= 8:
+        return ",".join(str(interval_id) for interval_id in interval_ids)
+    return _compress_interval_ids(interval_ids)
 
 
 def _format_elapsed_eta(elapsed_seconds: float, completed: int, total: int) -> str:

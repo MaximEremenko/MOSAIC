@@ -960,8 +960,19 @@ def _build_lattice_entry_from_inputs(
         amp = np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
         av = np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
         flat_rows = state["grids"].reshape(2, -1)     # view; grids object keeps its type
-        np.add.at(flat_rows[0], flat, amp - av)
-        np.add.at(flat_rows[1], flat, av)
+        # One interval's q-nodes are distinct lattice sites by construction,
+        # so the duplicate-safe np.add.at (an order of magnitude slower than
+        # a vectorized fancy-index add; ~155M adds per hkl40 shard) is only
+        # needed if that assumption is ever violated -- verify cheaply.
+        order = np.sort(flat)
+        has_duplicates = order.size > 1 and bool(np.any(order[1:] == order[:-1]))
+        del order
+        if has_duplicates:
+            np.add.at(flat_rows[0], flat, amp - av)
+            np.add.at(flat_rows[1], flat, av)
+        else:
+            flat_rows[0][flat] += amp - av
+            flat_rows[1][flat] += av
         del task, q, idx, flat, amp, av, flat_rows
     groups = []
     for role in sorted(per_role):

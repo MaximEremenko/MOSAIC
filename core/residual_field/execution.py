@@ -826,6 +826,72 @@ def _drop_mask_emptied_interval_chunks(
     return kept
 
 
+_RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT = 4 * 1024**3
+_RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN = 1024**2
+
+
+def _resolve_residual_shard_grid_budget_bytes() -> int:
+    """Projected-grid-bytes budget for one lattice shard (default 4 GiB).
+
+    Env override: ``MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES`` (clamped to a
+    1 MiB minimum; invalid values fall back to the default).
+    """
+    raw = os.getenv("MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES")
+    if raw is None:
+        return _RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.debug(
+            "Ignoring invalid MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES=%r", raw
+        )
+        return _RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
+    return max(_RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN, value)
+
+
+def _lattice_grid_capped_intervals_per_shard(
+    intervals,
+    supercell,
+    budget_bytes: int,
+) -> tuple[int, int]:
+    """Grid-size-aware cap on how many intervals fold into one lattice shard.
+
+    The lattice (scatter+type-2) residual path materialises one dense
+    coefficient grid per shard spanning the bounding box of the shard's
+    intervals at a reciprocal pitch of ``1/supercell_axis`` r.l.u. per axis.
+    Model: the dense grid for the FULL interval union spans, per axis,
+    ``(global_qmax - global_qmin) / pitch + 1`` points, and costs
+    ``prod(dims) * 16 bytes * 2`` (two complex128 transforms).  The per-shard
+    bounding box of a contiguous run of reciprocal-space-sorted interval ids
+    scales roughly with its interval fraction, so the shard size is capped at
+    ``max(1, floor(n_intervals * budget_bytes / full_union_grid_bytes))``;
+    the memmap spill remains the safety net for outlier shards.
+
+    This bounds the DEFAULT durable-mode shard fold so hkl40-scale runs no
+    longer build whole-extent (tens-of-GiB) grids by default.  Returns
+    ``(capped_max_intervals_per_shard, full_union_grid_bytes)``; when the
+    full-union grid fits the budget the cap equals ``len(intervals)`` (the
+    existing fold-everything behaviour is kept).
+    """
+    interval_dicts = [to_interval_dict(interval) for interval in intervals]
+    n_intervals = max(1, len(interval_dicts))
+    supercell = np.asarray(supercell, dtype=float)
+    grid_points = 1
+    for axis, cells in zip(("h", "k", "l"), supercell):
+        starts = [d[f"{axis}_start"] for d in interval_dicts if f"{axis}_start" in d]
+        ends = [d[f"{axis}_end"] for d in interval_dicts if f"{axis}_end" in d]
+        if not starts or not ends:
+            continue
+        pitch = 1.0 / float(cells)
+        span = max(ends) - min(starts)
+        grid_points *= max(1, int(math.floor(span / pitch + 0.5)) + 1)
+    full_union_grid_bytes = int(grid_points) * 16 * 2
+    if full_union_grid_bytes <= int(budget_bytes):
+        return n_intervals, full_union_grid_bytes
+    cap = max(1, (n_intervals * int(budget_bytes)) // full_union_grid_bytes)
+    return min(n_intervals, cap), full_union_grid_bytes
+
+
 def _adaptive_residual_intervals_per_shard(
     *,
     artifacts,
@@ -887,8 +953,28 @@ def run_residual_field_stage(
                 # interval means ONE scattered coefficient grid, cached and
                 # reused by all (chunk, partition) work units. The type-3
                 # source-point budget is irrelevant -- lattice memory is set by
-                # the grid dims, not the point count.
-                max_intervals_per_shard = max(1, len(list(artifacts.padded_intervals)))
+                # the grid dims, not the point count. Bound the fold by a
+                # projected-grid-bytes budget so wide-hkl 3D (e.g. hkl40) does
+                # not build a whole-extent dense grid by default.
+                _lattice_intervals = list(artifacts.padded_intervals)
+                max_intervals_per_shard = max(1, len(_lattice_intervals))
+                _grid_budget = _resolve_residual_shard_grid_budget_bytes()
+                _grid_cap, _full_grid_bytes = _lattice_grid_capped_intervals_per_shard(
+                    _lattice_intervals,
+                    structure.supercell,
+                    _grid_budget,
+                )
+                if _grid_cap < max_intervals_per_shard:
+                    logger.info(
+                        "Residual-field lattice shard fold capped by projected "
+                        "grid size: %d -> %d intervals/shard (full-union grid "
+                        "~%.2f GiB > budget %.2f GiB)",
+                        max_intervals_per_shard,
+                        _grid_cap,
+                        _full_grid_bytes / float(1024**3),
+                        _grid_budget / float(1024**3),
+                    )
+                    max_intervals_per_shard = _grid_cap
             else:
                 _budget = int(os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET", str(30_000_000)))
                 max_intervals_per_shard = _adaptive_residual_intervals_per_shard(
@@ -1788,9 +1874,15 @@ def run_residual_field_stage(
     def _update_pbar_postfix(pbar, work_unit, ok=True):
         elapsed = time.monotonic() - _residual_start_time
         timing = _format_elapsed_eta(elapsed, completed, total_tasks)
+        partition = (
+            "owner" if work_unit.partition_id is None else f"p{int(work_unit.partition_id)}"
+        )
         status = "" if ok else " | FAILED"
+        fails = f" | fails={len(exhausted_failures)}" if exhausted_failures else ""
         pbar.set_postfix_str(
-            f"chunk={work_unit.chunk_id} | running={len(flying)} | {timing}{status}"
+            f"done=chunk{int(work_unit.chunk_id)}/{partition}"
+            f":{_work_unit_interval_label(work_unit)}"
+            f" | running={len(flying)} | {timing}{fails}{status}"
         )
 
     with logging_redirect_tqdm():

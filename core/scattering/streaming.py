@@ -158,6 +158,25 @@ def _memo_store(key: tuple[str, int], task: IntervalTask | None) -> None:
             _STREAM_MEMO_BYTES -= int(old_bytes)
 
 
+def _stage1_parallelism(n_intervals: int) -> int:
+    """In-task thread count for streamed stage-1 interval computes.
+
+    Defaults to a quarter of the worker's thread allotment (min 1, max 8) so
+    concurrent work units on the same worker do not oversubscribe it;
+    ``MOSAIC_STREAMING_STAGE1_PARALLEL`` overrides (1 disables)."""
+    raw = os.getenv("MOSAIC_STREAMING_STAGE1_PARALLEL")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, min(int(raw), max(1, int(n_intervals))))
+        except (TypeError, ValueError):
+            pass
+    try:
+        threads = int(os.getenv("DASK_THREADS_PER_WORKER", "16"))
+    except ValueError:
+        threads = 16
+    return max(1, min(threads // 4, 8, max(1, int(n_intervals))))
+
+
 def compute_streamed_interval_tasks(
     interval_ids,
     context: StreamingComputeContext,
@@ -179,49 +198,70 @@ def compute_streamed_interval_tasks(
         nufft_prefer_cpu = bool(context.nufft_prefer_cpu)
     if context.nufft_gpu_only is not None:
         nufft_gpu_only = bool(context.nufft_gpu_only)
-    out: list[IntervalTask] = []
+    def _compute_one(interval_id: int) -> "IntervalTask | None":
+        key = (str(context.cache_token), int(interval_id))
+        cached = _memo_get(key)
+        if cached is not None:
+            return cached[0]
+        interval = context.interval_lookup.get(int(interval_id))
+        if interval is None:
+            raise KeyError(
+                "Streaming residual work unit references interval "
+                f"{int(interval_id)} that is missing from the scattering "
+                "plan's interval lookup — the residual plan and the "
+                "scattering identity disagree."
+            )
+        task = compute_scattering_interval_payload(
+            interval,
+            B_=context.B_,
+            mask_params=context.mask_params,
+            MaskStrategy=context.MaskStrategy,
+            supercell=context.supercell,
+            original_coords=context.original_coords,
+            cells_origin=context.cells_origin,
+            elements_arr=context.elements_arr,
+            charge=context.charge,
+            use_coeff=context.use_coeff,
+            coeff_val=context.coeff_val,
+            unique_elements=list(context.unique_elements),
+            ff_factory=context.ff_factory,
+            nufft_eps=nufft_eps,
+            nufft_prefer_cpu=nufft_prefer_cpu,
+            nufft_gpu_only=nufft_gpu_only,
+        )
+        _memo_store(key, task)
+        return task
+
     # Streaming stage-1 runs in-task with no interval IO, so it is
     # compute-bound: default the lattice type-1 forward path ON for the
     # duration of this batch's computation (set -> try/finally -> reset via
     # the ContextVar scope). An explicit MOSAIC_SCATTERING_LATTICE_FFT env
     # value still wins inside.
+    #
+    # The per-interval computes are independent and mostly release the GIL
+    # (numpy mask/q-grid work, GPU type-1 with the lease-guarded plan cache),
+    # so a small in-task pool overlaps them. One thread per interval was the
+    # dominant wall-clock term of an hkl40 shard (~0.8 s x 293 intervals
+    # sequential). ContextVars do not flow into pool threads on their own;
+    # each submit carries a fresh copy_context() so the lattice-ON default
+    # holds inside workers.
+    parallel = _stage1_parallelism(len(interval_ids))
     with streaming_lattice_default(True):
-        for interval_id in interval_ids:
-            key = (str(context.cache_token), int(interval_id))
-            cached = _memo_get(key)
-            if cached is not None:
-                task = cached[0]
-            else:
-                interval = context.interval_lookup.get(int(interval_id))
-                if interval is None:
-                    raise KeyError(
-                        "Streaming residual work unit references interval "
-                        f"{int(interval_id)} that is missing from the scattering "
-                        "plan's interval lookup — the residual plan and the "
-                        "scattering identity disagree."
+        if parallel <= 1 or len(interval_ids) <= 1:
+            results = [_compute_one(int(i)) for i in interval_ids]
+        else:
+            import contextvars
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=parallel) as pool:
+                futures = [
+                    pool.submit(
+                        contextvars.copy_context().run, _compute_one, int(i)
                     )
-                task = compute_scattering_interval_payload(
-                    interval,
-                    B_=context.B_,
-                    mask_params=context.mask_params,
-                    MaskStrategy=context.MaskStrategy,
-                    supercell=context.supercell,
-                    original_coords=context.original_coords,
-                    cells_origin=context.cells_origin,
-                    elements_arr=context.elements_arr,
-                    charge=context.charge,
-                    use_coeff=context.use_coeff,
-                    coeff_val=context.coeff_val,
-                    unique_elements=list(context.unique_elements),
-                    ff_factory=context.ff_factory,
-                    nufft_eps=nufft_eps,
-                    nufft_prefer_cpu=nufft_prefer_cpu,
-                    nufft_gpu_only=nufft_gpu_only,
-                )
-                _memo_store(key, task)
-            if task is not None:
-                out.append(task)
-    return tuple(out)
+                    for i in interval_ids
+                ]
+                results = [future.result() for future in futures]
+    return tuple(task for task in results if task is not None)
 
 
 __all__ = [
