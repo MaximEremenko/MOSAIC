@@ -234,10 +234,13 @@ def _cleanup_residual_attempts_enabled(workflow_parameters) -> bool:
 
 
 def _residual_attempt_cleanup_policy(workflow_parameters) -> str:
-    runtime_policy = workflow_parameters.runtime_info.get(
-        "residual_attempt_cleanup_policy"
-    )
-    if runtime_policy is not None:
+    for runtime_key in (
+        "residual_attempt_cleanup_policy",
+        "residual_shard_cleanup_policy",
+    ):
+        runtime_policy = workflow_parameters.runtime_info.get(runtime_key)
+        if runtime_policy is None:
+            continue
         value = str(runtime_policy).strip().lower()
         if value in {"off", "keep"}:
             return "off"

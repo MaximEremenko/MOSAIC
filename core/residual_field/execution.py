@@ -57,6 +57,7 @@ from core.residual_field.commit import (
 )
 from core.residual_field import commit as residual_commit
 from core.residual_field.artifacts import (
+    discover_residual_field_reducer_progress_manifest,
     summarize_residual_field_output_artifacts,
     summarize_residual_field_shards,
 )
@@ -64,6 +65,7 @@ from core.residual_field.planning import (
     _RESIDUAL_GRID_VALUE_BYTES_PER_POINT,
     _weighted_partition_split,
     build_adaptive_partition_plan,
+    build_residual_field_parameter_digest,
     build_residual_field_work_units,
     partition_residual_field_work_units,
 )
@@ -775,6 +777,7 @@ def _drop_mask_emptied_interval_chunks(
     *,
     output_dir,
     transient_interval_payloads,
+    parameter_digest,
     logger,
 ):
     """Drop (interval, chunk) pairs whose interval produced no scattering output.
@@ -789,11 +792,16 @@ def _drop_mask_emptied_interval_chunks(
     the residual stage try to open files that were never written.
 
     A genuine scattering failure aborts Stage-1 before the residual stage runs,
-    so at this point "no artifact and no payload" unambiguously means the mask
-    emptied the interval -- skipping it is correct, not lossy.
+    but "no artifact and no payload" alone is NOT enough to conclude the mask
+    emptied the interval: on a restart, an interval whose transient payload was
+    already consumed and folded into a committed durable generation looks
+    identical.  Such pairs must stay in the plan so the finalize/repair path can
+    re-mark them saved and apply the cleanup policy; only intervals that are
+    also absent from the chunk's durable reducer progress are dropped.
     """
     payloads = transient_interval_payloads or {}
     available: dict[int, bool] = {}
+    incorporated_by_chunk: dict[int, frozenset[int]] = {}
 
     def _has_payload(interval_id: int) -> bool:
         cached = available.get(interval_id)
@@ -806,10 +814,27 @@ def _drop_mask_emptied_interval_chunks(
         available[interval_id] = present
         return present
 
+    def _durably_incorporated(interval_id: int, chunk_id: int) -> bool:
+        incorporated = incorporated_by_chunk.get(chunk_id)
+        if incorporated is None:
+            progress = discover_residual_field_reducer_progress_manifest(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            incorporated = (
+                frozenset(int(value) for value in progress.incorporated_interval_ids)
+                if progress is not None
+                else frozenset()
+            )
+            incorporated_by_chunk[chunk_id] = incorporated
+        return interval_id in incorporated
+
     kept = [
         (interval_id, chunk_id)
         for interval_id, chunk_id in interval_chunk_pairs
         if _has_payload(int(interval_id))
+        or _durably_incorporated(int(interval_id), int(chunk_id))
     ]
     dropped_intervals = sorted(
         {int(interval_id) for interval_id, _ in interval_chunk_pairs}
@@ -1102,6 +1127,7 @@ def run_residual_field_stage(
             all_interval_chunk_pairs,
             output_dir=artifacts.output_dir,
             transient_interval_payloads=getattr(artifacts, "transient_interval_payloads", {}) or {},
+            parameter_digest=build_residual_field_parameter_digest(workflow_parameters),
             logger=logger,
         )
     # else: streaming mode has no interval artifacts or payload dict to probe;
