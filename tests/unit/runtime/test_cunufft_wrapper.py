@@ -91,7 +91,10 @@ def test_resolve_budget_policy_preserves_explicit_override():
     assert value == pytest.approx(0.42)
 
 
-def test_adaptive_default_reserve_is_relatively_more_permissive_on_large_vram():
+def test_adaptive_default_reserve_is_relatively_more_permissive_on_large_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_headroom_bytes", lambda: 0)
     small_reserve, small_frac, small_source = cunufft_wrapper._resolve_budget_policy(
         mem_frac=None,
         free_bytes=1 << 30,
@@ -109,7 +112,10 @@ def test_adaptive_default_reserve_is_relatively_more_permissive_on_large_vram():
     assert large_reserve >= 2 << 30
 
 
-def test_adaptive_default_remains_bounded_on_small_vram():
+def test_adaptive_default_remains_bounded_on_small_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_headroom_bytes", lambda: 0)
     reserve, value, source = cunufft_wrapper._resolve_budget_policy(
         mem_frac=None,
         free_bytes=1 << 30,
@@ -1075,3 +1081,128 @@ def test_concurrent_tiled_transforms_are_exact_and_deadlock_free(monkeypatch):
     for idx in range(2):
         np.testing.assert_allclose(results[idx], reference, rtol=1e-10, atol=1e-9)
     assert cunufft_wrapper._gpu_reserved == 0
+
+
+def test_headroom_default_keeps_ceiling_margin_on_big_cards(monkeypatch):
+    monkeypatch.delenv("MOSAIC_GPU_HEADROOM_GIB", raising=False)
+    total = 32 << 30
+    expected = int((1.0 - cunufft_wrapper._GPU_TOTAL_OCCUPANCY_CEILING) * float(total))
+    assert cunufft_wrapper._headroom_bytes_for_total(total) == expected
+
+
+def test_headroom_default_floors_on_small_cards(monkeypatch):
+    monkeypatch.delenv("MOSAIC_GPU_HEADROOM_GIB", raising=False)
+    assert (
+        cunufft_wrapper._headroom_bytes_for_total(8 << 30)
+        == cunufft_wrapper._MIN_GPU_HEADROOM_BYTES
+    )
+
+
+def test_headroom_env_override_wins_and_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    assert cunufft_wrapper._headroom_bytes_for_total(32 << 30) == 6 << 30
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "not-a-number")
+    total = 32 << 30
+    expected = int((1.0 - cunufft_wrapper._GPU_TOTAL_OCCUPANCY_CEILING) * float(total))
+    assert cunufft_wrapper._headroom_bytes_for_total(total) == expected
+
+
+def test_headroom_is_zero_without_a_gpu(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    assert cunufft_wrapper._headroom_bytes_for_total(0) == 0
+
+
+def test_pool_reservable_respects_absolute_headroom(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    monkeypatch.delenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 10 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 32 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0)
+    monkeypatch.setattr(cunufft_wrapper, "_uncommitted_budget_growth_bytes", lambda: 0)
+    # live = 10 GiB; fraction bound = 8.5 GiB; headroom bound = 10 - 6 = 4 GiB
+    assert cunufft_wrapper._pool_reservable_bytes() == 4 << 30
+
+
+def test_pool_reservable_precommits_capped_consumers(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    monkeypatch.delenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 30 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 32 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0)
+    monkeypatch.setattr(
+        cunufft_wrapper, "_uncommitted_budget_growth_bytes", lambda: 10 << 30
+    )
+    # live 30 - headroom 6 - future pool/cache growth 10 = 14 GiB: growth the
+    # capped consumers are still owed cannot be promised to fine grids, so the
+    # free floor survives the pool/cache filling AFTER a reservation is granted
+    assert cunufft_wrapper._pool_reservable_bytes() == 14 << 30
+
+
+def test_uncommitted_growth_counts_pool_and_type1_cache(monkeypatch):
+    class _FakePool:
+        def get_limit(self):
+            return 8 << 30
+
+        def total_bytes(self):
+            return 3 << 30
+
+    fake_cp = SimpleNamespace(get_default_memory_pool=lambda: _FakePool())
+    monkeypatch.setattr(cunufft_wrapper, "cp", fake_cp)
+    monkeypatch.setattr(cunufft_wrapper, "_type1_plan_cache_max_bytes", lambda: 4 << 30)
+    monkeypatch.setattr(
+        cunufft_wrapper, "_type1_cache_total_bytes_locked", lambda: 1 << 30
+    )
+    # pool still owed 8-3=5 GiB, type-1 cache still owed 4-1=3 GiB
+    assert cunufft_wrapper._uncommitted_budget_growth_bytes() == (5 << 30) + (3 << 30)
+
+
+def test_tile_budget_total_is_independent_of_inflight_count(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    monkeypatch.delenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 16 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 32 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0)
+    monkeypatch.setattr(cunufft_wrapper, "_uncommitted_budget_growth_bytes", lambda: 0)
+    pool = cunufft_wrapper._pool_reservable_bytes()
+    assert pool == 10 << 30  # live 16 GiB minus 6 GiB headroom (< 0.85 * live)
+    budgets = {}
+    for inflight in (1, 2, 4):
+        monkeypatch.setattr(cunufft_wrapper, "_gpu_inflight", inflight)
+        budgets[inflight] = cunufft_wrapper._current_tile_budget()
+    # a lone transform gets the whole pool; N transforms split the SAME pool
+    assert budgets[1] == pool
+    assert budgets[2] * 2 == pool
+    assert budgets[4] * 4 == pool
+
+
+def test_type1_cache_max_bytes_scales_with_total(monkeypatch):
+    monkeypatch.delenv("MOSAIC_SCATTERING_TYPE1_CACHE_MAX_BYTES", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 8 << 30)
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 1 << 30
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 64 << 30)
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 4 << 30
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 0)
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 4 << 30
+    monkeypatch.setenv("MOSAIC_SCATTERING_TYPE1_CACHE_MAX_BYTES", "123")
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 123
+
+
+def test_adaptive_reserve_enforces_absolute_headroom(monkeypatch):
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_headroom_bytes", lambda: 6 << 30)
+    reserve, frac, source = cunufft_wrapper._resolve_budget_policy(
+        mem_frac=None,
+        free_bytes=16 << 30,
+        resident_bytes=128 << 20,
+    )
+    assert source == "adaptive-reserve-default"
+    assert reserve >= 6 << 30
+    # usable = 16 - 6 = 10 GiB -> frac ~ 0.625 of free
+    assert frac == pytest.approx(10 / 16, abs=0.01)
+    # make-progress escape: free below headroom still leaves a usable sliver
+    reserve_small, frac_small, _ = cunufft_wrapper._resolve_budget_policy(
+        mem_frac=None,
+        free_bytes=2 << 30,
+        resident_bytes=128 << 20,
+    )
+    assert reserve_small <= int(0.85 * (2 << 30))
+    assert frac_small >= 0.05
