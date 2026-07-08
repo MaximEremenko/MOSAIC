@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
   "paths": {
-    "config_root": "/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/config_3D/chemical_ordering",
+    "config_root": ".",
     "structure_file": "LiFeO2.rmc6f",
-    "output_directory": "/mnt/c/Projects/MOSAICPaper/MOSAIC/examples/config_3D/chemical_ordering/output_demo_lifeo2_40x40x40_all",
+    "output_directory": "output_demo_lifeo2_40x40x40_all",
     "average_structure_file": "LiFeO2.rmc6f"
   },
   "structure": {
