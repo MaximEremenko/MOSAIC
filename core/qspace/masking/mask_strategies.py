@@ -29,6 +29,16 @@ _MASK_GPU_ESTIMATED_BYTES_PER_POINT = 128
 _MASK_GPU_ESTIMATE_SAFETY_FACTOR = 2.0
 _MASK_GPU_MIN_RESERVE_BYTES = 256 << 20
 _MASK_GPU_MAX_RESERVE_BYTES = 2 << 30
+# Evaluate the mask expression in batches of at most this many device bytes.
+# One full-grid evaluation of a ~1e8-point hkl32 grid burst-allocated the
+# whole card (~30 GiB of lambdify temporaries in one shot, free VRAM measured
+# at 222 MiB); identically-shaped batches reuse the same pool blocks, so the
+# steady footprint is ~one batch of temporaries.
+_MASK_GPU_BATCH_BYTES_DEFAULT = 1 << 30
+# Default absolute free-VRAM floor shared with the NUFFT wrapper's knob
+# (kept as a local computation so importing this module never probes CUDA).
+_MASK_GPU_HEADROOM_CEILING = 0.85
+_MASK_GPU_MIN_HEADROOM_BYTES = 2 << 30
 
 
 def _env_str(name: str, default: str) -> str:
@@ -163,6 +173,37 @@ def _estimate_mask_gpu_bytes(point_count: int, dim: int) -> int:
     return int(estimated * _MASK_GPU_ESTIMATE_SAFETY_FACTOR)
 
 
+def _mask_gpu_headroom_bytes(total_bytes: int) -> int:
+    """Absolute free-VRAM floor the mask evaluation must respect. Reads the
+    same ``MOSAIC_GPU_HEADROOM_GIB`` knob as the NUFFT wrapper (same default
+    arithmetic), without importing the wrapper."""
+    if total_bytes <= 0:
+        return 0
+    raw = os.getenv("MOSAIC_GPU_HEADROOM_GIB")
+    if raw:
+        try:
+            return max(0, int(float(raw) * (1 << 30)))
+        except ValueError:
+            logger.debug("Ignoring invalid MOSAIC_GPU_HEADROOM_GIB=%r", raw)
+    derived = (1.0 - _MASK_GPU_HEADROOM_CEILING) * float(total_bytes)
+    return int(max(derived, _MASK_GPU_MIN_HEADROOM_BYTES))
+
+
+def _mask_gpu_batch_bytes() -> int:
+    return max(
+        64 << 20,
+        _env_int("MOSAIC_MASK_EQUATION_GPU_BATCH_BYTES", _MASK_GPU_BATCH_BYTES_DEFAULT),
+    )
+
+
+def _mask_gpu_batch_points(dim: int) -> int:
+    per_point = max(
+        _mask_gpu_estimated_bytes_per_point(),
+        int(dim) * 8 + 96,
+    ) * _MASK_GPU_ESTIMATE_SAFETY_FACTOR
+    return int(max(1, _mask_gpu_batch_bytes() // int(per_point)))
+
+
 def _mask_gpu_reserve_bytes(*, free_bytes: int, total_bytes: int) -> int:
     reserve_override = _mask_gpu_reserve_override_bytes()
     if reserve_override is not None:
@@ -170,6 +211,7 @@ def _mask_gpu_reserve_bytes(*, free_bytes: int, total_bytes: int) -> int:
     reserve = max(
         _MASK_GPU_MIN_RESERVE_BYTES,
         min(_MASK_GPU_MAX_RESERVE_BYTES, max(total_bytes // 8, free_bytes // 4)),
+        _mask_gpu_headroom_bytes(total_bytes),
     )
     return int(min(reserve, max(free_bytes - (64 << 20), 0)))
 
@@ -218,7 +260,10 @@ def _resolve_mask_backend(
         decision["reason"] = "below-min-points"
         return decision
 
-    if max(0, int(free_bytes) - int(reserve_bytes)) < int(estimated_bytes):
+    # Evaluation is batched (``_mask_gpu_batch_points``), so eligibility only
+    # needs one batch of temporaries to fit, not the whole point set.
+    needed_bytes = min(int(estimated_bytes), _mask_gpu_batch_bytes())
+    if max(0, int(free_bytes) - int(reserve_bytes)) < needed_bytes:
         decision["reason"] = "insufficient-free-vram"
         return decision
 
@@ -503,13 +548,32 @@ class EqBasedStrategy:
         if decision["backend"] == "gpu" and cp_mod is not None:
             try:
                 func = self._ensure_gpu_callable(cp_mod)
-                d_h = cp_mod.asarray(h_vals)
-                d_k = cp_mod.asarray(k_vals)
-                d_l = cp_mod.asarray(l_vals)
-                d_mask = func(d_h, d_k, d_l)
-                mask = np.asarray(cp_mod.asnumpy(d_mask), dtype=bool).reshape(-1)
-                if mask.size == 1 and h_vals.size != 1:
-                    mask = np.broadcast_to(mask, h_vals.shape).copy()
+                # Batched evaluation: identically-shaped batches recycle the
+                # same pool blocks, so device residency stays ~one batch of
+                # lambdify temporaries instead of point_count * ~250 B at once.
+                batch_points = _mask_gpu_batch_points(dim)
+                mask = np.empty(point_count, dtype=bool)
+                for b0 in range(0, point_count, batch_points):
+                    b1 = min(b0 + batch_points, point_count)
+                    d_h = cp_mod.asarray(h_vals[b0:b1])
+                    d_k = cp_mod.asarray(k_vals[b0:b1])
+                    d_l = cp_mod.asarray(l_vals[b0:b1])
+                    d_mask = func(d_h, d_k, d_l)
+                    part = np.asarray(cp_mod.asnumpy(d_mask), dtype=bool).reshape(-1)
+                    if part.size == 1 and (b1 - b0) != 1:
+                        part = np.broadcast_to(part, (b1 - b0,)).copy()
+                    mask[b0:b1] = part
+                    d_h = d_k = d_l = d_mask = None
+                    try:
+                        free_now, total_now = _mask_gpu_memory_info(cp_mod)
+                        if free_now < _mask_gpu_headroom_bytes(total_now):
+                            logger.warning(
+                                "GPU free below headroom after mask batch %d-%d | "
+                                "free=%.2f GiB points=%d",
+                                b0, b1, free_now / 2**30, point_count,
+                            )
+                    except Exception:
+                        pass
                 self._validate_gpu_result(
                     gpu_mask=mask,
                     h_vals=h_vals,
