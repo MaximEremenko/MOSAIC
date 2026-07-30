@@ -177,6 +177,68 @@ def _stage1_parallelism(n_intervals: int) -> int:
     return max(1, min(threads // 4, 8, max(1, int(n_intervals))))
 
 
+def lazy_streamed_interval_loaders(
+    interval_ids,
+    context: StreamingComputeContext,
+    *,
+    nufft_eps: float = 1e-12,
+    nufft_prefer_cpu: bool = False,
+    nufft_gpu_only: bool = False,
+) -> tuple:
+    """Zero-arg loaders, one per interval: each call computes (or memo-fetches)
+    that interval's stage-1 payload and returns it — or ``None`` when the
+    interval is mask-empty. Consumers that stream payloads one at a time (the
+    two-pass lattice builder) use these to keep peak memory at ONE payload
+    instead of the whole shard's list. Each loader scopes the lattice-forward
+    default itself, so callers need no surrounding context manager."""
+    if context.nufft_eps is not None:
+        nufft_eps = float(context.nufft_eps)
+    if context.nufft_prefer_cpu is not None:
+        nufft_prefer_cpu = bool(context.nufft_prefer_cpu)
+    if context.nufft_gpu_only is not None:
+        nufft_gpu_only = bool(context.nufft_gpu_only)
+
+    def _make(interval_id: int):
+        def _load() -> "IntervalTask | None":
+            key = (str(context.cache_token), int(interval_id))
+            cached = _memo_get(key)
+            if cached is not None:
+                return cached[0]
+            interval = context.interval_lookup.get(int(interval_id))
+            if interval is None:
+                raise KeyError(
+                    "Streaming residual work unit references interval "
+                    f"{int(interval_id)} that is missing from the scattering "
+                    "plan's interval lookup — the residual plan and the "
+                    "scattering identity disagree."
+                )
+            with streaming_lattice_default(True):
+                task = compute_scattering_interval_payload(
+                    interval,
+                    B_=context.B_,
+                    mask_params=context.mask_params,
+                    MaskStrategy=context.MaskStrategy,
+                    supercell=context.supercell,
+                    original_coords=context.original_coords,
+                    cells_origin=context.cells_origin,
+                    elements_arr=context.elements_arr,
+                    charge=context.charge,
+                    use_coeff=context.use_coeff,
+                    coeff_val=context.coeff_val,
+                    unique_elements=list(context.unique_elements),
+                    ff_factory=context.ff_factory,
+                    nufft_eps=nufft_eps,
+                    nufft_prefer_cpu=nufft_prefer_cpu,
+                    nufft_gpu_only=nufft_gpu_only,
+                )
+            _memo_store(key, task)
+            return task
+
+        return _load
+
+    return tuple(_make(int(interval_id)) for interval_id in interval_ids)
+
+
 def compute_streamed_interval_tasks(
     interval_ids,
     context: StreamingComputeContext,
@@ -266,6 +328,7 @@ def compute_streamed_interval_tasks(
 
 __all__ = [
     "StreamingComputeContext",
+    "lazy_streamed_interval_loaders",
     "clear_streaming_payload_memo",
     "compute_streamed_interval_tasks",
     "stage2_streaming_enabled",

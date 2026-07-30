@@ -125,10 +125,80 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
 
 
+_SHARD_AXES = ("h", "k", "l")
+
+
+def _spatially_packed_shards(
+    interval_ids: list[int],
+    *,
+    interval_geometry: dict[int, dict],
+    supercell,
+    max_intervals_per_shard: int,
+    grid_budget_bytes: int,
+) -> list[tuple[int, ...]]:
+    """Group intervals into shards whose reciprocal-space BOUNDING BOX stays
+    inside a dense-grid byte budget.
+
+    Interval ids are ordered along one reciprocal axis at a time (k-fastest for
+    3D plans), so a contiguous run of ids is spatially THIN but LONG: at hkl40
+    a 147-id run spans the full 1281x1281x641 extent and its dense lattice
+    grid is 31 GiB — which fails RAM admission and silently demotes the shard
+    to the slow type-3 path. Sorting by spatial position first and then packing
+    greedily against the actual bounding-box grid size keeps every shard's
+    grid within budget by construction, for ANY id ordering the q-space
+    planner produces. Deterministic given (intervals, budget, cap), so shard
+    identity — and with it the checkpoint ledger — is invariant to worker
+    count and cluster size."""
+    import math
+
+    pitch = np.asarray(supercell, dtype=np.float64)
+    pitch = np.where(pitch > 0, 1.0 / pitch, 1.0)
+
+    def _bounds(interval_id: int):
+        info = interval_geometry[int(interval_id)]
+        start = np.array(
+            [float(info.get(f"{axis}_start", 0.0)) for axis in _SHARD_AXES]
+        )
+        end = np.array([float(info.get(f"{axis}_end", 0.0)) for axis in _SHARD_AXES])
+        return start, end
+
+    def _grid_bytes(lo: np.ndarray, hi: np.ndarray) -> int:
+        points = 1
+        for axis in range(len(_SHARD_AXES)):
+            step = pitch[axis] if axis < len(pitch) else 1.0
+            span = float(hi[axis] - lo[axis])
+            points *= max(1, int(math.floor(span / step + 0.5)) + 1)
+        return points * 16 * 2  # complex128 x (delta, average)
+
+    ordered = sorted(interval_ids, key=lambda i: tuple(_bounds(i)[0]))
+    shards: list[tuple[int, ...]] = []
+    current: list[int] = []
+    lo = hi = None
+    for interval_id in ordered:
+        start, end = _bounds(interval_id)
+        new_lo = start if lo is None else np.minimum(lo, start)
+        new_hi = end if hi is None else np.maximum(hi, end)
+        if current and (
+            len(current) >= max_intervals_per_shard
+            or _grid_bytes(new_lo, new_hi) > grid_budget_bytes
+        ):
+            shards.append(tuple(current))
+            current, lo, hi = [interval_id], start, end
+        else:
+            current.append(interval_id)
+            lo, hi = new_lo, new_hi
+    if current:
+        shards.append(tuple(current))
+    return shards
+
+
 def _batch_interval_chunks(
     unsaved_interval_chunks: list[tuple[int, int]],
     *,
     max_intervals_per_shard: int,
+    interval_geometry: dict[int, dict] | None = None,
+    supercell=None,
+    grid_budget_bytes: int | None = None,
 ) -> list[tuple[int, tuple[int, ...]]]:
     if max_intervals_per_shard <= 0:
         raise ValueError("max_intervals_per_shard must be positive.")
@@ -140,6 +210,23 @@ def _batch_interval_chunks(
     batches: list[tuple[int, tuple[int, ...]]] = []
     for chunk_id in sorted(grouped):
         interval_ids = grouped[chunk_id]
+        packable = (
+            interval_geometry is not None
+            and supercell is not None
+            and grid_budget_bytes is not None
+            and int(grid_budget_bytes) > 0
+            and all(int(i) in interval_geometry for i in interval_ids)
+        )
+        if packable:
+            for shard in _spatially_packed_shards(
+                interval_ids,
+                interval_geometry=interval_geometry,
+                supercell=supercell,
+                max_intervals_per_shard=max_intervals_per_shard,
+                grid_budget_bytes=int(grid_budget_bytes),
+            ):
+                batches.append((chunk_id, shard))
+            continue
         for start in range(0, len(interval_ids), max_intervals_per_shard):
             batches.append((chunk_id, tuple(interval_ids[start : start + max_intervals_per_shard])))
     return batches
@@ -151,6 +238,9 @@ def build_residual_field_work_units(
     parameters: object,
     output_dir: str,
     max_intervals_per_shard: int = 1,
+    interval_geometry: dict[int, dict] | None = None,
+    supercell=None,
+    grid_budget_bytes: int | None = None,
 ) -> list[ResidualFieldWorkUnit]:
     digest = build_residual_field_parameter_digest(parameters)
     patch_scope = "chunk"
@@ -159,6 +249,9 @@ def build_residual_field_work_units(
     for chunk_id, interval_ids in _batch_interval_chunks(
         unsaved_interval_chunks,
         max_intervals_per_shard=max_intervals_per_shard,
+        interval_geometry=interval_geometry,
+        supercell=supercell,
+        grid_budget_bytes=grid_budget_bytes,
     ):
         if len(interval_ids) == 1:
             work_units.append(

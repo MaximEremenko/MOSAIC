@@ -1562,7 +1562,8 @@ def execute_type2_on_lattice(
     eps: float = 1e-12,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
-) -> np.ndarray:
+    tile_consumer=None,
+) -> np.ndarray | None:
     """Evaluate ``F(r) = sum_m grid[m] exp(-i r.(origin + m*dq))`` at arbitrary
     targets via type-2 NUFFT, mode-slabbed along the FIRST axis. Exact to NUFFT
     eps.
@@ -1593,7 +1594,17 @@ def execute_type2_on_lattice(
       * Phase multiply and accumulation happen on the device; the result
         crosses PCIe once at the end instead of once per (slab x row). If the
     fixed device buffers do not fit the pool, the call falls back to
-    per-slab host accumulation transparently."""
+    per-slab host accumulation transparently.
+
+    ``tile_consumer(t0, t1, tile_out)``: when given, the full ``(n_trans,
+    n_tgt)`` result is NEVER materialized. Each completed target tile is
+    handed to the callback as a host ``(n_trans, t1 - t0)`` array (owned by
+    the callee only for the duration of the call) and the function returns
+    ``None``. This is the streaming path for huge target sets: the caller
+    folds tiles straight into its (possibly memmap-backed) accumulator, so
+    host memory is O(tile), not O(targets). The wrapped type-2 coordinates
+    are likewise computed per tile, so ``real_coords`` may be a read-only
+    memmap and no full-size host temporary of it is ever made."""
     if not (_CPU_ONLY or prefer_cpu):
         _ensure_gpu_backend()
     tgt = np.asarray(real_coords, dtype=np.float64)
@@ -1604,7 +1615,11 @@ def execute_type2_on_lattice(
     dim = len(dims)
     n_trans = int(grids.shape[0])
     n_tgt = int(len(tgt))
-    out = np.zeros((n_trans, n_tgt), dtype=np.complex128)
+    out = (
+        None
+        if tile_consumer is not None
+        else np.zeros((n_trans, n_tgt), dtype=np.complex128)
+    )
     if n_tgt == 0 or int(np.prod(dims)) == 0:
         return out
 
@@ -1652,7 +1667,14 @@ def execute_type2_on_lattice(
         )
         tile_len = min(tile_len, n_tgt)
     else:
-        tile_len = n_tgt
+        # CPU path: with a tile consumer the caller is streaming tiles into an
+        # accumulator precisely to bound host memory, so honor that here too
+        # instead of materializing every target-axis temporary at full size.
+        tile_len = (
+            min(n_tgt, _env_int("MOSAIC_NUFFT_CPU_TILE_TARGETS", 8_000_000))
+            if tile_consumer is not None
+            else n_tgt
+        )
     tile_bounds = [
         (t0, min(t0 + tile_len, n_tgt)) for t0 in range(0, n_tgt, tile_len)
     ]
@@ -1665,8 +1687,10 @@ def execute_type2_on_lattice(
             tile_len,
         )
 
-    # wrapped type-2 coordinates; degenerate axes (dq=0) map to x=0 (single mode)
-    x = ((tgt * dq[None, :] + np.pi) % (2.0 * np.pi)) - np.pi
+    # Wrapped type-2 coordinates are computed PER TILE inside the loop below
+    # (degenerate axes with dq=0 map to x=0, a single mode). Materializing the
+    # full (n_tgt, dim) wrap here doubled the target-side host footprint --
+    # ~5 GiB per hkl40 chunk -- before a single tile ran.
     centers = [d // 2 for d in dims]
     row_bytes_per_len = 16 * int(np.prod(dims[1:])) if dim > 1 else 16
     fine_other = 1
@@ -1776,8 +1800,8 @@ def execute_type2_on_lattice(
         )
         for tile_idx, (t0, t1) in enumerate(tile_bounds):
             n_t = t1 - t0
-            x_t = x[t0:t1]
-            tgt_t = tgt[t0:t1]
+            tgt_t = np.asarray(tgt[t0:t1], dtype=np.float64)
+            x_t = ((tgt_t * dq[None, :] + np.pi) % (2.0 * np.pi)) - np.pi
             if use_gpu:
                 try:
                     d_x = [
@@ -1834,6 +1858,11 @@ def execute_type2_on_lattice(
                 except cp.cuda.memory.OutOfMemoryError:
                     d_tgt = d_out = None
                     free_gpu_memory()
+            # Host-side accumulation target for this tile: the caller's full
+            # array when no consumer, a tile-sized scratch row otherwise.
+            tile_buf = None
+            if tile_consumer is not None and not device_accum:
+                tile_buf = np.zeros((n_trans, n_t), dtype=np.complex128)
             slab_len = _slab_len_now(device_accum, n_t)
             if use_gpu:
                 _ensure_plan_reservation(slab_len)
@@ -1870,7 +1899,10 @@ def execute_type2_on_lattice(
                             phase = np.exp(-1j * (tgt_t @ q_c))
                             host_rows = [cp.asnumpy(d_o) for d_o in row_results]
                             for row, o in enumerate(host_rows):
-                                out[row, t0:t1] += o * phase
+                                if tile_buf is not None:
+                                    tile_buf[row] += o * phase
+                                else:
+                                    out[row, t0:t1] += o * phase
                         row_results = None
                     else:
                         phase = np.exp(-1j * (tgt_t @ q_c))
@@ -1882,7 +1914,10 @@ def execute_type2_on_lattice(
                                 np.asarray(o, dtype=np.complex128).reshape(n_t)
                             )
                         for row, o in enumerate(row_results):
-                            out[row, t0:t1] += o * phase
+                            if tile_buf is not None:
+                                tile_buf[row] += o * phase
+                            else:
+                                out[row, t0:t1] += o * phase
                 except oom_errors as exc:
                     if use_gpu and isinstance(exc, RuntimeError) and not (
                         isinstance(exc, cp.cuda.memory.OutOfMemoryError)
@@ -1909,7 +1944,15 @@ def execute_type2_on_lattice(
                     continue
                 a0 = a1
             if use_gpu and device_accum:
-                out[:, t0:t1] = cp.asnumpy(d_out)
+                tile_host = cp.asnumpy(d_out)
+                if tile_consumer is not None:
+                    tile_consumer(t0, t1, tile_host)
+                else:
+                    out[:, t0:t1] = tile_host
+                tile_host = None
+            elif tile_buf is not None:
+                tile_consumer(t0, t1, tile_buf)
+            tile_buf = None
             d_out = d_tgt = None
             d_x = None
         if use_gpu:

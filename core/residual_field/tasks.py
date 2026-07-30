@@ -20,7 +20,11 @@ from core.residual_field.backend import (
     build_residual_field_reducer_backend,
     get_process_local_residual_field_backend,
 )
-from core.scattering.accumulation import apply_half_space_conjugate_reconstruction
+from core.scattering.accumulation import (
+    apply_half_space_conjugate_reconstruction,
+    half_space_conjugate_reconstruction_required,
+)
+from core.scattering.grid import _generate_grid
 from core.scattering.kernels import build_rifft_grid_for_chunk
 from core.scattering.kernels import IntervalTask
 from core.scattering.tasks import (
@@ -265,6 +269,93 @@ def clear_residual_rifft_payload_cache() -> None:
         _RIFFT_PAYLOAD_CACHE_BYTES = 0
 
 
+def _rifft_memmap_min_bytes() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_RIFFT_MEMMAP_MIN_BYTES")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 256 << 20
+
+
+def _rifft_grid_file_key(atoms: np.recarray, work_unit: ResidualFieldWorkUnit) -> str:
+    """Process-stable identity of a work unit's target grid (unlike the in-RAM
+    cache key, which keys on object ids)."""
+    import hashlib
+
+    token = "|".join(
+        str(part)
+        for part in (
+            str(work_unit.parameter_digest),
+            int(work_unit.chunk_id),
+            work_unit.partition_id,
+            work_unit.point_start,
+            work_unit.point_stop,
+            int(getattr(atoms, "shape", (len(atoms),))[0]),
+        )
+    )
+    return hashlib.sha256(token.encode("ascii")).hexdigest()[:24]
+
+
+def _build_rifft_grid_bounded(
+    chunk_data: list[dict],
+    *,
+    file_key: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a work unit's target grid with bounded host memory.
+
+    Small grids take the original single-pass path. Large ones (hkl40: 5.08 GB
+    per chunk, with a ~2x vstack peak on top) are built center-by-center
+    straight into a scratch-backed ``.npy`` memmap: anonymous RSS stays at one
+    patch (~2 MB) and the pages are evictable file cache. The file is written
+    once per (digest, chunk, partition) and REUSED by every later work unit,
+    resume, and worker on this host via atomic rename."""
+    coords = np.array([point["coordinates"] for point in chunk_data])
+    dist_vec = np.array([point["dist_from_atom_center"] for point in chunk_data])
+    step_vec = np.array([point["step_in_frac"] for point in chunk_data])
+    dim = coords.shape[1]
+
+    counts: list[int] = []
+    shapes: list[np.ndarray] = []
+    for center, dist, step in zip(coords, dist_vec, step_vec):
+        grid, shape = _generate_grid(dim, step, center, dist)
+        counts.append(int(grid.shape[0]))
+        shapes.append(np.asarray(shape))
+        del grid
+    total = int(sum(counts))
+    grid_shape_nd = np.vstack(shapes).astype(np.int64)
+    total_bytes = total * dim * 8
+
+    if total_bytes <= _rifft_memmap_min_bytes():
+        return build_rifft_grid_for_chunk(chunk_data)
+
+    root = Path(_lattice_scratch_dir()) / "mosaic-rifft-grids"
+    root.mkdir(parents=True, exist_ok=True)
+    final = root / f"rifft-{file_key}.npy"
+    if final.exists():
+        try:
+            existing = np.lib.format.open_memmap(str(final), mode="r")
+            if existing.shape == (total, dim):
+                return existing, grid_shape_nd
+        except (OSError, ValueError):
+            pass
+    tmp = root / f"rifft-{file_key}.{uuid4().hex}.tmp.npy"
+    mm = np.lib.format.open_memmap(
+        str(tmp), mode="w+", dtype=np.float64, shape=(total, dim)
+    )
+    offset = 0
+    for center, dist, step, count in zip(coords, dist_vec, step_vec, counts):
+        grid, _shape = _generate_grid(dim, step, center, dist)
+        mm[offset : offset + count] = grid
+        offset += count
+        del grid
+    mm.flush()
+    del mm
+    os.replace(tmp, final)
+    return np.lib.format.open_memmap(str(final), mode="r"), grid_shape_nd
+
+
 def _cached_rifft_payload(key: tuple) -> tuple[np.ndarray, np.ndarray] | None:
     if not _riff_payload_cache_enabled():
         return None
@@ -287,7 +378,12 @@ def _store_rifft_payload_cache(
     max_bytes = _riff_payload_cache_max_bytes()
     if max_bytes <= 0:
         return
-    payload_bytes = int(payload[0].nbytes + payload[1].nbytes)
+    # A read-only memmap grid costs page cache, not anonymous RAM: charge it
+    # nothing so large grids stay cached (evicting them would force a shape
+    # recomputation pass on every miss).
+    payload_bytes = int(
+        sum(0 if isinstance(arr, np.memmap) else int(arr.nbytes) for arr in payload)
+    )
     if payload_bytes > max_bytes:
         return
     with _RIFFT_PAYLOAD_CACHE_LOCK:
@@ -410,10 +506,12 @@ def build_residual_rifft_payload(
         return cached
     partition_atoms = _slice_work_unit_atoms(atoms, work_unit)
     build_start = time.perf_counter()
-    rifft_grid, grid_shape_nd = build_rifft_grid_for_chunk(
-        _atoms_to_chunk_data(partition_atoms)
+    rifft_grid, grid_shape_nd = _build_rifft_grid_bounded(
+        _atoms_to_chunk_data(partition_atoms),
+        file_key=_rifft_grid_file_key(atoms, work_unit),
     )
-    rifft_grid = np.asarray(rifft_grid, dtype=np.float64)
+    if not isinstance(rifft_grid, np.memmap):
+        rifft_grid = np.asarray(rifft_grid, dtype=np.float64)
     grid_shape_nd = np.asarray(grid_shape_nd, dtype=np.int64)
     if show_progress:
         logger.debug(
@@ -833,6 +931,47 @@ def _build_lattice_groups_streaming(
     return entry["groups"]
 
 
+def _result_memmap_min_bytes() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_RESULT_MEMMAP_MIN_BYTES")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 1 << 30
+
+
+def _allocate_result_arrays(n_points: int) -> tuple[np.ndarray, np.ndarray]:
+    """Zero-initialised (delta, average) result rows for one work unit.
+
+    Small results stay plain ndarrays. Large ones (hkl40: 2 x 3.39 GB per
+    chunk) become anonymous disk-backed memmaps under the lattice scratch dir
+    -- their pages are evictable file cache instead of anonymous RSS, which is
+    what lets several work units run concurrently inside one Dask worker
+    memory budget. Files are unlinked immediately after creation, so the
+    space can never leak past process exit."""
+    total = 2 * int(n_points) * 16
+    if total <= _result_memmap_min_bytes():
+        return (
+            np.zeros(int(n_points), dtype=np.complex128),
+            np.zeros(int(n_points), dtype=np.complex128),
+        )
+    root = Path(_lattice_scratch_dir()) / "mosaic-residual-results"
+    root.mkdir(parents=True, exist_ok=True)
+    arrays: list[np.ndarray] = []
+    for tag in ("delta", "average"):
+        path = root / f"result-{uuid4().hex}-{tag}.npy"
+        mm = np.lib.format.open_memmap(
+            str(path), mode="w+", dtype=np.complex128, shape=(int(n_points),)
+        )
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        arrays.append(mm)
+    return arrays[0], arrays[1]
+
+
 def _execute_lattice_groups(
     groups: list,
     *,
@@ -841,21 +980,38 @@ def _execute_lattice_groups(
     nufft_prefer_cpu: bool,
     nufft_gpu_only: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    amplitudes_delta = None
-    amplitudes_average = None
+    """Run every half-space role's type-2 and fold the tiles straight into one
+    (delta, average) result pair.
+
+    The transform streams target tiles through ``tile_consumer``, so the full
+    ``(n_trans, n_targets)`` output of a role is never materialized; the
+    conjugate half-space reconstruction (``v + conj(v)`` == ``2*Re(v)``) is
+    applied per tile during the fold. Host cost is O(tile) plus the result
+    pair itself, which spills to a scratch memmap when large."""
+    n_tgt = int(np.asarray(rifft_grid).shape[0])
+    amplitudes_delta, amplitudes_average = _allocate_result_arrays(n_tgt)
     for role, meta, grids in groups:
-        outs = execute_type2_on_lattice(
+        conjugate_double = half_space_conjugate_reconstruction_required(
+            _LATTICE_EMPTY_Q, role
+        )
+
+        def _fold_tile(t0: int, t1: int, tile_out, _double=conjugate_double):
+            if _double:
+                amplitudes_delta[t0:t1] += 2.0 * tile_out[0].real
+                amplitudes_average[t0:t1] += 2.0 * tile_out[1].real
+            else:
+                amplitudes_delta[t0:t1] += tile_out[0]
+                amplitudes_average[t0:t1] += tile_out[1]
+
+        execute_type2_on_lattice(
             meta,
             grids,
             rifft_grid,
             eps=nufft_eps,
             prefer_cpu=nufft_prefer_cpu,
             gpu_only=nufft_gpu_only,
+            tile_consumer=_fold_tile,
         )
-        d = apply_half_space_conjugate_reconstruction(outs[0], _LATTICE_EMPTY_Q, role)
-        a = apply_half_space_conjugate_reconstruction(outs[1], _LATTICE_EMPTY_Q, role)
-        amplitudes_delta = d if amplitudes_delta is None else amplitudes_delta + d
-        amplitudes_average = a if amplitudes_average is None else amplitudes_average + a
     return amplitudes_delta, amplitudes_average
 
 
@@ -873,12 +1029,19 @@ def _build_lattice_entry_from_inputs(
     def _load(interval_input):
         if isinstance(interval_input, IntervalTask):
             return interval_input
+        if callable(interval_input):
+            # Streaming lazy loader: computes one payload on demand and may
+            # return None for a mask-empty interval (an exact zero
+            # contribution; the caller's ledger still records the id).
+            return interval_input()
         return load_interval_task_payload(interval_input)
 
     per_role: dict[str, dict] = {}
     contribution = 0
     for interval_input in loaded_interval_inputs:
         task = _load(interval_input)
+        if task is None:
+            continue
         q = np.asarray(task.q_grid, dtype=np.float64)
         if q.ndim != 2 or q.shape[1] not in (1, 2, 3) or len(q) == 0:
             return None
@@ -938,6 +1101,8 @@ def _build_lattice_entry_from_inputs(
         )
     for interval_input in loaded_interval_inputs:
         task = _load(interval_input)
+        if task is None:
+            continue
         role = str(task.half_space_role)
         state = per_role[role]
         q = np.asarray(task.q_grid, dtype=np.float64)
@@ -1441,18 +1606,22 @@ def run_residual_field_interval_chunk_task(
         streamed_inputs_ready = streaming_compute_context is None
 
         def _resolve_interval_inputs():
-            """This batch's stage-1 payloads, computed on first demand.
+            """This batch's stage-1 inputs, as LAZY per-interval loaders.
 
-            Every work unit that hits the lattice cache consumes only the cached
-            entry, so computing these eagerly built ~3.7 GB of payloads per unit
-            and freed them unread for every fold after the first -- num_chunks
-            times per shard.
+            Two layers of laziness, both load-bearing for memory:
+            (1) nothing is built at all unless a consumer actually needs the
+                payloads (a lattice-cache hit consumes only the cached entry —
+                eager compute here built ~3.7 GB per unit and freed it unread
+                for every fold after the first, num_chunks times per shard);
+            (2) consumers receive zero-arg loaders, so the two-pass lattice
+                builder holds ONE ~57 MB payload at a time instead of the
+                whole shard's multi-GB list.
             """
             nonlocal loaded_interval_inputs, streamed_inputs_ready
             if not streamed_inputs_ready:
-                from core.scattering.streaming import compute_streamed_interval_tasks
+                from core.scattering.streaming import lazy_streamed_interval_loaders
 
-                loaded_interval_inputs = compute_streamed_interval_tasks(
+                loaded_interval_inputs = lazy_streamed_interval_loaders(
                     interval_ids,
                     streaming_compute_context,
                     nufft_eps=nufft_eps,
@@ -1559,17 +1728,23 @@ def run_residual_field_interval_chunk_task(
                 )
             else:
                 streamed_inputs = _resolve_interval_inputs()
-                if streaming_compute_context is not None and not streamed_inputs:
+                materialized: list[IntervalTask] = []
+                for interval_input in streamed_inputs:
+                    if isinstance(interval_input, IntervalTask):
+                        materialized.append(interval_input)
+                        continue
+                    if callable(interval_input):
+                        loaded = interval_input()
+                        if loaded is None:
+                            continue
+                        materialized.append(loaded)
+                        continue
+                    materialized.append(load_interval_task_payload(interval_input))
+                if streaming_compute_context is not None and not materialized:
+                    # Every interval in the batch is mask-empty: exact zero
+                    # contribution, recorded so coverage still closes.
                     return _record_mask_empty_batch()
-                interval_tasks = sorted(
-                    [
-                        interval_input
-                        if isinstance(interval_input, IntervalTask)
-                        else load_interval_task_payload(interval_input)
-                        for interval_input in streamed_inputs
-                    ],
-                    key=_interval_task_sort_key,
-                )
+                interval_tasks = sorted(materialized, key=_interval_task_sort_key)
                 compute_result = compute_residual_field_interval_chunk_arrays(
                     interval_tasks,
                     rifft_grid=rifft_grid,

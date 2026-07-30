@@ -1133,11 +1133,48 @@ def run_residual_field_stage(
     # else: streaming mode has no interval artifacts or payload dict to probe;
     # mask-emptiness is discovered inside the work unit, which folds an exact
     # zero and still records the interval as incorporated.
+    #
+    # Interval GEOMETRY for shard packing: interval ids run one reciprocal
+    # axis at a time, so a contiguous id run spans nearly the full q-volume
+    # and its dense lattice grid blows past every budget (hkl40: 31 GiB ->
+    # RAM-admission failure -> silent type-3 fallback). Handing the planner
+    # each id's bounds lets it pack shards by spatial bounding box instead.
+    interval_geometry: dict[int, dict] | None = None
+    try:
+        unique_interval_ids = sorted(
+            {int(interval_id) for interval_id, _chunk in all_interval_chunk_pairs}
+        )
+        interval_geometry = {
+            int(record.interval_id): {
+                "h_start": record.h_range[0],
+                "h_end": record.h_range[1],
+                "k_start": record.k_range[0],
+                "k_end": record.k_range[1],
+                "l_start": record.l_range[0],
+                "l_end": record.l_range[1],
+            }
+            for record in artifacts.db_manager.get_intervals_by_ids(
+                unique_interval_ids
+            )
+        }
+    except Exception:
+        logger.debug(
+            "Interval geometry unavailable; shard packing falls back to "
+            "contiguous id slicing.",
+            exc_info=True,
+        )
+        interval_geometry = None
+    _shard_packing_kwargs = {
+        "interval_geometry": interval_geometry,
+        "supercell": getattr(structure, "supercell", None),
+        "grid_budget_bytes": _resolve_residual_shard_grid_budget_bytes(),
+    }
     initial_work_units = build_residual_field_work_units(
         all_interval_chunk_pairs,
         parameters=workflow_parameters,
         output_dir=artifacts.output_dir,
         max_intervals_per_shard=max_intervals_per_shard,
+        **_shard_packing_kwargs,
     )
     initial_chunk_ids = sorted({work_unit.chunk_id for work_unit in initial_work_units})
     point_data_list: list[dict] = []
@@ -1170,6 +1207,7 @@ def run_residual_field_stage(
         parameters=workflow_parameters,
         output_dir=artifacts.output_dir,
         max_intervals_per_shard=max_intervals_per_shard,
+        **_shard_packing_kwargs,
     )
     planned_target_metrics: dict[tuple[int, int | None], dict[str, object]] = {}
     chunk_ids = sorted({work_unit.chunk_id for work_unit in work_units})
@@ -1821,6 +1859,7 @@ def run_residual_field_stage(
         ok = _future_completed_successfully(future, result_marker)
         bump()
         completed += 1
+        detail = "" if ok else _future_failure_detail(future, result_marker)
         if work_unit is not None and pbar is not None:
             _update_pbar_postfix(pbar, work_unit, ok=ok)
             if not ok:
@@ -1829,15 +1868,33 @@ def run_residual_field_stage(
                     work_unit.chunk_id,
                     "owner" if work_unit.partition_id is None else work_unit.partition_id,
                     _work_unit_interval_label(work_unit),
-                    _future_failure_detail(future, result_marker),
+                    detail,
                 )
         if not ok and work_unit is not None:
-            fail_streak += 1
-            if fail_streak >= fail_threshold:
-                _trip_to_cpu_only()
+            # Only GENUINE task failures count toward the GPU circuit
+            # breaker. Infrastructure casualties — a nanny restarting a
+            # worker over its memory budget, cancelled/lost futures, comm
+            # drops — say nothing about GPU health, and counting them is
+            # what turned every memory hiccup into a full CPU-only run
+            # (measured: one 95%-budget restart cascaded into thousands of
+            # cancelled batches, all "failures", breaker tripped, run dead).
+            infrastructure_failure = any(
+                marker in detail
+                for marker in (
+                    "KilledWorker",
+                    "Cancelled",
+                    "CommClosed",
+                    "TimeoutError",
+                    "WorkerProcessDied",
+                    "Nanny",
+                )
+            )
+            if not infrastructure_failure:
+                fail_streak += 1
+                if fail_streak >= fail_threshold:
+                    _trip_to_cpu_only()
             key = (str(work_unit.artifact_key), int(work_unit.chunk_id))
             remaining = int(retries_left.get(key, 0))
-            detail = _future_failure_detail(future, result_marker)
             _release_finished_future(future)
             if remaining > 0:
                 retries_left[key] = remaining - 1
