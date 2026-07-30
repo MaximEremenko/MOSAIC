@@ -110,8 +110,8 @@
   "runtime": {
     "dask": {
       "backend": "cuda-local",
-      "max_workers": 2,
-      "threads_per_worker": 16,
+      "max_workers": 4,
+      "threads_per_worker": 1,
       "processes": false,
       "worker_wait_timeout": "120s"
     },
@@ -119,6 +119,7 @@
       "kind": "ones",
       "calculator": "default"
     },
-    "scattering_stage2_mode": "streaming"
+    "scattering_stage2_mode": "streaming",
+    "residual_streaming_subchunks": 8
   }
 }

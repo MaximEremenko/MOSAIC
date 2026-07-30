@@ -681,7 +681,9 @@ class LiveLocalAccumulator:
                 "and an intervals-axis (subchunk) layout are irreconcilable; "
                 "delete 'residual_checkpoints/' under the output directory."
             )
-        if not np.array_equal(self.point_ids, point_ids_arr):
+        if self.point_ids is not point_ids_arr and not np.array_equal(
+            self.point_ids, point_ids_arr
+        ):
             raise ValueError("Local accumulator partial point_ids mismatch.")
         if not np.array_equal(self.grid_shape_nd, grid_shape_nd_arr):
             raise ValueError("Local accumulator partial grid_shape_nd mismatch.")

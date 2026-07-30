@@ -931,6 +931,51 @@ def _build_lattice_groups_streaming(
     return entry["groups"]
 
 
+_POINT_ID_CACHE: dict[tuple[int, int], np.ndarray] = {}
+_POINT_ID_CACHE_LOCK = threading.Lock()
+
+
+def _shared_point_ids(point_start: int, count: int) -> np.ndarray:
+    """One shared, read-only id vector per (start, count) per process.
+
+    Every streaming accumulator of a chunk stores the SAME
+    ``start + arange(count)`` — building a fresh 8-byte-per-point array per
+    accumulator held num_slots x num_chunks x 1.69 GB of anonymous RAM at
+    hkl40 scale. Large vectors live in a scratch-backed memmap (page cache,
+    not RSS); everything downstream treats them read-only."""
+    key = (int(point_start), int(count))
+    with _POINT_ID_CACHE_LOCK:
+        cached = _POINT_ID_CACHE.get(key)
+        if cached is not None:
+            return cached
+    nbytes = int(count) * 8
+    if nbytes <= (64 << 20):
+        ids = np.arange(key[0], key[0] + key[1], dtype=np.int64)
+        ids.setflags(write=False)
+    else:
+        root = Path(_lattice_scratch_dir()) / "mosaic-point-ids"
+        root.mkdir(parents=True, exist_ok=True)
+        final = root / f"ids-{key[0]}-{key[1]}.npy"
+        if not final.exists():
+            tmp = root / f"ids-{key[0]}-{key[1]}.{uuid4().hex}.tmp.npy"
+            mm = np.lib.format.open_memmap(
+                str(tmp), mode="w+", dtype=np.int64, shape=(key[1],)
+            )
+            step = 16_777_216
+            for offset in range(0, key[1], step):
+                stop = min(offset + step, key[1])
+                mm[offset:stop] = np.arange(
+                    key[0] + offset, key[0] + stop, dtype=np.int64
+                )
+            mm.flush()
+            del mm
+            os.replace(tmp, final)
+        ids = np.lib.format.open_memmap(str(final), mode="r")
+    with _POINT_ID_CACHE_LOCK:
+        _POINT_ID_CACHE.setdefault(key, ids)
+        return _POINT_ID_CACHE[key]
+
+
 def _result_memmap_min_bytes() -> int:
     raw = os.getenv("MOSAIC_RESIDUAL_RESULT_MEMMAP_MIN_BYTES")
     if raw is not None and str(raw).strip() != "":
@@ -1170,9 +1215,7 @@ def _compute_from_lattice_entry(
         nufft_prefer_cpu=nufft_prefer_cpu,
         nufft_gpu_only=nufft_gpu_only,
     )
-    point_ids = int(point_start or 0) + np.arange(
-        amplitudes_delta.shape[0], dtype=np.int64
-    )
+    point_ids = _shared_point_ids(int(point_start or 0), amplitudes_delta.shape[0])
     return ResidualChunkComputeResult(
         grid_shape_nd=grid_shape_nd,
         contribution_reciprocal_points=int(entry["contribution"]),
@@ -1506,8 +1549,7 @@ def compute_residual_field_interval_chunk_arrays(
             del grouped_average
     if amplitudes_delta is None or amplitudes_average is None:
         raise ValueError("Residual-field batch task produced no inverse outputs.")
-    point_offset = int(point_start or 0)
-    point_ids = point_offset + np.arange(amplitudes_delta.shape[0], dtype=np.int64)
+    point_ids = _shared_point_ids(int(point_start or 0), amplitudes_delta.shape[0])
     return ResidualChunkComputeResult(
         grid_shape_nd=np.asarray(grid_shape_nd, dtype=np.int64),
         contribution_reciprocal_points=int(contribution_reciprocal_points),
@@ -1644,8 +1686,9 @@ def run_residual_field_interval_chunk_task(
                 contribution_reciprocal_points=0,
                 amplitudes_delta=np.zeros(n_points, dtype=np.complex128),
                 amplitudes_average=np.zeros(n_points, dtype=np.complex128),
-                point_ids=int(work_unit.point_start or 0)
-                + np.arange(n_points, dtype=np.int64),
+                point_ids=_shared_point_ids(
+                    int(work_unit.point_start or 0), n_points
+                ),
                 output_dir=output_dir,
                 scratch_root=scratch_root,
                 db_path=db_path,
