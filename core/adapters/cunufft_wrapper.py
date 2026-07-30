@@ -402,14 +402,20 @@ _CPU_ONLY = os.getenv("MOSAIC_NUFFT_CPU_ONLY", "0") == "1"
 def set_cpu_only(flag: bool = True) -> None:
     """
     Force wrapper into CPU-only mode (or re-enable GPU when False).
-    Call once, before the first execute_* function.
+
+    Safe to call at ANY time, including from an error handler while sibling
+    threads are mid-transform: the module-global ``cp`` reference is left
+    intact so in-flight GPU code (device arrays, ``except cp.cuda...``
+    clauses) keeps working; only the mode flags flip, and every NEW transform
+    checks them. Nulling ``cp`` here is what used to crash concurrent threads
+    with ``'NoneType' object has no attribute 'cuda'`` and demote whole
+    workers to CPU on a single transient GPU error.
     """
-    global _CPU_ONLY, _GPU_AVAILABLE, _GPU_PROBED, cp
+    global _CPU_ONLY, _GPU_AVAILABLE, _GPU_PROBED
     _CPU_ONLY = bool(flag)
     if _CPU_ONLY:
         _GPU_AVAILABLE = False
         _GPU_PROBED = True
-        cp = None                     # type: ignore
         return
     _probe_gpu_backend()
 

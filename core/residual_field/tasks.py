@@ -976,6 +976,20 @@ def _shared_point_ids(point_start: int, count: int) -> np.ndarray:
         return _POINT_ID_CACHE[key]
 
 
+def _stage1_prefetch_window() -> int:
+    """In-builder stage-1 prefetch depth (payloads computed ahead, bounded).
+
+    ``MOSAIC_STREAMING_STAGE1_PARALLEL`` keeps its historical meaning as THE
+    stage-1 parallelism knob; default 4 (~230 MB of in-flight payloads)."""
+    raw = os.getenv("MOSAIC_STREAMING_STAGE1_PARALLEL")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 4
+
+
 def _result_memmap_min_bytes() -> int:
     raw = os.getenv("MOSAIC_RESIDUAL_RESULT_MEMMAP_MIN_BYTES")
     if raw is not None and str(raw).strip() != "":
@@ -1081,10 +1095,36 @@ def _build_lattice_entry_from_inputs(
             return interval_input()
         return load_interval_task_payload(interval_input)
 
+    def _iter_loaded(inputs):
+        """Yield loaded payloads in order, computing up to K ahead.
+
+        Stage-1 loads were strictly sequential here, so a shard's prologue ran
+        on ONE of the machine's cores while every GPU idled (measured: 25+ min
+        for a sparse-mask hkl40 shard). A bounded sliding window keeps peak
+        memory at K payloads (~57 MB each) while overlapping the mask/q-grid/
+        forward work across threads — safe now that ``set_cpu_only`` no longer
+        nulls the shared CuPy handle under running threads."""
+        window = _stage1_prefetch_window()
+        if window <= 1:
+            for interval_input in inputs:
+                yield _load(interval_input)
+            return
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=window) as pool:
+            pending: deque = deque()
+            iterator = iter(inputs)
+            for interval_input in iterator:
+                pending.append(pool.submit(_load, interval_input))
+                if len(pending) >= window:
+                    yield pending.popleft().result()
+            while pending:
+                yield pending.popleft().result()
+
     per_role: dict[str, dict] = {}
     contribution = 0
-    for interval_input in loaded_interval_inputs:
-        task = _load(interval_input)
+    for task in _iter_loaded(loaded_interval_inputs):
         if task is None:
             continue
         q = np.asarray(task.q_grid, dtype=np.float64)
@@ -1144,8 +1184,7 @@ def _build_lattice_entry_from_inputs(
             (2,) + state["dims"],
             in_ram=in_ram,
         )
-    for interval_input in loaded_interval_inputs:
-        task = _load(interval_input)
+    for task in _iter_loaded(loaded_interval_inputs):
         if task is None:
             continue
         role = str(task.half_space_role)

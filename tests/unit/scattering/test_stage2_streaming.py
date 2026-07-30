@@ -301,7 +301,17 @@ class TestBatchMajorOrdering:
             output_dir="/tmp/x",
         ).with_subchunk(subchunk_id=slot, point_count=10)
 
-    def test_same_batch_adjacent_across_chunks(self):
+    def test_same_batch_adjacent_within_owner_and_slots_interleaved(self):
+        """Two invariants of the submission order:
+
+        1. WITHIN a subchunk slot (one owner worker), a batch's units for the
+           different chunks stay adjacent and batch-major — that is what lets
+           the owner's payload memo / lattice cache serve every fold of a
+           batch from one stage-1 computation.
+        2. ACROSS slots, submissions round-robin so the first S units cover S
+           distinct slots — pure global batch-major kept all but
+           ceil(window / num_chunks) owners idle (measured: 2 of 4 GPUs busy).
+        """
         from core.residual_field.execution import (
             _sort_streaming_work_units_batch_major,
         )
@@ -311,6 +321,30 @@ class TestBatchMajorOrdering:
         y0 = self._unit((3, 4), 0, 1)
         y1 = self._unit((3, 4), 1, 1)
         # plan order is chunk-major: chunk 0's batches, then chunk 1's
+        ordered = _sort_streaming_work_units_batch_major([x0, y0, x1, y1])
+
+        first_two_slots = {int(unit.partition_id) for unit in ordered[:2]}
+        assert first_two_slots == {0, 1}, "early submissions must cover all slots"
+
+        for slot in (0, 1):
+            per_owner = [
+                (tuple(unit.interval_ids), int(unit.chunk_id))
+                for unit in ordered
+                if int(unit.partition_id) == slot
+            ]
+            assert per_owner == sorted(per_owner), (
+                "each owner's queue must stay batch-major"
+            )
+
+    def test_single_slot_order_is_plain_batch_major(self):
+        from core.residual_field.execution import (
+            _sort_streaming_work_units_batch_major,
+        )
+
+        x0 = self._unit((1, 2), 0, 0)
+        x1 = self._unit((1, 2), 1, 0)
+        y0 = self._unit((3, 4), 0, 0)
+        y1 = self._unit((3, 4), 1, 0)
         ordered = _sort_streaming_work_units_batch_major([x0, y0, x1, y1])
         assert [
             (tuple(unit.interval_ids), int(unit.chunk_id)) for unit in ordered

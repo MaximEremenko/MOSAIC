@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import OrderedDict
 import os
 from pathlib import Path
 import time
@@ -417,14 +418,37 @@ def _sort_streaming_work_units_batch_major(
     the capped per-worker payload memo this is the all-in-RAM constraint —
     the 1 GiB memo only ever needs the CURRENT batch, never more than one
     batch's payloads at a time. Chunk-major (plan) order would instead touch
-    every batch once per chunk and thrash the memo."""
-    return sorted(
+    every batch once per chunk and thrash the memo.
+
+    Across OWNERS the order is round-robin by subchunk slot: pure batch-major
+    ordering front-loads one shard's units, so with an in-flight window of W
+    only ceil(W / num_chunks) owners ever had work — measured on hkl40 as
+    exactly 2 of 4 GPUs busy at prefetch 2. Interleaving keeps each owner's
+    OWN queue batch-major (the memo/lattice-cache locality is per worker) while
+    the first S submissions cover S distinct slots."""
+    batch_major = sorted(
         work_units,
         key=lambda work_unit: (
             _work_unit_expected_interval_ids(work_unit),
             int(work_unit.chunk_id),
         ),
     )
+    slot_queues: "OrderedDict[object, list[ResidualFieldWorkUnit]]" = OrderedDict()
+    for work_unit in batch_major:
+        slot_queues.setdefault(work_unit.partition_id, []).append(work_unit)
+    if len(slot_queues) <= 1:
+        return batch_major
+    interleaved: list[ResidualFieldWorkUnit] = []
+    queues = [iter(queue) for queue in slot_queues.values()]
+    while queues:
+        remaining = []
+        for queue in queues:
+            unit = next(queue, None)
+            if unit is not None:
+                interleaved.append(unit)
+                remaining.append(queue)
+        queues = remaining
+    return interleaved
 
 
 def _invalidate_incompatible_local_checkpoints(
