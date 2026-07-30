@@ -45,6 +45,8 @@ examples/config_3D/displacement/output_disp_rod/
 examples/config_3D/displacement/output_disp_sphere/
 examples/config_3D/displacement/output_disp_rest/
 examples/config_3D/displacement/output_disp_all/
+examples/config_3D/displacement/output_disp_small_*/
+examples/config_3D/displacement/output_disp_hkl40_*/
 # 3D chemical
 examples/config_3D/chemical_ordering/output_chemical_ordering/
 examples/config_3D/chemical_ordering/output_chem_spheres/
@@ -62,4 +64,7 @@ ChangeLog
 
 # Environment
 .env
+.python/
+.venv/
+.dask-local/
 .vscode/

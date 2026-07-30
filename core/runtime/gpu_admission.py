@@ -165,7 +165,7 @@ def require_gpu_admission(
     )
     reports = _worker_reports(client)
     failures: list[str] = []
-    visible_tokens: dict[tuple[str, str], str] = {}
+    active_tokens: dict[tuple[str, str], str] = {}
     for report in reports:
         if (
             report.nthreads is not None
@@ -181,14 +181,17 @@ def require_gpu_admission(
                 f"{report.address}: cuFINUFFT probe failed"
                 + (f" ({report.error})" if report.error else "")
             )
-        for token in _visible_device_tokens(report):
-            key = (report.host, token)
-            if key in visible_tokens and not allow_multi_worker_per_gpu:
-                failures.append(
-                    f"{report.address}: CUDA device {token!r} on {report.host} is "
-                    f"also visible to {visible_tokens[key]}"
-                )
-            visible_tokens[key] = report.address
+        # Dask-CUDA rotates the complete CUDA_VISIBLE_DEVICES list per worker
+        # and assigns the first token to logical device 0. The remaining tokens
+        # being visible is expected and does not mean the worker owns them.
+        token = _visible_device_tokens(report)[0]
+        key = (report.host, token)
+        if key in active_tokens and not allow_multi_worker_per_gpu:
+            failures.append(
+                f"{report.address}: active CUDA device {token!r} on {report.host} "
+                f"is also assigned to {active_tokens[key]}"
+            )
+        active_tokens[key] = report.address
     if failures:
         raise GPUAdmissionError("GPU admission failed: " + "; ".join(failures))
     return GPUAdmissionReport(

@@ -43,7 +43,7 @@
   "processing": {
     "mode": "displacement",
     "method": "from_average",
-    "num_chunks": 2,
+    "num_chunks": 4,
     "fresh_start": true,
     "run_postprocessing": true,
     "points": [
@@ -103,14 +103,14 @@
       }
     ],
     "decoder": {
-      "source": "compute",
-      "compute_output_directory": "./output_disp_small_decoder"
+      "source": "cache",
+      "cache_path": "./output_disp_small_all/processed_point_data"
     }
   },
   "runtime": {
     "dask": {
-      "backend": "local",
-      "max_workers": 2,
+      "backend": "cuda-local",
+      "max_workers": 4,
       "threads_per_worker": 8,
       "processes": false,
       "worker_wait_timeout": "120s"

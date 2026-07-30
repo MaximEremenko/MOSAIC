@@ -97,7 +97,7 @@ def test_gpu_admission_rejects_duplicate_visible_device(monkeypatch):
         ),
     )
 
-    with pytest.raises(GPUAdmissionError, match="also visible"):
+    with pytest.raises(GPUAdmissionError, match="also assigned"):
         require_gpu_admission(
             FakeClient(
                 {
@@ -119,7 +119,7 @@ def test_gpu_admission_rejects_duplicate_all_visible_local_workers(monkeypatch):
         ),
     )
 
-    with pytest.raises(GPUAdmissionError, match="also visible"):
+    with pytest.raises(GPUAdmissionError, match="also assigned"):
         require_gpu_admission(
             FakeClient(
                 {
@@ -130,6 +130,31 @@ def test_gpu_admission_rejects_duplicate_all_visible_local_workers(monkeypatch):
             policy="gpu-required",
             required_gpu_tasks=1,
         )
+
+
+def test_gpu_admission_accepts_dask_cuda_rotated_visibility(monkeypatch):
+    monkeypatch.setattr(
+        "core.runtime.gpu_admission._worker_reports",
+        lambda client: (
+            _worker(address="worker-a", cuda_visible_devices="0,1,2,3"),
+            _worker(address="worker-b", cuda_visible_devices="1,2,3,0"),
+            _worker(address="worker-c", cuda_visible_devices="2,3,0,1"),
+            _worker(address="worker-d", cuda_visible_devices="3,0,1,2"),
+        ),
+    )
+
+    report = require_gpu_admission(
+        FakeClient(
+            {
+                address: {"resources": {"gpu": 1, "nufft": 1}}
+                for address in ("worker-a", "worker-b", "worker-c", "worker-d")
+            }
+        ),
+        policy="gpu-required",
+        required_gpu_tasks=1,
+    )
+
+    assert len(report.workers) == 4
 
 
 def test_runtime_provenance_contains_required_attempt_fields():

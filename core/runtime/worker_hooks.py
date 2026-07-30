@@ -17,10 +17,9 @@ logger = logging.getLogger(__name__)
 def free_gpu_memory() -> None:
     """Release GPU memory only if the NUFFT wrapper has already been loaded.
 
-    Importing ``core.adapters.cunufft_wrapper`` probes CuPy/CUDA and can create
-    CUDA process state. Runtime helpers import this module for non-GPU paths, so
-    cleanup must not import the GPU adapter just to discover there is nothing to
-    clean.
+    Runtime helpers import the NUFFT adapter for non-GPU paths, so cleanup must
+    not import it just to discover there is nothing to clean. CUDA initialization
+    in that adapter is intentionally deferred until the first GPU operation.
     """
     module = sys.modules.get("core.adapters.cunufft_wrapper")
     cleanup = getattr(module, "free_gpu_memory", None) if module is not None else None

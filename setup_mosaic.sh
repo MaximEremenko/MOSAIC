@@ -39,6 +39,7 @@ dependencies:
   - cuda-toolkit=${CUDA_VERSION}
   - pip
   - pip:
+      - cuda-bindings==12.*
       - finufft==${FINUFFT_VERSION}
       - cupy-cuda12x
       - cufinufft==${CUFINUFFT_VERSION}
@@ -62,6 +63,7 @@ pip install -e .
 
 echo ">>> Ensuring CUDA wheel stack ..."
 python -m pip install --upgrade \
+    "cuda-bindings==12.*" \
     "finufft==${FINUFFT_VERSION}" \
     "cupy-cuda12x" \
     "cufinufft==${CUFINUFFT_VERSION}" \

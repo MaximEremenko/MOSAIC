@@ -1438,48 +1438,60 @@ def run_residual_field_interval_chunk_task(
             )
         else:
             rifft_grid, grid_shape_nd = _normalize_rifft_payload(rifft_payload)
-        if streaming_compute_context is not None:
-            from core.scattering.streaming import compute_streamed_interval_tasks
+        streamed_inputs_ready = streaming_compute_context is None
 
-            loaded_interval_inputs = compute_streamed_interval_tasks(
-                interval_ids,
-                streaming_compute_context,
-                nufft_eps=nufft_eps,
-                nufft_prefer_cpu=nufft_prefer_cpu,
-                nufft_gpu_only=nufft_gpu_only,
+        def _resolve_interval_inputs():
+            """This batch's stage-1 payloads, computed on first demand.
+
+            Every work unit that hits the lattice cache consumes only the cached
+            entry, so computing these eagerly built ~3.7 GB of payloads per unit
+            and freed them unread for every fold after the first -- num_chunks
+            times per shard.
+            """
+            nonlocal loaded_interval_inputs, streamed_inputs_ready
+            if not streamed_inputs_ready:
+                from core.scattering.streaming import compute_streamed_interval_tasks
+
+                loaded_interval_inputs = compute_streamed_interval_tasks(
+                    interval_ids,
+                    streaming_compute_context,
+                    nufft_eps=nufft_eps,
+                    nufft_prefer_cpu=nufft_prefer_cpu,
+                    nufft_gpu_only=nufft_gpu_only,
+                )
+                streamed_inputs_ready = True
+            return loaded_interval_inputs
+
+        def _record_mask_empty_batch():
+            """Every interval in this batch is mask-empty: its exact
+            contribution is zero, but the accumulator must still record the
+            batch as incorporated or finalize's coverage check would
+            (correctly) refuse to publish the chunk."""
+            n_points = int(rifft_grid.shape[0])
+            worker_backend.accept_local_contribution(
+                work_unit,
+                grid_shape_nd=grid_shape_nd,
+                total_reciprocal_points=total_reciprocal_points,
+                contribution_reciprocal_points=0,
+                amplitudes_delta=np.zeros(n_points, dtype=np.complex128),
+                amplitudes_average=np.zeros(n_points, dtype=np.complex128),
+                point_ids=int(work_unit.point_start or 0)
+                + np.arange(n_points, dtype=np.int64),
+                output_dir=output_dir,
+                scratch_root=scratch_root,
+                db_path=db_path,
+                total_expected_partials=total_expected_partials,
+                cleanup_policy="off",
             )
-            if not loaded_interval_inputs:
-                # Every interval in this batch is mask-empty: its exact
-                # contribution is zero, but the accumulator must still record
-                # the batch as incorporated or finalize's coverage check
-                # would (correctly) refuse to publish the chunk.
-                n_points = int(rifft_grid.shape[0])
-                zeros_delta = np.zeros(n_points, dtype=np.complex128)
-                zeros_average = np.zeros(n_points, dtype=np.complex128)
-                worker_backend.accept_local_contribution(
-                    work_unit,
-                    grid_shape_nd=grid_shape_nd,
-                    total_reciprocal_points=total_reciprocal_points,
-                    contribution_reciprocal_points=0,
-                    amplitudes_delta=zeros_delta,
-                    amplitudes_average=zeros_average,
-                    point_ids=int(work_unit.point_start or 0)
-                    + np.arange(n_points, dtype=np.int64),
-                    output_dir=output_dir,
-                    scratch_root=scratch_root,
-                    db_path=db_path,
-                    total_expected_partials=total_expected_partials,
-                    cleanup_policy="off",
-                )
-                return ResidualFieldAccumulatorStatus(
-                    artifact_key=work_unit.artifact_key,
-                    chunk_id=work_unit.chunk_id,
-                    parameter_digest=work_unit.parameter_digest,
-                    interval_ids=work_unit.interval_ids,
-                    partition_id=work_unit.partition_id,
-                    contribution_reciprocal_point_count=0,
-                    total_reciprocal_points=total_reciprocal_points,
-                )
+            return ResidualFieldAccumulatorStatus(
+                artifact_key=work_unit.artifact_key,
+                chunk_id=work_unit.chunk_id,
+                parameter_digest=work_unit.parameter_digest,
+                interval_ids=work_unit.interval_ids,
+                partition_id=work_unit.partition_id,
+                contribution_reciprocal_point_count=0,
+                total_reciprocal_points=total_reciprocal_points,
+            )
         if show_progress:
             logger.debug(
                 "Residual batch start | chunk=%d | partition=%s | intervals=%s | rifft_points=%d",
@@ -1519,7 +1531,10 @@ def run_residual_field_interval_chunk_task(
                 # is the grids + ONE payload, never the full payload list. The
                 # result -- or a negative marker for lattice-ineligible data --
                 # is cached for every later work unit of this shard.
-                built_entry = _build_lattice_entry_from_inputs(loaded_interval_inputs)
+                streamed_inputs = _resolve_interval_inputs()
+                if streaming_compute_context is not None and not streamed_inputs:
+                    return _record_mask_empty_batch()
+                built_entry = _build_lattice_entry_from_inputs(streamed_inputs)
                 if built_entry == _LATTICE_RESOURCE_DENIED:
                     # Transient storage denial: fall back to type-3 for THIS
                     # work unit only; later work units retry the build.
@@ -1543,12 +1558,15 @@ def run_residual_field_interval_chunk_task(
                     nufft_gpu_only=nufft_gpu_only,
                 )
             else:
+                streamed_inputs = _resolve_interval_inputs()
+                if streaming_compute_context is not None and not streamed_inputs:
+                    return _record_mask_empty_batch()
                 interval_tasks = sorted(
                     [
                         interval_input
                         if isinstance(interval_input, IntervalTask)
                         else load_interval_task_payload(interval_input)
-                        for interval_input in loaded_interval_inputs
+                        for interval_input in streamed_inputs
                     ],
                     key=_interval_task_sort_key,
                 )

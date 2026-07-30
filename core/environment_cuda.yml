@@ -21,6 +21,7 @@ dependencies:
   - cuda-toolkit=12.4.0
   - pip
   - pip:
+      - cuda-bindings==12.*
       - finufft==2.2.0
       - cupy-cuda12x
       - cufinufft==2.5.1

@@ -103,13 +103,13 @@
       }
     ],
     "decoder": {
-      "source": "compute",
-      "compute_output_directory": "./output_disp_hkl40_decoder"
+      "source": "cache",
+      "cache_path": "./output_disp_hkl40_all/processed_point_data"
     }
   },
   "runtime": {
     "dask": {
-      "backend": "local",
+      "backend": "cuda-local",
       "max_workers": 2,
       "threads_per_worker": 16,
       "processes": false,

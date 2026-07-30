@@ -251,8 +251,10 @@ def _apply_cupy_pool_cap() -> None:
         logger.debug("Could not set CuPy pool limit: %s", exc)
 
 
-# Apply at import; safe even when CuPy is absent.
-_apply_cupy_pool_cap()
+# Deliberately do not touch CuPy/CUDA at import time.  Dask-CUDA imports the
+# workflow in its launcher before assigning each worker's visible device; an
+# import-time context would therefore be inherited on GPU 0 by every worker.
+# The cap is applied lazily by ``_ensure_gpu_backend`` after worker assignment.
 # Fixed, deterministic OOM back-off ladder for ``gpu_maxsubprobsize``.
 # Selection is intentionally history-independent: every call starts at the
 # same largest subproblem size and, on out-of-memory, backs off through this
@@ -402,10 +404,11 @@ def set_cpu_only(flag: bool = True) -> None:
     Force wrapper into CPU-only mode (or re-enable GPU when False).
     Call once, before the first execute_* function.
     """
-    global _CPU_ONLY, _GPU_AVAILABLE, cp
+    global _CPU_ONLY, _GPU_AVAILABLE, _GPU_PROBED, cp
     _CPU_ONLY = bool(flag)
     if _CPU_ONLY:
         _GPU_AVAILABLE = False
+        _GPU_PROBED = True
         cp = None                     # type: ignore
         return
     _probe_gpu_backend()
@@ -416,13 +419,16 @@ def set_cpu_only(flag: bool = True) -> None:
 ###############################################################################
 cp = None                             # type: ignore
 _GPU_AVAILABLE = False
+_GPU_PROBED = False
+_GPU_PROBE_LOCK = threading.Lock()
 
 
 def _probe_gpu_backend() -> None:
-    global cp, _GPU_AVAILABLE
+    global cp, _GPU_AVAILABLE, _GPU_PROBED
     if _CPU_ONLY:
         cp = None                     # type: ignore
         _GPU_AVAILABLE = False
+        _GPU_PROBED = True
         return
     try:
         import cupy as _cp            # noqa: E402
@@ -435,9 +441,25 @@ def _probe_gpu_backend() -> None:
     except ImportError:
         cp = None                     # type: ignore
         _GPU_AVAILABLE = False
+    _GPU_PROBED = True
 
 
-_probe_gpu_backend()
+def _ensure_gpu_backend() -> None:
+    """Initialize CUDA only when GPU work begins inside the assigned worker."""
+    if _CPU_ONLY:
+        return
+    # Tests and embedders may inject an already-live backend directly.
+    if not _GPU_PROBED and not _GPU_AVAILABLE:
+        with _GPU_PROBE_LOCK:
+            if not _GPU_PROBED and not _GPU_AVAILABLE:
+                _probe_gpu_backend()
+            if _GPU_PROBED and _GPU_AVAILABLE:
+                _apply_cupy_pool_cap()
+        return
+    if _GPU_PROBED and _GPU_AVAILABLE and not _CUPY_POOL_CAPPED:
+        with _GPU_PROBE_LOCK:
+            if not _CUPY_POOL_CAPPED:
+                _apply_cupy_pool_cap()
 
 # Lazily imported CPU backend (avoid importing finufft on GPU-only nodes)
 _FINUFFT3: dict[int, Callable] | None = None
@@ -1302,6 +1324,8 @@ def execute_inverse_cunufft_super_batch(
     max_batch_width: Optional[int] = None,
 ) -> np.ndarray:
     """Inverse type-3 helper that widens same-geometry batches when safe."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     if real_coords is None:
         raise ValueError("real_coords must be supplied for inverse transform")
     weights_arr = np.asarray(weights, dtype=np.complex128)
@@ -1568,8 +1592,10 @@ def execute_type2_on_lattice(
         once per (slab x row) as the simple interface would.
       * Phase multiply and accumulation happen on the device; the result
         crosses PCIe once at the end instead of once per (slab x row). If the
-        fixed device buffers do not fit the pool, the call falls back to
-        per-slab host accumulation transparently."""
+    fixed device buffers do not fit the pool, the call falls back to
+    per-slab host accumulation transparently."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     tgt = np.asarray(real_coords, dtype=np.float64)
     grids = np.asarray(grids, dtype=np.complex128)
     dims = meta["dims"]
@@ -2141,6 +2167,8 @@ def execute_type1_on_lattice(
     Returns ``None`` when the transform cannot run here (fine grid beyond the
     memory budget, or GPU OOM persisting after a cache flush) -- callers fall
     back to the type-3 path."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     r = np.asarray(real_coords, dtype=np.float64)
     if r.ndim == 1:
         r = r[:, None]
@@ -2311,6 +2339,8 @@ def execute_local_window_inverse(
     n_atoms*n_win)`` in atom-major order, identical to the global transform to
     NUFFT eps. The fine grid depends on the *window* extent (~1 A), not the
     supercell, which is what makes large-cell 3D tractable on the GPU."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     q = np.asarray(q_coords, dtype=np.float64)
     offsets = np.asarray(offsets, dtype=np.float64)
     centers = np.asarray(centers, dtype=np.float64)
@@ -2472,6 +2502,8 @@ def _execute_inverse_cunufft_batch(
     gpu_only: bool,
     device_out: bool,
 ) -> np.ndarray:
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     if weights_arr.shape[1] != len(q_coords):
         raise ValueError("weights shape must match q_coords on axis 1")
     experimental_overlap = _experimental_overlap_enabled()
@@ -2820,6 +2852,8 @@ def _batched_type3(
     prefer_cpu: bool,
     gpu_only: bool,
 ) -> np.ndarray:
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):
         raise ValueError("Only 1-, 2-, and 3-D inputs supported")
