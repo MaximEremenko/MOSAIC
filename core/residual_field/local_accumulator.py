@@ -133,6 +133,58 @@ def build_local_accumulator_snapshot_path(
     )
 
 
+def _mmap_npz_member(npz_path: Path, member: str) -> np.ndarray | None:
+    """Memory-map one array inside an UNCOMPRESSED ``.npz`` (``np.savez``).
+
+    ``np.savez`` stores members with ``ZIP_STORED``, so each embedded ``.npy``
+    sits contiguously in the file and can be mapped read-only at its offset.
+    Materializing snapshot members with ``np.asarray`` instead is what drove
+    the finalize driver to ~50 GB of anonymous RSS at hkl40 scale (8.5 GB per
+    snapshot, 32 snapshots) and got it OOM-killed twice. Returns ``None`` when
+    the member is compressed or otherwise unmappable (caller falls back)."""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(npz_path) as archive:
+            info = archive.getinfo(member + ".npy")
+            if info.compress_type != zipfile.ZIP_STORED:
+                return None
+            with archive.open(info) as handle:
+                version = np.lib.format.read_magic(handle)
+                if version == (1, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_1_0(handle)
+                elif version == (2, 0):
+                    shape, fortran, dtype = np.lib.format.read_array_header_2_0(handle)
+                else:
+                    return None
+                npy_header_bytes = handle.tell()
+            if fortran or dtype.hasobject:
+                return None
+        # Absolute payload offset = zip LOCAL header (30 fixed bytes + name +
+        # extra, read from the file itself: the local extra field can differ
+        # from the central directory's) + the .npy header we just measured.
+        with open(npz_path, "rb") as raw:
+            raw.seek(info.header_offset)
+            local_header = raw.read(30)
+            if local_header[:4] != b"PK\x03\x04":
+                return None
+            name_len = int.from_bytes(local_header[26:28], "little")
+            extra_len = int.from_bytes(local_header[28:30], "little")
+        data_offset = info.header_offset + 30 + name_len + extra_len + npy_header_bytes
+        return np.memmap(
+            npz_path, mode="r", dtype=dtype, shape=shape, offset=data_offset
+        )
+    except (KeyError, OSError, ValueError):
+        return None
+
+
+def _snapshot_member_array(data, npz_path: Path, member: str, dtype) -> np.ndarray:
+    mapped = _mmap_npz_member(npz_path, member)
+    if mapped is not None and mapped.dtype == np.dtype(dtype):
+        return mapped
+    return np.asarray(data[member], dtype=dtype)
+
+
 def load_local_accumulator_snapshot(
     output_dir: str,
     *,
@@ -152,10 +204,16 @@ def load_local_accumulator_snapshot(
         return None
     with np.load(snapshot_path, allow_pickle=False) as data:
         return {
-            "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
+            "point_ids": _snapshot_member_array(
+                data, snapshot_path, "point_ids", np.int64
+            ),
             "grid_shape_nd": np.asarray(data["grid_shape_nd"], dtype=np.int64),
-            "amplitudes_delta": np.asarray(data["amplitudes_delta"], dtype=np.complex128),
-            "amplitudes_average": np.asarray(data["amplitudes_average"], dtype=np.complex128),
+            "amplitudes_delta": _snapshot_member_array(
+                data, snapshot_path, "amplitudes_delta", np.complex128
+            ),
+            "amplitudes_average": _snapshot_member_array(
+                data, snapshot_path, "amplitudes_average", np.complex128
+            ),
             "reciprocal_point_count": int(np.asarray(data["reciprocal_point_count"]).ravel()[0]),
             "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
             "incorporated_interval_ids": tuple(
