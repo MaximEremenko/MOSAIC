@@ -267,6 +267,23 @@ def ensure_dask_client(
         cluster_kw.pop("python", None)
         cluster_kw.pop("scheduler_options", None)
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
+        # The residual pipeline stages its large arrays through file-backed
+        # memmaps (accumulators, result pairs, target grids). Their resident
+        # pages are RECLAIMABLE cache, but they count into process RSS, so
+        # dask's default per-worker limit (total RAM / n_workers) reads them
+        # as worker memory and the nanny kills healthy workers at 95% --
+        # measured on hkl40: every 4-worker run died this way while >20 GB
+        # stayed reclaimable. Default the limit OFF for cuda-local and let
+        # the kernel arbitrate page cache; DASK_MEMORY_LIMIT overrides for
+        # deployments that want a hard ceiling (e.g. cgroup-less shared
+        # hosts).
+        cluster_kw.setdefault(
+            "memory_limit",
+            os.getenv(
+                "DASK_MEMORY_LIMIT",
+                cfg_file.get("memory_limit", cfg_file.get("memory", 0)),
+            ),
+        )
         user_env = cluster_kw.get("env", {})
         if isinstance(user_env, dict):
             cluster_kw["env"] = {**_worker_env, **user_env}
