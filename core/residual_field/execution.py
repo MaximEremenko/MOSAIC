@@ -1836,6 +1836,7 @@ def run_residual_field_stage(
     }
     flying: set = set()
     future_meta: dict = {}
+    future_pinned_owner: dict = {}
     futures_by_chunk: dict[int, list] = {int(chunk_id): [] for chunk_id in chunk_ids}
     exhausted_failures: list[tuple[ResidualFieldWorkUnit, str]] = []
     submitted = 0
@@ -2006,6 +2007,7 @@ def run_residual_field_stage(
         )
         flying.add(future)
         future_meta[future] = work_unit
+        future_pinned_owner[future] = owner_address
         futures_by_chunk.setdefault(int(work_unit.chunk_id), []).append(future)
         submitted += 1
         if _should_log_async_progress(
@@ -2092,6 +2094,7 @@ def run_residual_field_stage(
     def _handle_completed_future(future, result_marker, bump, pbar=None) -> None:
         nonlocal completed, fail_streak
         flying.discard(future)
+        future_pinned_owner.pop(future, None)
         work_unit = future_meta.pop(future, None)
         ok = _future_completed_successfully(future, result_marker)
         bump()
@@ -2155,6 +2158,82 @@ def run_residual_field_stage(
                 _release_finished_future(future)
                 _mark_target_work_unit_done(work_unit)
 
+    def _rescue_futures_pinned_to_dead_workers() -> None:
+        """A queued fold task pinned (allow_other_workers=False) to a dead
+        worker parks in no-worker state FOREVER — nanny restarts come back
+        on NEW addresses, so nothing ever schedules it and the drain hangs
+        (observed: kernel OOM killed 2 of 4 workers; 30 'running' units
+        never moved again). Cancel and resubmit through the owner remap.
+        Infrastructure recovery, not a task failure: no retry budget spent,
+        no circuit-breaker count."""
+        live = set(_current_worker_addresses(client))
+        if not live:
+            return
+        for future in list(flying):
+            pinned = future_pinned_owner.get(future)
+            if pinned is None or pinned in live:
+                continue
+            if getattr(future, "status", "") in ("finished", "error", "cancelled"):
+                continue  # completion path will handle it
+            work_unit = future_meta.get(future)
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            flying.discard(future)
+            future_pinned_owner.pop(future, None)
+            future_meta.pop(future, None)
+            if work_unit is None:
+                continue
+            target_key = _reducer_target_key(work_unit)
+            # The cached rifft-payload future is pinned to the dead owner
+            # too — drop it so _submit rebuilds it on the new owner.
+            stale_rifft = target_rifft_futures.pop(target_key, None)
+            release = getattr(stale_rifft, "release", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    pass
+            logger.warning(
+                "Residual-field owner %s is gone; resubmitting chunk=%d "
+                "partition=%s via owner remap",
+                pinned,
+                int(work_unit.chunk_id),
+                "owner" if work_unit.partition_id is None else work_unit.partition_id,
+            )
+            _submit(work_unit)
+
+    def _drain_one_completion(bump, pbar=None, timeout_seconds: float = 45.0) -> bool:
+        """Handle ONE completion, waiting in bounded slices so tasks pinned
+        to since-dead workers get rescued instead of blocking as_completed
+        forever. Returns False only when nothing is in flight (or the
+        scheduler yields nothing for a completed set — anomaly)."""
+        from distributed import wait as _distributed_wait
+
+        while flying:
+            _rescue_futures_pinned_to_dead_workers()
+            if not flying:
+                return False
+            try:
+                _distributed_wait(
+                    list(flying),
+                    timeout=timeout_seconds,
+                    return_when="FIRST_COMPLETED",
+                )
+            except TimeoutError:
+                continue
+            except Exception:
+                # Sync/test clients (or comm hiccups) can make wait() raise
+                # immediately — fall through to the blocking generator path
+                # rather than spinning on retry.
+                pass
+            for future, result in yield_futures_with_results(list(flying), client):
+                _handle_completed_future(future, result, bump, pbar=pbar)
+                return True
+            return False
+        return False
+
     def _harvest_finished_nonblocking(bump, pbar=None) -> None:
         done_now = [future for future in list(flying) if future.done()]
         for future in done_now:
@@ -2183,12 +2262,7 @@ def run_residual_field_stage(
                 "trimming native pools and waiting for in-flight work before submitting more batches."
             )
         while flying and _cluster_host_memory_pressure(client):
-            drained_one = False
-            for future, result in yield_futures_with_results(list(flying), client):
-                _handle_completed_future(future, result, bump, pbar=pbar)
-                drained_one = True
-                break
-            if not drained_one:
+            if not _drain_one_completion(bump, pbar=pbar):
                 break
 
     def _update_pbar_postfix(pbar, work_unit, ok=True):
@@ -2217,26 +2291,13 @@ def run_residual_field_stage(
                 _apply_memory_backpressure(bump, pbar=pbar)
                 while len(flying) >= max_inflight:
                     # Drain ONE completion then break so the outer
-                    # submit-loop can enqueue the next work_unit immediately.
-                    # The snapshot is rebuilt on the next `while` iteration
-                    # if we are still at the cap.
-                    drained_one = False
-                    for future, result in yield_futures_with_results(list(flying), client):
-                        _handle_completed_future(future, result, bump, pbar=pbar)
-                        drained_one = True
-                        break
-                    if not drained_one:
-                        # Defensive: empty yield with non-empty `flying` would
-                        # otherwise spin. Break to avoid a tight loop.
+                    # submit-loop can enqueue the next work_unit immediately;
+                    # bounded waits inside keep dead-owner rescue running.
+                    if not _drain_one_completion(bump, pbar=pbar):
                         break
 
             while flying:
-                drained_one = False
-                for future, result in yield_futures_with_results(list(flying), client):
-                    _handle_completed_future(future, result, bump, pbar=pbar)
-                    drained_one = True
-                    break
-                if not drained_one:
+                if not _drain_one_completion(bump, pbar=pbar) and flying:
                     raise RuntimeError(
                         "Residual-field scheduler made no progress while draining "
                         f"{len(flying)} in-flight batch(es)."
