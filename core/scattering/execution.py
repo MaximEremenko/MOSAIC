@@ -1328,6 +1328,22 @@ def run_scattering_stage(
                 "streaming_state sink in the scattering parameters."
             )
         streaming_nufft = _nufft_execution_settings(parameters)
+        # Durable stage-1 payload store: computed payloads persist under the
+        # output dir, scoped by the scattering identity, so stage-1 runs once
+        # per interval across shards, owners, restarts, and cluster sizes.
+        # MOSAIC_STREAMING_PAYLOAD_STORE=0 disables; a path value relocates it
+        # (e.g. onto a parallel filesystem for multi-node runs).
+        _store_raw = os.getenv("MOSAIC_STREAMING_PAYLOAD_STORE", "1").strip()
+        payload_store_dir = None
+        if _store_raw.lower() not in {"0", "false", "no", "off"}:
+            _store_base = (
+                Path(_store_raw)
+                if _store_raw.lower() not in {"1", "true", "yes", "on", ""}
+                else Path(output_dir) / "stage1_payload_store"
+            )
+            payload_store_dir = str(_store_base / str(work_identity.run_digest))
+            Path(payload_store_dir).mkdir(parents=True, exist_ok=True)
+
         streaming_sink["compute_context"] = StreamingComputeContext(
             cache_token=str(work_identity.run_digest),
             interval_lookup=dict(interval_lookup),
@@ -1346,12 +1362,14 @@ def run_scattering_stage(
             nufft_eps=float(streaming_nufft.eps),
             nufft_prefer_cpu=bool(streaming_nufft.prefer_cpu),
             nufft_gpu_only=bool(streaming_nufft.gpu_only),
+            payload_store_dir=payload_store_dir,
         )
         logger.info(
             "Scattering stage-1/stage-2 skipped (streaming mode): %d interval(s) "
-            "will be computed inside residual work units; no durable interval "
-            "store will be written.",
+            "computed inside residual work units; durable stage-1 payload "
+            "store: %s.",
             len(interval_lookup),
+            payload_store_dir or "disabled",
         )
         return {
             "scattering_run_digest": work_identity.run_digest,

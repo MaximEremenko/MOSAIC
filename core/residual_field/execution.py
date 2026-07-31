@@ -407,6 +407,105 @@ def _streaming_slot_owner_map(
     }
 
 
+def _prewarm_stage1_store_if_enabled(
+    *,
+    client,
+    streaming_context,
+    streaming_context_future,
+    work_units,
+    worker_addresses,
+    workflow_parameters,
+) -> None:
+    """Fill the durable stage-1 payload store in parallel across ALL workers.
+
+    Without this, each interval's first compute happens inside its owner's
+    first fold of the shard: a serial, mostly-CPU prologue on one worker while
+    every other GPU idles (measured on hkl40: multi-minute all-idle windows,
+    25+ min for one sparse-mask shard). Prewarm batches are NOT slot-pinned,
+    so stage-1 spreads over every GPU up front; the store then makes every
+    later load — including restarts on any cluster size — a memmap read.
+    Best-effort: any failure degrades to the in-fold compute path.
+    ``MOSAIC_STREAMING_STAGE1_PREWARM=0`` disables."""
+    if streaming_context is None or streaming_context_future is None:
+        return
+    if not worker_addresses:
+        return
+    store_dir = getattr(streaming_context, "payload_store_dir", None)
+    if not store_dir:
+        return
+    raw = os.getenv("MOSAIC_STREAMING_STAGE1_PREWARM", "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return
+    try:
+        from core.scattering.streaming import (
+            prewarm_stage1_payload_store,
+            stage1_store_has,
+        )
+
+        interval_ids = sorted(
+            {
+                int(interval_id)
+                for work_unit in work_units
+                for interval_id in _work_unit_expected_interval_ids(work_unit)
+            }
+        )
+        missing = [
+            interval_id
+            for interval_id in interval_ids
+            if not stage1_store_has(store_dir, interval_id)
+        ]
+        if not missing:
+            if interval_ids:
+                logger.info(
+                    "Stage-1 payload store already complete (%d interval(s)).",
+                    len(interval_ids),
+                )
+            return
+        # ~4 batches per worker: enough tasks to balance uneven interval
+        # costs without paying scheduler overhead per interval.
+        batch_count = max(1, min(len(missing), 4 * len(worker_addresses)))
+        batch_size = -(-len(missing) // batch_count)
+        batches = [
+            missing[start : start + batch_size]
+            for start in range(0, len(missing), batch_size)
+        ]
+        settings = _residual_nufft_settings(workflow_parameters)
+        start_time = time.perf_counter()
+        logger.info(
+            "Prewarming stage-1 payload store: %d interval(s) in %d batch(es) "
+            "across %d worker(s) -> %s",
+            len(missing),
+            len(batches),
+            len(worker_addresses),
+            store_dir,
+        )
+        futures = [
+            client.submit(
+                prewarm_stage1_payload_store,
+                batch,
+                streaming_context_future,
+                nufft_eps=settings.eps,
+                nufft_prefer_cpu=settings.prefer_cpu,
+                nufft_gpu_only=settings.gpu_only,
+                resources={"nufft": 1},
+                retries=1,
+                pure=False,
+            )
+            for batch in batches
+        ]
+        computed = sum(int(count or 0) for count in client.gather(futures))
+        logger.info(
+            "Stage-1 payload store prewarmed: %d interval(s) in %.1fs.",
+            computed,
+            time.perf_counter() - start_time,
+        )
+    except Exception:
+        logger.warning(
+            "Stage-1 store prewarm failed; falling back to in-fold compute.",
+            exc_info=True,
+        )
+
+
 def _sort_streaming_work_units_batch_major(
     work_units: list[ResidualFieldWorkUnit],
 ) -> list[ResidualFieldWorkUnit]:
@@ -1638,6 +1737,14 @@ def run_residual_field_stage(
         else None
     )
     worker_addresses = _current_worker_addresses(client)
+    _prewarm_stage1_store_if_enabled(
+        client=client,
+        streaming_context=streaming_context,
+        streaming_context_future=streaming_context_future,
+        work_units=work_units,
+        worker_addresses=worker_addresses,
+        workflow_parameters=workflow_parameters,
+    )
     owner_local_target_units = planned_work_units if owner_local_reducer else work_units
     # Streaming: ownership keyed by SLOT alone (partition_id is never None for
     # streaming units) — the same batch content hashes to the same slot for

@@ -79,6 +79,12 @@ class StreamingComputeContext:
     nufft_eps: float | None = None
     nufft_prefer_cpu: bool | None = None
     nufft_gpu_only: bool | None = None
+    # Durable stage-1 payload store (directory path, already scoped to this
+    # run's scattering identity). When set, lazy loaders read computed
+    # payloads from disk before recomputing, and write fresh computes back —
+    # so stage-1 runs ONCE per interval per store lifetime instead of once
+    # per (shard, owner, restart). ``None`` keeps the pure in-RAM behaviour.
+    payload_store_dir: str | None = None
 
 
 def streaming_slot_for_batch(interval_ids, n_slots: int) -> int:
@@ -119,7 +125,7 @@ def _interval_task_nbytes(task: IntervalTask | None) -> int:
     total = 0
     for name in ("q_grid", "q_amp", "q_amp_av"):
         value = getattr(task, name, None)
-        if value is not None:
+        if value is not None and not isinstance(value, np.memmap):
             total += int(np.asarray(value).nbytes)
     return max(64, total)
 
@@ -156,6 +162,145 @@ def _memo_store(key: tuple[str, int], task: IntervalTask | None) -> None:
         while _STREAM_MEMO_BYTES > max_bytes and len(_STREAM_MEMO) > 1:
             _k, (_task, old_bytes) = _STREAM_MEMO.popitem(last=False)
             _STREAM_MEMO_BYTES -= int(old_bytes)
+
+
+# ---------------------------------------------------------------------------
+# Durable stage-1 payload store
+# ---------------------------------------------------------------------------
+# One uncompressed .npz per interval under the context's payload_store_dir.
+# Array members are read back as in-place memmaps (page cache, not RSS), so a
+# store hit costs no stage-1 compute AND almost no anonymous memory. Mask-empty
+# intervals are recorded as a marker file so their emptiness is durable too.
+
+_STORE_MISS = object()
+
+
+def _store_payload_path(store_dir: str, interval_id: int) -> "Path":
+    from pathlib import Path
+
+    return Path(store_dir) / f"interval_{int(interval_id):06d}.npz"
+
+
+def stage1_store_has(store_dir: str, interval_id: int) -> bool:
+    return _store_payload_path(store_dir, interval_id).exists()
+
+
+def read_stored_interval_payload(store_dir: str, interval_id: int):
+    """Return the stored payload, ``None`` for a recorded mask-empty interval,
+    or the ``_STORE_MISS`` sentinel when nothing durable exists yet."""
+    import json
+
+    from core.storage.npz_mmap import mmap_npz_member
+
+    path = _store_payload_path(store_dir, interval_id)
+    if not path.exists():
+        return _STORE_MISS
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            meta = json.loads(str(np.asarray(data["meta"]).item()))
+        if meta.get("empty"):
+            return None
+        arrays = {}
+        for member in ("q_grid", "q_amp", "q_amp_av"):
+            mapped = mmap_npz_member(path, member)
+            if mapped is None:
+                with np.load(path, allow_pickle=False) as data:
+                    mapped = np.asarray(data[member])
+            arrays[member] = mapped
+        return IntervalTask(
+            irecip_id=int(meta["irecip_id"]),
+            element=str(meta["element"]),
+            q_grid=arrays["q_grid"],
+            q_amp=arrays["q_amp"],
+            q_amp_av=arrays["q_amp_av"],
+            q_grid_digest=meta.get("q_grid_digest"),
+            half_space_role=str(meta["half_space_role"]),
+            reciprocal_multiplicity=int(meta.get("reciprocal_multiplicity", 1)),
+        )
+    except Exception:
+        logger.warning(
+            "Unreadable stage-1 store entry %s; recomputing.", path, exc_info=True
+        )
+        return _STORE_MISS
+
+
+def write_stored_interval_payload(
+    store_dir: str, interval_id: int, task: "IntervalTask | None"
+) -> None:
+    """Atomically persist one interval payload (idempotent, race-safe)."""
+    import json
+    from uuid import uuid4
+
+    path = _store_payload_path(store_dir, interval_id)
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        if task is None:
+            np.savez(tmp, meta=np.asarray(json.dumps({"empty": True})))
+        else:
+            meta = {
+                "empty": False,
+                "irecip_id": int(task.irecip_id),
+                "element": str(task.element),
+                "q_grid_digest": task.q_grid_digest,
+                "half_space_role": str(task.half_space_role),
+                "reciprocal_multiplicity": int(task.reciprocal_multiplicity),
+            }
+            np.savez(
+                tmp,
+                meta=np.asarray(json.dumps(meta)),
+                q_grid=np.ascontiguousarray(task.q_grid, dtype=np.float64),
+                q_amp=np.ascontiguousarray(
+                    np.asarray(task.q_amp).reshape(-1), dtype=np.complex128
+                ),
+                q_amp_av=np.ascontiguousarray(
+                    np.asarray(task.q_amp_av).reshape(-1), dtype=np.complex128
+                ),
+            )
+        # np.savez appends .npz when the target lacks it; our tmp ends in .tmp
+        produced = tmp if tmp.exists() else tmp.with_name(tmp.name + ".npz")
+        os.replace(produced, path)
+    except Exception:
+        logger.warning(
+            "Failed to persist stage-1 store entry %s; run continues without it.",
+            path,
+            exc_info=True,
+        )
+    finally:
+        for candidate in (tmp, tmp.with_name(tmp.name + ".npz")):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def prewarm_stage1_payload_store(
+    interval_ids,
+    context: StreamingComputeContext,
+    *,
+    nufft_eps: float = 1e-12,
+    nufft_prefer_cpu: bool = False,
+    nufft_gpu_only: bool = False,
+) -> int:
+    """Compute-and-persist a batch of interval payloads (a prewarm task).
+
+    Runs on any worker — prewarm batches are NOT slot-pinned, which is what
+    spreads stage-1 across every GPU up front instead of serializing it into
+    each owner's first fold of a shard. Payloads are dropped as soon as they
+    are durable; peak memory is one payload (plus the bounded memo)."""
+    computed = 0
+    for loader in lazy_streamed_interval_loaders(
+        interval_ids,
+        context,
+        nufft_eps=nufft_eps,
+        nufft_prefer_cpu=nufft_prefer_cpu,
+        nufft_gpu_only=nufft_gpu_only,
+    ):
+        loader()
+        computed += 1
+    return computed
 
 
 def _stage1_parallelism(n_intervals: int) -> int:
@@ -204,6 +349,12 @@ def lazy_streamed_interval_loaders(
             cached = _memo_get(key)
             if cached is not None:
                 return cached[0]
+            store_dir = getattr(context, "payload_store_dir", None)
+            if store_dir:
+                stored = read_stored_interval_payload(store_dir, int(interval_id))
+                if stored is not _STORE_MISS:
+                    _memo_store(key, stored)
+                    return stored
             interval = context.interval_lookup.get(int(interval_id))
             if interval is None:
                 raise KeyError(
@@ -231,6 +382,8 @@ def lazy_streamed_interval_loaders(
                     nufft_prefer_cpu=nufft_prefer_cpu,
                     nufft_gpu_only=nufft_gpu_only,
                 )
+            if store_dir:
+                write_stored_interval_payload(store_dir, int(interval_id), task)
             _memo_store(key, task)
             return task
 
@@ -329,6 +482,10 @@ def compute_streamed_interval_tasks(
 __all__ = [
     "StreamingComputeContext",
     "lazy_streamed_interval_loaders",
+    "prewarm_stage1_payload_store",
+    "read_stored_interval_payload",
+    "stage1_store_has",
+    "write_stored_interval_payload",
     "clear_streaming_payload_memo",
     "compute_streamed_interval_tasks",
     "stage2_streaming_enabled",
