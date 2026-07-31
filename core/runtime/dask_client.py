@@ -262,10 +262,19 @@ def shutdown_dask() -> None:
         cluster = getattr(client, "cluster", None)
         close = getattr(client, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception as exc:
+                logger.warning("Dask client close failed (ignored): %s", exc)
         cluster_close = getattr(cluster, "close", None)
         if callable(cluster_close):
-            cluster_close()
+            try:
+                cluster_close()
+            except Exception as exc:
+                # A slow/hung teardown (worker exits contending with the next
+                # case's spin-up) must never turn a COMPLETED run into rc!=0
+                # — the process is exiting and the OS reaps everything anyway.
+                logger.warning("Dask cluster close failed (ignored): %s", exc)
         logger.info("Dask client closed.")
     except ValueError:
         logger.info("No active Dask client.")
