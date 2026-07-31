@@ -44,7 +44,7 @@
     "mode": "displacement",
     "method": "from_average",
     "num_chunks": 4,
-    "fresh_start": true,
+    "fresh_start": false,
     "run_postprocessing": true,
     "points": [
       {
@@ -110,7 +110,7 @@
     "dask": {
       "backend": "cuda-local",
       "max_workers": 4,
-      "threads_per_worker": 1,
+      "threads_per_worker": 2,
       "processes": false,
       "worker_wait_timeout": "120s"
     },
