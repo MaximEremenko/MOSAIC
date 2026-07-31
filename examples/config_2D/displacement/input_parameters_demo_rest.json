@@ -1,9 +1,9 @@
 {
   "schema_version": 2,
   "paths": {
-    "config_root": ".",
+    "config_root": "<repo>/examples/config_2D/displacement",
     "structure_file": "sample_2d.f2d",
-    "output_directory": "output_demo_rest"
+    "output_directory": "<repo>/examples/config_2D/displacement/output_demo_rest"
   },
   "structure": {
     "dimension": 2,
@@ -36,7 +36,7 @@
     "run_postprocessing": true,
     "decoder": {
       "source": "compute",
-      "compute_output_directory": "output_demo_all_decoder"
+      "compute_output_directory": "<repo>/examples/config_2D/displacement/output_demo_all_decoder"
     },
     "points": [
       {

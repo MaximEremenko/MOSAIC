@@ -1,78 +1,78 @@
 {
-  "schema_version": 2,
-  "paths": {
-    "config_root": ".",
-    "structure_file": "sample_2d_chem_PMNPT_proj_101.f2d",
-    "output_directory": "output_demo_pmnpt_proj101_all"
-  },
-  "structure": {
-    "dimension": 2,
-    "coefficients": {
-      "source": "config"
-    }
-  },
-  "reciprocal_space": {
-    "intervals": [
-      {
-        "limit": [
-          40.0,
-          40.0
-        ],
-        "subvolume_step": [
-          5.0,
-          5.0
-        ]
-      }
-    ],
-    "mask": {
-      "equation": "h**2 + k**2 + 1 >= 0"
-    }
-  },
-  "processing": {
-    "mode": "chemical",
-    "method": "from_average",
-    "num_chunks": 1,
-    "fresh_start": true,
-    "run_postprocessing": true,
-    "chemical_filtered_ordering": true,
-    "coefficients": {
-      "center_by": "global",
-      "use": true
+    "schema_version": 2,
+    "paths": {
+        "config_root": ".",
+        "structure_file": "sample_2d_chem_PMNPT_proj_101.f2d",
+        "output_directory": "output_demo_pmnpt_proj101_all"
     },
-    "points": [
-      {
-        "selector": {
-          "element": "El1",
-          "reference_number": 1
-        },
-        "window": {
-          "dist_from_atom_center": [
-            0.8,
-            0.8
-          ],
-          "step_in_angstrom": [
-            0.8125,
-            0.8125
-          ]
+    "structure": {
+        "dimension": 2,
+        "coefficients": {
+            "source": "config"
         }
-      }
-    ]
-  },
-  "runtime": {
-    "progress": {
-      "force": true,
-      "task_logs": true
     },
-    "dask": {
-      "backend": "local",
-      "max_workers": 4,
-      "threads_per_worker": 1,
-      "processes": true,
-      "worker_wait_timeout": "30s"
+    "reciprocal_space": {
+        "intervals": [
+            {
+                "limit": [
+                    40.0,
+                    40.0
+                ],
+                "subvolume_step": [
+                    5.0,
+                    5.0
+                ]
+            }
+        ],
+        "mask": {
+            "equation": "h**2 + k**2 + 1 >= 0"
+        }
     },
-    "scattering_weights": {
-      "kind": "ones",
-      "calculator": "default"
+    "processing": {
+        "mode": "chemical",
+        "method": "from_average",
+        "num_chunks": 1,
+        "fresh_start": true,
+        "run_postprocessing": true,
+        "chemical_filtered_ordering": true,
+        "coefficients": {
+            "center_by": "global",
+            "use": true
+        },
+        "points": [
+            {
+                "selector": {
+                    "element": "El1",
+                    "reference_number": 1
+                },
+                "window": {
+                    "dist_from_atom_center": [
+                        0.8,
+                        0.8
+                    ],
+                    "step_in_angstrom": [
+                        0.8125,
+                        0.8125
+                    ]
+                }
+            }
+        ]
+    },
+    "runtime": {
+        "progress": {
+            "force": true,
+            "task_logs": true
+        },
+        "dask": {
+            "backend": "local",
+            "max_workers": "auto",
+            "threads_per_worker": 2,
+            "processes": true,
+            "worker_wait_timeout": "30s"
+        },
+        "scattering_weights": {
+            "kind": "ones",
+            "calculator": "default"
+        }
     }
-  }
 }
