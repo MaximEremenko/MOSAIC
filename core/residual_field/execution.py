@@ -394,18 +394,41 @@ def _streaming_slot_owner_map(
     target_keys,
     worker_addresses: list[str],
 ) -> dict[tuple[int, int | None], str]:
-    """Owner assignment keyed by subchunk SLOT alone for streaming targets.
+    """Owner assignment round-robin over the sorted (chunk, slot) targets.
 
-    Streaming target keys are (chunk_id, slot) where the slot is
-    content-addressed from the batch's interval ids, so the same batch hashes
-    to the same slot for EVERY chunk. Keying ownership by slot (instead of
-    round-robin over enumeration order) therefore lands every chunk's fold of
-    a given batch on one worker — the worker whose payload memo computed that
-    batch's stage-1 payloads once — so the compute is reused for all chunks
-    instead of being repeated on whichever worker enumeration happened to
-    pick (payload memo locality)."""
+    Slot-keyed placement (slot % workers) balanced unit COUNTS but not
+    WORK: slots are content-addressed from batch interval ids, and a
+    sparse mask concentrates nearly all real scattering volume in one
+    slot's batches — observed on the hkl40 'rod' case, whose second half
+    ran entirely on ONE GPU while three folded mask-empty no-ops. Spreading
+    each slot's per-chunk accumulators across workers quarters that skew.
+    The old co-location rationale (one worker computes a batch's payloads
+    once for all chunks) is obsolete with the durable stage-1 store: any
+    worker reads the payloads at disk speed, and the lattice entry a batch
+    needs is rebuilt at most once per owning worker, overlapped with other
+    units' transforms. Runtime-only placement — never part of work-unit
+    or checkpoint identity."""
+    # SLOT-major ordering: a slot's per-chunk accumulators take consecutive
+    # ranks, so one heavy slot spreads across workers even in the degenerate
+    # case where targets-per-chunk divides the worker count (chunk-major
+    # ordering collapses back to slot-keyed placement exactly then).
+    ordered = sorted(
+        {
+            (int(key[1]) if key[1] is not None else -1, int(key[0]))
+            for key in target_keys
+        }
+    )
+    rank = {target: index for index, target in enumerate(ordered)}
     return {
-        target_key: worker_addresses[int(target_key[1]) % len(worker_addresses)]
+        target_key: worker_addresses[
+            rank[
+                (
+                    int(target_key[1]) if target_key[1] is not None else -1,
+                    int(target_key[0]),
+                )
+            ]
+            % len(worker_addresses)
+        ]
         for target_key in target_keys
     }
 

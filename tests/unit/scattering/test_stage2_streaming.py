@@ -266,30 +266,48 @@ class TestStreamingLatticeDefault:
 
 
 class TestStreamingSlotOwnerMap:
-    def test_slot_keyed_chunk_ignored(self):
+    def test_round_robin_over_sorted_targets(self):
         from core.residual_field.execution import _streaming_slot_owner_map
 
         workers = ["tcp://w0", "tcp://w1", "tcp://w2"]
         keys = [(0, 0), (0, 1), (0, 5), (1, 0), (1, 1), (1, 5), (7, 2)]
+        # slot-major rank order: (slot,chunk) = (0,0),(0,1),(1,0),(1,1),
+        # (2,7),(5,0),(5,1) -> ranks 0..6 -> round-robin over 3 workers
         assert _streaming_slot_owner_map(keys, workers) == {
             (0, 0): "tcp://w0",
-            (0, 1): "tcp://w1",
+            (1, 0): "tcp://w1",
+            (0, 1): "tcp://w2",
+            (1, 1): "tcp://w0",
+            (7, 2): "tcp://w1",
             (0, 5): "tcp://w2",
-            (1, 0): "tcp://w0",
-            (1, 1): "tcp://w1",
-            (1, 5): "tcp://w2",
-            (7, 2): "tcp://w2",
+            (1, 5): "tcp://w0",
         }
 
-    def test_stable_across_chunks(self):
+    def test_targets_balance_across_workers(self):
+        # A sparse mask concentrates real work in ONE slot's batches
+        # (observed: hkl40 'rod' ran half its residual on a single GPU
+        # under slot-keyed placement). Per-(chunk, slot) round-robin must
+        # spread any single slot's chunk accumulators across workers.
+        from collections import Counter
+
         from core.residual_field.execution import _streaming_slot_owner_map
 
-        workers = ["a", "b"]
-        owners = _streaming_slot_owner_map(
-            [(chunk, slot) for chunk in range(5) for slot in range(4)], workers
+        workers = ["a", "b", "c", "d"]
+        keys = [(chunk, slot) for chunk in range(4) for slot in (4, 5, 6, 7)]
+        owners = _streaming_slot_owner_map(keys, workers)
+        counts = Counter(owners.values())
+        assert max(counts.values()) - min(counts.values()) <= 1
+        heavy_slot_owners = {owners[(chunk, 6)] for chunk in range(4)}
+        assert len(heavy_slot_owners) == 4  # one heavy slot -> all workers
+
+    def test_deterministic_given_same_inputs(self):
+        from core.residual_field.execution import _streaming_slot_owner_map
+
+        workers = ["a", "b", "c"]
+        keys = [(1, 5), (0, 4), (0, 5), (1, 4)]
+        assert _streaming_slot_owner_map(keys, workers) == _streaming_slot_owner_map(
+            list(reversed(keys)), workers
         )
-        for slot in range(4):
-            assert len({owners[(chunk, slot)] for chunk in range(5)}) == 1
 
 
 class TestBatchMajorOrdering:
