@@ -1399,10 +1399,20 @@ def run_residual_field_stage(
             artifacts.db_manager,
             output_dir=artifacts.output_dir,
             run_digest=run_digest,
+            # Credits COMMITTED streaming reducer progress (status-only
+            # results write no payload manifests) so a completed case's
+            # retry skips the residual stage instead of re-deriving it.
+            residual_parameter_digest=str(
+                initial_identity_units[0].parameter_digest
+            ),
         )
         pending_pairs = pending_residual_interval_chunks(
             snapshot,
             all_interval_chunk_pairs,
+            output_dir=artifacts.output_dir,
+            residual_parameter_digest=str(
+                initial_identity_units[0].parameter_digest
+            ),
         )
     else:
         pending_pairs = []

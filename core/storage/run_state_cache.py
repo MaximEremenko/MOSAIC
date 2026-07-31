@@ -436,16 +436,81 @@ def pending_scattering_interval_chunks(
 def pending_residual_interval_chunks(
     snapshot: RunStateSnapshot,
     expected_interval_chunks: Iterable[tuple[int, int]],
+    *,
+    output_dir: str | Path | None = None,
+    residual_parameter_digest: str | None = None,
 ) -> list[tuple[int, int]]:
     all_pairs = sorted({(int(interval_id), int(chunk_id)) for interval_id, chunk_id in expected_interval_chunks})
     if snapshot.residual_field.complete or snapshot.residual_field.no_output:
         return []
     complete_chunks = set(snapshot.residual_field.valid_chunk_ids)
+    # Streaming work units leave no payload manifests for the snapshot to
+    # see; their durable completion lives in COMMITTED reducer progress
+    # manifests (with final artifacts verified present). Without this a
+    # COMPLETED case re-derives its entire residual stage on retry.
+    credited: set[tuple[int, int]] = set()
+    if output_dir is not None and residual_parameter_digest:
+        for chunk_id, interval_ids in _committed_streaming_residual_credits(
+            output_dir, str(residual_parameter_digest)
+        ):
+            credited.update(
+                (int(interval_id), int(chunk_id)) for interval_id in interval_ids
+            )
     return [
         (interval_id, chunk_id)
         for interval_id, chunk_id in all_pairs
         if int(chunk_id) not in complete_chunks
+        and (interval_id, chunk_id) not in credited
     ]
+
+
+def _committed_streaming_residual_credits(
+    output_dir: str | Path,
+    parameter_digest: str,
+) -> list[tuple[int, tuple[int, ...]]]:
+    """(chunk_id, incorporated interval ids) from COMMITTED reducer
+    progress manifests of the CURRENT parameter digest whose final
+    artifacts all exist on disk.
+
+    Streaming residual work units return status-only results and write no
+    payload manifests, so the payload overlay in the rebuild cannot
+    re-credit them; without this source, the reset wipes a COMPLETED
+    case's saved rows and a retry re-derives the entire residual stage
+    (observed: ~53 min of GPU recompute on an already-published hkl40
+    case). Digest scoping comes from the manifest FILENAME, so a stale
+    config family can never credit rows for the current one; missing
+    final artifacts leave rows unsaved (manifests stay the authority)."""
+    credits: list[tuple[int, tuple[int, ...]]] = []
+    root = Path(output_dir) / "residual_checkpoints"
+    if not root.is_dir():
+        return credits
+    pattern = f"chunk_*/reducer_progress_params_{parameter_digest}.manifest.json"
+    for manifest_path in sorted(root.glob(pattern)):
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            continue
+        if str(manifest.get("completion_status", "")).lower() != "committed":
+            continue
+        if manifest.get("pending_interval_ids") or manifest.get("pending_shard_keys"):
+            continue
+        final_artifacts = manifest.get("final_artifacts") or []
+        if not final_artifacts or not all(
+            ref.get("path") and Path(ref["path"]).exists()
+            for ref in final_artifacts
+        ):
+            continue
+        try:
+            chunk_id = int(manifest.get("chunk_id"))
+            interval_ids = tuple(
+                int(value)
+                for value in manifest.get("incorporated_interval_ids") or ()
+            )
+        except (TypeError, ValueError):
+            continue
+        if interval_ids:
+            credits.append((chunk_id, interval_ids))
+    return credits
 
 
 def rebuild_sqlite_cache_from_manifests(
@@ -453,6 +518,7 @@ def rebuild_sqlite_cache_from_manifests(
     *,
     output_dir: str | Path,
     run_digest: str,
+    residual_parameter_digest: str | None = None,
 ) -> RunStateSnapshot:
     scan_started = time.perf_counter()
     snapshot = scan_run_state(output_dir, run_digest)
@@ -480,6 +546,12 @@ def rebuild_sqlite_cache_from_manifests(
         for payload in stage.selected_payloads:
             for interval_id in payload.interval_ids:
                 final_state[(int(interval_id), int(payload.chunk_id))] = True
+    if residual_parameter_digest:
+        for chunk_id, interval_ids in _committed_streaming_residual_credits(
+            output_dir, str(residual_parameter_digest)
+        ):
+            for interval_id in interval_ids:
+                final_state[(int(interval_id), int(chunk_id))] = True
     batch = getattr(db_manager, "update_interval_chunk_status_batch", None)
     if callable(batch):
         batch(
