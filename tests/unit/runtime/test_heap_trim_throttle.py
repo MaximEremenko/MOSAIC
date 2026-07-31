@@ -22,6 +22,8 @@ def test_transition_fires_only_every_nth(monkeypatch):
         raising=True,
     )
     plugin = wh._PerTaskHeapTrim()
+    monkeypatch.setattr(plugin, "_under_gpu_pressure", lambda: False, raising=True)
+    monkeypatch.setattr(plugin, "_under_host_pressure", lambda: False, raising=True)
     for _ in range(3):
         plugin.transition("k", "memory", "released")
     assert calls["trim"] == 0
@@ -89,6 +91,7 @@ def test_pressure_overrides_throttle(monkeypatch):
     plugin = wh._PerTaskHeapTrim()
     # Force pressure detection True regardless of CuPy availability.
     monkeypatch.setattr(plugin, "_under_gpu_pressure", lambda: True, raising=True)
+    monkeypatch.setattr(plugin, "_under_host_pressure", lambda: False, raising=True)
     plugin.transition("k", "memory", "released")
     assert calls["trim"] == 1
 
@@ -103,6 +106,7 @@ def test_no_pressure_respects_throttle(monkeypatch):
     )
     plugin = wh._PerTaskHeapTrim()
     monkeypatch.setattr(plugin, "_under_gpu_pressure", lambda: False, raising=True)
+    monkeypatch.setattr(plugin, "_under_host_pressure", lambda: False, raising=True)
     for _ in range(99):
         plugin.transition("k", "memory", "released")
     assert calls["trim"] == 0
