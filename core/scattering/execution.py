@@ -1094,7 +1094,7 @@ def run_interval_chunk_execution(
         exception_method = getattr(future, "exception", None)
         if callable(exception_method):
             try:
-                exc = exception_method(timeout=0)
+                exc = exception_method(timeout=30)
             except TypeError:
                 exc = exception_method()
             except Exception as err:

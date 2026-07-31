@@ -752,13 +752,23 @@ def _mem_available_bytes() -> int | None:
 
 
 def _lattice_ram_admission_fraction() -> float:
+    """Per-PROCESS share of MemAvailable a build may claim.
+
+    The live-grid ledger is per-process, so N worker processes each admit
+    against the SAME MemAvailable reading — an explicit fraction f is
+    effectively N*f host-wide (observed: 4 workers x 0.2 admitted ~0.8 of
+    the box and the kernel OOM killer took workers down). Divide the
+    configured/host default by the expected worker count."""
+    from core.adapters.cunufft_wrapper import _expected_worker_count
+
+    workers = max(1, int(_expected_worker_count()))
     raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION")
     if raw is not None and str(raw).strip() != "":
         try:
-            return min(1.0, max(0.05, float(raw)))
+            return min(1.0, max(0.02, float(raw) / workers))
         except (TypeError, ValueError):
             pass
-    return 0.5
+    return min(1.0, max(0.05, 0.5 / workers))
 
 
 def _lattice_grids_fit_in_ram(total_grid_bytes: int) -> bool:

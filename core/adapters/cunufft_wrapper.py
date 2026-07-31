@@ -143,7 +143,15 @@ def _expected_worker_count() -> int:
         try:
             return max(1, int(raw))
         except ValueError:
-            pass
+            pass  # "auto" falls through to the device probe
+    try:
+        import cupy as cp_mod  # type: ignore
+
+        count = int(cp_mod.cuda.runtime.getDeviceCount())
+        if count > 0:
+            return count  # cuda-local: one worker per visible GPU
+    except Exception:
+        pass
     return 4  # matches the project default
 
 
@@ -248,6 +256,49 @@ def _apply_cupy_pool_cap() -> None:
         )
     except Exception as exc:
         logger.debug("Could not set CuPy pool limit: %s", exc)
+    _apply_pinned_pool_policy(cp_mod)
+
+
+def _apply_pinned_pool_policy(cp_mod) -> None:
+    """Bound page-locked host memory on RAM-tight hosts.
+
+    Every ``cp.asarray(host_array)`` stages through CuPy's pinned pool,
+    which bins blocks by size and NEVER returns them to the OS (measured:
+    cudaHostAlloc pages land in shmem-rss; ~10 GB/worker at hkl40 —
+    the direct cause of kernel OOM kills on a 61 GB / 4-worker box).
+    CuPy has no set_limit for the pinned pool, so the cap is allocator
+    choice: MOSAIC_CUPY_PINNED_POOL_MODE = 'pool' (cached, default on
+    big-RAM hosts) | 'none' (direct cudaHostAlloc/FreeHost, zero cache).
+    Auto picks 'none' when total_ram / expected_workers < 24 GiB."""
+    mode = os.getenv("MOSAIC_CUPY_PINNED_POOL_MODE", "").strip().lower()
+    if mode not in ("pool", "none"):
+        from core.runtime.cpu_resources import total_memory_bytes
+
+        ram = total_memory_bytes()
+        workers = max(1, _expected_worker_count())
+        mode = "none" if ram and ram / workers < (24 << 30) else "pool"
+    if mode == "none":
+        try:
+            cp_mod.cuda.set_pinned_memory_allocator(None)
+            logger.info(
+                "CuPy pinned-memory pool DISABLED (RAM-tight host): "
+                "staging buffers use direct cudaHostAlloc/FreeHost."
+            )
+        except Exception as exc:
+            logger.debug("Could not disable pinned pool: %s", exc)
+
+
+def _flush_pinned_pool() -> None:
+    """Return the pinned pool's free blocks to the OS (no-op when the
+    pinned allocator is disabled). Free pinned blocks are pure cache; a
+    cudaFreeHost per block per tile is unmeasurable next to a transform."""
+    cp_mod = cp
+    if cp_mod is None:
+        return
+    try:
+        cp_mod.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
 
 
 # Deliberately do not touch CuPy/CUDA at import time.  Dask-CUDA imports the
@@ -1779,6 +1830,7 @@ def execute_type2_on_lattice(
     plans: dict[tuple[int, ...], object] = {}
     plans_tile: dict[tuple[int, ...], int] = {}   # shape -> tile of last setpts
     reserved_bytes = 0
+    persistent_slab_len = None
 
     def _ensure_plan_reservation(s_len: int) -> None:
         # Single-point reservation per call: drop the old claim (and the
@@ -1870,7 +1922,14 @@ def execute_type2_on_lattice(
             tile_buf = None
             if tile_consumer is not None and not device_accum:
                 tile_buf = np.zeros((n_trans, n_t), dtype=np.complex128)
-            slab_len = _slab_len_now(device_accum, n_t)
+            # Slab size is computed ONCE per call (first tile) and reused:
+            # recomputing per tile from fluctuating pool-free bytes minted a
+            # DIFFERENT pinned staging bin every tile (18 tiles x ~0.6 GiB
+            # retained = the 10 GB shmem that OOM-killed workers). The OOM
+            # halving below still adjusts it; halved sizes persist.
+            if persistent_slab_len is None:
+                persistent_slab_len = _slab_len_now(device_accum, n_t)
+            slab_len = persistent_slab_len
             if use_gpu:
                 _ensure_plan_reservation(slab_len)
             a0 = 0
@@ -1934,6 +1993,7 @@ def execute_type2_on_lattice(
                     if slab_len <= 1:
                         raise
                     slab_len = max(1, slab_len // 2)
+                    persistent_slab_len = slab_len
                     # drop every reference to the failed attempt BEFORE freeing:
                     # these locals would otherwise pin the old fine grid and row
                     # buffers through the retry's (smaller) allocations
@@ -1962,10 +2022,10 @@ def execute_type2_on_lattice(
             tile_buf = None
             d_out = d_tgt = None
             d_x = None
-        if use_gpu:
-            plans.clear()
-            plans_tile.clear()
-            _free_cupy_pool_blocks()
+            if use_gpu:
+                # Collapse the pinned high-water from "every staging size
+                # ever seen" to the live set — free blocks are pure cache.
+                _flush_pinned_pool()
     finally:
         plans.clear()
         plans_tile.clear()
@@ -1973,6 +2033,9 @@ def execute_type2_on_lattice(
             _release_tile(reserved_bytes)
             reserved_bytes = 0
         if use_gpu:
+            # Success AND failure paths: retained pool blocks from a failed
+            # transform otherwise survive into the retry.
+            _free_cupy_pool_blocks()
             _transform_exit()
     return out
 

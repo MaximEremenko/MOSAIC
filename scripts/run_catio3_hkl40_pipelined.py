@@ -32,6 +32,25 @@ CASES = ["all", "sphere", "rod", "rest"]
 RESIDUAL_DONE_MARKER = "Residual-field finished"
 
 
+def _is_tmpfs(path: Path) -> bool:
+    try:
+        resolved = str(path.resolve())
+        best_match = ""
+        best_type = ""
+        with open("/proc/mounts") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount_point, fs_type = parts[1], parts[2]
+                if resolved.startswith(mount_point.rstrip("/") + "/") or resolved == mount_point:
+                    if len(mount_point) > len(best_match):
+                        best_match, best_type = mount_point, fs_type
+        return best_type in ("tmpfs", "ramfs")
+    except OSError:
+        return False
+
+
 def build_env() -> dict[str, str]:
     site = ROOT / ".venv" / "lib" / "python3.11" / "site-packages"
     cuda_libs = ":".join(
@@ -54,6 +73,13 @@ def build_env() -> dict[str, str]:
         path = scratch / sub
         path.mkdir(parents=True, exist_ok=True)
         env.setdefault(name, str(path))
+        # tmpfs "spill" is RAM: ~57 GB of scratch on a tmpfs /tmp turns the
+        # relief valve into extra shmem-rss and feeds the OOM killer.
+        if _is_tmpfs(Path(env[name])):
+            raise SystemExit(
+                f"{name}={env[name]} is on tmpfs (RAM-backed). Point it at "
+                "real disk (e.g. the repo's .dask-local) and relaunch."
+            )
     env.setdefault("MOSAIC_NUFFT_EXECUTION_POLICY", "gpu-required")
     # Intra-worker double-buffering: two in-flight units per worker (2 task
     # threads x nufft:2). One unit's CPU fold overlaps the sibling's GPU

@@ -1829,6 +1829,19 @@ def run_residual_field_stage(
         (str(work_unit.artifact_key), int(work_unit.chunk_id)): DEFAULT_TASK_RETRIES
         for work_unit in work_units
     }
+    # Infrastructure failures (worker OOM-kill/restart, cancelled/lost comms)
+    # say nothing about the task and get their OWN budget with exponential
+    # backoff: a nanny-restart window otherwise burned entire retry budgets
+    # in seconds (observed: 15/32 units exhausted inside one 3-minute
+    # restart storm, every retry dying instantly on comm timeouts).
+    try:
+        infra_retry_budget = max(
+            1, int(os.getenv("MOSAIC_RESIDUAL_INFRA_RETRIES", "12"))
+        )
+    except ValueError:
+        infra_retry_budget = 12
+    infra_failures_seen: dict[tuple[str, int], int] = {}
+    deferred_resubmits: list = []  # (eligible_monotonic_time, work_unit)
     target_rifft_futures: dict[tuple[int, int | None], object] = {}
     target_remaining = {
         target_key: sum(1 for work_unit in work_units if _reducer_target_key(work_unit) == target_key)
@@ -2051,7 +2064,13 @@ def run_residual_field_stage(
         exception_method = getattr(future, "exception", None)
         if callable(exception_method):
             try:
-                exception = exception_method(timeout=0)
+                # timeout=0 through distributed's sync bridge ALWAYS raises
+                # a fabricated 'timed out after 0 s' from a non-loop thread,
+                # masking the real KilledWorker/Cancelled and making every
+                # failure classify as infrastructure. The state is already
+                # resolved locally (as_completed delivered it), so a
+                # positive timeout returns on the first loop tick.
+                exception = exception_method(timeout=30)
             except TypeError:
                 try:
                     exception = exception_method()
@@ -2129,13 +2148,38 @@ def run_residual_field_stage(
                     "Nanny",
                 )
             )
-            if not infrastructure_failure:
-                fail_streak += 1
-                if fail_streak >= fail_threshold:
-                    _trip_to_cpu_only()
             key = (str(work_unit.artifact_key), int(work_unit.chunk_id))
-            remaining = int(retries_left.get(key, 0))
             _release_finished_future(future)
+            if infrastructure_failure:
+                # Own budget + exponential backoff: resubmitting into the
+                # middle of a worker-restart storm just dies again in
+                # seconds and used to exhaust the genuine retry budget.
+                used = int(infra_failures_seen.get(key, 0))
+                infra_failures_seen[key] = used + 1
+                if used < infra_retry_budget:
+                    delay = min(60.0, 2.0 ** used)
+                    deferred_resubmits.append(
+                        (time.monotonic() + delay, work_unit)
+                    )
+                    logger.warning(
+                        "Residual-field infra failure | chunk=%d | partition=%s "
+                        "| resubmit deferred %.0fs (infra attempt %d/%d)",
+                        work_unit.chunk_id,
+                        "owner"
+                        if work_unit.partition_id is None
+                        else work_unit.partition_id,
+                        delay,
+                        used + 1,
+                        infra_retry_budget,
+                    )
+                    return
+                exhausted_failures.append((work_unit, detail))
+                _mark_target_work_unit_done(work_unit)
+                return
+            fail_streak += 1
+            if fail_streak >= fail_threshold:
+                _trip_to_cpu_only()
+            remaining = int(retries_left.get(key, 0))
             if remaining > 0:
                 retries_left[key] = remaining - 1
                 logger.warning(
@@ -2158,6 +2202,41 @@ def run_residual_field_stage(
                 _release_finished_future(future)
                 _mark_target_work_unit_done(work_unit)
 
+    def _process_deferred_resubmits() -> None:
+        if not deferred_resubmits:
+            return
+        now = time.monotonic()
+        ready = [item for item in deferred_resubmits if item[0] <= now]
+        for item in ready:
+            deferred_resubmits.remove(item)
+            _submit(item[1])
+
+    def _ensure_streaming_context_replicas() -> None:
+        """Re-scatter the streaming compute context when every worker that
+        held a replica died — dependents of a lost scattered future fail
+        with immediate comm timeouts, and a restarted worker never receives
+        the broadcast."""
+        nonlocal streaming_context_future
+        if streaming_context is None or streaming_context_future is None:
+            return
+        try:
+            key = getattr(streaming_context_future, "key", None)
+            holders = client.who_has(streaming_context_future)
+            held = holders.get(key) if isinstance(holders, dict) else None
+            if held:
+                return
+        except Exception:
+            return
+        try:
+            logger.warning(
+                "Streaming context replicas lost with dead workers; re-scattering."
+            )
+            streaming_context_future = client.scatter(
+                streaming_context, broadcast=True, hash=False
+            )
+        except Exception:
+            logger.exception("Streaming context re-scatter failed.")
+
     def _rescue_futures_pinned_to_dead_workers() -> None:
         """A queued fold task pinned (allow_other_workers=False) to a dead
         worker parks in no-worker state FOREVER — nanny restarts come back
@@ -2169,6 +2248,7 @@ def run_residual_field_stage(
         live = set(_current_worker_addresses(client))
         if not live:
             return
+        _ensure_streaming_context_replicas()
         for future in list(flying):
             pinned = future_pinned_owner.get(future)
             if pinned is None or pinned in live:
@@ -2212,6 +2292,7 @@ def run_residual_field_stage(
         from distributed import wait as _distributed_wait
 
         while flying:
+            _process_deferred_resubmits()
             _rescue_futures_pinned_to_dead_workers()
             if not flying:
                 return False
@@ -2296,7 +2377,12 @@ def run_residual_field_stage(
                     if not _drain_one_completion(bump, pbar=pbar):
                         break
 
-            while flying:
+            while flying or deferred_resubmits:
+                _process_deferred_resubmits()
+                if not flying:
+                    # Everything in flight is waiting out an infra backoff.
+                    time.sleep(0.5)
+                    continue
                 if not _drain_one_completion(bump, pbar=pbar) and flying:
                     raise RuntimeError(
                         "Residual-field scheduler made no progress while draining "

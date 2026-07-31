@@ -374,6 +374,29 @@ class _PerTaskHeapTrim:
         except Exception:
             return False
 
+    def _under_host_pressure(self) -> bool:
+        """Host RAM can be 2 GB from the OOM killer while the GPU sits
+        half idle — GPU pressure alone never trims then. Threshold via
+        MOSAIC_HOST_TRIM_AT_AVAIL_FRACTION (default 0.15 of total)."""
+        try:
+            from core.runtime.cpu_resources import (
+                available_memory_bytes,
+                total_memory_bytes,
+            )
+
+            total = total_memory_bytes()
+            available = available_memory_bytes()
+            if not total or available is None:
+                return False
+            raw = os.getenv("MOSAIC_HOST_TRIM_AT_AVAIL_FRACTION", "0.15")
+            try:
+                fraction = min(0.9, max(0.01, float(raw)))
+            except ValueError:
+                fraction = 0.15
+            return available < fraction * total
+        except Exception:
+            return False
+
     def transition(self, key, start, finish, **kwargs):
         if finish != "released":
             return
@@ -381,7 +404,9 @@ class _PerTaskHeapTrim:
             self._n += 1
             scheduled = (self._n % self._every) == 0
         # Always trim under pressure even if not scheduled.
-        if not (scheduled or self._under_gpu_pressure()):
+        if not (
+            scheduled or self._under_gpu_pressure() or self._under_host_pressure()
+        ):
             return
         try:
             import cupy as cp  # type: ignore

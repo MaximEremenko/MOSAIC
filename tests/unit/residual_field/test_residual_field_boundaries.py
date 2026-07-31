@@ -4698,6 +4698,9 @@ def test_lattice_ram_admission_availability_gate(monkeypatch):
     monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
     monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", raising=False)
     monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION", raising=False)
+    # Pin single-worker so the per-process fraction math is what is tested
+    # (the fraction divides by expected worker count host-wide).
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "1")
 
     # 10 GiB grid, 12 GiB available, default fraction 0.5 -> 6 GiB allowance
     monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 12 << 30)
@@ -4718,6 +4721,8 @@ def test_lattice_ram_admission_counts_live_grids(monkeypatch):
     thread just admitted; the live-grid counter must close that window and
     release on garbage collection."""
     import gc
+
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "1")
 
     from core.residual_field import tasks as tasks_mod
 
@@ -4788,3 +4793,18 @@ def test_streaming_builder_spills_when_availability_tight(monkeypatch, tmp_path)
     sp_d, sp_a = tasks_mod._execute_lattice_groups(spill_groups, **kwargs)
     np.testing.assert_array_equal(sp_d, ram_d)
     np.testing.assert_array_equal(sp_a, ram_a)
+
+
+def test_lattice_ram_admission_divides_by_worker_count(monkeypatch):
+    """N worker processes admit against the SAME MemAvailable reading, so
+    the per-process fraction must shrink with the expected worker count
+    (4 workers x 0.2 was effectively 0.8 host-wide -> OOM kills)."""
+    from core.residual_field import tasks as tasks_mod
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION", "0.5")
+    monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 40 << 30)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "1")
+    assert tasks_mod._lattice_grids_fit_in_ram(10 << 30)  # 20 GiB allowance
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    assert not tasks_mod._lattice_grids_fit_in_ram(10 << 30)  # 5 GiB each
