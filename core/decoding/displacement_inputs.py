@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from dataclasses import dataclass
 
@@ -353,6 +354,91 @@ def ensure_decoder(
         )
 
 
+# ---------------------------------------------------------------------------
+# Parallel per-site feature extraction
+# ---------------------------------------------------------------------------
+# The per-site pipeline (window -> regrid -> feature vector) is pure numpy on
+# disjoint slices of the chunk arrays, so it parallelizes across sites with a
+# fork process pool: children inherit the multi-GB chunk arrays copy-on-write
+# through this module-global (never pickled), compute independently, and
+# return only ~74 KB feature vectors. Results are reassembled in submission
+# order, so output is byte-identical to the serial loop. Serial fallback when
+# fork is unavailable or MOSAIC_DECODE_PARALLEL=1. This loop was the driver's
+# single-loaded-core phase (~3 min/chunk at hkl40) on a 96-core host.
+_SITE_FEATURE_CTX: dict = {}
+
+
+def _site_feature_one(item) -> np.ndarray:
+    cid, _decoder_key, center = item
+    ctx = _SITE_FEATURE_CTX
+    coords_all = ctx["coords_all"]
+    Rvals_all = ctx["Rvals_all"]
+    params = ctx["params"]
+    idxs = np.asarray(ctx["groups"][int(cid)], int)
+    coords = coords_all[idxs, :]
+    Rvals = Rvals_all[idxs]
+    Rvals_proc = apply_rq_pipeline_local(
+        Rvals,
+        coords,
+        q_window_kind=params["q_window_kind"],
+        q_window_at_db=params["q_window_at_db"],
+        size_aver=params["size_aver"],
+        hkl_max_xyz=params["hkl_max_xyz"],
+        guard_frac=params["guard_frac"],
+    )
+    y_grid, shape, axes_vals, _ = regrid_patch_to_c(coords, Rvals_proc)
+    return build_feature_vector_from_patch(
+        y_grid,
+        axes_vals,
+        center_abs=np.asarray(center, float),
+        D=len(shape),
+        weight_gamma=params["weight_g"],
+        remove_odd_tilt=True,
+        center_patch_subvoxel=center_patch_subvoxel,
+    )
+
+
+def _decode_parallel_workers(n_sites: int) -> int:
+    raw = os.getenv("MOSAIC_DECODE_PARALLEL")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, min(int(raw), n_sites))
+        except (TypeError, ValueError):
+            pass
+    return max(1, min(os.cpu_count() or 1, n_sites))
+
+
+def _compute_site_features(site_items, *, coords_all, Rvals_all, groups, params):
+    workers = _decode_parallel_workers(len(site_items))
+    use_pool = workers > 1 and len(site_items) >= 4
+    if use_pool:
+        import multiprocessing
+
+        try:
+            fork_ctx = multiprocessing.get_context("fork")
+        except ValueError:
+            use_pool = False
+    if not use_pool:
+        _SITE_FEATURE_CTX.update(
+            coords_all=coords_all, Rvals_all=Rvals_all, groups=groups, params=params
+        )
+        try:
+            return [_site_feature_one(item) for item in site_items]
+        finally:
+            _SITE_FEATURE_CTX.clear()
+    _SITE_FEATURE_CTX.update(
+        coords_all=coords_all, Rvals_all=Rvals_all, groups=groups, params=params
+    )
+    try:
+        # NOTE for CUDA-initialized parents: fork children run ONLY numpy —
+        # they never touch the GPU, which keeps fork-after-CUDA safe.
+        with fork_ctx.Pool(processes=workers) as pool:
+            chunksize = max(1, len(site_items) // (workers * 4))
+            return pool.map(_site_feature_one, site_items, chunksize=chunksize)
+    finally:
+        _SITE_FEATURE_CTX.clear()
+
+
 def build_feature_sets(
     processor,
     *,
@@ -394,6 +480,7 @@ def build_feature_sets(
     u_train = []
     training_decoder_keys = []
 
+    site_items = []
     for point_data, decoder_key in zip(point_data_list, decoder_keys):
         cid = int(point_data["central_point_id"])
         if cid not in groups:
@@ -401,32 +488,25 @@ def build_feature_sets(
         center = id2center.get(cid, None)
         if center is None:
             continue
+        site_items.append((cid, decoder_key, center))
 
-        idxs = np.asarray(groups[cid], int)
-        coords = coords_all[idxs, :]
-        Rvals = Rvals_all[idxs]
+    site_params = {
+        "q_window_kind": q_window_kind,
+        "q_window_at_db": q_window_at_db,
+        "size_aver": size_aver,
+        "hkl_max_xyz": hkl_max_xyz,
+        "guard_frac": guard_frac,
+        "weight_g": weight_g,
+    }
+    site_features = _compute_site_features(
+        site_items,
+        coords_all=coords_all,
+        Rvals_all=Rvals_all,
+        groups=groups,
+        params=site_params,
+    )
 
-        Rvals_proc = apply_rq_pipeline_local(
-            Rvals,
-            coords,
-            q_window_kind=q_window_kind,
-            q_window_at_db=q_window_at_db,
-            size_aver=size_aver,
-            hkl_max_xyz=hkl_max_xyz,
-            guard_frac=guard_frac,
-        )
-        y_grid, shape, axes_vals, _ = regrid_patch_to_c(coords, Rvals_proc)
-        D = len(shape)
-        feat = build_feature_vector_from_patch(
-            y_grid,
-            axes_vals,
-            center_abs=center,
-            D=D,
-            weight_gamma=weight_g,
-            remove_odd_tilt=True,
-            center_patch_subvoxel=center_patch_subvoxel,
-        )
-
+    for (cid, decoder_key, _center), feat in zip(site_items, site_features):
         features_all.append(feat)
         cids_all.append(cid)
         decoder_keys_all.append(decoder_key)
