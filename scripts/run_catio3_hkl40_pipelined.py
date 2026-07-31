@@ -42,7 +42,8 @@ def build_env() -> dict[str, str]:
     env["LD_LIBRARY_PATH"] = cuda_libs + (
         ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""
     )
-    env.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3")
+    # No device literals: cases size themselves (one worker per visible
+    # GPU); a SLURM allocation constrains visibility via its cgroup.
     scratch = ROOT / ".dask-local"
     env.setdefault("DASK_LOCAL_DIR", str(scratch))
     for name, sub in (
@@ -61,7 +62,7 @@ def build_env() -> dict[str, str]:
     # Concurrent cases share the box: cap the per-case extraction fork
     # pool so a CPU tail cannot starve a co-resident GPU case of RAM
     # (measured: 96-way extraction + prewarm OOM-killed the CPU case).
-    env.setdefault("MOSAIC_DECODE_PARALLEL", "32")
+    env.setdefault("MOSAIC_DECODE_PARALLEL", str(max(4, (os.cpu_count() or 8) // 3)))
     env.setdefault("MOSAIC_NUFFT_SLOTS_PER_WORKER", "2")
     env.setdefault("MOSAIC_DASK_GPU_RESOURCE", "2")
     env.setdefault("MOSAIC_SCATTERING_STAGE2_STREAMING", "1")
@@ -175,7 +176,8 @@ def main() -> int:
     # them ungated, fully overlapped with the gated chain's GPU work.
     ungated = [case for case in CASES if os.getenv("MOSAIC_PIPELINE_UNGATED", "all") and case in os.getenv("MOSAIC_PIPELINE_UNGATED", "all").split(",")]
     gated = [case for case in CASES if case not in ungated]
-    min_free_gb = float(os.getenv("MOSAIC_PIPELINE_MIN_FREE_GB", "18"))
+    default_floor = max(8.0, 0.3 * (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1073741824))
+    min_free_gb = float(os.getenv("MOSAIC_PIPELINE_MIN_FREE_GB", str(round(default_floor))))
     for case in ungated:
         wait_for_ram(min_free_gb, f"ungated case {case}")
         start(case)

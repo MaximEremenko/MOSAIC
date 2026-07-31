@@ -128,6 +128,36 @@ def set_log_dir_for_run(run_dir: str | Path) -> Path:
     return log_dir
 
 
+def _detected_gpu_count() -> int:
+    try:
+        import cupy
+
+        return int(cupy.cuda.runtime.getDeviceCount())
+    except Exception:
+        visible = os.getenv("CUDA_VISIBLE_DEVICES", "")
+        if visible.strip():
+            return len([t for t in visible.split(",") if t.strip()])
+        return 0
+
+
+def _resolve_max_workers(backend: str | None) -> int:
+    """Worker count portable across machines: an explicit integer wins;
+    ``auto``/unset means one worker per visible GPU for cuda-local (any node
+    size), falling back to 4 elsewhere. Hard-coding a count is what quietly
+    stranded half the GPUs on a 4-card box and would waste an 8-card node."""
+    raw = os.getenv("DASK_MAX_WORKERS", "auto").strip().lower()
+    if raw not in {"", "auto"}:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("Invalid DASK_MAX_WORKERS=%r; using auto.", raw)
+    if str(backend or "").strip().lower() == "cuda-local":
+        detected = _detected_gpu_count()
+        if detected > 0:
+            return detected
+    return 4
+
+
 def get_client() -> Client:
     global _CLIENT
     if _CLIENT is not None:
@@ -172,7 +202,7 @@ def get_client() -> Client:
 
     _CLIENT = ensure_dask_client(
         backend=configured_backend,
-        max_workers=int(os.getenv("DASK_MAX_WORKERS", "4")),
+        max_workers=_resolve_max_workers(configured_backend),
         threads_per_worker=threads_per_worker,
         processes=processes,
         gpu=int(os.getenv("GPUS_PER_JOB", "0")),

@@ -110,7 +110,7 @@
   "runtime": {
     "dask": {
       "backend": "cuda-local",
-      "max_workers": 4,
+      "max_workers": "auto",
       "threads_per_worker": 2,
       "processes": false,
       "worker_wait_timeout": "120s"

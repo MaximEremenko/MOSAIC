@@ -415,6 +415,28 @@ def _solve_linear_decoder(
     lam_reg: float,
     logger,
 ) -> np.ndarray:
+    # The launch environment pins BLAS to one thread (correct for the dask
+    # workers, which parallelize across tasks) — but this solve runs in the
+    # DRIVER, where one BLAS thread means a ~4e13-FLOP kernel build + solve
+    # crawls on one of 96 cores while every GPU idles. Open the pool up for
+    # exactly this call.
+    import os as _os
+
+    from threadpoolctl import threadpool_limits
+
+    with threadpool_limits(limits=max(1, _os.cpu_count() or 1)):
+        return _solve_linear_decoder_inner(
+            R_data=R_data, U_data=U_data, lam_reg=lam_reg, logger=logger
+        )
+
+
+def _solve_linear_decoder_inner(
+    *,
+    R_data: np.ndarray,
+    U_data: np.ndarray,
+    lam_reg: float,
+    logger,
+) -> np.ndarray:
     P, N = R_data.shape
     lam = float(lam_reg)
     # Pick the smaller normal system: primal (P×P) when P ≤ N, otherwise the

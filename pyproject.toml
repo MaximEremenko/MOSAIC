@@ -35,6 +35,7 @@ dependencies = [
   "requests",
   "scipy",
   "sympy",
+  "threadpoolctl",
   "tqdm",
 ]
 

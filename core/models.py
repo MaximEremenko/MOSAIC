@@ -416,7 +416,7 @@ class WorkflowRuntimeInfo(_MappingView):
 class RuntimeSettings:
     worker_dashboard: bool = False
     backend: str = "local"
-    max_workers: int = 2
+    max_workers: "int | str" = "auto"
     threads_per_worker: int = 16
     processes: bool = False
     wait_timeout: str = "120s"
