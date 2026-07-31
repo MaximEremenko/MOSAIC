@@ -31,6 +31,7 @@ class PointDataPostprocessingProcessor:
         self.u_true_all = state.u_true_all
         self.decoder_source_policy = state.decoder_source_policy
         self.decoder_source_provenance = None
+        self.prepared_inputs_cache = None
         self._decoder_M = None
         self._feature_dim = None
         self._decoder_family = None

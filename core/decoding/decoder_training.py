@@ -566,6 +566,9 @@ class DisplacementDecoderSourceService:
         logger = logging.getLogger(__name__)
         output_dir = str(artifacts.output_dir)
         processor.decoder_source_policy = policy
+        # A reused processor must not carry a stale prepared-inputs cache
+        # into a different source mode/run.
+        processor.prepared_inputs_cache = None
         unique_decoder_keys: list[DisplacementDecoderKey] = []
         db_manager = getattr(artifacts, "db_manager", None)
         if db_manager is not None and hasattr(db_manager, "get_pending_chunk_ids"):
@@ -616,6 +619,17 @@ class DisplacementDecoderSourceService:
             )
 
         if policy.mode == "current":
+            # Training and decode share this processor/output: carry the
+            # training pass's prepared per-chunk inputs to the decode pass.
+            from core.decoding.prepared_inputs_cache import (
+                PreparedInputsCache,
+                prepared_cache_max_bytes,
+            )
+
+            processor.prepared_inputs_cache = PreparedInputsCache(
+                max_bytes=prepared_cache_max_bytes(),
+                spill_dir=output_dir,
+            )
             return self._prepare_current_decoder_cache(
                 processor=processor,
                 policy=policy,
@@ -706,6 +720,7 @@ class DisplacementDecoderSourceService:
         training_processor,
         artifacts,
         output_dir: str,
+        prepared_cache=None,
     ) -> tuple[list[np.ndarray], list[np.ndarray], list[DisplacementDecoderKey]]:
         training_features: list[np.ndarray] = []
         training_targets: list[np.ndarray] = []
@@ -720,6 +735,40 @@ class DisplacementDecoderSourceService:
                 point_data_list=point_data_list,
                 output_dir=output_dir,
             )
+            # Hand the full per-site features to the decode pass (which
+            # previously recomputed them from scratch: another 6.78 GB
+            # residual read + grid rebuild + feature extraction per chunk).
+            # .get() throughout: tests stub this payload with the training
+            # subset only.
+            features_all = training_payload.get("features_all")
+            if prepared_cache is not None and features_all is not None:
+                from core.decoding.prepared_inputs_cache import (
+                    PreparedChunkInputs,
+                    prepared_inputs_token,
+                )
+
+                prepared_cache.put(
+                    int(chunk_id),
+                    PreparedChunkInputs(
+                        output_dir=str(
+                            training_payload.get("output_dir", output_dir)
+                        ),
+                        token=prepared_inputs_token(
+                            int(chunk_id), point_data_list, output_dir
+                        ),
+                        cids_all=training_payload.get("cids_all", []),
+                        decoder_keys_all=training_payload.get(
+                            "decoder_keys_all", []
+                        ),
+                        features_all=features_all,
+                        nbytes=sum(
+                            int(feature.nbytes) for feature in features_all
+                        ),
+                    ),
+                )
+            # The 6.78 GB amplitudes dict has zero readers — release it now
+            # rather than at the next loop iteration's rebind.
+            training_payload.pop("data", None)
             training_features.extend(training_payload["features_train"])
             training_targets.extend(training_payload["u_train"])
             training_decoder_keys.extend(training_payload["training_decoder_keys"])
@@ -754,6 +803,14 @@ class DisplacementDecoderSourceService:
             training_processor=training_processor,
             artifacts=artifacts,
             output_dir=output_dir,
+            # Reuse is only safe when training and decode share the SAME
+            # processor/output (mode='current'); 'compute' trains on a
+            # different, unmasked point set and must never populate it.
+            prepared_cache=(
+                getattr(target_processor, "prepared_inputs_cache", None)
+                if training_processor is target_processor
+                else None
+            ),
         )
         if policy.assignment == "family":
             train_decoder_family_from_samples(

@@ -175,7 +175,7 @@ def test_residual_field_partial_result_merge_is_metadata_oriented():
     merged = merge_residual_field_partial_results(left, right)
 
     assert merged.contributing_interval_ids == (1, 2)
-    assert merged.point_ids == (1, 2, 3)
+    assert tuple(int(v) for v in merged.point_ids) == (1, 2, 3)
     assert merged.grid_shape == (4, 4)
     assert RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS.associative is True
 
@@ -203,7 +203,7 @@ def test_residual_field_partial_result_merge_is_metadata_oriented():
         grid_shape=(4, 4),
     )
     assert identity.output_artifacts == ()
-    assert identity.point_ids == ()
+    assert tuple(int(v) for v in identity.point_ids) == ()
 
 
 def test_scattering_handoff_round_trips_through_mapping_bridge():

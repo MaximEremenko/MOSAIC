@@ -23,17 +23,40 @@ def compute_and_save_displacements(
     output_dir=None,
 ):
     log = logging.getLogger(__name__)
-    prepared = prepare_displacement_decoder_inputs(
-        processor,
-        chunk_id=chunk_id,
-        rifft_saver=rifft_saver,
-        point_data_list=point_data_list,
-        output_dir=output_dir,
+    from core.decoding.prepared_inputs_cache import prepared_inputs_token
+    from core.residual_field.loader import resolve_output_dir
+
+    resolved_dir = resolve_output_dir(rifft_saver, chunk_id, output_dir)
+    cache = getattr(processor, "prepared_inputs_cache", None)
+    entry = (
+        None
+        if cache is None
+        else cache.pop(
+            int(chunk_id),
+            token=prepared_inputs_token(chunk_id, point_data_list, resolved_dir),
+            output_dir=resolved_dir,
+        )
     )
-    output_dir = prepared["output_dir"]
-    features_all = prepared["features_all"]
-    cids_all = prepared["cids_all"]
-    decoder_keys_all = prepared["decoder_keys_all"]
+    if entry is not None:
+        # Training pass (decoder.source='current') already prepared these
+        # exact inputs: skip the 6.78 GB residual reload, grid rebuild and
+        # per-site feature extraction the decode pass used to repeat.
+        output_dir = entry.output_dir
+        features_all = entry.features_all
+        cids_all = entry.cids_all
+        decoder_keys_all = entry.decoder_keys_all
+    else:
+        prepared = prepare_displacement_decoder_inputs(
+            processor,
+            chunk_id=chunk_id,
+            rifft_saver=rifft_saver,
+            point_data_list=point_data_list,
+            output_dir=resolved_dir,
+        )
+        output_dir = prepared["output_dir"]
+        features_all = prepared["features_all"]
+        cids_all = prepared["cids_all"]
+        decoder_keys_all = prepared["decoder_keys_all"]
     ensure_decoder(
         processor,
         features_all=features_all,

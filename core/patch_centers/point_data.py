@@ -13,6 +13,18 @@ from typing import Optional
 import h5py
 import os
 
+# Fork-COW context for parallel chunk-file materialization: children
+# inherit the processor object (including any test monkeypatches on it)
+# without pickling; each child writes only its own chunk's files.
+_POINT_INIT_PROCESSOR = None
+
+
+def _materialize_point_chunk(task):
+    chunk_id, mask = task
+    _POINT_INIT_PROCESSOR._process_chunk(chunk_id, mask)
+    return chunk_id
+
+
 class PointDataProcessor:
     """
     Processes point data by expanding points and saving grid points and amplitudes by chunks.
@@ -88,6 +100,7 @@ class PointDataProcessor:
         unique_chunk_ids = np.unique(self.point_data.chunk_ids)
         self.logger.info(f"Found {len(unique_chunk_ids)} unique chunk_ids.")
 
+        pending: list[tuple[int, np.ndarray]] = []
         for chunk_id in unique_chunk_ids:
             # Find points in this chunk that haven't been initialized
             mask = (self.point_data.chunk_ids == chunk_id) & (~self.point_data.grid_amplitude_initialized)
@@ -98,12 +111,57 @@ class PointDataProcessor:
                 continue
 
             self.logger.info(f"Processing chunk {chunk_id} with {num_uninitialized} uninitialized points.")
+            pending.append((chunk_id, mask))
 
-            # Process points in this chunk
-            self._process_chunk(chunk_id, mask)
+        # Each chunk's pre-allocation writes ~13.5 GB (hkl40) through one
+        # driver thread under h5py's per-process lock — 54 GB / 51 s
+        # single-threaded. Chunks write disjoint files, so a fork pool
+        # sidesteps the lock entirely; children inherit this processor
+        # copy-on-write and the parent owns the bitmap.
+        workers = self._point_data_init_workers(len(pending))
+        if workers <= 1 or len(pending) <= 1:
+            for chunk_id, mask in pending:
+                self._process_chunk(chunk_id, mask)
+        else:
+            import multiprocessing
+
+            global _POINT_INIT_PROCESSOR
+            try:
+                fork_ctx = multiprocessing.get_context("fork")
+            except ValueError:
+                fork_ctx = None
+            if fork_ctx is None:
+                for chunk_id, mask in pending:
+                    self._process_chunk(chunk_id, mask)
+            else:
+                mask_by_chunk = {int(chunk_id): mask for chunk_id, mask in pending}
+                _POINT_INIT_PROCESSOR = self
+                try:
+                    with fork_ctx.Pool(processes=workers) as pool:
+                        for done_chunk in pool.imap_unordered(
+                            _materialize_point_chunk, pending
+                        ):
+                            self.point_data.grid_amplitude_initialized[
+                                mask_by_chunk[int(done_chunk)]
+                            ] = True
+                finally:
+                    _POINT_INIT_PROCESSOR = None
 
         # After processing all chunks, save the updated grid_amplitude_initialized
         self.save_grid_amplitude_initialized()
+
+    def _point_data_init_workers(self, pending_count: int) -> int:
+        raw = os.getenv("MOSAIC_POINT_DATA_INIT_PROCS")
+        if raw is not None and str(raw).strip() != "":
+            try:
+                return max(1, min(int(raw), pending_count))
+            except ValueError:
+                pass
+        from core.runtime.cpu_resources import available_cpu_count
+
+        # I/O-bound full-chunk writes: more than a few concurrent writers
+        # just fragments the device queue.
+        return max(1, min(pending_count, available_cpu_count(), 8))
 
     def _process_chunk(self, chunk_id: int, mask: np.ndarray):
         """
