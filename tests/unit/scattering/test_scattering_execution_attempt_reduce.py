@@ -337,6 +337,7 @@ def test_stage2_retry_after_chunk_commit_before_db_mark_is_idempotent(
         _fake_chunk_task,
     )
     real_update = db.update_interval_chunk_status
+    real_update_batch = db.update_interval_chunk_status_batch
     crashed = False
 
     def crash_once(interval_id, chunk_id, saved=1):
@@ -346,7 +347,15 @@ def test_stage2_retry_after_chunk_commit_before_db_mark_is_idempotent(
             raise RuntimeError("db mark failed")
         return real_update(interval_id, chunk_id, saved=saved)
 
+    def crash_once_batch(status_rows):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("db mark failed")
+        return real_update_batch(status_rows)
+
     monkeypatch.setattr(db, "update_interval_chunk_status", crash_once)
+    monkeypatch.setattr(db, "update_interval_chunk_status_batch", crash_once_batch)
     try:
         with pytest.raises(RuntimeError, match="db mark failed"):
             scattering_execution.run_interval_chunk_execution(

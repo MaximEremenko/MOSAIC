@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-from collections import defaultdict
 
 import numpy as np
 
+from core.decoding.displacement_inputs import build_site_row_groups
 from core.decoding.io import write_site_intensities_csv
 from core.residual_field.loader import (
     load_chunk_residual_field_and_grid,
@@ -39,9 +39,7 @@ def compute_and_save_site_intensities(
     coords_all = rifft_space_grid[:, :D_all]
     ids_all = rifft_space_grid[:, -1].astype(int)
 
-    groups = defaultdict(list)
-    for index, cid in enumerate(ids_all):
-        groups[int(cid)].append(index)
+    groups = build_site_row_groups(ids_all)
 
     elements_all = processor.parameters.get("elements", None)
     refnumbers_all = processor.parameters.get("refnumbers", None)
@@ -55,8 +53,8 @@ def compute_and_save_site_intensities(
 
     for point_data in point_data_list:
         cid = int(point_data["central_point_id"])
-        idxs = groups.get(cid, None)
-        if not idxs:
+        idxs = groups.get(cid)
+        if idxs is None:
             continue
         idxs = np.asarray(idxs, dtype=int)
 

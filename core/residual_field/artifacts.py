@@ -123,6 +123,34 @@ class _ResidualFieldChunkStatusUpdater:
         finally:
             db.close()
 
+    def mark_saved_many(self, interval_ids, chunk_id: int) -> None:
+        """One connection + one transaction for a whole chunk's rows.
+
+        Falls back to per-row mark_saved semantics when the manager lacks
+        the batch method (test doubles, monkeypatched single-row seams)."""
+        rows = [(int(iv), int(chunk_id), 1) for iv in interval_ids]
+        if not rows:
+            return
+        db = self.db_manager_factory(self.db_path)
+        try:
+            batch = getattr(db, "update_interval_chunk_status_batch", None)
+            if batch is not None:
+                batch(rows)
+            else:
+                for interval_id, chunk, _saved in rows:
+                    db.update_interval_chunk_status(interval_id, chunk, saved=True)
+        finally:
+            db.close()
+
+    def unsaved_pairs(self) -> set[tuple[int, int]]:
+        db = self.db_manager_factory(self.db_path)
+        try:
+            return {
+                (int(iv), int(ch)) for iv, ch in db.get_unsaved_interval_chunks()
+            }
+        finally:
+            db.close()
+
     def is_saved(self, interval_id: int, chunk_id: int) -> bool:
         db = self.db_manager_factory(self.db_path)
         try:
@@ -525,13 +553,13 @@ def is_residual_field_replacement_complete(
         db_path,
         db_manager_factory=db_manager_factory,
     )
+    unsaved = status_updater.unsaved_pairs()
     missing_db_rows = [
         int(interval_id)
-        for interval_id in expected_set
-        if not status_updater.is_saved(int(interval_id), int(chunk_id))
+        for interval_id in sorted(int(v) for v in expected_set)
+        if (int(interval_id), int(chunk_id)) in unsaved
     ]
-    for interval_id in missing_db_rows:
-        status_updater.mark_saved(int(interval_id), int(chunk_id))
+    status_updater.mark_saved_many(missing_db_rows, int(chunk_id))
     representative = ResidualFieldWorkUnit.interval_chunk(
         interval_id=max(expected_set),
         chunk_id=int(chunk_id),
@@ -777,8 +805,9 @@ def reconcile_residual_field_reducer_progress(
             db_path,
             db_manager_factory=db_manager_factory,
         )
-        for interval_id in target_interval_ids:
-            status_updater.mark_saved(int(interval_id), int(chunk_id))
+        status_updater.mark_saved_many(
+            sorted({int(v) for v in target_interval_ids}), int(chunk_id)
+        )
     return written_progress
 
 
@@ -1546,8 +1575,9 @@ def reduce_residual_field_shards_for_chunk(
         db_manager_factory=db_manager_factory,
     )
     if expected_interval_ids is None:
-        for interval_id in sorted(set(reduced_interval_ids)):
-            status_updater.mark_saved(interval_id, chunk_id)
+        status_updater.mark_saved_many(
+            sorted(set(reduced_interval_ids)), chunk_id
+        )
 
     representative_interval_id = (
         max(int(interval_id) for interval_id in applied_set)
@@ -1629,8 +1659,7 @@ def reduce_residual_field_shards_for_chunk(
                 f"chunk={int(chunk_id)} expected={list(sorted(expected_set))} "
                 f"actual={list(sorted(incorporated))}"
             )
-        for interval_id in sorted(incorporated):
-            status_updater.mark_saved(int(interval_id), int(chunk_id))
+        status_updater.mark_saved_many(sorted(incorporated), int(chunk_id))
     if quiet_logs:
         logger.debug(
             "reduce-shards | chunk %d | reduced %d shard(s) | committed_shards=%d | shard_bytes=%d | point_count=%d | checkpoint_writes=%d | checkpoint_bytes=%d | checkpoint_wall=%.3fs | duration=%.3fs",

@@ -367,12 +367,16 @@ def _mark_scattering_chunk_saved(
     chunk_id: int,
     expected_interval_ids: tuple[int, ...],
 ) -> None:
-    for interval_id in expected_interval_ids:
-        db_manager.update_interval_chunk_status(
-            int(interval_id),
-            int(chunk_id),
-            saved=True,
-        )
+    rows = [
+        (int(interval_id), int(chunk_id), 1)
+        for interval_id in expected_interval_ids
+    ]
+    batch = getattr(db_manager, "update_interval_chunk_status_batch", None)
+    if callable(batch):
+        batch(rows)
+    else:
+        for interval_id, chunk, _saved in rows:
+            db_manager.update_interval_chunk_status(interval_id, chunk, saved=True)
 
 
 def _scatter_shared_precompute_inputs(

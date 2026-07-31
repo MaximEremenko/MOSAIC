@@ -109,6 +109,36 @@ class SQLiteProcessingStateRepository:
             self.logger.error("update_interval_chunk_status failed: %s", exc)
             raise
 
+    def update_interval_chunk_status_batch(
+        self, status_rows: "list[tuple[int, int, int | bool]]"
+    ) -> None:
+        """Same upsert as update_interval_chunk_status, one transaction.
+
+        The hot finalize path marks ~2,300 interval rows per chunk; one
+        row per fsync-commit cost ~46 s per hkl40 run on NVMe (worse on
+        slower fsync). executemany in a single transaction leaves
+        bit-identical table content."""
+        if not status_rows:
+            return
+        try:
+            with self.connection:
+                self.connection.executemany(
+                    """
+                    INSERT INTO Interval_Chunk_Status
+                    (reciprocal_space_id, chunk_id, saved)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(reciprocal_space_id, chunk_id)
+                    DO UPDATE SET saved = excluded.saved
+                    """,
+                    [
+                        (int(interval_id), int(chunk_id), int(saved))
+                        for interval_id, chunk_id, saved in status_rows
+                    ],
+                )
+        except sqlite3.Error as exc:
+            self.logger.error("update_interval_chunk_status_batch failed: %s", exc)
+            raise
+
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         try:
             cursor = self.connection.execute(

@@ -469,16 +469,28 @@ def rebuild_sqlite_cache_from_manifests(
     update_status = getattr(db_manager, "update_interval_chunk_status", None)
     if not callable(get_pairs) or not callable(update_status):
         return snapshot
-    for interval_id, chunk_id in get_pairs():
-        update_status(interval_id, chunk_id, saved=False)
+    # Last-write-wins overlay reproducing the sequential loops' final
+    # state, applied in ONE transaction where the manager supports it
+    # (the sequential form was up to ~18k single-row fsync commits).
+    final_state: dict[tuple[int, int], bool] = {
+        (int(interval_id), int(chunk_id)): False
+        for interval_id, chunk_id in get_pairs()
+    }
     for stage in (snapshot.scattering, snapshot.residual_field):
         for payload in stage.selected_payloads:
             for interval_id in payload.interval_ids:
-                update_status(
-                    int(interval_id),
-                    int(payload.chunk_id),
-                    saved=True,
-                )
+                final_state[(int(interval_id), int(payload.chunk_id))] = True
+    batch = getattr(db_manager, "update_interval_chunk_status_batch", None)
+    if callable(batch):
+        batch(
+            [
+                (interval_id, chunk_id, int(saved))
+                for (interval_id, chunk_id), saved in sorted(final_state.items())
+            ]
+        )
+    else:
+        for (interval_id, chunk_id), saved in sorted(final_state.items()):
+            update_status(interval_id, chunk_id, saved=saved)
     return snapshot
 
 

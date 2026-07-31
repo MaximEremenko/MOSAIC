@@ -122,6 +122,13 @@ class DatabaseManager:
             saved=saved,
         )
 
+    def update_interval_chunk_status_batch(
+        self, status_rows: "list[tuple[int, int, int | bool]]"
+    ) -> None:
+        self.processing_state_repository.update_interval_chunk_status_batch(
+            status_rows
+        )
+
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         return self.processing_state_repository.get_unsaved_interval_chunks()
 
@@ -268,6 +275,12 @@ class ManifestOnlyDatabaseManager:
         self, interval_id: int, chunk_id: int, saved: int | bool = 1
     ) -> None:
         self._status[(int(interval_id), int(chunk_id))] = bool(saved)
+
+    def update_interval_chunk_status_batch(
+        self, status_rows: "list[tuple[int, int, int | bool]]"
+    ) -> None:
+        for interval_id, chunk_id, saved in status_rows:
+            self._status[(int(interval_id), int(chunk_id))] = bool(saved)
 
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         return sorted(

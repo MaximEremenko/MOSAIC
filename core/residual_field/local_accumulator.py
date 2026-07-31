@@ -725,17 +725,54 @@ class LiveLocalAccumulator:
             "point_stop": self.point_stop,
         }
 
+    def capture_snapshot_payload(self) -> dict[str, object]:
+        """snapshot_payload with PRIVATE copies of the mutable arrays.
+
+        snapshot_payload() returns live views, so the durable write must
+        stay serialized against folds. This copy (sub-second memcpy vs a
+        4.5-7 s savez) lets the write proceed on a writer thread while
+        folds continue. point_ids/grid_shape_nd stay by-reference: they
+        are never mutated after construction (equality-validated on every
+        fold above)."""
+        payload = self.snapshot_payload()
+        payload["amplitudes_delta"] = np.array(
+            self.amplitudes_delta, dtype=np.complex128, copy=True
+        )
+        payload["amplitudes_average"] = np.array(
+            self.amplitudes_average, dtype=np.complex128, copy=True
+        )
+        return payload
+
+    def mark_snapshot_captured(self) -> None:
+        """Reset the cadence counter at CAPTURE time so an in-flight
+        async write does not retrigger a capture every subsequent fold."""
+        self.accepted_since_snapshot = 0
+
     def durable_progress_interval_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self.durable_interval_ids))
 
     def next_snapshot_seq(self) -> int:
         return int(self.durable_snapshot_seq) + 1
 
-    def mark_snapshot_committed(self, snapshot_seq: int) -> tuple[int, ...]:
-        newly_durable = tuple(sorted(self.current_interval_ids - self.durable_interval_ids))
-        self.durable_interval_ids = set(self.current_interval_ids)
+    def mark_snapshot_committed(
+        self, snapshot_seq: int, captured_interval_ids=None
+    ) -> tuple[int, ...]:
+        if captured_interval_ids is None:
+            newly_durable = tuple(
+                sorted(self.current_interval_ids - self.durable_interval_ids)
+            )
+            self.durable_interval_ids = set(self.current_interval_ids)
+            self.accepted_since_snapshot = 0
+        else:
+            # Async commit: only what the CAPTURE contained is durable.
+            # Folds accepted during the in-flight write are in no snapshot
+            # file yet — marking them durable would make a crash-resume
+            # silently skip recomputing them (data loss). Union, never
+            # assignment; cadence counter belongs to capture time.
+            captured = {int(v) for v in captured_interval_ids}
+            newly_durable = tuple(sorted(captured - self.durable_interval_ids))
+            self.durable_interval_ids |= captured
         self.durable_snapshot_seq = int(snapshot_seq)
-        self.accepted_since_snapshot = 0
         return newly_durable
 
     def record_checkpoint_metrics(

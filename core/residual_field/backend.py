@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import re
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -710,6 +712,108 @@ def assemble_interval_partitioned_chunk_payload(
     }
 
 
+@dataclass(frozen=True)
+class _PendingLocalSnapshot:
+    """A captured, self-contained snapshot awaiting its durable commit."""
+
+    key: tuple
+    accumulator: "LiveLocalAccumulator"
+    snapshot_seq: int
+    payload: dict = field(repr=False)
+    captured_interval_ids: tuple
+    output_dir: str
+    db_path: str
+    cleanup_policy: str
+
+
+class _LocalSnapshotWriter:
+    """Per-process writer thread for durable accumulator snapshots.
+
+    An 8.5 GB savez under the per-target fold lock blocked folds for
+    4.5-7 s per checkpoint; the writer runs the identical commit sequence
+    (savez -> atomic rename -> chunk-mutex manifest -> mark committed ->
+    SQLite -> unlink prev) off the fold path. At most one write per
+    target key is in flight; errors are stored and re-raised on the next
+    fold or drain for that key.
+
+    Lock order contract: never call drain() while holding a per-target
+    lock or chunk_mutex — the commit acquires both.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._queue: "queue.Queue[tuple | None]" = queue.Queue()
+        self._in_flight: dict[tuple, threading.Event] = {}
+        self._errors: dict[tuple, BaseException] = {}
+        self._thread: threading.Thread | None = None
+
+    def _ensure_thread(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._run, name="mosaic-snapshot-writer", daemon=True
+            )
+            self._thread.start()
+
+    def submit(self, key: tuple, commit_fn) -> bool:
+        with self._guard:
+            if key in self._in_flight:
+                return False
+            event = threading.Event()
+            self._in_flight[key] = event
+            self._ensure_thread()
+        self._queue.put((key, commit_fn, event))
+        return True
+
+    def in_flight(self, key: tuple) -> bool:
+        with self._guard:
+            return key in self._in_flight
+
+    def pop_error(self, key: tuple) -> BaseException | None:
+        with self._guard:
+            return self._errors.pop(key, None)
+
+    def drain(self, key: tuple) -> bool:
+        """Wait for the in-flight commit of ``key`` (if any); re-raise its
+        stored error. Returns True when a commit finished during the wait."""
+        with self._guard:
+            event = self._in_flight.get(key)
+        if event is None:
+            error = self.pop_error(key)
+            if error is not None:
+                raise error
+            return False
+        event.wait()
+        error = self.pop_error(key)
+        if error is not None:
+            raise error
+        return True
+
+    def drain_matching(self, predicate) -> None:
+        with self._guard:
+            keys = [key for key in self._in_flight if predicate(key)]
+        for key in keys:
+            self.drain(key)
+
+    def drain_all(self) -> None:
+        self.drain_matching(lambda _key: True)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            key, commit_fn, event = item
+            try:
+                commit_fn()
+            except BaseException as exc:  # stored, surfaced on the fold path
+                with self._guard:
+                    self._errors[key] = exc
+            finally:
+                with self._guard:
+                    self._in_flight.pop(key, None)
+                event.set()
+
+
 class ManifestDrivenResidualFieldReducerBackend:
     """
     Wave 1 concrete backend.
@@ -743,12 +847,13 @@ class ManifestDrivenResidualFieldReducerBackend:
 
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
-        # Live accumulators and locks are process-local runtime state. Dask
-        # serializes this backend into task graphs, so only configuration can
-        # cross the scheduler boundary.
+        # Live accumulators, locks and the snapshot writer are process-local
+        # runtime state. Dask serializes this backend into task graphs, so
+        # only configuration can cross the scheduler boundary.
         state["_local_accumulators"] = {}
         state["_local_accumulator_locks"] = {}
         state.pop("_local_accumulator_locks_guard", None)
+        state.pop("_snapshot_writer_obj", None)
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -756,6 +861,26 @@ class ManifestDrivenResidualFieldReducerBackend:
         self._local_accumulators = {}
         self._local_accumulator_locks = {}
         self._local_accumulator_locks_guard = threading.Lock()
+        self._snapshot_writer_obj = None
+
+    def _snapshot_writer(self) -> _LocalSnapshotWriter:
+        writer = getattr(self, "_snapshot_writer_obj", None)
+        if writer is None:
+            with self._local_accumulator_locks_guard:
+                writer = getattr(self, "_snapshot_writer_obj", None)
+                if writer is None:
+                    writer = _LocalSnapshotWriter()
+                    self._snapshot_writer_obj = writer
+        return writer
+
+    def _async_snapshot_writes_enabled(self) -> bool:
+        """Async durable snapshot writes (default on for local_restartable).
+
+        MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES=0 restores the fully
+        synchronous write-under-fold-lock behavior for A/B verification."""
+        if self.layout.kind != "local_restartable":
+            return False
+        return os.getenv("MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES", "1").strip() != "0"
 
     def _repair_progress_final_artifacts(
         self,
@@ -1516,8 +1641,66 @@ class ManifestDrivenResidualFieldReducerBackend:
         db_path: str,
         cleanup_policy: str,
     ) -> None:
+        """Synchronous capture + commit (caller holds the per-target lock)."""
+        pending = self._capture_local_snapshot(
+            accumulator,
+            output_dir=output_dir,
+            db_path=db_path,
+            cleanup_policy=cleanup_policy,
+            copy_arrays=False,
+        )
+        self._commit_local_snapshot(pending)
+
+    def _capture_local_snapshot(
+        self,
+        accumulator: LiveLocalAccumulator,
+        *,
+        output_dir: str,
+        db_path: str,
+        cleanup_policy: str,
+        copy_arrays: bool,
+    ) -> _PendingLocalSnapshot:
+        """Runs UNDER the per-target lock. copy_arrays=True materializes
+        private array copies so the commit may run on the writer thread
+        while folds continue; False keeps live views for the synchronous
+        path (no extra memory)."""
         snapshot_seq = accumulator.next_snapshot_seq()
-        snapshot_payload = accumulator.snapshot_payload()
+        payload = (
+            accumulator.capture_snapshot_payload()
+            if copy_arrays
+            else accumulator.snapshot_payload()
+        )
+        accumulator.mark_snapshot_captured()
+        return _PendingLocalSnapshot(
+            key=self._local_accumulator_key(
+                chunk_id=accumulator.chunk_id,
+                parameter_digest=accumulator.parameter_digest,
+                partition_id=accumulator.partition_id,
+            ),
+            accumulator=accumulator,
+            snapshot_seq=int(snapshot_seq),
+            payload=payload,
+            captured_interval_ids=tuple(
+                int(v) for v in payload["incorporated_interval_ids"]
+            ),
+            output_dir=str(output_dir),
+            db_path=str(db_path),
+            cleanup_policy=str(cleanup_policy),
+        )
+
+    def _commit_local_snapshot(self, pending: _PendingLocalSnapshot) -> None:
+        """The durable commit sequence, byte-identical to the historical
+        inline path: write -> atomic rename -> chunk-mutex manifest union ->
+        mark committed -> SQLite -> unlink previous seq. Runs either inline
+        (sync path, caller holds the per-target lock; re-acquisition is
+        reentrant) or on the writer thread (acquires the per-target lock
+        only for the brief accumulator-mutating sections)."""
+        accumulator = pending.accumulator
+        snapshot_seq = pending.snapshot_seq
+        snapshot_payload = pending.payload
+        output_dir = pending.output_dir
+        db_path = pending.db_path
+        cleanup_policy = pending.cleanup_policy
         if self.uses_shared_durable_generations():
             generation_manifest = persist_residual_field_generation_checkpoint(
                 chunk_id=accumulator.chunk_id,
@@ -1552,15 +1735,16 @@ class ManifestDrivenResidualFieldReducerBackend:
                 1,
                 int(accumulator.checkpoint_cadence_batches or 1),
             )
-            accumulator.record_checkpoint_metrics(
-                bytes_written=int(
-                    generation_metrics.get("checkpoint_bytes_written", 0)
-                ),
-                wall_seconds=float(
-                    generation_metrics.get("checkpoint_wall_seconds", 0.0)
-                ),
-                checkpoint_cadence_batches=checkpoint_cadence_batches,
-            )
+            with self._local_accumulator_lock(pending.key):
+                accumulator.record_checkpoint_metrics(
+                    bytes_written=int(
+                        generation_metrics.get("checkpoint_bytes_written", 0)
+                    ),
+                    wall_seconds=float(
+                        generation_metrics.get("checkpoint_wall_seconds", 0.0)
+                    ),
+                    checkpoint_cadence_batches=checkpoint_cadence_batches,
+                )
             logger.info(
                 "Residual-field durable checkpoint | chunk=%d | partition=%s | seq=%d | cadence_batches=%d | max_recompute_batches=%d | bytes=%d | wall=%.3fs",
                 int(accumulator.chunk_id),
@@ -1601,14 +1785,15 @@ class ManifestDrivenResidualFieldReducerBackend:
                 point_stop=accumulator.point_stop,
                 accumulator_axis=getattr(accumulator, "accumulator_axis", "points"),
             )
-            accumulator.record_checkpoint_metrics(
-                bytes_written=int(local_snapshot_path.stat().st_size),
-                wall_seconds=0.0,
-                checkpoint_cadence_batches=max(
-                    1,
-                    int(accumulator.checkpoint_cadence_batches or 1),
-                ),
-            )
+            with self._local_accumulator_lock(pending.key):
+                accumulator.record_checkpoint_metrics(
+                    bytes_written=int(local_snapshot_path.stat().st_size),
+                    wall_seconds=0.0,
+                    checkpoint_cadence_batches=max(
+                        1,
+                        int(accumulator.checkpoint_cadence_batches or 1),
+                    ),
+                )
             new_snapshot_key = make_local_accumulator_snapshot_key(
                 chunk_id=accumulator.chunk_id,
                 parameter_digest=accumulator.parameter_digest,
@@ -1687,11 +1872,15 @@ class ManifestDrivenResidualFieldReducerBackend:
                 cleanup_policy=cleanup_policy,
             )
             self.write_progress_manifest(progress_manifest)
-        newly_durable = accumulator.mark_snapshot_committed(snapshot_seq)
+        with self._local_accumulator_lock(pending.key):
+            newly_durable = accumulator.mark_snapshot_committed(
+                snapshot_seq, pending.captured_interval_ids
+            )
         if accumulator.partition_id is None:
             status_updater = _ResidualFieldChunkStatusUpdater(db_path)
-            for interval_id in newly_durable:
-                status_updater.mark_saved(int(interval_id), int(accumulator.chunk_id))
+            status_updater.mark_saved_many(
+                sorted(int(v) for v in newly_durable), int(accumulator.chunk_id)
+            )
         previous_snapshot_seq = snapshot_seq - 1
         if previous_snapshot_seq > 0 and not self.uses_shared_durable_generations():
             previous_snapshot_path = build_local_accumulator_snapshot_path(
@@ -1813,19 +2002,48 @@ class ManifestDrivenResidualFieldReducerBackend:
                 partition_axis=getattr(work_unit, "partition_axis", None),
             )
             accumulator.checkpoint_cadence_batches = int(snapshot_every)
+            async_writes = self._async_snapshot_writes_enabled()
+            if async_writes:
+                # A failed async commit surfaces on the fold path, exactly
+                # where the synchronous write would have raised.
+                writer_error = self._snapshot_writer().pop_error(key)
+                if writer_error is not None:
+                    raise writer_error
             flushed = False
+            captured = False
             if accumulator.accepted_since_snapshot >= snapshot_every:
-                flushed = self.flush_local_reducer_target(
-                    chunk_id=work_unit.chunk_id,
-                    parameter_digest=work_unit.parameter_digest,
-                    partition_id=work_unit.partition_id,
-                    output_dir=output_dir,
-                    db_path=db_path,
-                    cleanup_policy=cleanup_policy,
-                )
+                if async_writes and not self.uses_shared_durable_generations():
+                    if not self._snapshot_writer().in_flight(key):
+                        pending = self._capture_local_snapshot(
+                            accumulator,
+                            output_dir=output_dir,
+                            db_path=db_path,
+                            cleanup_policy=cleanup_policy,
+                            copy_arrays=True,
+                        )
+                        self._snapshot_writer().submit(
+                            key,
+                            lambda pending=pending: self._commit_local_snapshot(
+                                pending
+                            ),
+                        )
+                        accumulator.trim_live_memory()
+                        captured = True
+                    # else: a write is already in flight — keep folding;
+                    # the cadence counter re-arms after that commit.
+                else:
+                    flushed = self.flush_local_reducer_target(
+                        chunk_id=work_unit.chunk_id,
+                        parameter_digest=work_unit.parameter_digest,
+                        partition_id=work_unit.partition_id,
+                        output_dir=output_dir,
+                        db_path=db_path,
+                        cleanup_policy=cleanup_policy,
+                    )
             trim_every = self._live_trim_cadence(snapshot_every)
             if (
                 not flushed
+                and not captured
                 and accumulator.accepted_since_snapshot > 0
                 and accumulator.accepted_since_snapshot % trim_every == 0
             ):
@@ -1989,13 +2207,20 @@ class ManifestDrivenResidualFieldReducerBackend:
             parameter_digest=parameter_digest,
             partition_id=partition_id,
         )
+        # Drain BEFORE taking the per-target lock: the async commit acquires
+        # that lock (and chunk_mutex), so draining under it would deadlock.
+        # Reentrant callers (the fold cadence path) never reach here with a
+        # write in flight, so their drain is a no-op.
+        drained = False
+        if self._async_snapshot_writes_enabled():
+            drained = self._snapshot_writer().drain(key)
         with self._local_accumulator_lock(key):
             accumulator = self._local_accumulators.get(key)
             if accumulator is None:
-                return False
+                return drained
             if accumulator.current_interval_ids == accumulator.durable_interval_ids:
                 accumulator.trim_live_memory()
-                return False
+                return drained
             self._snapshot_local_accumulator(
                 accumulator,
                 output_dir=output_dir,
@@ -2125,6 +2350,13 @@ class ManifestDrivenResidualFieldReducerBackend:
         ``expected_interval_ids`` is the plan's full interval set for this
         chunk; interval-partitioned (subchunk) families must union to it
         exactly before their snapshots are summed."""
+        # In-flight async snapshot commits for this chunk must land before
+        # finalize reads durable state (drain outside all locks).
+        if self._async_snapshot_writes_enabled():
+            self._snapshot_writer().drain_matching(
+                lambda key: key[0] == int(chunk_id)
+                and key[1] == str(parameter_digest)
+            )
         repaired_manifest = self._repair_progress_final_artifacts(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
@@ -2589,6 +2821,12 @@ def get_process_local_residual_field_backend(
 
 def clear_process_local_residual_field_backends() -> None:
     for backend in list(_PROCESS_LOCAL_REDUCER_BACKENDS.values()):
+        writer = getattr(backend, "_snapshot_writer_obj", None)
+        if writer is not None:
+            try:
+                writer.drain_all()
+            except Exception:
+                logger.exception("async snapshot writer drain failed at clear")
         for key in list(getattr(backend, "_local_accumulators", {})):
             release = getattr(backend, "_release_local_accumulator", None)
             if callable(release):

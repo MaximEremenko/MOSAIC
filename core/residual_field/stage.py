@@ -96,12 +96,18 @@ def _write_empty_replacement_no_output_manifest(
 
 
 def _reset_expected_interval_chunks(artifacts: RunArtifacts, expected_by_chunk: dict[int, tuple[int, ...]]) -> None:
-    for chunk_id, interval_ids in expected_by_chunk.items():
-        for interval_id in interval_ids:
+    rows = [
+        (int(interval_id), int(chunk_id), 0)
+        for chunk_id, interval_ids in expected_by_chunk.items()
+        for interval_id in interval_ids
+    ]
+    batch = getattr(artifacts.db_manager, "update_interval_chunk_status_batch", None)
+    if callable(batch):
+        batch(rows)
+    else:
+        for interval_id, chunk_id, _saved in rows:
             artifacts.db_manager.update_interval_chunk_status(
-                int(interval_id),
-                int(chunk_id),
-                saved=False,
+                interval_id, chunk_id, saved=False
             )
 
 

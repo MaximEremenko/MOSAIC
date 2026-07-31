@@ -88,8 +88,9 @@ def _mark_residual_intervals_saved(
     interval_ids: tuple[int, ...] | list[int] | set[int],
 ) -> None:
     status_updater = _ResidualFieldChunkStatusUpdater(db_path)
-    for interval_id in sorted(int(value) for value in interval_ids):
-        status_updater.mark_saved(int(interval_id), int(chunk_id))
+    status_updater.mark_saved_many(
+        sorted({int(value) for value in interval_ids}), int(chunk_id)
+    )
 
 
 def is_same_node_local_client(client) -> bool:

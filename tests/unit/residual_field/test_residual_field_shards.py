@@ -307,7 +307,11 @@ def test_residual_field_backend_round_trip_preserves_reducer_progress(tmp_path):
         db.close()
 
 
-def test_local_backend_accept_partial_snapshots_without_shard_per_batch(tmp_path):
+def test_local_backend_accept_partial_snapshots_without_shard_per_batch(tmp_path, monkeypatch):
+    # These pin the SYNCHRONOUS snapshot contract (file exists right
+    # after the cadence fold); the async writer has its own suite in
+    # test_async_snapshot_writer.py.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES", "0")
     db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
     backend = build_residual_field_reducer_backend("local_restartable")
     scratch_root = str(tmp_path / "scratch")
@@ -392,7 +396,11 @@ def test_local_backend_accept_partial_snapshots_without_shard_per_batch(tmp_path
         db.close()
 
 
-def test_local_backend_restores_from_snapshot_and_finalizes(tmp_path):
+def test_local_backend_restores_from_snapshot_and_finalizes(tmp_path, monkeypatch):
+    # These pin the SYNCHRONOUS snapshot contract (file exists right
+    # after the cadence fold); the async writer has its own suite in
+    # test_async_snapshot_writer.py.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES", "0")
     db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
     scratch_root = str(tmp_path / "scratch")
     try:
@@ -471,7 +479,11 @@ def test_local_backend_restores_from_snapshot_and_finalizes(tmp_path):
         db.close()
 
 
-def test_local_backend_accepts_direct_local_contributions_without_partial_wrapper(tmp_path):
+def test_local_backend_accepts_direct_local_contributions_without_partial_wrapper(tmp_path, monkeypatch):
+    # These pin the SYNCHRONOUS snapshot contract (file exists right
+    # after the cadence fold); the async writer has its own suite in
+    # test_async_snapshot_writer.py.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES", "0")
     db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
     backend = build_residual_field_reducer_backend("local_restartable")
     scratch_root = str(tmp_path / "scratch")
@@ -1097,7 +1109,11 @@ def test_local_backend_repairs_db_from_committed_progress_without_snapshots(tmp_
         db.close()
 
 
-def test_local_backend_file_backed_accumulator_path_works(tmp_path):
+def test_local_backend_file_backed_accumulator_path_works(tmp_path, monkeypatch):
+    # These pin the SYNCHRONOUS snapshot contract (file exists right
+    # after the cadence fold); the async writer has its own suite in
+    # test_async_snapshot_writer.py.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES", "0")
     db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
     scratch_root = str(tmp_path / "scratch")
     try:
