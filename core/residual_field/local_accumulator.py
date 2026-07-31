@@ -43,6 +43,20 @@ def _local_accumulation_block_len() -> int:
     return max(1, int(block_bytes) // np.dtype(np.complex128).itemsize)
 
 
+
+def _as_point_ids_no_copy(point_ids) -> np.ndarray:
+    """Return the SAME object when it is already a 1-D int64 vector (the
+    per-process _shared_point_ids cache guarantees one object per
+    (start, count)), so identity checks short-circuit instead of paying a
+    211.7M-element GIL-held compare on every fold."""
+    if (
+        isinstance(point_ids, np.ndarray)
+        and point_ids.dtype == np.int64
+        and point_ids.ndim == 1
+    ):
+        return point_ids
+    return np.asarray(point_ids, dtype=np.int64).reshape(-1)
+
 def _chunked_add_complex(target, source) -> None:
     source_arr = np.asarray(source, dtype=np.complex128).reshape(-1)
     target_arr = np.asarray(target, dtype=np.complex128).reshape(-1)
@@ -423,7 +437,7 @@ class LiveLocalAccumulator:
         self.chunk_id = int(chunk_id)
         self.parameter_digest = str(parameter_digest)
         self.partition_id = int(partition_id) if partition_id is not None else None
-        self.point_ids = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        self.point_ids = _as_point_ids_no_copy(point_ids)
         self.point_start = int(point_start) if point_start is not None else None
         self.point_stop = int(point_stop) if point_stop is not None else None
         self.accumulator_axis = str(accumulator_axis)
@@ -475,7 +489,7 @@ class LiveLocalAccumulator:
         scratch_root: str,
         max_ram_bytes: int,
     ) -> "LiveLocalAccumulator":
-        point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        point_ids_arr = _as_point_ids_no_copy(point_ids)
         grid_shape_nd_arr = np.asarray(grid_shape_nd, dtype=np.int64)
         amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
         amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
@@ -675,7 +689,7 @@ class LiveLocalAccumulator:
         amplitudes_delta: np.ndarray,
         amplitudes_average: np.ndarray,
     ) -> None:
-        point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        point_ids_arr = _as_point_ids_no_copy(point_ids)
         grid_shape_nd_arr = np.asarray(grid_shape_nd, dtype=np.int64)
         amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
         amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
@@ -697,10 +711,13 @@ class LiveLocalAccumulator:
                 "and an intervals-axis (subchunk) layout are irreconcilable; "
                 "delete 'residual_checkpoints/' under the output directory."
             )
-        if self.point_ids is not point_ids_arr and not np.array_equal(
-            self.point_ids, point_ids_arr
-        ):
-            raise ValueError("Local accumulator partial point_ids mismatch.")
+        if self.point_ids is not point_ids_arr:
+            if not np.array_equal(self.point_ids, point_ids_arr):
+                raise ValueError("Local accumulator partial point_ids mismatch.")
+            # Equality proven (e.g. snapshot-restored accumulator vs the
+            # shared cache object): rebind so every later fold takes the
+            # O(1) identity path.
+            self.point_ids = point_ids_arr
         if not np.array_equal(self.grid_shape_nd, grid_shape_nd_arr):
             raise ValueError("Local accumulator partial grid_shape_nd mismatch.")
         if int(total_reciprocal_points) != self.total_reciprocal_points:

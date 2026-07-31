@@ -1071,6 +1071,89 @@ def _execute_lattice_groups(
     return amplitudes_delta, amplitudes_average
 
 
+_SCATTER_INVALID = object()  # sentinel: interval failed lattice validation
+
+
+def _lattice_scatter_workers(total_grid_bytes: int) -> int:
+    """Stripe-parallel scatter width. Runtime-only knob — never part of
+    any digest or work-unit identity. Small grids stay serial (thread
+    fan-out overhead beats the win below ~256 MiB)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_SCATTER_THREADS")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    if total_grid_bytes < (256 << 20):
+        return 1
+    from core.runtime.cpu_resources import available_cpu_count
+
+    return max(1, min(8, available_cpu_count() // 8))
+
+
+def _prepare_interval_scatter(task, state, snap_tol):
+    """Index-prep for one interval (cast, snap, ravel, stable sort) —
+    pure with respect to ``state`` (reads dq/dims/qmin only), so it can
+    ride the prefetch pool instead of the single builder thread. Returns
+    None for a mask-empty task, _SCATTER_INVALID on validation failure,
+    else the sorted scatter arrays."""
+    if task is None:
+        return None
+    role = str(task.half_space_role)
+    q = np.asarray(task.q_grid, dtype=np.float64)
+    dq = state["dq"]
+    dims_t = state["dims"]
+    idx = np.zeros(q.shape, dtype=np.int64)
+    for ax in range(len(dq)):
+        if dq[ax] <= 0:
+            if np.abs(q[:, ax] - state["qmin"][ax]).max() > 1e-9:
+                return _SCATTER_INVALID
+            continue
+        ratio = (q[:, ax] - state["qmin"][ax]) / dq[ax]
+        ax_idx = np.round(ratio).astype(np.int64)
+        if np.abs(ratio - ax_idx).max() > snap_tol:
+            return _SCATTER_INVALID
+        if ax_idx.min() < 0 or ax_idx.max() >= dims_t[ax]:
+            return _SCATTER_INVALID
+        idx[:, ax] = ax_idx
+    flat = np.ravel_multi_index(tuple(idx.T), dims_t)
+    amp = np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
+    av = np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
+    # Stable sort by cell: equal-cell entries keep their original relative
+    # order, so the duplicate-summing order (np.add.at branch) is exactly
+    # the serial code's; distinct cells are independent accumulators.
+    order = np.argsort(flat, kind="stable")
+    flat_sorted = flat[order]
+    has_duplicates = flat_sorted.size > 1 and bool(
+        np.any(flat_sorted[1:] == flat_sorted[:-1])
+    )
+    return {
+        "role": role,
+        "flat": flat_sorted,
+        "delta": (amp - av)[order],
+        "av": av[order],
+        "has_duplicates": has_duplicates,
+    }
+
+
+def _apply_scatter_stripe(flat_rows, prepared, cell_lo, cell_hi):
+    """Apply one interval's contributions for cells in [cell_lo, cell_hi).
+    Cell-disjoint across stripe workers -> no write overlap; per-cell FP64
+    accumulation order is identical to the serial loop."""
+    flat = prepared["flat"]
+    lo = int(np.searchsorted(flat, cell_lo, side="left"))
+    hi = int(np.searchsorted(flat, cell_hi, side="left"))
+    if lo >= hi:
+        return
+    seg = slice(lo, hi)
+    if prepared["has_duplicates"]:
+        np.add.at(flat_rows[0], flat[seg], prepared["delta"][seg])
+        np.add.at(flat_rows[1], flat[seg], prepared["av"][seg])
+    else:
+        flat_rows[0][flat[seg]] += prepared["delta"][seg]
+        flat_rows[1][flat[seg]] += prepared["av"][seg]
+
+
 def _build_lattice_entry_from_inputs(
     loaded_interval_inputs,
     *,
@@ -1181,45 +1264,86 @@ def _build_lattice_entry_from_inputs(
             (2,) + state["dims"],
             in_ram=in_ram,
         )
-    for task in _iter_loaded(loaded_interval_inputs):
-        if task is None:
-            continue
-        role = str(task.half_space_role)
-        state = per_role[role]
-        q = np.asarray(task.q_grid, dtype=np.float64)
-        dq = state["dq"]
-        dims_t = state["dims"]
-        idx = np.zeros(q.shape, dtype=np.int64)
-        for ax in range(len(dq)):
-            if dq[ax] <= 0:
-                if np.abs(q[:, ax] - state["qmin"][ax]).max() > 1e-9:
-                    return None
+    # Pass 2: scatter. The serial form ran cast/snap/ravel/sort AND the
+    # ~155M fancy-index adds per hkl40 shard on the ONE builder thread
+    # while sibling work units parked on the build event. Now the index
+    # prep rides the prefetch pool (_iter_prepared) and the adds fan out
+    # over cell-disjoint stripes — bitwise-identical accumulation order.
+    scatter_workers = _lattice_scatter_workers(total_grid_bytes)
+
+    def _iter_prepared(inputs):
+        window = _stage1_prefetch_window()
+
+        def _prep(interval_input):
+            task = _load(interval_input)
+            if task is None:
+                return None
+            return _prepare_interval_scatter(
+                task, per_role[str(task.half_space_role)], snap_tol
+            )
+
+        if window <= 1:
+            for interval_input in inputs:
+                yield _prep(interval_input)
+            return
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=window) as pool:
+            pending: deque = deque()
+            for interval_input in inputs:
+                pending.append(pool.submit(_prep, interval_input))
+                if len(pending) >= window:
+                    yield pending.popleft().result()
+            while pending:
+                yield pending.popleft().result()
+
+    if scatter_workers <= 1:
+        for prepared in _iter_prepared(loaded_interval_inputs):
+            if prepared is None:
                 continue
-            ratio = (q[:, ax] - state["qmin"][ax]) / dq[ax]
-            ax_idx = np.round(ratio).astype(np.int64)
-            if np.abs(ratio - ax_idx).max() > snap_tol:
+            if prepared is _SCATTER_INVALID:
                 return None
-            if ax_idx.min() < 0 or ax_idx.max() >= dims_t[ax]:
-                return None
-            idx[:, ax] = ax_idx
-        flat = np.ravel_multi_index(tuple(idx.T), dims_t)
-        amp = np.asarray(task.q_amp, dtype=np.complex128).reshape(-1)
-        av = np.asarray(task.q_amp_av, dtype=np.complex128).reshape(-1)
-        flat_rows = state["grids"].reshape(2, -1)     # view; grids object keeps its type
-        # One interval's q-nodes are distinct lattice sites by construction,
-        # so the duplicate-safe np.add.at (an order of magnitude slower than
-        # a vectorized fancy-index add; ~155M adds per hkl40 shard) is only
-        # needed if that assumption is ever violated -- verify cheaply.
-        order = np.sort(flat)
-        has_duplicates = order.size > 1 and bool(np.any(order[1:] == order[:-1]))
-        del order
-        if has_duplicates:
-            np.add.at(flat_rows[0], flat, amp - av)
-            np.add.at(flat_rows[1], flat, av)
-        else:
-            flat_rows[0][flat] += amp - av
-            flat_rows[1][flat] += av
-        del task, q, idx, flat, amp, av, flat_rows
+            state = per_role[prepared["role"]]
+            flat_rows = state["grids"].reshape(2, -1)  # view; keeps grid type
+            _apply_scatter_stripe(
+                flat_rows, prepared, 0, int(np.prod(state["dims"])) + 1
+            )
+            del prepared, flat_rows
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        invalid = False
+        with ThreadPoolExecutor(max_workers=scatter_workers) as scatter_pool:
+            for prepared in _iter_prepared(loaded_interval_inputs):
+                if prepared is None:
+                    continue
+                if prepared is _SCATTER_INVALID:
+                    # Pool context exit joins in-flight stripe jobs before
+                    # the caller can cache (and thus leak) a partial entry.
+                    invalid = True
+                    break
+                state = per_role[prepared["role"]]
+                flat_rows = state["grids"].reshape(2, -1)
+                n_cells = int(np.prod(state["dims"]))
+                bounds = np.linspace(
+                    0, n_cells + 1, scatter_workers + 1
+                ).astype(np.int64)
+                futures = [
+                    scatter_pool.submit(
+                        _apply_scatter_stripe,
+                        flat_rows,
+                        prepared,
+                        int(bounds[w]),
+                        int(bounds[w + 1]),
+                    )
+                    for w in range(scatter_workers)
+                ]
+                for future in futures:
+                    future.result()
+                del prepared, flat_rows, futures
+        if invalid:
+            return None
     groups = []
     for role in sorted(per_role):
         state = per_role[role]

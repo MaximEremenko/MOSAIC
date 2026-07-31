@@ -410,6 +410,38 @@ def _streaming_slot_owner_map(
     }
 
 
+def _mark_finalized_chunk_intervals_saved(*, db_path, chunk_id, interval_ids):
+    """Driver-side SQLite marking for streaming finalizes (single writer).
+
+    Marks the PLAN's interval set: _validate_local_durable_coverage_or_raise
+    proved the durable union covers the plan, and finalize_chunk's family
+    validation raises unless the snapshot union equals it exactly."""
+    from core.residual_field.reducer_helpers import _mark_residual_intervals_saved
+
+    _mark_residual_intervals_saved(
+        db_path=db_path, chunk_id=int(chunk_id), interval_ids=tuple(interval_ids)
+    )
+
+
+def _streaming_finalize_owner_map(
+    chunk_ids,
+    worker_addresses: list[str],
+) -> dict[int, str]:
+    """Finalize ownership keyed by CHUNK, round-robin across workers.
+
+    Finalize reads the durable slot snapshots from the shared output
+    directory, so unlike fold tasks it has no slot-owner locality tie —
+    but the slot-keyed map sends EVERY chunk's finalize to the same
+    worker (every chunk shares the identical content-addressed slot set),
+    serializing ~34 GB reads + 13.5 GB writes per chunk on one worker
+    while the rest idle. Deterministic and independent of the fold-owner
+    map (which _resolve_owner_address may mutate on remap)."""
+    return {
+        int(chunk_id): worker_addresses[index % len(worker_addresses)]
+        for index, chunk_id in enumerate(sorted(int(c) for c in chunk_ids))
+    }
+
+
 def _prewarm_stage1_store_if_enabled(
     *,
     client,
@@ -774,6 +806,7 @@ def _flush_local_reducer_targets_or_raise(
     output_dir: str,
     db_path: str,
     target_owners: dict[tuple[int, int | None], str],
+    pre_submitted_futures: dict[tuple[int, int | None], object] | None = None,
 ) -> None:
     if not target_keys:
         return
@@ -794,6 +827,18 @@ def _flush_local_reducer_targets_or_raise(
     flush_futures = []
     worker_addresses = _current_worker_addresses(client)
     for chunk_id, partition_id in target_keys:
+        pre_submitted = (pre_submitted_futures or {}).get(
+            (int(chunk_id), partition_id)
+        )
+        if pre_submitted is not None and getattr(
+            pre_submitted, "status", ""
+        ) not in ("error", "cancelled"):
+            # Early per-target flush already in flight (submitted the moment
+            # the target's last work unit completed) — the barrier just
+            # waits on it. Errored/cancelled ones are resubmitted fresh so
+            # owner-remap-at-barrier behavior is preserved.
+            flush_futures.append(pre_submitted)
+            continue
         owner_address = _resolve_owner_address(
             target_key=(int(chunk_id), partition_id),
             target_owners=target_owners,
@@ -1831,9 +1876,49 @@ def run_residual_field_stage(
         target_rifft_futures[target_key] = future
         return future
 
-    def _mark_target_work_unit_done(work_unit: ResidualFieldWorkUnit | None) -> None:
-        if not reuse_rifft_payload:
+    early_flush_futures: dict[tuple[int, int | None], object] = {}
+
+    def _submit_early_target_flush(target_key) -> None:
+        """Flush a reducer target the moment its LAST work unit completes.
+
+        The end-of-stage barrier previously wrote ~271 GB of snapshots with
+        zero compute overlap (90-135 s, GPUs idle). Targets finish staggered
+        (slot-interleaved submission), so streaming their final snapshots
+        during the tail degrades the barrier to a short wait on writes that
+        are already running. Failure here is harmless: the key stays absent
+        and the barrier resubmits fresh."""
+        if (
+            not owner_local_reducer
+            or not worker_addresses
+            or flush_process_local_residual_reducer_target is None
+            or target_key not in target_owners
+            or target_key in early_flush_futures
+        ):
             return
+        try:
+            owner_address = _resolve_owner_address(
+                target_key=target_key,
+                target_owners=target_owners,
+                worker_addresses=_current_worker_addresses(client),
+            )
+            if owner_address is None:
+                return
+            early_flush_futures[target_key] = client.submit(
+                flush_process_local_residual_reducer_target,
+                task_reducer_backend,
+                chunk_id=int(target_key[0]),
+                parameter_digest=planned_work_units[0].parameter_digest,
+                output_dir=artifacts.output_dir,
+                db_path=artifacts.db_manager.db_path,
+                partition_id=target_key[1],
+                pure=False,
+                workers=[owner_address],
+                allow_other_workers=False,
+            )
+        except Exception:
+            early_flush_futures.pop(target_key, None)
+
+    def _mark_target_work_unit_done(work_unit: ResidualFieldWorkUnit | None) -> None:
         if work_unit is None:
             return
         target_key = _reducer_target_key(work_unit)
@@ -1843,13 +1928,15 @@ def run_residual_field_stage(
         if target_remaining[target_key] > 0:
             return
         target_remaining.pop(target_key, None)
-        rifft_future = target_rifft_futures.pop(target_key, None)
-        release = getattr(rifft_future, "release", None)
-        if callable(release):
-            try:
-                release()
-            except Exception:
-                pass
+        if reuse_rifft_payload:
+            rifft_future = target_rifft_futures.pop(target_key, None)
+            release = getattr(rifft_future, "release", None)
+            if callable(release):
+                try:
+                    release()
+                except Exception:
+                    pass
+        _submit_early_target_flush(target_key)
 
     def _submit(work_unit: ResidualFieldWorkUnit) -> None:
         nonlocal submitted
@@ -2158,6 +2245,7 @@ def run_residual_field_stage(
             output_dir=artifacts.output_dir,
             db_path=artifacts.db_manager.db_path,
             target_owners=target_owners,
+            pre_submitted_futures=early_flush_futures,
         )
         inspected_target_states = _inspect_owner_local_reducer_targets_or_raise(
             client=client,
@@ -2182,9 +2270,23 @@ def run_residual_field_stage(
             inspected_target_states=inspected_target_states,
         )
         finalize_futures = []
+        finalize_chunk_by_future: dict = {}
+        finalize_live_workers = _current_worker_addresses(client)
+        # Chunk-keyed finalize placement for streaming: the slot-keyed fold
+        # map sends every chunk's finalize to ONE worker (all chunks share
+        # the same content-addressed slot set) — 3-5 min serialized on one
+        # worker while the rest idle. Finalize reads durable snapshots from
+        # the shared output dir, so any worker can run any chunk.
+        finalize_owner_by_chunk = (
+            _streaming_finalize_owner_map(chunk_ids, finalize_live_workers)
+            if streaming_context is not None and finalize_live_workers
+            else {}
+        )
         for chunk_id in chunk_ids:
             finalizer_owner = None
-            if any(int(work_unit.chunk_id) == int(chunk_id) for work_unit in owner_local_target_units):
+            if streaming_context is not None:
+                finalizer_owner = finalize_owner_by_chunk.get(int(chunk_id))
+            elif any(int(work_unit.chunk_id) == int(chunk_id) for work_unit in owner_local_target_units):
                 representative = next(
                     work_unit
                     for work_unit in owner_local_target_units
@@ -2202,32 +2304,45 @@ def run_residual_field_stage(
                 raise RuntimeError(
                     f"Owner-local residual finalization requires an available worker for chunk {int(chunk_id)}."
                 )
-            finalize_futures.append(
-                client.submit(
-                    finalize_process_local_residual_chunk,
-                    task_reducer_backend,
+            future = client.submit(
+                finalize_process_local_residual_chunk,
+                task_reducer_backend,
+                chunk_id=int(chunk_id),
+                parameter_digest=planned_work_units[0].parameter_digest,
+                output_dir=artifacts.output_dir,
+                db_path=artifacts.db_manager.db_path,
+                cleanup_policy=cleanup_policy,
+                scratch_root=scratch_root,
+                quiet_logs=False,
+                expected_partitions=_expected_partition_family_for_chunk(
+                    planned_work_units,
                     chunk_id=int(chunk_id),
-                    parameter_digest=planned_work_units[0].parameter_digest,
-                    output_dir=artifacts.output_dir,
-                    db_path=artifacts.db_manager.db_path,
-                    cleanup_policy=cleanup_policy,
-                    scratch_root=scratch_root,
-                    quiet_logs=False,
-                    expected_partitions=_expected_partition_family_for_chunk(
-                        planned_work_units,
-                        chunk_id=int(chunk_id),
-                    ),
-                    expected_interval_ids=expected_interval_ids_by_chunk.get(
-                        int(chunk_id)
-                    ),
-                    pure=False,
-                    workers=[finalizer_owner],
-                    allow_other_workers=False,
-                )
+                ),
+                expected_interval_ids=expected_interval_ids_by_chunk.get(
+                    int(chunk_id)
+                ),
+                # Streaming finalizes run on multiple workers concurrently;
+                # SQLite marking moves to the driver (single writer).
+                mark_intervals_saved=streaming_context is None,
+                pure=False,
+                workers=[finalizer_owner],
+                allow_other_workers=False,
             )
+            finalize_futures.append(future)
+            finalize_chunk_by_future[future] = int(chunk_id)
         for future, result in yield_futures_with_results(finalize_futures, client):
             if not bool(result):
                 raise RuntimeError("Owner-local residual finalization failed.")
+            if streaming_context is not None:
+                finalized_chunk = finalize_chunk_by_future.get(future)
+                if finalized_chunk is not None:
+                    _mark_finalized_chunk_intervals_saved(
+                        db_path=artifacts.db_manager.db_path,
+                        chunk_id=finalized_chunk,
+                        interval_ids=expected_interval_ids_by_chunk.get(
+                            finalized_chunk, ()
+                        ),
+                    )
     else:
         for chunk_id in chunk_ids:
             require_chunk_quiescence(

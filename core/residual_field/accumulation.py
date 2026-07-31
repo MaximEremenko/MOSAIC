@@ -15,6 +15,7 @@ from core.residual_field.contracts import (
     ResidualFieldPartialResult,
     ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
+    point_ids_equal,
     validate_residual_field_partial_result,
 )
 from core.contracts import ArtifactRef
@@ -85,7 +86,7 @@ def merge_residual_field_partial_results(
     if (
         left.residual_values is not None
         and right.residual_values is not None
-        and left.point_ids != right.point_ids
+        and not point_ids_equal(left.point_ids, right.point_ids)
     ):
         raise ValueError(
             "Cannot merge materialized residual-field partials with different point_ids."
@@ -99,7 +100,10 @@ def merge_residual_field_partial_results(
     merged_point_ids = (
         left.point_ids
         if left.residual_values is not None and right.residual_values is not None
-        else tuple(sorted(set(left.point_ids) | set(right.point_ids)))
+        else np.union1d(
+            np.asarray(left.point_ids, dtype=np.int64),
+            np.asarray(right.point_ids, dtype=np.int64),
+        )
     )
     return ResidualFieldPartialResult(
         chunk_id=left.chunk_id,
@@ -171,7 +175,7 @@ def build_materialized_residual_field_state(
         source_artifacts=work_unit.source_artifacts,
         output_artifacts=output_artifacts,
         grid_shape=_grid_shape_tuple(grid_shape_nd),
-        point_ids=tuple(int(point_id) for point_id in payload.point_ids),
+        point_ids=payload.point_ids,
         residual_values=payload.amplitudes_delta.copy(),
         residual_average_values=payload.amplitudes_average.copy(),
         reciprocal_point_count=payload.reciprocal_point_count,
@@ -212,7 +216,7 @@ def build_existing_materialized_residual_field_state(
         source_artifacts=(),
         output_artifacts=output_artifacts,
         grid_shape=_grid_shape_tuple(grid_shape_nd),
-        point_ids=tuple(int(point_id) for point_id in payload.point_ids),
+        point_ids=payload.point_ids,
         residual_values=payload.amplitudes_delta.copy(),
         residual_average_values=payload.amplitudes_average.copy(),
         reciprocal_point_count=payload.reciprocal_point_count,
@@ -248,7 +252,7 @@ def build_materialized_residual_field_state_from_shard(
         source_artifacts=manifest.upstream_artifacts,
         output_artifacts=output_artifacts,
         grid_shape=_grid_shape_tuple(grid_shape_nd),
-        point_ids=tuple(int(point_id) for point_id in payload.point_ids),
+        point_ids=payload.point_ids,
         residual_values=payload.amplitudes_delta.copy(),
         residual_average_values=payload.amplitudes_average.copy(),
         reciprocal_point_count=payload.reciprocal_point_count,
@@ -267,8 +271,7 @@ def validate_materialized_residual_field_state(
     payload_grid_shape = _grid_shape_tuple(state.payload.grid_shape_nd)
     if state.metadata.grid_shape != payload_grid_shape:
         raise ValueError("Residual-field metadata grid_shape must match the payload grid shape.")
-    payload_point_ids = tuple(int(point_id) for point_id in state.payload.point_ids)
-    if state.metadata.point_ids != payload_point_ids:
+    if not point_ids_equal(state.metadata.point_ids, state.payload.point_ids):
         raise ValueError("Residual-field metadata point_ids must match the payload point_ids.")
     if state.metadata.reciprocal_point_count != state.payload.reciprocal_point_count:
         raise ValueError(

@@ -572,7 +572,12 @@ class ResidualFieldPartialResult:
     source_artifacts: tuple[ArtifactRef, ...]
     output_artifacts: tuple[ArtifactRef, ...] = ()
     grid_shape: tuple[int, ...] | None = None
-    point_ids: tuple[int, ...] = ()
+    # int64 ndarray after __post_init__ (accepts tuples for convenience).
+    # A 211.7M-point chunk as Python tuples cost ~45 s + GC churn per
+    # materialization, twice per chunk; the ndarray passes through
+    # zero-copy. Instances are never compared or hashed (frozen-dataclass
+    # eq over an ndarray field would raise) — verified across the repo.
+    point_ids: "np.ndarray | tuple[int, ...]" = ()
     residual_values: np.ndarray | None = None
     residual_average_values: np.ndarray | None = None
     reciprocal_point_count: int | None = None
@@ -591,7 +596,7 @@ class ResidualFieldPartialResult:
         object.__setattr__(
             self,
             "point_ids",
-            tuple(int(point_id) for point_id in self.point_ids),
+            np.asarray(self.point_ids, dtype=np.int64).reshape(-1),
         )
         if self.residual_values is not None:
             object.__setattr__(self, "residual_values", np.asarray(self.residual_values).reshape(-1))
@@ -736,6 +741,13 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
             )
 
 
+def point_ids_equal(left, right) -> bool:
+    """Identity short-circuit first: builders share the payload's array
+    object, so the common case is O(1) instead of a 211.7M-element
+    compare."""
+    return left is right or np.array_equal(left, right)
+
+
 def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -> None:
     if len(set(result.contributing_interval_ids)) != len(result.contributing_interval_ids):
         raise ValueError("contributing_interval_ids must be unique per residual-field partial.")
@@ -744,11 +756,12 @@ def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -
         raise ValueError("output_artifacts must not contain duplicate artifact keys.")
     if result.reciprocal_point_count is not None and result.reciprocal_point_count < 0:
         raise ValueError("reciprocal_point_count must be non-negative.")
+    point_id_count = int(np.asarray(result.point_ids).size)
     if result.residual_values is not None:
-        if result.point_ids and len(result.point_ids) != result.residual_values.shape[0]:
+        if point_id_count and point_id_count != result.residual_values.shape[0]:
             raise ValueError("residual_values must align with point_ids.")
     if result.residual_average_values is not None:
-        if result.point_ids and len(result.point_ids) != result.residual_average_values.shape[0]:
+        if point_id_count and point_id_count != result.residual_average_values.shape[0]:
             raise ValueError("residual_average_values must align with point_ids.")
     if (
         result.residual_values is not None

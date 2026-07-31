@@ -891,6 +891,7 @@ class ManifestDrivenResidualFieldReducerBackend:
         db_path: str,
         cleanup_policy: str | bool | None,
         scratch_root: str | None = None,
+        mark_intervals_saved: bool = True,
     ) -> ResidualFieldArtifactManifest | None:
         progress = self.load_progress_manifest(
             output_dir=output_dir,
@@ -962,11 +963,12 @@ class ManifestDrivenResidualFieldReducerBackend:
             )
             self.write_progress_manifest(committed_progress)
 
-        _mark_residual_intervals_saved(
-            db_path=db_path,
-            chunk_id=chunk_id,
-            interval_ids=incorporated_interval_ids,
-        )
+        if mark_intervals_saved:
+            _mark_residual_intervals_saved(
+                db_path=db_path,
+                chunk_id=chunk_id,
+                interval_ids=incorporated_interval_ids,
+            )
         if resolved_cleanup_policy == "delete_reclaimable":
             self.cleanup_reclaimable_shards(
                 output_dir=output_dir,
@@ -2337,8 +2339,14 @@ class ManifestDrivenResidualFieldReducerBackend:
         opportunistic: bool = False,
         expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
         expected_interval_ids: tuple[int, ...] | None = None,
+        mark_intervals_saved: bool = True,
     ) -> ResidualFieldArtifactManifest | None:
         """Fold committed local snapshots into the final chunk artifact.
+
+        ``mark_intervals_saved=False`` defers SQLite interval marking to the
+        driver (single writer) when finalizes run concurrently on many
+        workers; SQLite is a rebuildable cache, so ordering only shifts the
+        crash-repair window (manifests remain the authority).
 
         ``opportunistic=True`` marks a caller (startup recovery) that runs
         BEFORE planning and therefore cannot know the expected partition
@@ -2364,6 +2372,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             db_path=db_path,
             cleanup_policy=cleanup_policy,
             scratch_root=scratch_root,
+            mark_intervals_saved=mark_intervals_saved,
         )
         if repaired_manifest is not None:
             return repaired_manifest
@@ -2484,13 +2493,15 @@ class ManifestDrivenResidualFieldReducerBackend:
                 cleanup_policy=str(cleanup_policy or "off"),
             )
             self.write_progress_manifest(progress_manifest)
-            _mark_residual_intervals_saved(
-                db_path=db_path,
-                chunk_id=chunk_id,
-                interval_ids=tuple(
-                    int(v) for v in snapshot_payload["incorporated_interval_ids"]
-                ),
-            )
+            if mark_intervals_saved:
+                _mark_residual_intervals_saved(
+                    db_path=db_path,
+                    chunk_id=chunk_id,
+                    interval_ids=tuple(
+                        int(v)
+                        for v in snapshot_payload["incorporated_interval_ids"]
+                    ),
+                )
             deleted = self.cleanup_reclaimable_shards(
                 output_dir=output_dir,
                 chunk_id=chunk_id,
@@ -2724,13 +2735,15 @@ class ManifestDrivenResidualFieldReducerBackend:
                 cleanup_policy=str(cleanup_policy or "off"),
             )
             self.write_progress_manifest(progress_manifest)
-            _mark_residual_intervals_saved(
-                db_path=db_path,
-                chunk_id=chunk_id,
-                interval_ids=tuple(
-                    int(v) for v in snapshot_payload["incorporated_interval_ids"]
-                ),
-            )
+            if mark_intervals_saved:
+                _mark_residual_intervals_saved(
+                    db_path=db_path,
+                    chunk_id=chunk_id,
+                    interval_ids=tuple(
+                        int(v)
+                        for v in snapshot_payload["incorporated_interval_ids"]
+                    ),
+                )
             for partition_id, snapshot_seq, _metadata in snapshot_metadata:
                 build_local_accumulator_snapshot_path(
                     output_dir,
@@ -2853,6 +2866,8 @@ def finalize_process_local_residual_chunk(
     quiet_logs: bool = False,
     expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
     expected_interval_ids: tuple[int, ...] | None = None,
+    mark_intervals_saved: bool = True,
+    opportunistic: bool = False,
 ) -> ResidualFieldArtifactManifest | None:
     backend = get_process_local_residual_field_backend(template_backend)
     return backend.finalize_chunk(
@@ -2865,6 +2880,8 @@ def finalize_process_local_residual_chunk(
         quiet_logs=quiet_logs,
         expected_partitions=expected_partitions,
         expected_interval_ids=expected_interval_ids,
+        mark_intervals_saved=mark_intervals_saved,
+        opportunistic=opportunistic,
     )
 
 

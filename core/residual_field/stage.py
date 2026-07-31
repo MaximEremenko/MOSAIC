@@ -95,6 +95,64 @@ def _write_empty_replacement_no_output_manifest(
     )
 
 
+def _fan_out_recover_finalizes(
+    *,
+    client,
+    backend,
+    chunk_ids,
+    parameter_digest,
+    output_dir,
+    db_path,
+    scratch_root,
+):
+    """Run recovery finalizes as worker tasks, one per pending chunk.
+
+    Driver-serial recovery cost ~80-90 s/chunk (34 GB snapshot reads +
+    13.5 GB writes each). Pre-plan there is no ownership map and no live
+    accumulator state, so placement is pure round-robin load balancing;
+    allow_other_workers=True so a dying worker cannot strand recovery.
+    Returns None when fan-out is unavailable (no client/workers, or a
+    test-double backend) — the caller then runs the serial path."""
+    if not chunk_ids:
+        return []
+    layout_kind = getattr(getattr(backend, "layout", None), "kind", None)
+    if client is None or layout_kind != "local_restartable":
+        return None
+    try:
+        from core.residual_field.backend import (
+            finalize_process_local_residual_chunk,
+        )
+        from core.residual_field.cluster_helpers import _current_worker_addresses
+        from core.runtime.dask_helpers import is_sync_client
+
+        if is_sync_client(client):
+            return None
+        workers = _current_worker_addresses(client)
+    except Exception:
+        return None
+    if not workers:
+        return None
+    futures = [
+        client.submit(
+            finalize_process_local_residual_chunk,
+            backend,
+            chunk_id=int(chunk_id),
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+            db_path=db_path,
+            cleanup_policy="off",
+            scratch_root=scratch_root,
+            quiet_logs=True,
+            opportunistic=True,
+            pure=False,
+            workers=[workers[index % len(workers)]],
+            allow_other_workers=True,
+        )
+        for index, chunk_id in enumerate(chunk_ids)
+    ]
+    return [future.result() for future in futures]
+
+
 def _reset_expected_interval_chunks(artifacts: RunArtifacts, expected_by_chunk: dict[int, tuple[int, ...]]) -> None:
     rows = [
         (int(interval_id), int(chunk_id), 0)
@@ -157,30 +215,49 @@ class ResidualFieldStage:
             stage="residual_field",
         )
         parameter_digest = build_residual_field_parameter_digest(workflow_parameters)
-        recovered_chunks: list[int] = []
+        # Cheap serial pre-filter (small shared-FS manifest reads).
+        chunks_with_progress: list[int] = []
         for chunk_id in sorted(int(value) for value in get_pending_chunk_ids()):
             progress = load_progress_manifest(
                 output_dir=artifacts.output_dir,
                 chunk_id=int(chunk_id),
                 parameter_digest=parameter_digest,
             )
-            if progress is None:
-                continue
-            manifest = finalize_chunk(
-                chunk_id=int(chunk_id),
-                parameter_digest=parameter_digest,
-                output_dir=artifacts.output_dir,
-                db_path=db_manager.db_path,
-                cleanup_policy="off",
-                scratch_root=scratch_root,
-                quiet_logs=True,
-                # Pre-plan recovery: partitioned families whose completeness
-                # cannot be proven are deferred to the residual stage instead
-                # of being published or failed.
-                opportunistic=True,
-            )
-            if manifest is not None:
-                recovered_chunks.append(int(chunk_id))
+            if progress is not None:
+                chunks_with_progress.append(int(chunk_id))
+
+        manifests = _fan_out_recover_finalizes(
+            client=client,
+            backend=backend,
+            chunk_ids=chunks_with_progress,
+            parameter_digest=parameter_digest,
+            output_dir=artifacts.output_dir,
+            db_path=db_manager.db_path,
+            scratch_root=scratch_root,
+        )
+        if manifests is None:
+            # No live workers (sync/local runs) — driver-serial as before.
+            manifests = [
+                finalize_chunk(
+                    chunk_id=int(chunk_id),
+                    parameter_digest=parameter_digest,
+                    output_dir=artifacts.output_dir,
+                    db_path=db_manager.db_path,
+                    cleanup_policy="off",
+                    scratch_root=scratch_root,
+                    quiet_logs=True,
+                    # Pre-plan recovery: partitioned families whose
+                    # completeness cannot be proven are deferred to the
+                    # residual stage instead of being published or failed.
+                    opportunistic=True,
+                )
+                for chunk_id in chunks_with_progress
+            ]
+        recovered_chunks = [
+            int(chunk_id)
+            for chunk_id, manifest in zip(chunks_with_progress, manifests)
+            if manifest is not None
+        ]
 
         if recovered_chunks:
             logger.info(
