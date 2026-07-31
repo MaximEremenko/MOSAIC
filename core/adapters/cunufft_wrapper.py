@@ -242,9 +242,8 @@ def _apply_cupy_pool_cap() -> None:
         cp_mod.get_default_memory_pool().set_limit(size=int(limit_bytes))
         _CUPY_POOL_CAPPED = True
         logger.info(
-            "CuPy pool capped at %.2f GiB (workers=%d, total_vram=%.2f GiB).",
+            "CuPy pool capped at %.2f GiB (total_vram=%.2f GiB).",
             limit_bytes / (1 << 30),
-            _expected_worker_count(),
             total_vram / (1 << 30),
         )
     except Exception as exc:

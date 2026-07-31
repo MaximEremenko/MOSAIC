@@ -376,7 +376,10 @@ def _expected_partition_family_for_chunk(
 def _streaming_subchunk_slot_count(workflow_parameters, client) -> int:
     """Number of subchunk slots per chunk in streaming mode.
 
-    Defaults to one slot per live worker so every worker can fold batches
+    The slot count is part of work-unit/checkpoint identity, so it must
+    NOT depend on how many workers happen to be alive: a run started on a
+    1-GPU node has to resume on an 8-GPU node with its checkpoints intact.
+    Fixed default of 8 keeps every realistic worker count folding
     concurrently; ``runtime_info.residual_streaming_subchunks`` overrides.
     Sync execution gets one slot (a single accumulator per chunk)."""
     raw = workflow_parameters.runtime_info.get("residual_streaming_subchunks")
@@ -384,7 +387,7 @@ def _streaming_subchunk_slot_count(workflow_parameters, client) -> int:
         return max(1, int(raw))
     if client is None or is_sync_client(client):
         return 1
-    return max(1, len(_current_worker_addresses(client)))
+    return 8
 
 
 def _streaming_slot_owner_map(
