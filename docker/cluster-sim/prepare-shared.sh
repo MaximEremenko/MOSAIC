@@ -31,5 +31,19 @@ json.dump({"input_parameters_path": f"./input_parameters_small_{case}.json"},
           open(f"{dest}/run_parameters_small_{case}.json", "w"), indent=2)
 EOF
 done
+# Multi-node-per-case variant: same physics as 'all' (so the stage-1
+# store is shared with the single-node runs), backend "mpi", launched
+# with mpi-rank.sh under mpirun across all sim nodes.
+python3 - "$DEST" <<'EOF'
+import json, sys
+dest = sys.argv[1]
+cfg = json.load(open(f"{dest}/input_parameters_small_all.json"))
+cfg["paths"]["output_directory"] = "./output_disp_small_all_multinode"
+cfg["runtime"]["dask"]["backend"] = "mpi"
+cfg["runtime"]["dask"]["max_workers"] = 4
+json.dump(cfg, open(f"{dest}/input_parameters_small_all_multinode.json", "w"), indent=2)
+json.dump({"input_parameters_path": "./input_parameters_small_all_multinode.json"},
+          open(f"{dest}/run_parameters_small_all_multinode.json", "w"), indent=2)
+EOF
 mkdir -p "$SIM_ROOT/shared/stage1_store"
-echo "staged: $DEST/run_parameters_small_{all,sphere,rod,rest}.json"
+echo "staged: $DEST/run_parameters_small_{all,sphere,rod,rest,all_multinode}.json"

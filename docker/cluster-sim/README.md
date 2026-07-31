@@ -45,6 +45,25 @@ Strategy checks this cluster has to keep passing:
 4. **Array shape** — independent cases on all three nodes concurrently
    against one store (sphere/rod/rest need the `all` case's decoder
    first — same gating as the hkl40 pipeline).
+5. **Multi-node-per-case (backend "mpi")** — one case across all three
+   nodes under real `mpirun` via `mpi-rank.sh` (6 ranks: scheduler,
+   driver, 4 GPU workers), reusing the same shared store:
+
+   ```bash
+   sudo docker compose exec node3 mpirun --allow-run-as-root -np 6 \
+       --host node3:3,node1:1,node2:2 \
+       --mca btl_tcp_if_include eth0 --mca oob_tcp_if_include eth0 \
+       bash $PWD/mpi-rank.sh \
+       /mnt/shared/configs/displacement/run_parameters_small_all_multinode.json
+   ```
+
+   Requires `mpi4py`/`dask_mpi` on the shared FS (`pip install --target
+   /mnt/shared/pylibs mpi4py dask_mpi` inside a node, then strip the
+   duplicate dask/distributed dirs so the venv's pinned versions win).
+   The shared FS must be mounted `lookupcache=positive` — with default
+   negative-dentry caching, ranks on other nodes can see ENOENT for a
+   directory the driver just created (this is standard practice for
+   shared job directories on HPC NFS).
 
 Cleanup: `sudo docker compose down`; shared-FS files created by the
 nodes are root-owned on the host (`no_root_squash`), so use `sudo rm`.

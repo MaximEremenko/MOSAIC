@@ -6,7 +6,18 @@ FROM ubuntu:24.04
 # CUDA driver libraries are injected by the NVIDIA container runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         nfs-common iproute2 iputils-ping procps ca-certificates \
+        openmpi-bin libopenmpi-dev openssh-server openssh-client \
+        build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+# Passwordless root ssh between sim nodes (mpirun's launcher). The keypair
+# is baked into the image — every node shares it. SIM ONLY: acceptable
+# because the cluster network is a private docker bridge.
+RUN mkdir -p /run/sshd /root/.ssh \
+    && ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 \
+    && cp /root/.ssh/id_ed25519.pub /root/.ssh/authorized_keys \
+    && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  LogLevel ERROR\n' > /root/.ssh/config \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility

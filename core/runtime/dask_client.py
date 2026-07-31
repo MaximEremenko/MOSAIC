@@ -113,6 +113,27 @@ def _gpu_resource_slots(backend: str | None) -> int:
     return 0
 
 
+def _mkdir_shared(path: Path, attempts: int = 5) -> None:
+    """mkdir -p that tolerates many ranks racing on a network filesystem.
+
+    On NFS/parallel FS, negative dentry caching makes ``exist_ok`` unreliable
+    inside the race window (a sibling rank's fresh directory can still raise
+    FileExistsError with is_dir() False, or the parent can look absent right
+    after another rank created it). Retry with a short backoff.
+    """
+    import time
+
+    for attempt in range(attempts):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except (FileNotFoundError, FileExistsError):
+            if path.is_dir():
+                return
+            time.sleep(0.2 * (attempt + 1))
+    path.mkdir(parents=True, exist_ok=True)
+
+
 def default_log_dir(base_dir: str | Path | None = None) -> Path:
     if os.getenv("MOSAIC_LOG_DIR"):
         return Path(os.environ["MOSAIC_LOG_DIR"]).expanduser()
@@ -163,9 +184,15 @@ def get_client() -> Client:
     if _CLIENT is not None:
         return _CLIENT
 
-    # Where to write worker *.o / *.e logs – default: <run_dir>/dask_logs
+    # Where to write worker *.o / *.e logs – default: <run_dir>/dask_logs.
+    # Non-fatal: in SPMD launches (dask-mpi) every rank passes through here
+    # concurrently and only the driver strictly needs the directory; a
+    # shared-FS race must not kill worker ranks.
     log_dir = default_log_dir().expanduser()
-    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _mkdir_shared(log_dir)
+    except OSError as exc:
+        logger.warning("Could not create dask log dir %s: %s", log_dir, exc)
 
     extra = {}
     configured_backend = os.getenv("DASK_BACKEND")

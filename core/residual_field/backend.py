@@ -2718,6 +2718,16 @@ def resolve_residual_field_reducer_backend_kind(
         override = os.getenv("MOSAIC_RESIDUAL_FIELD_REDUCER_BACKEND")
     if override is not None:
         return _normalize_reducer_backend_kind(str(override))
+    # Streaming stage-2 REQUIRES the owner-local reducer (amplitudes exist
+    # only inside worker accumulators), and the tile-owner architecture made
+    # it multi-node-safe: working accumulators live on node-local scratch,
+    # durable snapshots/checkpoints land in the shared output directory.
+    # The locality heuristic below predates that and would strand multi-node
+    # (MPI/SLURM) streaming runs on durable_shared, which streaming rejects.
+    from core.scattering.streaming import stage2_streaming_enabled
+
+    if stage2_streaming_enabled({"runtime_info": runtime_info}):
+        return "local_restartable"
     return (
         "local_restartable"
         if is_same_node_local_client(client)

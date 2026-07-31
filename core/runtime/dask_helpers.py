@@ -361,16 +361,32 @@ def ensure_dask_client(
 
     # ────────── dask‑mpi ──────────
     if backend == "mpi":
+        # SPMD shape: every rank runs the same driver; initialize() turns
+        # rank 0 into the scheduler and ranks >= 2 into workers (they never
+        # return), rank 1 continues as the client. GPU pinning is per-rank
+        # CUDA_VISIBLE_DEVICES set by the launch wrapper (one rank per GPU),
+        # so plain distributed workers are correct — no dask-cuda needed.
         from dask_mpi import initialize
 
+        worker_options: Dict[str, Any] = {}
+        resources = cluster_kw.pop("resources", None)
+        if isinstance(resources, dict) and resources:
+            worker_options["resources"] = {
+                str(name): float(value) for name, value in resources.items()
+            }
         initialize(
             nthreads=threads_per_worker,
-            memory_limit="0",
-            worker_dashboard=worker_dashboard,
-            local_directory=os.getenv("DASK_LOCAL_DIR", cfg_file.get("local_directory", "/tmp")),
-            python="dask-cuda-worker" if gpu else None,
+            # Same rationale as cuda-local: memmap pages count into RSS and
+            # the nanny would kill healthy workers; kernel arbitrates.
+            memory_limit=os.getenv("DASK_MEMORY_LIMIT", "0"),
+            local_directory=os.getenv(
+                "DASK_LOCAL_DIR", cfg_file.get("local_directory", "/tmp")
+            ),
+            worker_options=worker_options or None,
         )
-        return Client()
+        client = Client()
+        _register_heap_trim_plugin(client)
+        return client
 
     raise ValueError(f"Unknown backend '{backend}'")
 

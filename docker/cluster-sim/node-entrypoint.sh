@@ -8,7 +8,7 @@ tc qdisc replace dev eth0 root netem \
 
 mkdir -p /mnt/shared /scratch
 for _ in $(seq 1 90); do
-    if mount -t nfs4 -o vers=4.2,proto=tcp,hard,timeo=600 \
+    if mount -t nfs4 -o vers=4.2,proto=tcp,hard,timeo=600,lookupcache=positive \
         nfs-server:/ /mnt/shared 2>/tmp/mount.err; then
         break
     fi
@@ -19,6 +19,8 @@ if ! mountpoint -q /mnt/shared; then
     cat /tmp/mount.err >&2
     exit 1
 fi
+
+/usr/sbin/sshd -e 2>/dev/null || echo "WARN: sshd failed to start" >&2
 
 echo "READY node=$(hostname) cpus=$(nproc) gpus=$(nvidia-smi -L 2>/dev/null | wc -l)" \
      "cgroup_mem=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo '?')"
