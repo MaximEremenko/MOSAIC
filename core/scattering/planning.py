@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -546,9 +547,8 @@ def build_qspace_plan(
     supercell = np.asarray(parameters["supercell"])
     intervals = list(parameters["reciprocal_space_intervals"])
     mask_digest = build_mask_digest(mask_params, MaskStrategy)
-    interval_plans: list[QSpaceIntervalPlan] = []
-    normalization_contracts: list[QNormalizationContract] = []
-    for interval in sorted(intervals, key=lambda item: int(item["id"])):
+
+    def _plan_one_interval(interval: dict):
         if "id" not in interval:
             raise ValueError("qspace_plan intervals must include stable interval IDs.")
         interval_dict = to_interval_dict(dict(interval))
@@ -581,7 +581,6 @@ def build_qspace_plan(
             interval_id=int(interval["id"]),
             q_digest=q_digest,
         )
-        normalization_contracts.append(contract)
         logger.debug(
             "qspace interval %d q-normalization: planned=%d accepted=%d "
             "mask_rejected=%d multiplicity=%d (role=%s)",
@@ -592,20 +591,42 @@ def build_qspace_plan(
             multiplicity,
             role,
         )
-        interval_plans.append(
-            QSpaceIntervalPlan(
-                interval_id=int(interval["id"]),
-                h_bounds=_axis_bounds(interval_dict, "h"),
-                k_bounds=_axis_bounds(interval_dict, "k"),
-                l_bounds=_axis_bounds(interval_dict, "l"),
-                half_space_role=role,
-                reciprocal_multiplicity=multiplicity,
-                reciprocal_point_count=int(reciprocal_space_points_counter(interval_dict, supercell)),
-                q_grid_digest=q_digest,
-                mask_digest=mask_digest,
-                l_coverage=_l_coverage_for_role(role),
-            )
+        plan = QSpaceIntervalPlan(
+            interval_id=int(interval["id"]),
+            h_bounds=_axis_bounds(interval_dict, "h"),
+            k_bounds=_axis_bounds(interval_dict, "k"),
+            l_bounds=_axis_bounds(interval_dict, "l"),
+            half_space_role=role,
+            reciprocal_multiplicity=multiplicity,
+            reciprocal_point_count=int(reciprocal_space_points_counter(interval_dict, supercell)),
+            q_grid_digest=q_digest,
+            mask_digest=mask_digest,
+            l_coverage=_l_coverage_for_role(role),
         )
+        return contract, plan
+
+    # Per-interval planning (grid gen + mask + sha256) is independent and
+    # GIL-releasing; it ran serially on ONE core for minutes per case (2,304
+    # intervals at hkl40 on a 96-core host). executor.map preserves input
+    # order, so the produced plan and every digest are byte-identical to the
+    # serial loop. MOSAIC_QSPACE_PLAN_PARALLEL overrides (1 = serial).
+    ordered_intervals = sorted(intervals, key=lambda item: int(item["id"]))
+    _raw_parallel = os.getenv("MOSAIC_QSPACE_PLAN_PARALLEL", "").strip()
+    try:
+        _plan_workers = max(1, int(_raw_parallel)) if _raw_parallel else min(
+            16, os.cpu_count() or 1
+        )
+    except ValueError:
+        _plan_workers = min(16, os.cpu_count() or 1)
+    if _plan_workers > 1 and len(ordered_intervals) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=_plan_workers) as _pool:
+            planned_pairs = list(_pool.map(_plan_one_interval, ordered_intervals))
+    else:
+        planned_pairs = [_plan_one_interval(interval) for interval in ordered_intervals]
+    normalization_contracts = [contract for contract, _plan in planned_pairs]
+    interval_plans = [plan for _contract, plan in planned_pairs]
     # One INFO summary instead of one line per interval (per-interval detail is at DEBUG).
     _total_mask_rejected = sum(c.mask_rejected for c in normalization_contracts)
     _multiplicity_counts: dict[int, int] = {}
