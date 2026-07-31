@@ -1,0 +1,17 @@
+FROM ubuntu:24.04
+
+# Compute-node image. Deliberately minimal: the MOSAIC software stack
+# (repo + uv-managed CPython + venv with CUDA wheels) is bind-mounted
+# read-only at its host path, exactly like an /apps tree on a cluster.
+# CUDA driver libraries are injected by the NVIDIA container runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nfs-common iproute2 iputils-ping procps ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+COPY node-entrypoint.sh /usr/local/bin/node-entrypoint.sh
+RUN chmod +x /usr/local/bin/node-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/node-entrypoint.sh"]

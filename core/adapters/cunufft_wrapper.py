@@ -1447,13 +1447,15 @@ def lattice_host_budget_bytes() -> int:
             return max(1 << 20, int(raw))
         except (TypeError, ValueError):
             pass
-    try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, OSError, AttributeError):
-        total = 0
+    from core.runtime.cpu_resources import total_memory_bytes
+
+    total = total_memory_bytes()
     if total <= 0:
         return 24 << 30
-    return int(min(max(int(total * 0.55), 8 << 30), 96 << 30))
+    # Floor stays below the smallest realistic allocation (a 6 GB grant
+    # must not be told to budget 8 GB): min(55% of the grant, grant-2GB).
+    floor = min(8 << 30, max(1 << 30, total - (2 << 30)))
+    return int(min(max(int(total * 0.55), floor), 96 << 30))
 
 
 def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,

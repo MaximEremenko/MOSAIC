@@ -405,7 +405,9 @@ def _decode_parallel_workers(n_sites: int) -> int:
             return max(1, min(int(raw), n_sites))
         except (TypeError, ValueError):
             pass
-    return max(1, min(os.cpu_count() or 1, n_sites))
+    from core.runtime.cpu_resources import available_cpu_count
+
+    return max(1, min(available_cpu_count(), n_sites))
 
 
 def _compute_site_features(site_items, *, coords_all, Rvals_all, groups, params):

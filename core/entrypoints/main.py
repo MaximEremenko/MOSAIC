@@ -84,7 +84,7 @@ def main(
     log.info("Using input parameters: %s", short_path(run_settings.input_parameters_path))
     log.info("Resolved configuration root: %s", short_path(run_settings.config_root))
     log.info(
-        "Runtime settings: backend=%s max_workers=%d threads_per_worker=%d processes=%s",
+        "Runtime settings: backend=%s max_workers=%s threads_per_worker=%d processes=%s",
         run_settings.runtime.backend,
         run_settings.runtime.max_workers,
         run_settings.runtime.threads_per_worker,
@@ -106,8 +106,15 @@ def main(
                 )
             except Exception:
                 pass
+        expected_workers = run_settings.runtime.max_workers
+        if not isinstance(expected_workers, int):
+            # "auto" resolves at cluster build (one worker per visible GPU);
+            # ask the same resolver so the wait matches what was spawned.
+            from core.runtime.dask_client import _resolve_max_workers
+
+            expected_workers = _resolve_max_workers(run_settings.runtime.backend)
         client.wait_for_workers(
-            run_settings.runtime.max_workers,
+            expected_workers,
             timeout=run_settings.runtime.wait_timeout,
         )
 

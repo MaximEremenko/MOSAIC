@@ -611,13 +611,15 @@ def build_qspace_plan(
     # order, so the produced plan and every digest are byte-identical to the
     # serial loop. MOSAIC_QSPACE_PLAN_PARALLEL overrides (1 = serial).
     ordered_intervals = sorted(intervals, key=lambda item: int(item["id"]))
+    from core.runtime.cpu_resources import available_cpu_count
+
     _raw_parallel = os.getenv("MOSAIC_QSPACE_PLAN_PARALLEL", "").strip()
     try:
         _plan_workers = max(1, int(_raw_parallel)) if _raw_parallel else min(
-            16, os.cpu_count() or 1
+            16, available_cpu_count()
         )
     except ValueError:
-        _plan_workers = min(16, os.cpu_count() or 1)
+        _plan_workers = min(16, available_cpu_count())
     if _plan_workers > 1 and len(ordered_intervals) > 1:
         from concurrent.futures import ThreadPoolExecutor
 

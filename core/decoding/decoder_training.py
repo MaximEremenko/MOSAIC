@@ -420,11 +420,11 @@ def _solve_linear_decoder(
     # DRIVER, where one BLAS thread means a ~4e13-FLOP kernel build + solve
     # crawls on one of 96 cores while every GPU idles. Open the pool up for
     # exactly this call.
-    import os as _os
-
     from threadpoolctl import threadpool_limits
 
-    with threadpool_limits(limits=max(1, _os.cpu_count() or 1)):
+    from core.runtime.cpu_resources import available_cpu_count
+
+    with threadpool_limits(limits=available_cpu_count()):
         return _solve_linear_decoder_inner(
             R_data=R_data, U_data=U_data, lam_reg=lam_reg, logger=logger
         )

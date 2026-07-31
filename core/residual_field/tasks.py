@@ -743,15 +743,12 @@ def _track_live_lattice_ram(grid: np.ndarray) -> None:
 
 
 def _mem_available_bytes() -> int | None:
-    """Linux MemAvailable (reclaimable-aware); None where /proc is absent."""
-    try:
-        with open("/proc/meminfo", "r", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
+    """MemAvailable clamped to the cgroup/SLURM allocation (containers and
+    HPC jobs see the whole host in /proc/meminfo); None where /proc is
+    absent."""
+    from core.runtime.cpu_resources import available_memory_bytes
+
+    return available_memory_bytes()
 
 
 def _lattice_ram_admission_fraction() -> float:
