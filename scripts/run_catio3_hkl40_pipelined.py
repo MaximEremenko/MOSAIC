@@ -58,6 +58,10 @@ def build_env() -> dict[str, str]:
     # threads x nufft:2). One unit's CPU fold overlaps the sibling's GPU
     # transform; the wrapper's VRAM ledger queues the transforms themselves.
     env.setdefault("MOSAIC_GPU_ALLOW_MULTI_THREAD_WORKER", "1")
+    # Concurrent cases share the box: cap the per-case extraction fork
+    # pool so a CPU tail cannot starve a co-resident GPU case of RAM
+    # (measured: 96-way extraction + prewarm OOM-killed the CPU case).
+    env.setdefault("MOSAIC_DECODE_PARALLEL", "32")
     env.setdefault("MOSAIC_NUFFT_SLOTS_PER_WORKER", "2")
     env.setdefault("MOSAIC_DASK_GPU_RESOURCE", "2")
     env.setdefault("MOSAIC_SCATTERING_STAGE2_STREAMING", "1")
@@ -112,6 +116,33 @@ def wait_for_residual_done(proc: subprocess.Popen, log_path: Path) -> None:
         time.sleep(3)
 
 
+def mem_available_gb() -> float:
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1048576.0
+    except OSError:
+        pass
+    return float("inf")
+
+
+def wait_for_ram(min_gb: float, context: str) -> None:
+    """Case-level RAM admission: do not start a case into a box that cannot
+    hold it alongside the residents (the orchestrator-level analogue of the
+    workers' budget discipline)."""
+    waited = 0
+    while mem_available_gb() < min_gb:
+        if waited == 0:
+            print(
+                f"[pipeline] waiting for {min_gb:.0f} GB free before {context} "
+                f"(now {mem_available_gb():.0f} GB)",
+                flush=True,
+            )
+        time.sleep(10)
+        waited += 10
+
+
 def main() -> int:
     log_dir = Path(
         os.getenv("MOSAIC_PIPELINE_LOG_DIR", str(ROOT / ".dask-local" / "pipeline-logs"))
@@ -144,9 +175,12 @@ def main() -> int:
     # them ungated, fully overlapped with the gated chain's GPU work.
     ungated = [case for case in CASES if os.getenv("MOSAIC_PIPELINE_UNGATED", "all") and case in os.getenv("MOSAIC_PIPELINE_UNGATED", "all").split(",")]
     gated = [case for case in CASES if case not in ungated]
+    min_free_gb = float(os.getenv("MOSAIC_PIPELINE_MIN_FREE_GB", "18"))
     for case in ungated:
+        wait_for_ram(min_free_gb, f"ungated case {case}")
         start(case)
     for index, case in enumerate(gated):
+        wait_for_ram(min_free_gb, f"case {case}")
         proc, log_path = start(case)
         if index < len(gated) - 1:
             wait_for_residual_done(proc, log_path)
@@ -157,9 +191,19 @@ def main() -> int:
             )
     for reaper in reapers:
         reaper.join()
-    failed = {case: rc for case, rc in results.items() if rc != 0}
+    failed = sorted(case for case, rc in results.items() if rc != 0)
     if failed:
-        print(f"[pipeline] FAILED cases: {failed}", flush=True)
+        # Overlap casualties (OOM etc.) rerun SERIALLY with the box to
+        # themselves; all their durable state resumes, so retries are cheap.
+        print(f"[pipeline] retrying failed cases serially: {failed}", flush=True)
+        for case in failed:
+            wait_for_ram(min_free_gb, f"retry of {case}")
+            proc, _log = start(case)
+            results[case] = proc.wait()
+            print(f"[pipeline] retry case={case} rc={results[case]}", flush=True)
+    still_failed = {case: rc for case, rc in results.items() if rc != 0}
+    if still_failed:
+        print(f"[pipeline] FAILED cases: {still_failed}", flush=True)
         return 1
     print("[pipeline] all cases complete", flush=True)
     return 0
