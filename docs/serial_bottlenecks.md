@@ -1,5 +1,16 @@
 # Serial-bottleneck inventory (hkl40 streaming hot path)
 
+> **STATUS (2026-07-31): ALL TEN ITEMS BELOW ARE IMPLEMENTED** on
+> `feature/tile-owner-architecture` (commits 313eb46 group 1: items 3, 8,
+> 10; c0a34b9 group 2: items 9, 5, 1, 6, 4; ce9ba46 group 3: items 2, 7 +
+> the loader double-read). Every group passed the 1482-test unit suite and
+> a fresh-run regression gate (small_all + small_sphere vs reference,
+> max|diff| < 1e-10 Å; measured 2e-13..4e-13). Per user decision,
+> byte-identity is NOT required — FP64 precision and eps are untouchable,
+> summation order is free. Kill switches: MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES=0,
+> MOSAIC_RESIDUAL_LATTICE_SCATTER_THREADS=1, MOSAIC_POINT_DATA_INIT_PROCS=1,
+> MOSAIC_DECODER_PREPARED_CACHE_MAX_BYTES=0.
+
 Produced by a 29-agent audited sweep (every finding adversarially verified for
 hot-path reachability and cost arithmetic). Principle: on a 4-GPU / 96-core
 node, any phase holding one core or one GPU while the rest idle is a defect.
