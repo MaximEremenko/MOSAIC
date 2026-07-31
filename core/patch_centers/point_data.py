@@ -134,13 +134,26 @@ class PointDataProcessor:
                 for chunk_id, mask in pending:
                     self._process_chunk(chunk_id, mask)
             else:
+                # ProcessPoolExecutor (not mp.Pool): a SIGKILLed child makes
+                # future.result() raise BrokenProcessPool instead of hanging
+                # the parent forever on an unposted imap result.
+                from concurrent.futures import (
+                    ProcessPoolExecutor,
+                    as_completed,
+                )
+
                 mask_by_chunk = {int(chunk_id): mask for chunk_id, mask in pending}
                 _POINT_INIT_PROCESSOR = self
                 try:
-                    with fork_ctx.Pool(processes=workers) as pool:
-                        for done_chunk in pool.imap_unordered(
-                            _materialize_point_chunk, pending
-                        ):
+                    with ProcessPoolExecutor(
+                        max_workers=workers, mp_context=fork_ctx
+                    ) as pool:
+                        futures = [
+                            pool.submit(_materialize_point_chunk, task)
+                            for task in pending
+                        ]
+                        for future in as_completed(futures):
+                            done_chunk = future.result()
                             self.point_data.grid_amplitude_initialized[
                                 mask_by_chunk[int(done_chunk)]
                             ] = True

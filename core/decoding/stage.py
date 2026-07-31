@@ -56,9 +56,20 @@ class DecodingStage:
                 artifacts=artifacts,
                 client=client,
             )
-        for chunk_id in sorted(context.artifacts.db_manager.get_pending_chunk_ids()):
-            processor.process_chunk(
-                int(chunk_id),
-                context.artifacts.saver,
-                output_dir=context.artifacts.output_dir,
-            )
+        try:
+            for chunk_id in sorted(context.artifacts.db_manager.get_pending_chunk_ids()):
+                processor.process_chunk(
+                    int(chunk_id),
+                    context.artifacts.saver,
+                    output_dir=context.artifacts.output_dir,
+                )
+        finally:
+            # Release un-popped prepared inputs and remove any spill files
+            # from the run output directory.
+            cache = getattr(processor, "prepared_inputs_cache", None)
+            if cache is not None:
+                try:
+                    cache.clear()
+                except Exception:
+                    pass
+                processor.prepared_inputs_cache = None

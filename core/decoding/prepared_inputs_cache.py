@@ -104,7 +104,10 @@ class PreparedInputsCache:
             return False
         try:
             self.spill_dir.mkdir(parents=True, exist_ok=True)
-            path = self.spill_dir / f"chunk_{chunk_id}_features.npy"
+            path = (
+                self.spill_dir
+                / f"chunk_{chunk_id}_{entry.token[:16]}_features.npy"
+            )
             spilled = np.lib.format.open_memmap(
                 str(path),
                 mode="w+",
@@ -117,7 +120,11 @@ class PreparedInputsCache:
             del spilled
         except OSError:
             return False
-        self._spilled[chunk_id] = (entry, path)
+        # Store metadata WITHOUT the feature arrays — keeping them would
+        # retain the full RAM footprint and make the spill free zero bytes.
+        from dataclasses import replace
+
+        self._spilled[chunk_id] = (replace(entry, features_all=()), path)
         return True
 
     def pop(

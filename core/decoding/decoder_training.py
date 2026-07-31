@@ -567,7 +567,13 @@ class DisplacementDecoderSourceService:
         output_dir = str(artifacts.output_dir)
         processor.decoder_source_policy = policy
         # A reused processor must not carry a stale prepared-inputs cache
-        # into a different source mode/run.
+        # into a different source mode/run; clear any old spill files too.
+        stale_cache = getattr(processor, "prepared_inputs_cache", None)
+        if stale_cache is not None:
+            try:
+                stale_cache.clear()
+            except Exception:
+                pass
         processor.prepared_inputs_cache = None
         unique_decoder_keys: list[DisplacementDecoderKey] = []
         db_manager = getattr(artifacts, "db_manager", None)

@@ -830,15 +830,26 @@ def _flush_local_reducer_targets_or_raise(
         pre_submitted = (pre_submitted_futures or {}).get(
             (int(chunk_id), partition_id)
         )
-        if pre_submitted is not None and getattr(
-            pre_submitted, "status", ""
-        ) not in ("error", "cancelled"):
-            # Early per-target flush already in flight (submitted the moment
-            # the target's last work unit completed) — the barrier just
-            # waits on it. Errored/cancelled ones are resubmitted fresh so
-            # owner-remap-at-barrier behavior is preserved.
-            flush_futures.append(pre_submitted)
-            continue
+        if pre_submitted is not None:
+            pre_future, pre_owner = pre_submitted
+            pre_status = getattr(pre_future, "status", "")
+            if pre_status == "finished" or (
+                pre_status not in ("error", "cancelled", "lost")
+                and pre_owner in worker_addresses
+            ):
+                # Early per-target flush already done or in flight on a
+                # LIVE owner — the barrier just waits on it.
+                flush_futures.append(pre_future)
+                continue
+            # Owner died (a worker-pinned future for a dead worker parks in
+            # no-worker state as 'pending' FOREVER — reusing it would hang
+            # the barrier). Cancel and resubmit through the owner remap.
+            cancel = getattr(pre_future, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
         owner_address = _resolve_owner_address(
             target_key=(int(chunk_id), partition_id),
             target_owners=target_owners,
@@ -1903,17 +1914,22 @@ def run_residual_field_stage(
             )
             if owner_address is None:
                 return
-            early_flush_futures[target_key] = client.submit(
-                flush_process_local_residual_reducer_target,
-                task_reducer_backend,
-                chunk_id=int(target_key[0]),
-                parameter_digest=planned_work_units[0].parameter_digest,
-                output_dir=artifacts.output_dir,
-                db_path=artifacts.db_manager.db_path,
-                partition_id=target_key[1],
-                pure=False,
-                workers=[owner_address],
-                allow_other_workers=False,
+            # Store the pinned owner with the future: the barrier must not
+            # wait on a future whose only allowed worker has since died.
+            early_flush_futures[target_key] = (
+                client.submit(
+                    flush_process_local_residual_reducer_target,
+                    task_reducer_backend,
+                    chunk_id=int(target_key[0]),
+                    parameter_digest=planned_work_units[0].parameter_digest,
+                    output_dir=artifacts.output_dir,
+                    db_path=artifacts.db_manager.db_path,
+                    partition_id=target_key[1],
+                    pure=False,
+                    workers=[owner_address],
+                    allow_other_workers=False,
+                ),
+                owner_address,
             )
         except Exception:
             early_flush_futures.pop(target_key, None)

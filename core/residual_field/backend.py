@@ -794,6 +794,10 @@ class _LocalSnapshotWriter:
         for key in keys:
             self.drain(key)
 
+    def has_matching(self, predicate) -> bool:
+        with self._guard:
+            return any(predicate(key) for key in self._in_flight)
+
     def drain_all(self) -> None:
         self.drain_matching(lambda _key: True)
 
@@ -2014,7 +2018,16 @@ class ManifestDrivenResidualFieldReducerBackend:
             flushed = False
             captured = False
             if accumulator.accepted_since_snapshot >= snapshot_every:
-                if async_writes and not self.uses_shared_durable_generations():
+                # Async capture copies the amplitude arrays. That is a win
+                # only for RAM-mode targets (memcpy << savez); a file-backed
+                # target's copy would cost as much as the write it hides AND
+                # allocate the very RSS the file mode exists to avoid — so
+                # file mode keeps the synchronous flush.
+                if (
+                    async_writes
+                    and not self.uses_shared_durable_generations()
+                    and getattr(accumulator, "storage_mode", "ram") != "file"
+                ):
                     if not self._snapshot_writer().in_flight(key):
                         pending = self._capture_local_snapshot(
                             accumulator,
@@ -2209,28 +2222,42 @@ class ManifestDrivenResidualFieldReducerBackend:
             parameter_digest=parameter_digest,
             partition_id=partition_id,
         )
-        # Drain BEFORE taking the per-target lock: the async commit acquires
-        # that lock (and chunk_mutex), so draining under it would deadlock.
-        # Reentrant callers (the fold cadence path) never reach here with a
-        # write in flight, so their drain is a no-op.
+        # Drain BEFORE taking the per-target lock (the async commit acquires
+        # that lock and chunk_mutex — draining under it would deadlock), then
+        # RE-CHECK in-flight under the lock: a fold can submit a fresh async
+        # capture in the drain->lock gap, and a concurrent sync capture would
+        # then claim the SAME snapshot_seq (durable_snapshot_seq only bumps
+        # at commit) — two seq-N renames racing while the manifest union
+        # records the superset. Submissions only happen under the per-target
+        # lock, so once the check passes while we hold it, no new write can
+        # start beneath us.
         drained = False
-        if self._async_snapshot_writes_enabled():
-            drained = self._snapshot_writer().drain(key)
-        with self._local_accumulator_lock(key):
-            accumulator = self._local_accumulators.get(key)
-            if accumulator is None:
-                return drained
-            if accumulator.current_interval_ids == accumulator.durable_interval_ids:
+        writer = (
+            self._snapshot_writer()
+            if self._async_snapshot_writes_enabled()
+            else None
+        )
+        lock = self._local_accumulator_lock(key)
+        while True:
+            if writer is not None:
+                drained = writer.drain(key) or drained
+            with lock:
+                if writer is not None and writer.in_flight(key):
+                    continue
+                accumulator = self._local_accumulators.get(key)
+                if accumulator is None:
+                    return drained
+                if accumulator.current_interval_ids == accumulator.durable_interval_ids:
+                    accumulator.trim_live_memory()
+                    return drained
+                self._snapshot_local_accumulator(
+                    accumulator,
+                    output_dir=output_dir,
+                    db_path=db_path,
+                    cleanup_policy=cleanup_policy,
+                )
                 accumulator.trim_live_memory()
-                return drained
-            self._snapshot_local_accumulator(
-                accumulator,
-                output_dir=output_dir,
-                db_path=db_path,
-                cleanup_policy=cleanup_policy,
-            )
-            accumulator.trim_live_memory()
-            return True
+                return True
 
     def persist_shard_checkpoint(
         self,
@@ -2359,12 +2386,20 @@ class ManifestDrivenResidualFieldReducerBackend:
         chunk; interval-partitioned (subchunk) families must union to it
         exactly before their snapshots are summed."""
         # In-flight async snapshot commits for this chunk must land before
-        # finalize reads durable state (drain outside all locks).
+        # finalize reads durable state (drain outside all locks). Loop:
+        # a straggler fold can submit a new capture during the drain, and a
+        # commit landing AFTER finalize published would rewrite the progress
+        # manifest and re-reference snapshots finalize unlinked.
         if self._async_snapshot_writes_enabled():
-            self._snapshot_writer().drain_matching(
-                lambda key: key[0] == int(chunk_id)
-                and key[1] == str(parameter_digest)
-            )
+            writer = self._snapshot_writer()
+
+            def _matches(key) -> bool:
+                return key[0] == int(chunk_id) and key[1] == str(parameter_digest)
+
+            for _ in range(1000):
+                writer.drain_matching(_matches)
+                if not writer.has_matching(_matches):
+                    break
         repaired_manifest = self._repair_progress_final_artifacts(
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
