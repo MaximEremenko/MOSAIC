@@ -109,6 +109,19 @@ def write_interval_payload(
     )
 
 
+def mmap_is_safe_for_gpu_transfer(path: Path | str) -> bool:
+    """Whether arrays mapped from ``path`` may be handed to CUDA.
+
+    A mapping of a NETWORK-filesystem file must not be: its pages fault in
+    over the network and the driver's host-to-device DMA from them fails.
+    Measured in the 3-node sim — every GPU fold died with
+    cudaErrorDevicesUnavailable while the byte-identical run against a
+    node-local store passed — so a shared-FS store is read materialized."""
+    from core.runtime.worker_hooks import path_is_network_fs
+
+    return not path_is_network_fs(path)
+
+
 def mmap_h5_dataset(path: Path | str, member: str) -> np.ndarray | None:
     """Memory-map one contiguous, uncompressed HDF5 dataset.
 
@@ -148,6 +161,10 @@ def read_interval_payload(
     path = Path(path)
     if not path.exists():
         return PAYLOAD_MISS
+    if mmap and not mmap_is_safe_for_gpu_transfer(path):
+        # These arrays go straight to the GPU; a network-FS mapping would
+        # make the driver DMA from pages that fault in over the wire.
+        mmap = False
     with h5py.File(path, "r") as data:
         if bool(data.attrs.get("empty", False)):
             return None

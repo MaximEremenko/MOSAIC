@@ -159,3 +159,30 @@ def test_torn_entry_reads_as_a_miss_instead_of_failing_the_run(tmp_path):
     data = path.read_bytes()
     path.write_bytes(data[: len(data) // 3])
     assert read_stored_interval_payload(str(tmp_path), 9) is _STORE_MISS
+
+
+def test_network_fs_store_reads_are_not_memory_mapped(tmp_path, monkeypatch):
+    """Payload arrays go straight to the GPU. A mapping of a network-FS file
+    makes the driver DMA from pages that fault in over the wire — measured in
+    the 3-node sim as cudaErrorDevicesUnavailable on every GPU fold, while the
+    byte-identical run against a node-local store passed. Shared-FS stores are
+    therefore read materialized."""
+    task = _task(interval_id=31, n=512)
+    write_stored_interval_payload(str(tmp_path), 31, task)
+
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.path_filesystem_type", lambda path: "nfs"
+    )
+    payload = read_stored_interval_payload(str(tmp_path), 31)
+    assert not isinstance(payload.q_amp, np.memmap)
+    assert not isinstance(payload.q_grid, np.memmap)
+    _assert_same_payload(payload, task)   # identical physics either way
+
+
+def test_local_fs_store_reads_stay_memory_mapped(tmp_path, monkeypatch):
+    task = _task(interval_id=32, n=512)
+    write_stored_interval_payload(str(tmp_path), 32, task)
+    monkeypatch.setattr(
+        "core.runtime.worker_hooks.path_filesystem_type", lambda path: "ext4"
+    )
+    assert isinstance(read_stored_interval_payload(str(tmp_path), 32).q_amp, np.memmap)

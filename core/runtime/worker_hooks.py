@@ -201,9 +201,26 @@ def _worker_scratch_base() -> Path:
     return Path(tempfile.gettempdir())
 
 
-def path_is_tmpfs(path) -> bool:
-    """True when the deepest mount containing path is tmpfs/ramfs — where
-    GB-scale scratch memmaps would silently consume RAM."""
+_NETWORK_FS_TYPES = frozenset(
+    {
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "fuse.sshfs",
+        "lustre",
+        "beegfs",
+        "gpfs",
+        "ceph",
+        "glusterfs",
+        "9p",
+    }
+)
+
+
+def path_filesystem_type(path) -> str:
+    """Filesystem type of the deepest mount containing ``path`` ("" if
+    unknown, e.g. no /proc)."""
     try:
         best_mount, best_type = "", ""
         with open("/proc/mounts") as handle:
@@ -214,9 +231,27 @@ def path_is_tmpfs(path) -> bool:
                 mount, fs_type = parts[1], parts[2]
                 if str(path).startswith(mount) and len(mount) > len(best_mount):
                     best_mount, best_type = mount, fs_type
-        return best_type in {"tmpfs", "ramfs"}
+        return best_type
     except OSError:
-        return False
+        return ""
+
+
+def path_is_tmpfs(path) -> bool:
+    """True when the deepest mount containing path is tmpfs/ramfs — where
+    GB-scale scratch memmaps would silently consume RAM."""
+    return path_filesystem_type(path) in {"tmpfs", "ramfs"}
+
+
+def path_is_network_fs(path) -> bool:
+    """True when ``path`` lives on a network filesystem.
+
+    Memory-mapping such a file is fine for CPU reads, but handing the
+    mapping's pointer to CUDA is not: the pages fault in over the network
+    and the driver's DMA from them fails (observed on the multi-node
+    stage-1 payload store: every GPU fold died with
+    cudaErrorDevicesUnavailable, while the identical run with a
+    node-local store passed)."""
+    return path_filesystem_type(path) in _NETWORK_FS_TYPES
 
 
 def resolve_worker_scratch_root(

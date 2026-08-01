@@ -208,15 +208,19 @@ def stage1_store_has(store_dir: str, interval_id: int) -> bool:
 def _read_legacy_npz_payload(path):
     import json
 
+    from core.scattering.interval_payload import mmap_is_safe_for_gpu_transfer
     from core.storage.npz_mmap import mmap_npz_member
 
     with np.load(path, allow_pickle=False) as data:
         meta = json.loads(str(np.asarray(data["meta"]).item()))
     if meta.get("empty"):
         return None
+    # Same constraint as the current format: never hand CUDA a mapping of a
+    # network-filesystem file (see mmap_is_safe_for_gpu_transfer).
+    allow_mmap = mmap_is_safe_for_gpu_transfer(path)
     arrays = {}
     for member in ("q_grid", "q_amp", "q_amp_av"):
-        mapped = mmap_npz_member(path, member)
+        mapped = mmap_npz_member(path, member) if allow_mmap else None
         if mapped is None:
             with np.load(path, allow_pickle=False) as data:
                 mapped = np.asarray(data[member])
