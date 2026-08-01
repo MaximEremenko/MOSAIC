@@ -184,22 +184,28 @@ def cross_host_read_after_rename_probe(
     )
 
 
-def _probe_file_lock(path_text: str) -> dict[str, Any]:
-    """Runs on driver or worker: can this host take an fcntl lock HERE?
+def _probe_file_lock(dir_text: str) -> dict[str, Any]:
+    """Runs on driver or worker: can this process take an fcntl lock on the
+    shared filesystem?
 
     Catches NFS nolock / local_lock=all mounts and dead lockd, where
     fcntl.flock raises (ENOLCK) and the chunk mutex silently degrades to a
     per-process lock — the one capability the multi-node reducer-progress
-    commit actually depends on."""
+    commit actually depends on. The probe file is PER PROCESS: all probers
+    run concurrently via client.run, and a shared path turns a sibling's
+    perfectly functional lock into a spurious EAGAIN (observed in the
+    cluster sim: node2's 'failure' was node1 holding the probe lock —
+    evidence lockd WORKS, misread as it being broken)."""
     host = socket.gethostname()
     try:
         import fcntl
 
-        path = Path(path_text)
+        path = Path(dir_text) / f"lock_probe.{host}.{os.getpid()}.dat"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a+b") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        path.unlink(missing_ok=True)
         return {"host": host, "ok": True, "error": None}
     except Exception as exc:
         return {"host": host, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -207,13 +213,13 @@ def _probe_file_lock(path_text: str) -> dict[str, Any]:
 
 def cross_host_file_lock_probe(
     *,
-    path: str | Path,
+    probe_dir: str | Path,
     client=None,
 ) -> tuple[dict[str, Any], ...]:
-    results: list[dict[str, Any]] = [_probe_file_lock(str(path))]
+    results: list[dict[str, Any]] = [_probe_file_lock(str(probe_dir))]
     if client is not None and hasattr(client, "run"):
         try:
-            raw = client.run(_probe_file_lock, str(path))
+            raw = client.run(_probe_file_lock, str(probe_dir))
         except Exception as exc:
             results.append(
                 {
@@ -305,7 +311,7 @@ def profile_output_filesystem(
         # to test. Fail closed for multi-node runs; single-host runs only
         # record the result (the in-process thread lock suffices there).
         lock_probe_results = cross_host_file_lock_probe(
-            path=probe_dir / "lock_probe.dat",
+            probe_dir=probe_dir,
             client=client,
         )
         lock_ok = all(bool(item.get("ok")) for item in lock_probe_results)

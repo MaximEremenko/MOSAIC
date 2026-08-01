@@ -88,7 +88,7 @@ def test_profile_output_filesystem_fails_when_required_cross_host_probe_fails(
 def test_file_lock_probe_passes_locally_and_is_recorded(tmp_path):
     from core.runtime.fs_capability import _probe_file_lock
 
-    result = _probe_file_lock(str(tmp_path / "lock_probe.dat"))
+    result = _probe_file_lock(str(tmp_path))
     assert result["ok"] is True
 
     manifest = profile_output_filesystem(tmp_path, run_digest="run123")
