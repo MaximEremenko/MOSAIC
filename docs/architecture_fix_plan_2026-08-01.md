@@ -35,6 +35,79 @@ Post-campaign follow-ups (same branch):
   network filesystem are now read materialized. The original failing
   configuration — 6 ranks, 3 nodes, 4 GPUs, NFS store — completes clean and
   matches the host reference at 4.9e-15.
+- **Cross-mode stage-1 reuse** — the last deliberate non-fix is now done.
+  Every payload carries a `payload_identity` stamp (see below), so each
+  mode can reuse what the other left on disk: streaming reads
+  `precomputed_intervals/` before recomputing, and precompute adopts
+  `stage1_payload_store/<payload_identity>/` entries as its own artifacts.
+  A payload whose identity cannot be PROVEN to match is recomputed, never
+  served. Verified end to end on CaTiO3-small (320 intervals), each phase
+  reusing the previous one's output directory:
+
+  | phase | mode | stage-1 transforms | evidence |
+  |---|---|---|---|
+  | A | streaming | 320 | store filled |
+  | B | precompute, A's store | **0** | "Adopted 320 stage-1 payload(s)"; 0 written, 320 cached |
+  | C | streaming, B's artifacts | **0** | its own store stayed empty |
+  | D | streaming, B's artifacts, ONE atom moved | 320 | store filled — artifacts refused |
+
+  B and C match the reference at 5.940e-15. D lands 1.317e-03 away from it,
+  which is the point: the physics really did change, and serving B's
+  payloads would have returned the reference answer for a structure that no
+  longer produces it.
+
+## Stage-1 payload identity
+
+`precomputed_intervals/interval_<id>.hdf5` is keyed by interval id alone.
+Every run sharing an output directory writes the same paths, and
+`fresh_start` defaults to False — so reuse across runs is the default, and
+file existence has never been evidence that the current run produced the
+file. Neither is the SQLite `precomputed` column: it is not digest-scoped
+and no rebuild resets it.
+
+The stamp is therefore in the FILE:
+
+    payload_identity = H(scientific_digest, source_structure_digest,
+                         eps, dtype, pre_sum_mode)
+
+which is what a forward transform actually depends on. `run_digest` cannot
+serve here, in both directions:
+
+- **It carries too much.** `run_digest` is built with `reducer_strategy`,
+  which is `"stage2-streaming"` in streaming mode and `"attempt-commit"`
+  in precompute mode. The same CaTiO3 case measured `1760a0ae…` streaming
+  vs `cb86ad49…` precompute — so the two modes addressed different store
+  directories and could never have reused each other's payloads whatever
+  the stamp said. The reducer consumes stage-1 output; it does not change
+  it, so it is excluded.
+- **It carries too little.** `run_digest` is **invariant to the atomic
+  coordinates**: nothing in the pipeline populates the
+  `structure_content_digest` / `structure_file_sha256` / `structure_digest`
+  keys its scientific payload hashes. Measured, not inferred: while the
+  store leaf was still the run digest, phase D — one atom displaced by 0.01
+  fractional units, a change worth 1.3e-03 Å in the output — resolved to
+  the SAME leaf `1760a0ae…` as the unperturbed phase A. Two structures,
+  one store directory. Under the payload identity they separate
+  (`5873b359…` vs `47f2d59b…`).
+
+`pre_sum_mode` reaches no stage-1 code today; it is folded in anyway,
+because a false miss costs one recompute and a false hit is wrong physics.
+
+The store's directory leaf moved from `run_digest` to this identity for
+the same two reasons: a run-digest leaf split the modes apart and merged
+two structures together. Existing stores under the old leaf go cold and
+recompute — they are a cache, and the recompute is what correctness costs.
+
+Readers apply it by what their directory can prove:
+
+| reader | directory proves identity | unstamped file |
+|---|---|---|
+| `stage1_payload_store/<payload_identity>/` | yes (identity leaf) | accepted |
+| `precomputed_intervals/` | no (shared path) | refused |
+
+A contradicting stamp is refused in both. The store still checks the stamp
+it does not need, because `MOSAIC_STREAMING_PAYLOAD_STORE` can relocate the
+base onto a path whose scoping is the operator's problem.
 
 ## Phase order and rationale
 
@@ -135,13 +208,53 @@ Post-campaign follow-ups (same branch):
 ## Explicit non-fixes (decision recorded, per the review's own verdicts)
 
 - **M14 two stage-1 payload formats**: initially deferred as a store-format
-  break with hot-path perf implications; subsequently DONE (`f941373`, see
-  the follow-ups above). What remains deliberately undone is automatic
-  cross-mode reuse of a durable run's `precomputed_intervals/`: the shared
-  format now permits it, but those paths are not digest-scoped, so reading
-  them blind could serve stale amplitudes after a physics change.
+  break with hot-path perf implications; subsequently DONE (`f941373`), and
+  the cross-mode reuse it unblocked is now done too (see the follow-ups
+  above). Nothing from the review's 48 findings remains open.
 - Findings L7/L14 ("sound, do not disturb") are constraints on the above, not
   work items.
+
+## Open finding, NOT fixed here: run_digest ignores the structure
+
+Discovered while scoping the payload identity above, and larger than the
+item it was found under.
+
+`run_digest` addresses the whole durable run tree — `.mosaic/runs/<digest>/`
+chunk commits, the streaming payload store, resume credits. It is built
+from `scientific_digest`, which hashes the structure only through
+`structure_content_digest` / `structure_file_sha256` / `structure_digest`,
+and **no code path in the repository ever sets any of those keys**
+(`grep` finds only the two definitions in `scattering/planning.py`).
+`build_source_structure_digest` does hash the coordinates, but its result
+is carried as metadata beside the identity — never folded into it.
+
+Reproduction (two parameter sets differing only in `original_coords`):
+
+    build_run_identity(params(1), ...).run_digest
+      == build_run_identity(params(2), ...).run_digest   ->  True
+    build_source_structure_digest(params(1))
+      == build_source_structure_digest(params(2))        ->  False
+
+Consequence: point one output directory at a different structure with the
+same cell, supercell, intervals and mask, and the run resolves to the SAME
+run tree. Scattering chunk commits validate (their recorded payload hashes
+match the files the previous run left at the same paths), the SQLite cache
+is credited from them, and the stage can be reported complete with the
+PREVIOUS structure's results. `fresh_start` defaults to False, so this is
+the default resume path, not an opt-in one.
+
+Stage-1 payloads are no longer exposed to it — that is exactly what
+`payload_identity` closes, and the cross-mode check's phase D demonstrates
+the refusal on a real structure change. The chunk/commit layer above them
+is still exposed.
+
+Not fixed here because the fix is a second checkpoint-identity break:
+folding `source_structure_digest` into `_build_run_identity_digest` changes
+every run digest, so every existing `.mosaic/runs/` tree, payload store and
+resume credit goes cold and recomputes — including the published hkl40
+case. That is non-destructive (a disjoint family, per the phase-3
+principle) but it is a deliberate, costly decision that belongs to the
+operator, not to a follow-up commit. Recommended as its own change.
 
 ## Gates
 

@@ -8,6 +8,7 @@ import pytest
 
 from core.scattering.artifacts import persist_precomputed_interval_artifact
 from core.scattering.contracts import ScatteringWorkUnit
+from core.scattering.interval_payload import INTERVAL_PAYLOAD_SCHEMA_VERSION
 from core.scattering.kernels import IntervalTask
 from core.scattering.tasks import load_interval_task_payload
 from core.storage.database_manager import DatabaseManager
@@ -51,7 +52,9 @@ def test_interval_artifact_hdf5_roundtrip_and_digest(tmp_path):
             if isinstance(expected_digest, bytes):
                 expected_digest = expected_digest.decode("ascii")
             assert loaded.q_grid_digest == expected_digest
-            assert h5file.attrs["schema_version"] == 2
+            assert (
+                h5file.attrs["schema_version"] == INTERVAL_PAYLOAD_SCHEMA_VERSION
+            )
     finally:
         db.close()
 

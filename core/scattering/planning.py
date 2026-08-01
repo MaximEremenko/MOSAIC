@@ -19,6 +19,7 @@ from core.scattering.half_space import (
 )
 from core.scattering.kernels import reciprocal_space_points_counter, to_interval_dict
 from core.scattering.grid import generate_q_space_grid_sync
+from core.scattering.interval_payload import build_interval_payload_identity
 from core.storage.attempt_store import qspace_plan_path, run_manifest_path
 from core.storage.digests import (
     build_execution_digest as _build_execution_digest,
@@ -85,6 +86,12 @@ class ScatteringWorkIdentity:
     qspace_plan_digest: str
     backend_policy_digest: str
     source_structure_digest: str
+    # What a durable stage-1 payload must match to be reused — by EITHER
+    # durable mode, from either directory. Deliberately not run_digest:
+    # that carries the stage-2 reducer strategy (which differs between the
+    # modes) and not the coordinates (which every amplitude depends on).
+    # See scattering.interval_payload.build_interval_payload_identity.
+    interval_payload_identity: str = ""
 
     def __post_init__(self) -> None:
         require_sha256_hex(self.scientific_digest, field_name="scientific_digest")
@@ -483,13 +490,21 @@ def prepare_scattering_run_identity(
         qspace_plan.run_digest,
         qspace_plan.q_normalization_contracts,
     )
+    source_structure_digest = build_source_structure_digest(parameters)
     return ScatteringWorkIdentity(
         scientific_digest=run_identity.scientific_digest,
         execution_digest=run_identity.execution_digest,
         run_digest=run_identity.run_digest,
         qspace_plan_digest=file_sha256(qspace_path),
         backend_policy_digest=backend_policy_digest,
-        source_structure_digest=build_source_structure_digest(parameters),
+        source_structure_digest=source_structure_digest,
+        interval_payload_identity=build_interval_payload_identity(
+            scientific_digest=run_identity.scientific_digest,
+            source_structure_digest=source_structure_digest,
+            eps=eps,
+            dtype=dtype,
+            pre_sum_mode=pre_sum_mode,
+        ),
     )
 
 

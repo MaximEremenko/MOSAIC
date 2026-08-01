@@ -23,8 +23,10 @@ from typing import Any, Dict, Mapping
 import numpy as np
 
 from core.runtime.budgeted_cache import BudgetedLRU
+from core.scattering.contracts import interval_artifact_filename
 from core.scattering.interval_payload import (
     PAYLOAD_MISS,
+    IntervalPayloadIdentityMismatch,
     read_interval_payload,
     write_interval_payload,
 )
@@ -88,6 +90,15 @@ class StreamingComputeContext:
     # so stage-1 runs ONCE per interval per store lifetime instead of once
     # per (shard, owner, restart). ``None`` keeps the pure in-RAM behaviour.
     payload_store_dir: str | None = None
+    # The precompute mode's interval artifact directory. It holds the SAME
+    # payloads in the SAME format, so a durable run already on disk spares
+    # streaming mode every stage-1 transform it would otherwise repeat. The
+    # directory is NOT digest-scoped — one path per interval id, whatever
+    # produced it — so entries are admitted only on a payload_identity match.
+    precomputed_artifact_dir: str | None = None
+    # Identity every reused payload must carry (see
+    # scattering.interval_payload.build_interval_payload_identity).
+    payload_identity: str | None = None
 
 
 def streaming_slot_map(
@@ -198,6 +209,44 @@ def _legacy_npz_store_path(store_dir: str, interval_id: int) -> "Path":
     return Path(store_dir) / f"interval_{int(interval_id):06d}.npz"
 
 
+def _precomputed_artifact_path(artifact_dir: str, interval_id: int) -> "Path":
+    from pathlib import Path
+
+    return Path(artifact_dir) / interval_artifact_filename(interval_id)
+
+
+def resolve_stage1_payload_store_dir(
+    output_dir: str, payload_identity: str
+) -> str | None:
+    """Where the durable stage-1 payload store for this physics lives.
+
+    The leaf is the PAYLOAD identity, not the run digest. Two reasons, both
+    load-bearing:
+
+    * the run digest carries the stage-2 reducer strategy, so the two
+      durable modes would address different store directories for identical
+      physics and neither could ever reuse the other's payloads;
+    * the run digest is invariant to the atomic coordinates, so a store
+      keyed on it would serve one structure's amplitudes to another.
+
+    ``MOSAIC_STREAMING_PAYLOAD_STORE`` disables the store (``0``) or
+    relocates its base (any path — e.g. a parallel filesystem for
+    multi-node runs); the identity always scopes the leaf, so a relocated
+    base still cannot mix physics. BOTH durable modes resolve the path
+    here, so one owner of the layout keeps them from disagreeing."""
+    from pathlib import Path
+
+    raw = os.getenv("MOSAIC_STREAMING_PAYLOAD_STORE", "1").strip()
+    if raw.lower() in {"0", "false", "no", "off"}:
+        return None
+    base = (
+        Path(output_dir) / "stage1_payload_store"
+        if raw.lower() in {"1", "true", "yes", "on", ""}
+        else Path(raw)
+    )
+    return str(base / str(payload_identity))
+
+
 def stage1_store_has(store_dir: str, interval_id: int) -> bool:
     return (
         _store_payload_path(store_dir, interval_id).exists()
@@ -237,20 +286,39 @@ def _read_legacy_npz_payload(path):
     )
 
 
-def read_stored_interval_payload(store_dir: str, interval_id: int):
+def read_stored_interval_payload(
+    store_dir: str,
+    interval_id: int,
+    *,
+    expect_identity: str | None = None,
+):
     """Return the stored payload, ``None`` for a recorded mask-empty interval,
     or the ``_STORE_MISS`` sentinel when nothing durable exists yet.
 
     Reads are memory-mapped: a store hit costs page cache, not the anonymous
-    RSS that materializing multi-GB members would."""
+    RSS that materializing multi-GB members would.
+
+    The store directory is already scoped to the scattering identity, so an
+    entry written before identity stamping is admitted on the path's
+    authority; a stamp that DISAGREES is still refused (a store relocated
+    onto a shared path by MOSAIC_STREAMING_PAYLOAD_STORE loses the
+    directory's guarantee, and defence in depth costs one attribute read)."""
     path = _store_payload_path(store_dir, interval_id)
     legacy_path = _legacy_npz_store_path(store_dir, interval_id)
     try:
         if path.exists():
-            payload = read_interval_payload(path, mmap=True)
+            payload = read_interval_payload(
+                path,
+                mmap=True,
+                expect_identity=expect_identity,
+                accept_unstamped=True,
+            )
             return _STORE_MISS if payload is PAYLOAD_MISS else payload
         if legacy_path.exists():
             return _read_legacy_npz_payload(legacy_path)
+        return _STORE_MISS
+    except IntervalPayloadIdentityMismatch as exc:
+        logger.warning("Stage-1 store entry rejected: %s", exc)
         return _STORE_MISS
     except Exception:
         logger.warning(
@@ -259,8 +327,49 @@ def read_stored_interval_payload(store_dir: str, interval_id: int):
         return _STORE_MISS
 
 
+def read_precomputed_interval_artifact(
+    artifact_dir: str,
+    interval_id: int,
+    *,
+    expect_identity: str,
+):
+    """Read the PRECOMPUTE mode's artifact for one interval, for reuse here.
+
+    Same payload, same format, different directory — and that directory is
+    keyed by interval id alone, so nothing but the payload's own identity
+    stamp can establish that the file belongs to this run. Unstamped and
+    mismatched entries are both refused, which makes a miss (recompute) the
+    only outcome when proof is unavailable.
+
+    Returns the payload, ``None`` for a recorded mask-empty interval, or
+    ``_STORE_MISS``."""
+    path = _precomputed_artifact_path(artifact_dir, interval_id)
+    try:
+        payload = read_interval_payload(
+            path,
+            mmap=True,
+            expect_identity=expect_identity,
+            accept_unstamped=False,
+        )
+    except IntervalPayloadIdentityMismatch as exc:
+        logger.debug("Precompute artifact not reusable: %s", exc)
+        return _STORE_MISS
+    except Exception:
+        logger.warning(
+            "Unreadable precompute interval artifact %s; recomputing.",
+            path,
+            exc_info=True,
+        )
+        return _STORE_MISS
+    return _STORE_MISS if payload is PAYLOAD_MISS else payload
+
+
 def write_stored_interval_payload(
-    store_dir: str, interval_id: int, task: "IntervalTask | None"
+    store_dir: str,
+    interval_id: int,
+    task: "IntervalTask | None",
+    *,
+    payload_identity: str | None = None,
 ) -> None:
     """Persist one interval payload (idempotent, race-safe).
 
@@ -273,7 +382,12 @@ def write_stored_interval_payload(
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_interval_payload(path, task, interval_id=int(interval_id))
+        write_interval_payload(
+            path,
+            task,
+            interval_id=int(interval_id),
+            payload_identity=payload_identity,
+        )
     except Exception:
         logger.warning(
             "Failed to persist stage-1 store entry %s; run continues without it.",
@@ -336,12 +450,29 @@ def lazy_streamed_interval_loaders(
             cached = _memo_get(key)
             if cached is not _MEMO_MISS:
                 return cached
+            identity = getattr(context, "payload_identity", None)
             store_dir = getattr(context, "payload_store_dir", None)
             if store_dir:
-                stored = read_stored_interval_payload(store_dir, int(interval_id))
+                stored = read_stored_interval_payload(
+                    store_dir, int(interval_id), expect_identity=identity
+                )
                 if stored is not _STORE_MISS:
                     _memo_store(key, stored)
                     return stored
+            # A durable (precompute-mode) run of the SAME physics already
+            # holds this payload; reuse it rather than repeating stage-1.
+            # Only an identity match admits it — that directory is shared
+            # across runs (see read_precomputed_interval_artifact). The
+            # payload is not copied into the store: it is already durable,
+            # in the same format, and equally mappable from where it is.
+            artifact_dir = getattr(context, "precomputed_artifact_dir", None)
+            if artifact_dir and identity:
+                reused = read_precomputed_interval_artifact(
+                    artifact_dir, int(interval_id), expect_identity=str(identity)
+                )
+                if reused is not _STORE_MISS:
+                    _memo_store(key, reused)
+                    return reused
             interval = context.interval_lookup.get(int(interval_id))
             if interval is None:
                 raise KeyError(
@@ -370,7 +501,12 @@ def lazy_streamed_interval_loaders(
                     nufft_gpu_only=nufft_gpu_only,
                 )
             if store_dir:
-                write_stored_interval_payload(store_dir, int(interval_id), task)
+                write_stored_interval_payload(
+                    store_dir,
+                    int(interval_id),
+                    task,
+                    payload_identity=identity,
+                )
             _memo_store(key, task)
             return task
 
@@ -383,7 +519,9 @@ __all__ = [
     "StreamingComputeContext",
     "lazy_streamed_interval_loaders",
     "prewarm_stage1_payload_store",
+    "read_precomputed_interval_artifact",
     "read_stored_interval_payload",
+    "resolve_stage1_payload_store_dir",
     "stage1_store_has",
     "write_stored_interval_payload",
     "clear_streaming_payload_memo",

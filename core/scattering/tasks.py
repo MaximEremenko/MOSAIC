@@ -272,8 +272,11 @@ def run_scattering_interval_task(
     nufft_eps: float = 1e-12,
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
+    payload_identity: str | None = None,
 ) -> ScatteringArtifactManifest | None:
-    if db_path is not None and is_interval_artifact_committed(work_unit, db_path=db_path):
+    if db_path is not None and is_interval_artifact_committed(
+        work_unit, db_path=db_path, payload_identity=payload_identity
+    ):
         return build_scattering_interval_manifest(
             work_unit,
             completion_status=CompletionStatus.COMMITTED,
@@ -306,7 +309,12 @@ def run_scattering_interval_task(
                 work_unit.interval_id, db_path=db_path
             )
         return None
-    return persist_precomputed_interval_artifact(work_unit, interval_task, db_path=db_path)
+    return persist_precomputed_interval_artifact(
+        work_unit,
+        interval_task,
+        db_path=db_path,
+        payload_identity=payload_identity,
+    )
 
 
 __all__ = [

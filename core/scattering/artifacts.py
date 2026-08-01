@@ -15,7 +15,11 @@ from core.scattering.contracts import (
     validate_scattering_artifact_manifest,
 )
 from core.scattering.kernels import IntervalTask
-from core.scattering.interval_payload import write_interval_payload
+from core.scattering.interval_payload import (
+    IntervalPayloadIdentityMismatch,
+    check_interval_payload_identity,
+    write_interval_payload,
+)
 from core.contracts import ArtifactManifestAssessment, CompletionStatus
 from core.storage.database_manager import create_db_manager_for_thread
 from core.storage.hdf5_atomic import atomic_hdf5_write
@@ -474,21 +478,65 @@ def can_resume_scattering_work_unit(
     ).can_resume
 
 
+def interval_artifact_reusable(
+    work_unit: ScatteringWorkUnit,
+    *,
+    payload_identity: str | None,
+) -> bool:
+    """Whether this run may consume the interval artifact already on disk.
+
+    ``precomputed_intervals/interval_<id>.hdf5`` is keyed by interval id
+    alone: re-running the same output directory with different physics
+    finds the PREVIOUS run's file sitting at the path this run would write.
+    Existence therefore proves nothing, and neither does the SQLite
+    `precomputed` flag — that column is not digest-scoped and no rebuild
+    resets it. The payload's own identity stamp is the proof.
+
+    ``payload_identity=None`` (callers that never derived an identity)
+    keeps the historical existence-only behaviour."""
+    if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
+        return False
+    path = Path(work_unit.interval_artifact.path)
+    if not path.exists():
+        return False
+    if payload_identity is None:
+        return True
+    try:
+        # Attribute read only: this gate runs once per interval, and a
+        # materializing read here would cost more than the transform it
+        # is deciding whether to skip.
+        check_interval_payload_identity(path, str(payload_identity))
+    except IntervalPayloadIdentityMismatch as exc:
+        logger.info(
+            "Recomputing interval %d: %s", int(work_unit.interval_id), exc
+        )
+        return False
+    except Exception:
+        logger.warning(
+            "Unreadable interval artifact %s; recomputing.", path, exc_info=True
+        )
+        return False
+    return True
+
+
 def is_interval_artifact_committed(
     work_unit: ScatteringWorkUnit,
     *,
     db_path: str,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+    payload_identity: str | None = None,
 ) -> bool:
     manifest = build_scattering_interval_manifest(
         work_unit,
         completion_status=CompletionStatus.COMMITTED,
     )
-    return is_scattering_manifest_complete(
+    if not is_scattering_manifest_complete(
         manifest,
         db_path=db_path,
         db_manager_factory=db_manager_factory,
-    )
+    ):
+        return False
+    return interval_artifact_reusable(work_unit, payload_identity=payload_identity)
 
 
 def persist_precomputed_interval_artifact(
@@ -497,12 +545,15 @@ def persist_precomputed_interval_artifact(
     *,
     db_path: str | None,
     db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
+    payload_identity: str | None = None,
 ) -> ScatteringArtifactManifest:
     if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
         raise ValueError("Precompute work unit must include an interval artifact path.")
     out_path = Path(work_unit.interval_artifact.path)
     # One format for both durable modes — see scattering/interval_payload.
-    write_interval_payload(out_path, interval_task)
+    write_interval_payload(
+        out_path, interval_task, payload_identity=payload_identity
+    )
     if db_path is not None:
         _IntervalPrecomputeStateUpdater(
             db_path,
@@ -520,6 +571,7 @@ __all__ = [
     "build_scattering_chunk_manifest",
     "build_scattering_interval_manifest",
     "can_resume_scattering_work_unit",
+    "interval_artifact_reusable",
     "is_interval_artifact_committed",
     "is_scattering_manifest_complete",
     "mark_empty_interval_precomputed",

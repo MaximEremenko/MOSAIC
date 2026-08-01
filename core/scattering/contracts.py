@@ -82,6 +82,24 @@ def make_scattering_artifact_key(
     return ":".join(parts)
 
 
+# Precompute-mode interval artifacts. The directory is keyed by interval id
+# alone — it carries no run identity — so a reader that did not write the
+# file must validate the payload's own identity stamp before reusing it.
+INTERVAL_ARTIFACT_DIRNAME = "precomputed_intervals"
+
+
+def interval_artifact_filename(interval_id: int) -> str:
+    return f"interval_{int(interval_id)}.hdf5"
+
+
+def interval_artifact_dir(output_dir: str | Path) -> Path:
+    return Path(output_dir) / INTERVAL_ARTIFACT_DIRNAME
+
+
+def interval_artifact_path(output_dir: str | Path, interval_id: int) -> Path:
+    return interval_artifact_dir(output_dir) / interval_artifact_filename(interval_id)
+
+
 def build_interval_artifact_ref(output_dir: str, interval_id: int) -> ArtifactRef:
     return ArtifactRef(
         stage="scattering",
@@ -90,7 +108,7 @@ def build_interval_artifact_ref(output_dir: str, interval_id: int) -> ArtifactRe
             "interval-precompute",
             interval_id=interval_id,
         ),
-        path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.hdf5"),
+        path=str(interval_artifact_path(output_dir, interval_id)),
         schema_version=SCATTERING_CONTRACT_SCHEMA_VERSION,
     )
 
@@ -525,6 +543,7 @@ def validate_scattering_artifact_manifest(manifest: ScatteringArtifactManifest) 
 
 
 __all__ = [
+    "INTERVAL_ARTIFACT_DIRNAME",
     "SCATTERING_CONTRACT_SCHEMA_VERSION",
     "SCATTERING_CHUNK_ARTIFACT_SCHEMA",
     "SCATTERING_INTERVAL_ARTIFACT_SCHEMA",
@@ -534,6 +553,9 @@ __all__ = [
     "ScatteringWorkUnit",
     "build_chunk_artifact_refs",
     "build_interval_artifact_ref",
+    "interval_artifact_dir",
+    "interval_artifact_filename",
+    "interval_artifact_path",
     "make_scattering_artifact_key",
     "make_scattering_retry_key",
     "merge_scattering_partial_results",

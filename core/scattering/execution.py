@@ -12,12 +12,14 @@ from core.residual_field.backend import (
     resolve_residual_field_reducer_backend_kind,
 )
 from core.scattering.artifacts import (
+    interval_artifact_reusable,
     mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
 )
 from core.scattering.contracts import (
     ScatteringIntervalArtifactPolicy,
     ScatteringWorkUnit,
+    interval_artifact_dir,
 )
 from core.scattering.kernels import (
     IntervalTask,
@@ -56,6 +58,7 @@ from core.storage.digests import digest_dict
 from core.workflow.run_state_cache import rebuild_sqlite_cache_from_manifests
 from core.scattering.streaming import (
     StreamingComputeContext,
+    resolve_stage1_payload_store_dir,
     stage2_streaming_enabled,
 )
 
@@ -301,12 +304,84 @@ def _local_direct_handoff_limits(parameters: Dict[str, Any]) -> tuple[int, int]:
     return max_intervals, max_bytes
 
 
-def _interval_artifact_present(work_unit: ScatteringWorkUnit) -> bool:
-    return (
-        work_unit.interval_artifact is not None
-        and work_unit.interval_artifact.path is not None
-        and Path(work_unit.interval_artifact.path).exists()
+def _import_stage1_store_payloads(
+    work_units: list[ScatteringWorkUnit],
+    *,
+    store_dir: str | None,
+    payload_identity: str | None,
+    db,
+) -> tuple[list[ScatteringWorkUnit], list[Path]]:
+    """Adopt payloads a STREAMING run of the same physics already computed.
+
+    Both modes now persist the identical payload object in the identical
+    format; only the directory layout differs. So a mode switch that would
+    otherwise repeat every stage-1 transform can instead copy — the store
+    entry becomes this run's interval artifact, and the interval is
+    committed exactly as if precompute had produced it.
+
+    Only identity-matching entries are adopted. Returns the work units
+    still needing compute, plus the artifact paths adopted."""
+    if not store_dir or not payload_identity or not work_units:
+        return work_units, []
+    from core.scattering.streaming import (
+        _STORE_MISS,
+        read_stored_interval_payload,
     )
+
+    db_path = _sqlite_cache_path(db)
+    remaining: list[ScatteringWorkUnit] = []
+    adopted: list[Path] = []
+    for work_unit in work_units:
+        stored = _STORE_MISS
+        try:
+            stored = read_stored_interval_payload(
+                store_dir,
+                int(work_unit.interval_id),
+                expect_identity=payload_identity,
+            )
+        except Exception:
+            logger.warning(
+                "Stage-1 store adoption failed for interval %d; recomputing.",
+                int(work_unit.interval_id),
+                exc_info=True,
+            )
+        if stored is _STORE_MISS:
+            remaining.append(work_unit)
+            continue
+        try:
+            if stored is None:
+                # The store records mask-emptiness durably; precompute mode
+                # expresses the same answer as "no artifact, marked done".
+                mark_empty_interval_precomputed(
+                    work_unit.interval_id, db_path=db_path
+                )
+                continue
+            manifest = persist_precomputed_interval_artifact(
+                work_unit,
+                stored,
+                db_path=db_path,
+                payload_identity=payload_identity,
+            )
+        except Exception:
+            logger.warning(
+                "Could not adopt stage-1 store entry for interval %d; recomputing.",
+                int(work_unit.interval_id),
+                exc_info=True,
+            )
+            remaining.append(work_unit)
+            continue
+        if manifest is not None and manifest.artifacts:
+            artifact_path = manifest.artifacts[0].path
+            if artifact_path is not None:
+                adopted.append(Path(artifact_path))
+    if adopted or len(remaining) != len(work_units):
+        logger.info(
+            "Adopted %d stage-1 payload(s) from the streaming store; %d "
+            "interval(s) still need computing.",
+            len(work_units) - len(remaining),
+            len(remaining),
+        )
+    return remaining, adopted
 
 
 def _sqlite_cache_path(db) -> str | None:
@@ -367,6 +442,8 @@ def run_interval_precompute(
     db: DatabaseManager,
     client: "Client | None",
     transient_interval_payloads: dict[int, IntervalTask] | None = None,
+    payload_identity: str | None = None,
+    stage1_store_dir: str | None = None,
 ) -> list[Path]:
     payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
     nufft_settings = _nufft_execution_settings(parameters)
@@ -376,30 +453,44 @@ def run_interval_precompute(
         client=client,
     )
     persist_interval_artifacts = interval_artifact_policy == "required_transport"
+    # Validated ONCE per interval: proving reusability opens the artifact,
+    # and both the pending and the cached list ask the same question.
+    reusable = {
+        int(work_unit.interval_id): (
+            persist_interval_artifacts
+            and interval_artifact_reusable(
+                work_unit, payload_identity=payload_identity
+            )
+        )
+        for work_unit in work_units
+    }
     pending = [
         work_unit
         for work_unit in work_units
-        if (
-            int(work_unit.interval_id) not in payload_cache
-            and not (
-                persist_interval_artifacts
-                and _interval_artifact_present(work_unit)
-            )
-        )
+        if int(work_unit.interval_id) not in payload_cache
+        and not reusable[int(work_unit.interval_id)]
     ]
     cached = [
         Path(work_unit.interval_artifact.path)
         for work_unit in work_units
         if work_unit.interval_artifact is not None
         and work_unit.interval_artifact.path is not None
-        and persist_interval_artifacts
-        and _interval_artifact_present(work_unit)
+        and reusable[int(work_unit.interval_id)]
     ]
     cached_payloads = [
         int(work_unit.interval_id)
         for work_unit in work_units
         if int(work_unit.interval_id) in payload_cache
     ]
+    # A streaming run of the same physics may already hold these payloads.
+    if persist_interval_artifacts:
+        pending, adopted = _import_stage1_store_payloads(
+            pending,
+            store_dir=stage1_store_dir,
+            payload_identity=payload_identity,
+            db=db,
+        )
+        cached.extend(adopted)
     if local_fast_handoff and not _local_direct_handoff_is_safe(
         pending=pending,
         interval_lookup=interval_lookup,
@@ -487,6 +578,7 @@ def run_interval_precompute(
                                 work_unit,
                                 interval_task,
                                 db_path=_sqlite_cache_path(db),
+                                payload_identity=payload_identity,
                             )
                             if manifest is not None and manifest.artifacts:
                                 artifact_path = manifest.artifacts[0].path
@@ -543,6 +635,7 @@ def run_interval_precompute(
                             work_unit,
                             interval_task,
                             db_path=_sqlite_cache_path(db),
+                            payload_identity=payload_identity,
                         )
                         if manifest is not None and manifest.artifacts:
                             artifact_path = manifest.artifacts[0].path
@@ -599,6 +692,7 @@ def run_interval_precompute(
                 nufft_eps=nufft_settings.eps,
                 nufft_prefer_cpu=nufft_settings.prefer_cpu,
                 nufft_gpu_only=nufft_settings.gpu_only,
+                payload_identity=payload_identity,
                 pure=False,
                 resources=_nufft_resources_for_parameters(parameters),
             )
@@ -654,6 +748,7 @@ def run_interval_precompute(
                 nufft_eps=nufft_settings.eps,
                 nufft_prefer_cpu=nufft_settings.prefer_cpu,
                 nufft_gpu_only=nufft_settings.gpu_only,
+                payload_identity=payload_identity,
             )
             if manifest is not None and manifest.artifacts:
                 artifact_path = manifest.artifacts[0].path
@@ -727,6 +822,9 @@ def run_scattering_stage(
         output_dir=output_dir,
         run_digest=work_identity.run_digest,
     )
+    # What a durable stage-1 payload must match to be reused — by either
+    # mode, from either directory. Derived once, with the run identity.
+    payload_identity = work_identity.interval_payload_identity or None
     interval_lookup = build_scattering_interval_lookup(reciprocal_space_intervals)
     if stage2_streaming_enabled(parameters):
         # Streaming (fused stage-1) mode: compute NO interval payloads and
@@ -748,15 +846,12 @@ def run_scattering_stage(
         # per interval across shards, owners, restarts, and cluster sizes.
         # MOSAIC_STREAMING_PAYLOAD_STORE=0 disables; a path value relocates it
         # (e.g. onto a parallel filesystem for multi-node runs).
-        _store_raw = os.getenv("MOSAIC_STREAMING_PAYLOAD_STORE", "1").strip()
-        payload_store_dir = None
-        if _store_raw.lower() not in {"0", "false", "no", "off"}:
-            _store_base = (
-                Path(_store_raw)
-                if _store_raw.lower() not in {"1", "true", "yes", "on", ""}
-                else Path(output_dir) / "stage1_payload_store"
-            )
-            payload_store_dir = str(_store_base / str(work_identity.run_digest))
+        payload_store_dir = (
+            resolve_stage1_payload_store_dir(output_dir, payload_identity)
+            if payload_identity
+            else None
+        )
+        if payload_store_dir is not None:
             Path(payload_store_dir).mkdir(parents=True, exist_ok=True)
 
         streaming_sink["compute_context"] = StreamingComputeContext(
@@ -778,13 +873,16 @@ def run_scattering_stage(
             nufft_prefer_cpu=bool(streaming_nufft.prefer_cpu),
             nufft_gpu_only=bool(streaming_nufft.gpu_only),
             payload_store_dir=payload_store_dir,
+            precomputed_artifact_dir=str(interval_artifact_dir(output_dir)),
+            payload_identity=payload_identity,
         )
         logger.info(
             "Scattering stage-1/stage-2 skipped (streaming mode): %d interval(s) "
             "computed inside residual work units; durable stage-1 payload "
-            "store: %s.",
+            "store: %s; precompute artifacts reusable from %s.",
             len(interval_lookup),
             payload_store_dir or "disabled",
+            interval_artifact_dir(output_dir),
         )
         return {
             "scattering_run_digest": work_identity.run_digest,
@@ -812,6 +910,14 @@ def run_scattering_stage(
                 db=db_manager,
                 client=client,
                 transient_interval_payloads=parameters.get("transient_interval_payloads"),
+                payload_identity=payload_identity,
+                # A streaming run of the same physics leaves its payloads
+                # here; adopting them beats recomputing stage-1.
+                stage1_store_dir=(
+                    resolve_stage1_payload_store_dir(output_dir, payload_identity)
+                    if payload_identity
+                    else None
+                ),
             )
         finally:
             # The type-1 plans only fill during interval precompute; release

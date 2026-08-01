@@ -13,6 +13,13 @@ Reads may be memory-mapped: the datasets are written contiguous and
 uncompressed, so a reader can map them at their HDF5 offset and pay
 evictable page cache instead of anonymous RSS (what the streaming store's
 npz mmap did, kept).
+
+Every payload carries the identity of the physics that produced it (see
+:func:`build_interval_payload_identity`). One mode's directory layout is
+digest-scoped and the other's is not, so a shared FILE is the only place
+an identity both modes can check will survive; a reader that cannot prove
+a payload belongs to its own run refuses it rather than serving stale
+amplitudes.
 """
 from __future__ import annotations
 
@@ -24,18 +31,89 @@ import numpy as np
 
 from core.scattering.half_space import normalize_half_space_role
 from core.scattering.kernels import IntervalTask
+from core.storage.digests import digest_dict, require_sha256_hex
 from core.storage.hdf5_atomic import atomic_hdf5_write
 
 logger = logging.getLogger(__name__)
 
 INTERVAL_PAYLOAD_FORMAT = "mosaic.scattering.interval"
-INTERVAL_PAYLOAD_SCHEMA_VERSION = 2
+# 3: payloads carry `payload_identity`. Version 2 files stay readable, but
+# only where the DIRECTORY already proves identity (the digest-scoped
+# streaming store) — never from the shared precompute artifact directory.
+INTERVAL_PAYLOAD_SCHEMA_VERSION = 3
 
 # Returned when nothing durable exists yet — distinct from ``None``, which
 # records an interval the mask emptied (a real, reusable answer).
 PAYLOAD_MISS = object()
 
 _ARRAY_MEMBERS = ("q_grid", "q_amp", "q_amp_av")
+
+
+class IntervalPayloadIdentityMismatch(ValueError):
+    """A payload exists but was not produced by the caller's run.
+
+    Callers that treat an unusable payload as absence (both durable stores
+    recompute on a miss) catch this; callers consuming a payload as
+    required transport let it propagate — silently substituting another
+    run's amplitudes is the failure this type exists to prevent."""
+
+
+def build_interval_payload_identity(
+    *,
+    scientific_digest: str,
+    source_structure_digest: str,
+    eps: float,
+    dtype: str,
+    pre_sum_mode: str,
+) -> str:
+    """The identity a stage-1 payload must match to be reusable.
+
+    A payload is ``A(q) = sum_k w_k exp(+i q.r_k)`` over the interval's
+    q-grid. What determines it:
+
+    * ``scientific_digest`` — the intervals, mask, cell, supercell, charge
+      and coefficients that fix the q-grid and the weights;
+    * ``source_structure_digest`` — the coordinates, cell origins and
+      elements the transform sums over;
+    * ``eps`` / ``dtype`` — the numerical contract of the transform itself.
+
+    ``pre_sum_mode`` does not reach stage-1 today (it is an accumulation
+    knob), but it is folded in anyway: a false miss costs one recompute
+    while a false hit is wrong physics, so the conservative direction is
+    free to take.
+
+    What is deliberately EXCLUDED is the stage-2 reducer strategy — the
+    only reason ``run_digest`` cannot serve as this identity. ``run_digest``
+    is built with ``reducer_strategy``, which is ``"stage2-streaming"`` in
+    streaming mode and ``"attempt-commit"`` in precompute mode, so the two
+    durable modes address DIFFERENT run trees for identical physics
+    (measured: 1760a0ae… vs cb86ad49… on the same CaTiO3 case). Keying
+    payload reuse on it would make cross-mode reuse impossible by
+    construction. The reducer consumes stage-1 output; it does not change
+    it.
+
+    ``run_digest`` is also missing something this identity must have: it is
+    invariant to the atomic COORDINATES, because nothing in the pipeline
+    populates the structure keys its scientific payload hashes (see
+    docs/architecture_fix_plan_2026-08-01.md). ``source_structure_digest``
+    supplies what it lacks, so displaced coordinates cannot reuse the
+    undisplaced run's amplitudes."""
+    return digest_dict(
+        {
+            "schema_version": INTERVAL_PAYLOAD_SCHEMA_VERSION,
+            "scientific_digest": require_sha256_hex(
+                str(scientific_digest), field_name="scientific_digest"
+            ),
+            "source_structure_digest": require_sha256_hex(
+                str(source_structure_digest),
+                field_name="source_structure_digest",
+            ),
+            "eps": float(eps),
+            "dtype": str(dtype),
+            "pre_sum_mode": str(pre_sum_mode),
+        },
+        domain="mosaic.scattering.interval_payload.v1",
+    )
 
 
 def _q_grid_digest(q_grid) -> str:
@@ -78,34 +156,35 @@ def write_interval_payload(
     task: IntervalTask | None,
     *,
     interval_id: int | None = None,
+    payload_identity: str | None = None,
 ) -> None:
     """Persist one payload atomically (temp file -> fsync -> validate ->
     rename). ``task=None`` records a mask-emptied interval, so its
-    emptiness is durable too and never re-derived."""
+    emptiness is durable too and never re-derived.
+
+    ``payload_identity`` stamps the producing run into the file; a payload
+    written without one can only ever be reused from a directory that
+    proves identity by itself."""
     path = Path(path)
+    attrs: dict[str, object] = {
+        "schema_version": INTERVAL_PAYLOAD_SCHEMA_VERSION,
+        "format": INTERVAL_PAYLOAD_FORMAT,
+    }
+    if payload_identity is not None:
+        attrs["payload_identity"] = str(payload_identity)
     if task is None:
         if interval_id is None:
             raise ValueError("Recording an empty interval requires interval_id.")
         atomic_hdf5_write(
             path,
             {"irecip_id": np.array([int(interval_id)], dtype=np.int64)},
-            attrs={
-                "schema_version": INTERVAL_PAYLOAD_SCHEMA_VERSION,
-                "interval_id": int(interval_id),
-                "format": INTERVAL_PAYLOAD_FORMAT,
-                "empty": True,
-            },
+            attrs={**attrs, "interval_id": int(interval_id), "empty": True},
         )
         return
     atomic_hdf5_write(
         path,
         interval_payload_datasets(task),
-        attrs={
-            "schema_version": INTERVAL_PAYLOAD_SCHEMA_VERSION,
-            "interval_id": int(task.irecip_id),
-            "format": INTERVAL_PAYLOAD_FORMAT,
-            "empty": False,
-        },
+        attrs={**attrs, "interval_id": int(task.irecip_id), "empty": False},
     )
 
 
@@ -147,17 +226,77 @@ def mmap_h5_dataset(path: Path | str, member: str) -> np.ndarray | None:
         return None
 
 
+def _require_payload_identity(
+    path: Path,
+    attrs,
+    *,
+    expect_identity: str | None,
+    accept_unstamped: bool,
+) -> None:
+    """Refuse a payload the caller cannot prove belongs to its own run."""
+    if expect_identity is None:
+        return
+    stamped = attrs.get("payload_identity")
+    if stamped is None:
+        if accept_unstamped:
+            return
+        raise IntervalPayloadIdentityMismatch(
+            f"Interval payload {path} carries no payload_identity; it "
+            "predates identity stamping and its directory does not scope "
+            "identity, so it cannot be proven to match this run."
+        )
+    if isinstance(stamped, bytes):
+        stamped = stamped.decode("ascii")
+    if str(stamped) != str(expect_identity):
+        raise IntervalPayloadIdentityMismatch(
+            f"Interval payload {path} was produced by a different run "
+            f"({stamped} != {expect_identity})."
+        )
+
+
+def check_interval_payload_identity(
+    path: Path | str,
+    expect_identity: str,
+    *,
+    accept_unstamped: bool = False,
+) -> None:
+    """Validate a payload's identity WITHOUT reading its arrays.
+
+    The gate that decides whether stage-1 must rerun asks this once per
+    interval, so it must cost an attribute read and not a multi-GB
+    materialization. Raises exactly what :func:`read_interval_payload`
+    raises: :class:`IntervalPayloadIdentityMismatch` for a payload from
+    another run, ``FileNotFoundError`` for an absent one."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    with h5py.File(path, "r") as data:
+        _require_payload_identity(
+            path,
+            data.attrs,
+            expect_identity=expect_identity,
+            accept_unstamped=accept_unstamped,
+        )
+
+
 def read_interval_payload(
     path: Path | str,
     *,
     mmap: bool = False,
+    expect_identity: str | None = None,
+    accept_unstamped: bool = False,
 ):
     """Load one payload.
 
     Returns an :class:`IntervalTask`, ``None`` for a recorded mask-empty
     interval, or :data:`PAYLOAD_MISS` when the file is absent. Raises for a
     present-but-invalid payload — callers that treat corruption as absence
-    (the streaming store self-heals by recomputing) catch it themselves."""
+    (the streaming store self-heals by recomputing) catch it themselves.
+
+    ``expect_identity`` rejects a payload from another run with
+    :class:`IntervalPayloadIdentityMismatch`. ``accept_unstamped`` admits
+    pre-stamping files and belongs ONLY to readers whose directory is
+    already digest-scoped."""
     path = Path(path)
     if not path.exists():
         return PAYLOAD_MISS
@@ -166,6 +305,12 @@ def read_interval_payload(
         # make the driver DMA from pages that fault in over the wire.
         mmap = False
     with h5py.File(path, "r") as data:
+        _require_payload_identity(
+            path,
+            data.attrs,
+            expect_identity=expect_identity,
+            accept_unstamped=accept_unstamped,
+        )
         if bool(data.attrs.get("empty", False)):
             return None
         if "half_space_role" not in data or "reciprocal_multiplicity" not in data:
@@ -215,8 +360,12 @@ __all__ = [
     "INTERVAL_PAYLOAD_FORMAT",
     "INTERVAL_PAYLOAD_SCHEMA_VERSION",
     "PAYLOAD_MISS",
+    "IntervalPayloadIdentityMismatch",
+    "build_interval_payload_identity",
+    "check_interval_payload_identity",
     "interval_payload_datasets",
     "mmap_h5_dataset",
+    "mmap_is_safe_for_gpu_transfer",
     "read_interval_payload",
     "write_interval_payload",
 ]
