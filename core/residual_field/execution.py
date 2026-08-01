@@ -77,8 +77,6 @@ from core.storage.run_state_cache import (
 from core.residual_field.runtime_policy import (
     DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES,
     _cleanup_residual_attempts_enabled,
-    _distributed_owner_affinity_enabled,
-    _distributed_owner_local_reducer_supported,
     _memory_backpressure_poll_seconds,
     _memory_backpressure_threshold,
     _owner_local_reducer_enabled,
@@ -1318,10 +1316,6 @@ def run_residual_field_stage(
         reducer_backend.layout.kind == "local_restartable"
         and _worker_owned_local_reducer_enabled(workflow_parameters)
     )
-    distributed_owner_local_reducer = (
-        reducer_backend.layout.kind == "durable_shared_restartable"
-        and _distributed_owner_affinity_enabled(workflow_parameters)
-    )
     if reducer_backend.layout.kind == "local_restartable" and not worker_owned_local_reducer:
         raise ValueError(
             "Residual-field local execution requires worker-owned local reduction. "
@@ -1367,41 +1361,14 @@ def run_residual_field_stage(
         reducer_runtime_state.checkpoint_policy.final_chunk_artifacts,
         reducer_runtime_state.checkpoint_policy.worker_local_scratch_role,
     )
-    if reducer_backend.layout.kind == "durable_shared_restartable":
-        if not distributed_owner_local_reducer:
-            raise ValueError(
-                "Residual-field distributed durable execution requires owner affinity. "
-                "The shard-per-partial distributed path has been removed."
-            )
-        if not _distributed_owner_local_reducer_supported(
-            reducer_backend,
-            reducer_runtime_state=reducer_runtime_state,
-        ):
-            raise RuntimeError(
-                "Residual-field distributed durable execution requires backend support "
-                "for owner-local accumulation via accept_local_contribution, "
-                "inspect_local_reducer_target, and flush_local_reducer_target."
-            )
     owner_local_reducer = _owner_local_reducer_enabled(
         reducer_backend=reducer_backend,
         worker_owned_local_reducer=worker_owned_local_reducer,
-        distributed_owner_local_reducer=distributed_owner_local_reducer,
     )
     cleanup_policy = _residual_attempt_cleanup_policy(workflow_parameters)
     streaming_context = (getattr(artifacts, "streaming_state", None) or {}).get(
         "compute_context"
     )
-    if streaming_context is not None and (
-        not owner_local_reducer
-        or reducer_backend.layout.kind != "local_restartable"
-    ):
-        raise RuntimeError(
-            "Streaming stage-2 mode requires the local_restartable owner-local "
-            "reducer: its amplitudes exist only inside worker accumulators, and "
-            "the durable_shared generation checkpoints carry no interval-axis "
-            "(subchunk) semantics. Disable streaming or switch the reducer "
-            "backend."
-        )
     all_interval_chunk_pairs = list(
         artifacts.db_manager.get_interval_chunks()
         if hasattr(artifacts.db_manager, "get_interval_chunks")

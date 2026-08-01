@@ -19,7 +19,6 @@ from core.residual_field.artifacts import (
     _build_residual_field_reducer_progress_manifest,
     build_residual_field_output_artifact_refs,
     discover_residual_field_reducer_progress_manifest,
-    persist_residual_field_generation_checkpoint,
     persist_residual_field_interval_chunk_result,
 )
 from core.residual_field.loader import load_chunk_residual_field_and_grid
@@ -35,8 +34,6 @@ from core.residual_field.execution import (
     _build_task_reducer_backend,
     _cap_async_max_inflight,
     _cluster_host_memory_pressure,
-    _distributed_owner_affinity_enabled,
-    _distributed_owner_local_reducer_supported,
     _residual_partition_runtime_policy,
     _trim_workers_for_memory_pressure,
     run_residual_field_stage,
@@ -142,12 +139,13 @@ def _write_interval_hdf5(
 class _FakeLocalReducerBackend:
     layout = SimpleNamespace(kind="local_restartable")
 
-    def __init__(self):
+    def __init__(self, *, metrics_by_target=None):
         self.accepted: list[ResidualFieldLocalAccumulatorPartial] = []
         self.reconciled: list[int] = []
         self.flushed: list[tuple[int, int | None]] = []
         self.pending_by_target: dict[tuple[int, int | None], set[int]] = {}
         self.durable_by_target: dict[tuple[int, int | None], set[int]] = {}
+        self.metrics_by_target = metrics_by_target or {}
 
     def uses_local_chunk_accumulator(self):
         return True
@@ -279,9 +277,11 @@ class _FakeLocalReducerBackend:
         partition_id=None,
     ):
         target_key = (int(chunk_id), None if partition_id is None else int(partition_id))
-        return {
+        target_state = {
             "durable_interval_ids": tuple(sorted(self.durable_by_target.get(target_key, set()))),
         }
+        target_state.update(self.metrics_by_target.get(target_key, {}))
+        return target_state
 
     def finalize_chunk(
         self,
@@ -309,64 +309,6 @@ class _FakeLocalReducerBackend:
         scratch_root=None,
     ):
         return ()
-
-
-class _FakeDistributedOwnerLocalBackend(_FakeLocalReducerBackend):
-    distributed_owner_local_reducer_supported = True
-
-    def __init__(self, *, supported=True, metrics_by_target=None):
-        super().__init__()
-        self.distributed_owner_local_reducer_supported = supported
-        self.metrics_by_target = metrics_by_target or {}
-        self.layout = SimpleNamespace(kind="durable_shared_restartable")
-
-    def uses_local_chunk_accumulator(self):
-        return False
-
-    def describe_runtime_state(self, *, output_dir, scratch_root):
-        return SimpleNamespace(
-            kind="durable_shared_restartable",
-            local_scratch_root=scratch_root,
-            durable_root=output_dir,
-            ram_state=(),
-            local_scratch_state=(),
-            durable_state=(),
-            scattering_interval_transport="durable interval artifacts required execution transport",
-            uncommitted_restart_rule="recompute",
-            committed_shard_root=output_dir,
-            committed_shard_storage="durable shared storage",
-            shard_compression="np.savez_compressed",
-            durable_truth_unit="committed_local_snapshot_generation",
-            live_state_storage_role="owner-local-live-accumulator",
-            durable_checkpoint_storage_role="durable-local-snapshot-generation",
-            final_artifact_storage_role="durable-final-chunk-artifact",
-            direct_interval_handoff_supported=False,
-            checkpoint_policy=SimpleNamespace(
-                interval_artifacts="required_transport",
-                shard_checkpoints="required_durable_checkpoint",
-                reducer_progress_manifest="required_durable",
-                final_chunk_artifacts="required_durable",
-                worker_local_scratch_role="temporary_staging_only",
-            ),
-        )
-
-    def inspect_local_reducer_target(
-        self,
-        *,
-        chunk_id,
-        parameter_digest,
-        output_dir,
-        partition_id=None,
-    ):
-        target_key = (int(chunk_id), None if partition_id is None else int(partition_id))
-        target_state = super().inspect_local_reducer_target(
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            output_dir=output_dir,
-            partition_id=partition_id,
-        ) or {}
-        target_state.update(self.metrics_by_target.get(target_key, {}))
-        return target_state
 
 
 def _point_rows_2d(count: int) -> list[dict[str, object]]:
@@ -1057,95 +999,6 @@ def test_residual_field_artifacts_preserve_current_saved_and_applied_semantics(t
         db.close()
 
 
-def test_committed_generation_restart_updates_cleanup_policy_and_deletes_reclaimable(
-    tmp_path,
-):
-    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
-    store = ResidualFieldArtifactStore(str(tmp_path))
-    try:
-        interval_1, interval_2 = db.insert_reciprocal_space_interval_batch(
-            [{"h_range": (0.0, 1.0)}, {"h_range": (1.0, 2.0)}]
-        )
-        db.insert_interval_chunk_status_batch(
-            [(interval_1, 3, 0), (interval_2, 3, 0)]
-        )
-        backend = build_residual_field_reducer_backend(
-            "durable_shared_restartable"
-        )
-        parameter_digest = "a8c0af52d1dd"
-        generation_manifest = persist_residual_field_generation_checkpoint(
-            chunk_id=3,
-            parameter_digest=parameter_digest,
-            partition_id=None,
-            generation_seq=2,
-            incorporated_interval_ids=(interval_1, interval_2),
-            grid_shape_nd=np.array([[1]], dtype=np.int64),
-            reciprocal_point_count=2,
-            total_reciprocal_points=2,
-            amplitudes_delta=np.array([4.0 + 0.0j], dtype=np.complex128),
-            amplitudes_average=np.array([2.0 + 0.0j], dtype=np.complex128),
-            point_ids=np.array([0], dtype=np.int64),
-            output_dir=str(tmp_path),
-            shard_storage_root=str(tmp_path),
-            quiet_logs=True,
-        )
-        generation_paths = [
-            artifact.path
-            for artifact in generation_manifest.artifacts
-            if artifact.path is not None
-        ]
-        assert generation_paths
-        assert all(Path(path).exists() for path in generation_paths)
-
-        store.ensure_grid_shape(3, np.array([[1]], dtype=np.int64))
-        store.ensure_total_reciprocal_points(3, 2)
-        store.save_chunk_payload_components(
-            3,
-            point_ids=np.array([0], dtype=np.int64),
-            amplitudes_delta=np.array([4.0 + 0.0j], dtype=np.complex128),
-            amplitudes_average=np.array([2.0 + 0.0j], dtype=np.complex128),
-            reciprocal_point_count=2,
-        )
-        store.save_applied_interval_ids(3, {interval_1, interval_2})
-        backend.write_progress_manifest(
-            _build_residual_field_reducer_progress_manifest(
-                output_dir=str(tmp_path),
-                chunk_id=3,
-                parameter_digest=parameter_digest,
-                completion_status=CompletionStatus.COMMITTED,
-                durable_truth_unit="committed_local_snapshot_generation",
-                incorporated_shard_keys=(generation_manifest.artifact_key,),
-                incorporated_interval_ids=(interval_1, interval_2),
-                reclaimable_shard_keys=(generation_manifest.artifact_key,),
-                final_artifacts=build_residual_field_output_artifact_refs(
-                    str(tmp_path), 3
-                ),
-                pending_shard_keys=(),
-                pending_interval_ids=(),
-                cleanup_policy="off",
-            )
-        )
-
-        repaired = backend.finalize_chunk(
-            chunk_id=3,
-            parameter_digest=parameter_digest,
-            output_dir=str(tmp_path),
-            db_path=db.db_path,
-            cleanup_policy="delete_reclaimable",
-        )
-        assert repaired is not None
-        progress_after_repair = discover_residual_field_reducer_progress_manifest(
-            output_dir=str(tmp_path),
-            chunk_id=3,
-            parameter_digest=parameter_digest,
-        )
-        assert progress_after_repair is not None
-        assert progress_after_repair.cleanup_policy == "delete_reclaimable"
-        assert all(not Path(path).exists() for path in generation_paths)
-    finally:
-        db.close()
-
-
 def test_residual_field_loader_reconstructs_grid_and_normalizes_values(tmp_path):
     store = ResidualFieldArtifactStore(str(tmp_path))
     payload = np.array([[10 + 0j, 2 + 0j], [10 + 0j, 4 + 0j]], dtype=np.complex128)
@@ -1248,38 +1101,25 @@ def test_residual_field_reducer_backend_resolution_is_mode_aware(monkeypatch):
         == "required_local_restart_state"
     )
 
+    # Distributed (async) clients resolve to local_restartable too: the
+    # tile-owner architecture made it multi-node-safe, and the multi-node
+    # non-streaming case was validated in the cluster sim (2026-08-01,
+    # max|diff| 1.7e-12 A), retiring durable_shared_restartable.
     async_client = SimpleNamespace(loop=SimpleNamespace(asyncio_loop=object()))
-    durable_backend = resolve_residual_field_reducer_backend(
+    distributed_backend = resolve_residual_field_reducer_backend(
         workflow_parameters=parameters,
         client=async_client,
     )
-    assert durable_backend.layout.kind == "durable_shared_restartable"
-    durable_state = durable_backend.describe_runtime_state(
+    assert distributed_backend.layout.kind == "local_restartable"
+    distributed_state = distributed_backend.describe_runtime_state(
         output_dir="/tmp/out",
         scratch_root="/tmp/scratch",
     )
-    assert durable_state.checkpoint_policy.interval_artifacts == "required_transport"
-    assert (
-        durable_state.checkpoint_policy.shard_checkpoints
-        == "required_durable_checkpoint"
-    )
-    assert (
-        durable_state.checkpoint_policy.worker_local_scratch_role
-        == "temporary_staging_only"
-    )
     assert local_state.durable_truth_unit == "committed_local_snapshot_generation"
-    assert durable_state.durable_truth_unit == "committed_local_snapshot_generation"
-    assert durable_state.live_state_storage_role == "owner-local-live-accumulator-with-shared-durable-generations"
-    assert durable_state.durable_checkpoint_storage_role == "durable-shared-generation"
-    assert durable_state.final_artifact_storage_role == "durable-final-chunk-artifact"
-
-    monkeypatch.setenv("DASK_BACKEND", "local")
-    local_async_backend = resolve_residual_field_reducer_backend(
-        workflow_parameters=parameters,
-        client=async_client,
-    )
-    assert local_async_backend.layout.kind == "local_restartable"
-    monkeypatch.delenv("DASK_BACKEND", raising=False)
+    assert distributed_state.durable_truth_unit == "committed_local_snapshot_generation"
+    assert distributed_state.live_state_storage_role == "owner-local-live-accumulator"
+    assert distributed_state.durable_checkpoint_storage_role == "durable-local-snapshot-generation"
+    assert distributed_state.final_artifact_storage_role == "durable-final-chunk-artifact"
 
     override_backend = resolve_residual_field_reducer_backend(
         workflow_parameters=SimpleNamespace(
@@ -1288,6 +1128,18 @@ def test_residual_field_reducer_backend_resolution_is_mode_aware(monkeypatch):
         client=async_client,
     )
     assert override_backend.layout.kind == "local_restartable"
+
+    # An explicit request for the retired layout must fail LOUDLY, not be
+    # silently remapped.
+    with pytest.raises(ValueError, match="retired"):
+        resolve_residual_field_reducer_backend(
+            workflow_parameters=SimpleNamespace(
+                runtime_info={
+                    "residual_field_reducer_backend": "durable_shared_restartable"
+                }
+            ),
+            client=async_client,
+        )
 
     durable_root_override = resolve_residual_field_reducer_backend(
         workflow_parameters=SimpleNamespace(
@@ -1302,6 +1154,25 @@ def test_residual_field_reducer_backend_resolution_is_mode_aware(monkeypatch):
         ).committed_shard_root
         == "/tmp/shared-shards"
     )
+
+
+def test_normalize_reducer_backend_kind_rejects_retired_durable_shared():
+    from core.residual_field.reducer_helpers import _normalize_reducer_backend_kind
+
+    assert _normalize_reducer_backend_kind("local") == "local_restartable"
+    assert _normalize_reducer_backend_kind("local_restartable") == "local_restartable"
+    for retired_alias in (
+        "durable",
+        "durable_shared",
+        "durable_shared_restartable",
+        "durable-shared-restartable",
+        "durable_restartable",
+    ):
+        with pytest.raises(
+            ValueError,
+            match="retired; use 'local_restartable'",
+        ):
+            _normalize_reducer_backend_kind(retired_alias)
 
 
 def test_residual_field_async_local_handoff_reuses_scattered_interval_payloads(monkeypatch, tmp_path):
@@ -1368,149 +1239,6 @@ def test_residual_field_async_local_handoff_reuses_scattered_interval_payloads(m
         monkeypatch.delenv("DASK_BACKEND", raising=False)
 
     assert scatter_calls == []
-
-
-def test_residual_field_async_stage_uses_owner_affinity_for_distributed_backend_when_enabled(
-    monkeypatch,
-    tmp_path,
-):
-    work_unit = ResidualFieldWorkUnit.interval_chunk(
-        interval_id=1,
-        chunk_id=3,
-        parameter_digest="abc123",
-        output_dir=str(tmp_path),
-    )
-
-    class _FakeFuture:
-        def __init__(self, value):
-            self._value = value
-
-        def result(self):
-            return self._value
-
-        def done(self):
-            return True
-
-    submits = []
-
-    class _FakeClient:
-        loop = SimpleNamespace(asyncio_loop=object())
-
-        def scheduler_info(self):
-            return {
-                "workers": {
-                    "worker-a": {"resources": {"nufft": 1}},
-                    "worker-b": {"resources": {"nufft": 1}},
-                }
-            }
-
-        def scatter(self, data, **kwargs):
-            return data
-
-        def submit(self, func, *args, **kwargs):
-            submits.append(kwargs)
-            if kwargs.get("key", "").startswith("residual-"):
-                work_unit = args[0]
-                return _FakeFuture(
-                    ResidualFieldAccumulatorStatus(
-                        artifact_key=work_unit.artifact_key,
-                        chunk_id=work_unit.chunk_id,
-                        parameter_digest=work_unit.parameter_digest,
-                        interval_ids=work_unit.interval_ids,
-                        partition_id=work_unit.partition_id,
-                        contribution_reciprocal_point_count=1,
-                        total_reciprocal_points=1,
-                    )
-                )
-            call_kwargs = dict(kwargs)
-            for reserved_key in (
-                "key",
-                "pure",
-                "workers",
-                "allow_other_workers",
-                "resources",
-                "retries",
-            ):
-                call_kwargs.pop(reserved_key, None)
-            return _FakeFuture(func(*args, **call_kwargs))
-
-    durable_backend = _FakeDistributedOwnerLocalBackend()
-
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_residual_field_reducer_backend",
-        lambda *args, **kwargs: durable_backend,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_worker_scratch_root",
-        lambda preferred, stage: str(tmp_path / "scratch"),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.build_residual_field_work_units",
-        lambda *args, **kwargs: [work_unit],
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.reciprocal_space_points_counter",
-        lambda *args, **kwargs: 1,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.point_list_to_recarray",
-        lambda *args, **kwargs: np.array(
-            [([0.0], [0.1], [0.05], 3)],
-            dtype=[
-                ("coordinates", object),
-                ("dist_from_atom_center", object),
-                ("step_in_frac", object),
-                ("chunk_id", np.int64),
-            ],
-        ).view(np.recarray),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.yield_futures_with_results",
-        lambda futures, client: ((future, future.result()) for future in futures),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution._finalize_residual_field_chunks",
-        lambda **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution._validate_local_durable_coverage_or_raise",
-        lambda **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.finalize_process_local_residual_chunk",
-        lambda *args, **kwargs: {"chunk_id": kwargs["chunk_id"]},
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.finalize_process_local_residual_chunk",
-        lambda *args, **kwargs: {"chunk_id": kwargs["chunk_id"]},
-    )
-
-    artifacts = SimpleNamespace(
-        db_manager=SimpleNamespace(
-            cache_enabled=False,
-            get_unsaved_interval_chunks=lambda: [(1, 3)],
-            get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
-            db_path=str(tmp_path / "state.db"),
-        ),
-        padded_intervals=[{"h_range": (0.0, 0.0)}],
-        output_dir=str(tmp_path),
-        transient_interval_payloads={},
-    )
-    workflow_parameters = SimpleNamespace(
-        runtime_info={}
-    )
-    structure = SimpleNamespace(supercell=np.array([1]))
-
-    run_residual_field_stage(
-        workflow_parameters=workflow_parameters,
-        structure=structure,
-        artifacts=artifacts,
-        client=_FakeClient(),
-    )
-
-    task_submit = next(kwargs for kwargs in submits if kwargs.get("key", "").startswith("residual-"))
-    assert task_submit["workers"] == ["worker-a"]
-    assert task_submit["allow_other_workers"] is False
 
 
 def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
@@ -1596,11 +1324,11 @@ def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
                 call_kwargs.pop(reserved_key, None)
             return _FakeFuture(func(*args, **call_kwargs))
 
-    durable_backend = _FakeDistributedOwnerLocalBackend()
+    local_backend = _FakeLocalReducerBackend()
 
     monkeypatch.setattr(
         "core.residual_field.execution.resolve_residual_field_reducer_backend",
-        lambda *args, **kwargs: durable_backend,
+        lambda *args, **kwargs: local_backend,
     )
     monkeypatch.setattr(
         "core.residual_field.execution.resolve_worker_scratch_root",
@@ -1677,7 +1405,7 @@ def test_residual_field_final_drain_retries_failed_owner_local_batch(
         parameter_digest="abc123",
         output_dir=str(tmp_path),
     ).with_partition(partition_id=6, point_start=0, point_stop=1)
-    fake_backend = _FakeDistributedOwnerLocalBackend()
+    fake_backend = _FakeLocalReducerBackend()
     attempts = []
     finalized = []
 
@@ -1833,7 +1561,7 @@ def test_residual_field_final_drain_raises_before_finalize_when_retries_exhaust(
         parameter_digest="abc123",
         output_dir=str(tmp_path),
     ).with_partition(partition_id=6, point_start=0, point_stop=1)
-    fake_backend = _FakeDistributedOwnerLocalBackend()
+    fake_backend = _FakeLocalReducerBackend()
     attempts = []
     finalized = []
 
@@ -1934,114 +1662,6 @@ def test_residual_field_final_drain_raises_before_finalize_when_retries_exhaust(
     assert finalized == []
 
 
-def test_distributed_owner_affinity_defaults_to_true():
-    assert _distributed_owner_affinity_enabled(SimpleNamespace(runtime_info={})) is True
-
-
-def test_real_distributed_backend_support_check_accepts_shared_generation_role():
-    parameters = SimpleNamespace(runtime_info={})
-    async_client = SimpleNamespace(loop=SimpleNamespace(asyncio_loop=object()))
-    durable_backend = resolve_residual_field_reducer_backend(
-        workflow_parameters=parameters,
-        client=async_client,
-    )
-    durable_state = durable_backend.describe_runtime_state(
-        output_dir="/tmp/out",
-        scratch_root="/tmp/scratch",
-    )
-
-    assert durable_state.durable_checkpoint_storage_role == "durable-shared-generation"
-    assert (
-        _distributed_owner_local_reducer_supported(
-            durable_backend,
-            reducer_runtime_state=durable_state,
-        )
-        is True
-    )
-
-
-def test_residual_field_distributed_stage_rejects_disabled_owner_affinity(
-    monkeypatch,
-    tmp_path,
-):
-    fake_backend = _FakeDistributedOwnerLocalBackend()
-
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_residual_field_reducer_backend",
-        lambda *args, **kwargs: fake_backend,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_worker_scratch_root",
-        lambda preferred, stage: str(tmp_path / "scratch"),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.build_residual_field_work_units",
-        lambda *args, **kwargs: [],
-    )
-
-    artifacts = SimpleNamespace(
-        db_manager=SimpleNamespace(
-            cache_enabled=False,
-            get_unsaved_interval_chunks=lambda: [],
-            get_point_data_for_chunk=lambda chunk_id: [],
-            db_path=str(tmp_path / "state.db"),
-        ),
-        padded_intervals=[],
-        output_dir=str(tmp_path),
-        transient_interval_payloads={},
-    )
-
-    with pytest.raises(ValueError, match="requires owner affinity"):
-        run_residual_field_stage(
-            workflow_parameters=SimpleNamespace(
-                runtime_info={"residual_distributed_owner_affinity": False}
-            ),
-            structure=SimpleNamespace(supercell=np.array([1])),
-            artifacts=artifacts,
-            client=SimpleNamespace(loop=SimpleNamespace(asyncio_loop=object())),
-        )
-
-
-def test_residual_field_distributed_stage_rejects_missing_owner_local_backend_support(
-    monkeypatch,
-    tmp_path,
-):
-    fake_backend = _FakeDistributedOwnerLocalBackend(supported=False)
-
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_residual_field_reducer_backend",
-        lambda *args, **kwargs: fake_backend,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_worker_scratch_root",
-        lambda preferred, stage: str(tmp_path / "scratch"),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.build_residual_field_work_units",
-        lambda *args, **kwargs: [],
-    )
-
-    artifacts = SimpleNamespace(
-        db_manager=SimpleNamespace(
-            cache_enabled=False,
-            get_unsaved_interval_chunks=lambda: [],
-            get_point_data_for_chunk=lambda chunk_id: [],
-            db_path=str(tmp_path / "state.db"),
-        ),
-        padded_intervals=[],
-        output_dir=str(tmp_path),
-        transient_interval_payloads={},
-    )
-
-    with pytest.raises(RuntimeError, match="requires backend support"):
-        run_residual_field_stage(
-            workflow_parameters=SimpleNamespace(runtime_info={}),
-            structure=SimpleNamespace(supercell=np.array([1])),
-            artifacts=artifacts,
-            client=SimpleNamespace(loop=SimpleNamespace(asyncio_loop=object())),
-        )
-
-
 def test_residual_field_sync_stage_filters_already_durable_local_work_units_before_dispatch(
     monkeypatch,
     tmp_path,
@@ -2138,109 +1758,6 @@ def test_residual_field_sync_stage_filters_already_durable_local_work_units_befo
     run_residual_field_stage(
         workflow_parameters=workflow_parameters,
         structure=structure,
-        artifacts=artifacts,
-        client=None,
-    )
-
-    assert dispatched == [(2,)]
-    assert finalized == [3]
-
-
-def test_residual_field_sync_stage_filters_already_durable_distributed_work_units_before_dispatch(
-    monkeypatch,
-    tmp_path,
-):
-    durable_work_unit = ResidualFieldWorkUnit.interval_chunk(
-        interval_id=1,
-        chunk_id=3,
-        parameter_digest="abc123",
-        output_dir=str(tmp_path),
-    )
-    pending_work_unit = ResidualFieldWorkUnit.interval_chunk(
-        interval_id=2,
-        chunk_id=3,
-        parameter_digest="abc123",
-        output_dir=str(tmp_path),
-    )
-    fake_backend = _FakeDistributedOwnerLocalBackend()
-    fake_backend.durable_by_target[(3, None)] = {1}
-    rec = np.array(
-        [([0.0], [0.1], [0.05], 3)],
-        dtype=[
-            ("coordinates", object),
-            ("dist_from_atom_center", object),
-            ("step_in_frac", object),
-            ("chunk_id", np.int64),
-        ],
-    ).view(np.recarray)
-    dispatched = []
-    finalized = []
-
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_residual_field_reducer_backend",
-        lambda *args, **kwargs: fake_backend,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution._build_task_reducer_backend",
-        lambda backend: backend,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.resolve_worker_scratch_root",
-        lambda preferred, stage: str(tmp_path / "scratch"),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.build_residual_field_work_units",
-        lambda *args, **kwargs: [durable_work_unit, pending_work_unit],
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.reciprocal_space_points_counter",
-        lambda *args, **kwargs: 1,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.point_list_to_recarray",
-        lambda *args, **kwargs: rec,
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.run_residual_field_interval_chunk_task",
-        lambda work_unit, *args, **kwargs: dispatched.append(work_unit.interval_ids or (work_unit.interval_id,)) or ResidualFieldAccumulatorStatus(
-            artifact_key=work_unit.artifact_key,
-            chunk_id=work_unit.chunk_id,
-            parameter_digest=work_unit.parameter_digest,
-            interval_ids=work_unit.interval_ids,
-            partition_id=work_unit.partition_id,
-            contribution_reciprocal_point_count=1,
-            total_reciprocal_points=1,
-        ),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution.finalize_process_local_residual_chunk",
-        lambda *args, **kwargs: finalized.append(kwargs["chunk_id"]) or {"chunk_id": kwargs["chunk_id"]},
-    )
-    monkeypatch.setattr(
-        "core.residual_field.execution._validate_local_durable_coverage_or_raise",
-        lambda **kwargs: None,
-    )
-    monkeypatch.setattr(
-        fake_backend,
-        "local_intervals_already_durable",
-        lambda work_unit, *, output_dir: int(work_unit.interval_id or work_unit.interval_ids[0]) == 1,
-    )
-
-    artifacts = SimpleNamespace(
-        db_manager=SimpleNamespace(
-            cache_enabled=False,
-            get_unsaved_interval_chunks=lambda: [(1, 3), (2, 3)],
-            get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
-            db_path=str(tmp_path / "state.db"),
-        ),
-        padded_intervals=[{"h_range": (0.0, 0.0)}],
-        output_dir=str(tmp_path),
-        transient_interval_payloads={},
-    )
-
-    run_residual_field_stage(
-        workflow_parameters=SimpleNamespace(runtime_info={}),
-        structure=SimpleNamespace(supercell=np.array([1])),
         artifacts=artifacts,
         client=None,
     )
@@ -2635,7 +2152,7 @@ def test_residual_field_async_stage_passes_hysteresis_policy_into_partition_plan
     )
 
 
-def test_residual_field_async_distributed_stage_flushes_validates_and_logs_metrics(
+def test_residual_field_async_stage_flushes_validates_and_logs_metrics(
     monkeypatch,
     tmp_path,
     caplog,
@@ -2659,7 +2176,7 @@ def test_residual_field_async_distributed_stage_flushes_validates_and_logs_metri
 
     submits = []
     finalized = []
-    fake_backend = _FakeDistributedOwnerLocalBackend(
+    fake_backend = _FakeLocalReducerBackend(
         metrics_by_target={
             (3, None): {
                 "total_checkpoint_bytes_written": 128,
@@ -2784,7 +2301,7 @@ def test_residual_field_async_distributed_stage_flushes_validates_and_logs_metri
         )
 
     assert finalized == [3]
-    assert any("finalize checkpoints | backend=durable_shared_restartable" in rec.message for rec in caplog.records)
+    assert any("finalize checkpoints | backend=local_restartable" in rec.message for rec in caplog.records)
     assert any("Residual-field partition report | target=" in rec.message for rec in caplog.records)
     assert any(
         kwargs.get("workers") == ["worker-a"] and kwargs.get("allow_other_workers") is False
@@ -2793,7 +2310,7 @@ def test_residual_field_async_distributed_stage_flushes_validates_and_logs_metri
     )
 
 
-def test_residual_field_async_distributed_stage_remaps_missing_owner_for_finalize_steps(
+def test_residual_field_async_stage_remaps_missing_owner_for_finalize_steps(
     monkeypatch,
     tmp_path,
 ):
@@ -2822,7 +2339,7 @@ def test_residual_field_async_distributed_stage_remaps_missing_owner_for_finaliz
         {"worker-b": {"resources": {"nufft": 1}}},
     ]
     submits = []
-    fake_backend = _FakeDistributedOwnerLocalBackend()
+    fake_backend = _FakeLocalReducerBackend()
     rec = np.array(
         [([0.0], [0.1], [0.05], 3)],
         dtype=[
@@ -3826,80 +3343,6 @@ def test_residual_field_interval_chunk_task_returns_small_status_for_local_backe
     np.testing.assert_allclose(captured["accepted"].amplitudes_delta, np.array([9.0 + 0.0j]))
     np.testing.assert_allclose(captured["accepted"].amplitudes_average, np.array([10.0 + 0.0j]))
     assert not (tmp_path / "residual_shards").exists()
-
-
-def test_residual_field_interval_chunk_task_returns_small_status_for_distributed_owner_local_backend(
-    monkeypatch,
-    tmp_path,
-):
-    atoms = np.array(
-        [([0.0], [0.1], [0.05])],
-        dtype=[
-            ("coordinates", object),
-            ("dist_from_atom_center", object),
-            ("step_in_frac", object),
-        ],
-    )
-    distributed_backend = _FakeDistributedOwnerLocalBackend()
-    captured = {}
-
-    monkeypatch.setattr(
-        "core.residual_field.tasks.build_rifft_grid_for_chunk",
-        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
-    )
-    monkeypatch.setattr(
-        "core.residual_field.tasks.execute_inverse_cunufft_super_batch",
-        lambda **kwargs: np.array([[9.0 + 0.0j], [10.0 + 0.0j]]),
-    )
-
-    class _WorkerDistributedBackend:
-        def local_intervals_already_durable(self, work_unit, *, output_dir):
-            return False
-
-        def accept_local_contribution(self, work_unit, **kwargs):
-            captured["accepted"] = ResidualFieldLocalAccumulatorPartial(
-                work_unit=work_unit,
-                point_ids=kwargs["point_ids"],
-                grid_shape_nd=kwargs["grid_shape_nd"],
-                total_reciprocal_points=kwargs["total_reciprocal_points"],
-                contribution_reciprocal_points=kwargs["contribution_reciprocal_points"],
-                amplitudes_delta=kwargs["amplitudes_delta"],
-                amplitudes_average=kwargs["amplitudes_average"],
-            )
-
-    monkeypatch.setattr(
-        "core.residual_field.tasks.get_process_local_residual_field_backend",
-        lambda template_backend: _WorkerDistributedBackend(),
-    )
-
-    result = run_residual_field_interval_chunk_task(
-        ResidualFieldWorkUnit.interval_chunk(
-            interval_id=1,
-            chunk_id=3,
-            parameter_digest="abc123",
-            output_dir=str(tmp_path),
-        ),
-        IntervalTask(
-            1,
-            "All",
-            np.array([[0.0]], dtype=np.float64),
-            np.array([2.0 + 0.0j]),
-            np.array([1.0 + 0.0j]),
-        ),
-        atoms,
-        total_reciprocal_points=11,
-        output_dir=str(tmp_path),
-        db_path=str(tmp_path / "state.db"),
-        scratch_root=str(tmp_path / "scratch"),
-        reducer_backend=distributed_backend,
-        total_expected_partials=4,
-        owner_local_reducer=True,
-        quiet_logs=True,
-    )
-
-    assert isinstance(result, ResidualFieldAccumulatorStatus)
-    np.testing.assert_allclose(captured["accepted"].amplitudes_delta, np.array([9.0 + 0.0j]))
-    np.testing.assert_allclose(captured["accepted"].amplitudes_average, np.array([10.0 + 0.0j]))
 
 
 def test_residual_field_interval_chunk_task_returns_small_status_for_owner_local_reducer(

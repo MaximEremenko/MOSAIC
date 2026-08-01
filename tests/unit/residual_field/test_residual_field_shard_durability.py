@@ -7,7 +7,6 @@ import pytest
 
 from core.residual_field.artifacts import (
     load_residual_field_shard_payload,
-    persist_residual_field_generation_checkpoint,
     persist_residual_field_shard_checkpoint,
 )
 from core.residual_field.contracts import ResidualFieldWorkUnit
@@ -81,28 +80,3 @@ def test_residual_shard_manifest_is_not_published_when_durable_replace_fails(
 
     shard_dir = tmp_path / "residual_checkpoints" / "chunk_3"
     assert list(shard_dir.glob("*.manifest.json")) == []
-
-
-def test_residual_generation_checkpoint_uses_same_durable_publish_order(tmp_path):
-    scratch_root = tmp_path / "scratch"
-
-    manifest = persist_residual_field_generation_checkpoint(
-        chunk_id=3,
-        parameter_digest="abc123",
-        partition_id=None,
-        generation_seq=1,
-        incorporated_interval_ids=(7, 8),
-        grid_shape_nd=np.array([[2]]),
-        reciprocal_point_count=5,
-        total_reciprocal_points=11,
-        amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
-        amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
-        point_ids=np.array([10, 11]),
-        output_dir=str(tmp_path),
-        scratch_root=str(scratch_root),
-        quiet_logs=True,
-    )
-
-    assert Path(manifest.artifacts[0].path).exists()
-    assert Path(manifest.artifacts[1].path).exists()
-    assert list((scratch_root / "residual_checkpoints" / "chunk_3").glob("*")) == []

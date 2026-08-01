@@ -34,17 +34,12 @@ if TYPE_CHECKING:
 # Literal type aliases
 # ---------------------------------------------------------------------------
 
-ResidualFieldReducerBackendKind = Literal[
-    "local_restartable",
-    "durable_shared_restartable",
-]
-ResidualShardCheckpointPolicy = Literal[
-    "required_local_restart_state",
-    "required_durable_checkpoint",
-]
+# durable_shared_restartable was retired after the tile-owner work made
+# local_restartable multi-node-safe; local_restartable is the only layout.
+ResidualFieldReducerBackendKind = Literal["local_restartable"]
+ResidualShardCheckpointPolicy = Literal["required_local_restart_state"]
 ScratchRolePolicy = Literal[
     "committed_local_restart_state_and_temporary_staging",
-    "temporary_staging_only",
 ]
 
 
@@ -362,34 +357,6 @@ LOCAL_RESTARTABLE_LAYOUT = ResidualFieldReducerBackendLayout(
     ),
 )
 
-SHARED_DURABLE_LAYOUT = ResidualFieldReducerBackendLayout(
-    kind="durable_shared_restartable",
-    reducer_ownership="single-writer chunk-owned reducer",
-    reducer_backing_store="owner-local accumulator with immutable shared-storage generations",
-    durability_policy=(
-        "restart from committed accumulator generations, reducer progress, and final artifacts "
-        "visible to workers/jobs; uncommitted task-local work may be recomputed"
-    ),
-    checkpoint_policy=ResidualFieldCheckpointPolicy(
-        interval_artifacts="required_transport",
-        shard_checkpoints="required_durable_checkpoint",
-        reducer_progress_manifest="required_durable",
-        final_chunk_artifacts="required_durable",
-        worker_local_scratch_role="temporary_staging_only",
-    ),
-    ram_state=LOCAL_RESTARTABLE_LAYOUT.ram_state,
-    local_scratch_state=LOCAL_RESTARTABLE_LAYOUT.local_scratch_state,
-    durable_state=LOCAL_RESTARTABLE_LAYOUT.durable_state,
-    scattering_interval_transport="durable interval artifacts required execution transport",
-    scattering_interval_outputs_supported=True,
-    direct_interval_handoff_supported=False,
-    persist_interval_artifacts_by_default=True,
-    committed_shard_storage="durable shared storage",
-    shard_compression="np.savez_compressed",
-    uncommitted_restart_rule=LOCAL_RESTARTABLE_LAYOUT.uncommitted_restart_rule,
-)
-
-
 __all__ = [
     "LOCAL_RESTARTABLE_LAYOUT",
     "ResidualFieldCheckpointPolicy",
@@ -404,6 +371,5 @@ __all__ = [
     "ResidualFieldReducerRuntimeState",
     "ResidualShardCheckpointPolicy",
     "ScatteringIntervalArtifactPolicy",
-    "SHARED_DURABLE_LAYOUT",
     "ScratchRolePolicy",
 ]

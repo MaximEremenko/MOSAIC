@@ -933,26 +933,15 @@ class TestCheckpointCadencePolicy:
         from core.residual_field.reducer_helpers import checkpoint_cadence
 
         monkeypatch.setenv("MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", "7")
-        assert checkpoint_cadence(1000, uses_shared_durable_generations=False) == 7
-        assert checkpoint_cadence(1000, uses_shared_durable_generations=True) == 7
-        # wins over the legacy shared-durable env too
-        monkeypatch.setenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE", "3")
-        assert checkpoint_cadence(1000, uses_shared_durable_generations=True) == 7
-        # and over the intervals-axis floor
-        assert (
-            checkpoint_cadence(
-                1000,
-                uses_shared_durable_generations=False,
-                partition_axis="intervals",
-            )
-            == 7
-        )
+        assert checkpoint_cadence(1000) == 7
+        # wins over the intervals-axis floor too
+        assert checkpoint_cadence(1000, partition_axis="intervals") == 7
 
     def test_env_override_clamped_to_one(self, monkeypatch):
         from core.residual_field.reducer_helpers import checkpoint_cadence
 
         monkeypatch.setenv("MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", "0")
-        assert checkpoint_cadence(1000, uses_shared_durable_generations=False) == 1
+        assert checkpoint_cadence(1000) == 1
 
     def test_default_formula_unchanged_when_unset(self, monkeypatch):
         from core.residual_field.reducer_helpers import checkpoint_cadence
@@ -960,14 +949,9 @@ class TestCheckpointCadencePolicy:
         monkeypatch.delenv(
             "MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", raising=False
         )
-        monkeypatch.delenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE", raising=False)
-        assert checkpoint_cadence(0, uses_shared_durable_generations=False) == 1
-        assert checkpoint_cadence(3, uses_shared_durable_generations=False) == 1
-        assert checkpoint_cadence(40, uses_shared_durable_generations=False) == 10
-        # legacy shared-durable env still honored when the new knob is unset
-        monkeypatch.setenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE", "5")
-        assert checkpoint_cadence(40, uses_shared_durable_generations=True) == 5
-        assert checkpoint_cadence(40, uses_shared_durable_generations=False) == 10
+        assert checkpoint_cadence(0) == 1
+        assert checkpoint_cadence(3) == 1
+        assert checkpoint_cadence(40) == 10
 
     def test_intervals_axis_floor_is_two(self, monkeypatch):
         from core.residual_field.reducer_helpers import checkpoint_cadence
@@ -975,21 +959,6 @@ class TestCheckpointCadencePolicy:
         monkeypatch.delenv(
             "MOSAIC_RESIDUAL_CHECKPOINT_CADENCE_BATCHES", raising=False
         )
-        assert (
-            checkpoint_cadence(
-                3, uses_shared_durable_generations=False, partition_axis="intervals"
-            )
-            == 2
-        )
-        assert (
-            checkpoint_cadence(
-                40, uses_shared_durable_generations=False, partition_axis="intervals"
-            )
-            == 10
-        )
-        assert (
-            checkpoint_cadence(
-                3, uses_shared_durable_generations=False, partition_axis="points"
-            )
-            == 1
-        )
+        assert checkpoint_cadence(3, partition_axis="intervals") == 2
+        assert checkpoint_cadence(40, partition_axis="intervals") == 10
+        assert checkpoint_cadence(3, partition_axis="points") == 1

@@ -1,8 +1,7 @@
 """Residual-field shard discovery helpers.
 
-Functions for scanning the filesystem for shard manifests, discovering
-stale generation checkpoints, merging manifest collections, and querying
-the reducer-progress manifest.
+Functions for scanning the filesystem for shard manifests, merging manifest
+collections, and querying the reducer-progress manifest.
 
 This module imports from ``core.residual_field.manifest_io`` and
 ``core.residual_field.contracts`` only — it has no dependency on
@@ -29,7 +28,6 @@ from core.residual_field.manifest_io import (
     build_residual_field_reducer_progress_artifact,
     load_residual_field_reducer_progress_manifest,
     load_residual_field_shard_manifest,
-    parse_residual_field_generation_ref,
 )
 
 __all__ = [
@@ -37,7 +35,6 @@ __all__ = [
     "_shard_manifests_by_key",
     "discover_residual_field_reducer_progress_manifest",
     "discover_residual_field_shard_manifests",
-    "discover_stale_residual_field_generation_manifests",
     "list_reclaimable_residual_field_shards",
 ]
 
@@ -48,7 +45,6 @@ def discover_residual_field_shard_manifests(
     chunk_id: int,
     parameter_digest: str,
     shard_storage_root: str | None = None,
-    include_stale_generations: bool = False,
 ) -> list[ResidualFieldShardManifest]:
     shard_dir = Path(shard_storage_root or output_dir) / "residual_checkpoints" / f"chunk_{chunk_id}"
     if not shard_dir.exists():
@@ -56,66 +52,7 @@ def discover_residual_field_shard_manifests(
     manifests: list[ResidualFieldShardManifest] = []
     for path in sorted(shard_dir.glob(f"batch_*_params_{parameter_digest}.manifest.json")):
         manifests.append(load_residual_field_shard_manifest(path))
-    generation_manifests: list[ResidualFieldShardManifest] = []
-    for path in sorted(shard_dir.glob(f"generation_*_params_{parameter_digest}.manifest.json")):
-        generation_manifests.append(load_residual_field_shard_manifest(path))
-    if include_stale_generations:
-        manifests.extend(generation_manifests)
-        return manifests
-    latest_generations: dict[int | None, tuple[int, ResidualFieldShardManifest]] = {}
-    for manifest in generation_manifests:
-        generation_ref = parse_residual_field_generation_ref(manifest)
-        if generation_ref is None:
-            manifests.append(manifest)
-            continue
-        partition_id, generation_seq = generation_ref
-        existing = latest_generations.get(partition_id)
-        if existing is None or generation_seq > existing[0]:
-            latest_generations[partition_id] = (generation_seq, manifest)
-    manifests.extend(
-        manifest
-        for _, manifest in sorted(
-            latest_generations.values(),
-            key=lambda item: (
-                -1 if parse_residual_field_generation_ref(item[1])[0] is None else int(parse_residual_field_generation_ref(item[1])[0]),
-                item[0],
-            ),
-        )
-    )
     return manifests
-
-
-def discover_stale_residual_field_generation_manifests(
-    *,
-    output_dir: str,
-    chunk_id: int,
-    parameter_digest: str,
-    shard_storage_root: str | None = None,
-) -> list[ResidualFieldShardManifest]:
-    all_manifests = discover_residual_field_shard_manifests(
-        output_dir=output_dir,
-        chunk_id=chunk_id,
-        parameter_digest=parameter_digest,
-        shard_storage_root=shard_storage_root,
-        include_stale_generations=True,
-    )
-    latest_generation_keys = {
-        manifest.artifact_key
-        for manifest in discover_residual_field_shard_manifests(
-            output_dir=output_dir,
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            shard_storage_root=shard_storage_root,
-            include_stale_generations=False,
-        )
-        if parse_residual_field_generation_ref(manifest) is not None
-    }
-    return [
-        manifest
-        for manifest in all_manifests
-        if parse_residual_field_generation_ref(manifest) is not None
-        and manifest.artifact_key not in latest_generation_keys
-    ]
 
 
 def _merge_residual_field_shard_manifests(

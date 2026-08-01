@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,7 +37,6 @@ from core.contracts import (
 )
 
 __all__ = [
-    "_GENERATION_FILENAME_RE",
     "_artifact_ref_from_payload",
     "_build_residual_field_reducer_progress_manifest",
     "_load_array_payload",
@@ -48,16 +46,10 @@ __all__ = [
     "_write_json_atomic",
     "_write_residual_field_shard_manifest_json",
     "build_residual_field_reducer_progress_artifact",
-    "load_residual_field_generation_metadata",
     "load_residual_field_reducer_progress_manifest",
     "load_residual_field_shard_manifest",
-    "parse_residual_field_generation_ref",
     "write_residual_field_reducer_progress_manifest",
 ]
-
-_GENERATION_FILENAME_RE = re.compile(
-    r"^generation_partition_(?P<partition_token>[^_]+)_seq_(?P<generation_seq>\d+)_params_(?P<parameter_digest>.+)$"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -178,27 +170,6 @@ def _residual_field_reducer_progress_manifest_to_payload(
 
 
 # ---------------------------------------------------------------------------
-# Generation-ref parsing
-# ---------------------------------------------------------------------------
-
-def parse_residual_field_generation_ref(
-    manifest: ResidualFieldShardManifest,
-) -> tuple[int | None, int] | None:
-    manifest_ref = next(
-        (artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"),
-        None,
-    )
-    if manifest_ref is None or manifest_ref.path is None:
-        return None
-    match = _GENERATION_FILENAME_RE.match(Path(manifest_ref.path).stem.removesuffix(".manifest"))
-    if match is None:
-        return None
-    partition_token = match.group("partition_token")
-    partition_id = None if partition_token == "owner" else int(partition_token)
-    return partition_id, int(match.group("generation_seq"))
-
-
-# ---------------------------------------------------------------------------
 # Manifest load / write
 # ---------------------------------------------------------------------------
 
@@ -263,37 +234,6 @@ def _write_residual_field_shard_manifest_json(
         Path(manifest_ref.path),
         payload,
     )
-
-
-def load_residual_field_generation_metadata(
-    manifest: ResidualFieldShardManifest,
-) -> dict[str, object]:
-    manifest_ref = next(
-        artifact for artifact in manifest.artifacts if artifact.kind == "residual-shard-manifest"
-    )
-    if manifest_ref.path is None or not Path(manifest_ref.path).exists():
-        return {}
-    payload = json.loads(Path(manifest_ref.path).read_text(encoding="utf-8"))
-    generation_ref = parse_residual_field_generation_ref(manifest)
-    partition_id = None
-    generation_seq = None
-    if generation_ref is not None:
-        partition_id, generation_seq = generation_ref
-    return {
-        "partition_id": (
-            int(payload["partition_id"])
-            if payload.get("partition_id") is not None
-            else partition_id
-        ),
-        "generation_seq": (
-            int(payload["generation_seq"])
-            if payload.get("generation_seq") is not None
-            else generation_seq
-        ),
-        "checkpoint_bytes_written": int(payload.get("checkpoint_bytes_written", 0)),
-        "checkpoint_wall_seconds": float(payload.get("checkpoint_wall_seconds", 0.0)),
-        "compression": str(payload.get("compression", "")),
-    }
 
 
 def load_residual_field_reducer_progress_manifest(

@@ -21,8 +21,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES",
     "_cleanup_residual_attempts_enabled",
-    "_distributed_owner_affinity_enabled",
-    "_distributed_owner_local_reducer_supported",
     "_memory_backpressure_poll_seconds",
     "_memory_backpressure_threshold",
     "_owner_local_reducer_enabled",
@@ -53,56 +51,15 @@ def _worker_owned_local_reducer_enabled(workflow_parameters) -> bool:
     return bool(override)
 
 
-def _distributed_owner_affinity_enabled(workflow_parameters) -> bool:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    override = None
-    if hasattr(runtime_info, "get"):
-        override = runtime_info.get("residual_distributed_owner_affinity")
-    if override is None:
-        override = os.getenv("MOSAIC_RESIDUAL_DISTRIBUTED_OWNER_AFFINITY")
-    if override is None:
-        return True
-    if isinstance(override, str):
-        return override.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(override)
-
-
-def _distributed_owner_local_reducer_supported(
-    reducer_backend: ResidualFieldReducerBackend,
-    *,
-    reducer_runtime_state,
-) -> bool:
-    support_override = getattr(
-        reducer_backend,
-        "distributed_owner_local_reducer_supported",
-        None,
-    )
-    if support_override is None:
-        support_override = getattr(
-            reducer_backend,
-            "supports_distributed_owner_local_reducer",
-            None,
-        )
-    if support_override is not None:
-        return bool(support_override)
-    return (
-        callable(getattr(reducer_backend, "accept_local_contribution", None))
-        and callable(getattr(reducer_backend, "inspect_local_reducer_target", None))
-        and callable(getattr(reducer_backend, "flush_local_reducer_target", None))
-        and getattr(reducer_runtime_state, "durable_truth_unit", None)
-        == "committed_local_snapshot_generation"
-        and getattr(reducer_runtime_state, "durable_checkpoint_storage_role", None)
-        in {"durable-local-snapshot-generation", "durable-shared-generation"}
-    )
-
-
 def _owner_local_reducer_enabled(
     *,
     reducer_backend: ResidualFieldReducerBackend,
     worker_owned_local_reducer: bool,
-    distributed_owner_local_reducer: bool,
 ) -> bool:
-    return bool(worker_owned_local_reducer or distributed_owner_local_reducer)
+    # local_restartable is the only layout; owner-local reduction is simply
+    # the worker-owned flag (the durable_shared distributed-owner-affinity
+    # plumbing was retired with that layout).
+    return bool(worker_owned_local_reducer)
 
 
 def _residual_partition_runtime_policy(

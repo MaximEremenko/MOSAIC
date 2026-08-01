@@ -32,7 +32,7 @@ def test_recover_pending_noop_when_backend_not_local(monkeypatch):
         ),
     )
     backend = SimpleNamespace(
-        layout=SimpleNamespace(kind="durable_shared_restartable"),
+        layout=SimpleNamespace(kind="not_local_restartable"),
         load_progress_manifest=lambda **kwargs: object(),
         finalize_chunk=lambda **kwargs: object(),
     )

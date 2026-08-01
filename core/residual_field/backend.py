@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import queue
-import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,18 +17,11 @@ from core.residual_field.artifacts import (
     build_residual_field_chunk_manifest,
     build_residual_field_output_artifact_refs,
     delete_reclaimable_residual_field_shards,
-    discover_stale_residual_field_generation_manifests,
     discover_residual_field_reducer_progress_manifest,
     discover_residual_field_shard_manifests,
-    load_residual_field_generation_metadata,
-    load_residual_field_generation_payload,
-    parse_residual_field_generation_ref,
-    persist_residual_field_generation_checkpoint,
     ResidualFieldArtifactStore,
     persist_residual_field_shard_checkpoint,
     reconcile_residual_field_reducer_progress,
-    reduce_residual_field_shards_for_chunk,
-    summarize_residual_field_generation_metrics,
     write_residual_field_reducer_progress_manifest,
     _normalize_residual_shard_cleanup_policy,
 )
@@ -74,7 +66,6 @@ from core.residual_field.reducer_policy import (  # noqa: F401
     ResidualFieldReducerRuntimeState,
     ResidualShardCheckpointPolicy,
     ScatteringIntervalArtifactPolicy,
-    SHARED_DURABLE_LAYOUT,
     ScratchRolePolicy,
 )
 
@@ -85,136 +76,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_GENERATION_KEY_RE = re.compile(r":generation-partition-(?P<partition_token>[^:]+):seq-(?P<generation_seq>\d+)$")
 _PROCESS_LOCAL_REDUCER_BACKENDS: dict[
     tuple[str, str | None, int],
     "ManifestDrivenResidualFieldReducerBackend",
 ] = {}
-
-
-def assemble_durable_generation_chunk_payload(
-    *,
-    sorted_manifests,
-    total_reciprocal_points,
-    scratch_dir,
-    chunk_id,
-) -> dict:
-    if len(sorted_manifests) > 1:
-        interval_sets = {
-            frozenset(int(v) for v in manifest.contributing_interval_ids)
-            for manifest in sorted_manifests
-            if getattr(manifest, "contributing_interval_ids", None) is not None
-        }
-        if len(interval_sets) > 1:
-            sizes = sorted(len(s) for s in interval_sets)
-            raise RuntimeError(
-                "Residual-field generation finalization found partition "
-                f"checkpoints with mismatched interval coverage for chunk="
-                f"{int(chunk_id)} (interval-set sizes {sizes}). At least one "
-                "partition checkpoint is stale or incomplete; clear the durable "
-                "generation checkpoints and re-run to recompute this chunk."
-            )
-    # Pass 1: load each snapshot briefly to record shape, then
-    # release it. Peak memory = one block at a time.
-    # Match np.vstack semantics: 1-D block of shape (k,) counts
-    # as 1 row × k columns; 2-D block (r, c) is r rows × c cols.
-    sizes: list[tuple[int, int]] = []
-    total_points = 0
-    total_rows = 0
-    grid_cols: int | None = None
-    for manifest in sorted_manifests:
-        snapshot = load_residual_field_generation_payload(manifest)
-        n_points = int(
-            np.asarray(snapshot["amplitudes_delta"]).reshape(-1).shape[0]
-        )
-        grid_arr = np.asarray(snapshot["grid_shape_nd"])
-        if grid_arr.ndim == 1:
-            block_rows = 1
-            block_cols = int(grid_arr.shape[0])
-        elif grid_arr.ndim >= 2:
-            block_rows = int(grid_arr.shape[0])
-            block_cols = int(grid_arr.shape[1])
-        else:
-            block_rows = 0
-            block_cols = 1
-        if grid_cols is None:
-            grid_cols = block_cols
-        sizes.append((n_points, block_rows))
-        total_points += n_points
-        total_rows += block_rows
-        del snapshot, grid_arr
-    grid_shape = (total_rows, int(grid_cols or 1))
-    final_point_ids = _allocate_finalize_output(
-        shape=(total_points,), dtype=np.int64,
-        scratch_dir=scratch_dir, name="point_ids",
-    )
-    final_delta = _allocate_finalize_output(
-        shape=(total_points,), dtype=np.complex128,
-        scratch_dir=scratch_dir, name="delta",
-    )
-    final_average = _allocate_finalize_output(
-        shape=(total_points,), dtype=np.complex128,
-        scratch_dir=scratch_dir, name="average",
-    )
-    final_grid_shape_nd = _allocate_finalize_output(
-        shape=grid_shape, dtype=np.int64,
-        scratch_dir=scratch_dir, name="grid_shape_nd",
-    )
-    # Pass 2: stream each block into its preallocated slot.
-    point_offset = 0
-    row_offset = 0
-    applied_set: set[int] = set()
-    reciprocal_point_count = 0
-    for manifest, (n_points, n_rows) in zip(sorted_manifests, sizes):
-        snapshot = load_residual_field_generation_payload(manifest)
-        snapshot_point_ids = np.asarray(snapshot["point_ids"], dtype=np.int64).reshape(-1)
-        expected_point_ids = np.arange(
-            point_offset,
-            point_offset + n_points,
-            dtype=np.int64,
-        )
-        if snapshot_point_ids.shape != expected_point_ids.shape or not np.array_equal(
-            snapshot_point_ids,
-            expected_point_ids,
-        ):
-            raise RuntimeError(
-                "Residual-field checkpoint point IDs do not match the expected "
-                "absolute chunk-row IDs for the current artifact contract."
-            )
-        final_point_ids[point_offset:point_offset + n_points] = snapshot_point_ids
-        final_delta[point_offset:point_offset + n_points] = np.asarray(
-            snapshot["amplitudes_delta"], dtype=np.complex128
-        ).reshape(-1)
-        final_average[point_offset:point_offset + n_points] = np.asarray(
-            snapshot["amplitudes_average"], dtype=np.complex128
-        ).reshape(-1)
-        grid_block = np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
-        if final_grid_shape_nd.ndim == 2 and grid_block.ndim == 1:
-            grid_block = grid_block.reshape(1, -1)
-        final_grid_shape_nd[row_offset:row_offset + n_rows] = grid_block
-        point_offset += n_points
-        row_offset += n_rows
-        reciprocal_point_count += int(snapshot["reciprocal_point_count"])
-        applied_set.update(
-            int(interval_id)
-            for interval_id in snapshot["incorporated_interval_ids"]
-        )
-        del snapshot, grid_block, snapshot_point_ids
-    if np.unique(np.asarray(final_point_ids)).shape[0] != int(total_points):
-        raise RuntimeError(
-            "Residual-field partition finalization produced duplicate point_ids "
-            f"for chunk={int(chunk_id)}."
-        )
-    snapshot_payload = {
-        "point_ids": final_point_ids,
-        "grid_shape_nd": final_grid_shape_nd,
-        "amplitudes_delta": final_delta,
-        "amplitudes_average": final_average,
-        "reciprocal_point_count": int(reciprocal_point_count),
-        "total_reciprocal_points": int(total_reciprocal_points),
-        "incorporated_interval_ids": tuple(sorted(applied_set)),
-    }
-    return snapshot_payload
 
 
 def validate_local_partition_snapshot_family(
@@ -984,11 +849,10 @@ class ManifestDrivenResidualFieldReducerBackend:
     def uses_local_chunk_accumulator(self) -> bool:
         return self.layout.kind == "local_restartable"
 
-    def uses_shared_durable_generations(self) -> bool:
-        return self.layout.kind == "durable_shared_restartable"
-
     def uses_owner_local_accumulator(self) -> bool:
-        return self.uses_local_chunk_accumulator() or self.uses_shared_durable_generations()
+        # local_restartable is the only layout since durable_shared_restartable
+        # was retired; every backend keeps an owner-local accumulator.
+        return self.uses_local_chunk_accumulator()
 
     def build_local_partial(
         self,
@@ -1040,16 +904,8 @@ class ManifestDrivenResidualFieldReducerBackend:
             committed_shard_storage=self.layout.committed_shard_storage,
             shard_compression=self.layout.shard_compression,
             durable_truth_unit="committed_local_snapshot_generation",
-            live_state_storage_role=(
-                "owner-local-live-accumulator"
-                if self.uses_local_chunk_accumulator()
-                else "owner-local-live-accumulator-with-shared-durable-generations"
-            ),
-            durable_checkpoint_storage_role=(
-                "durable-local-snapshot-generation"
-                if self.uses_local_chunk_accumulator()
-                else "durable-shared-generation"
-            ),
+            live_state_storage_role="owner-local-live-accumulator",
+            durable_checkpoint_storage_role="durable-local-snapshot-generation",
             final_artifact_storage_role="durable-final-chunk-artifact",
             uncommitted_restart_rule=self.layout.uncommitted_restart_rule,
         )
@@ -1062,8 +918,6 @@ class ManifestDrivenResidualFieldReducerBackend:
     ) -> str:
         if self.shard_storage_root_override is not None:
             return self.shard_storage_root_override
-        if self.layout.kind == "durable_shared_restartable":
-            return str(output_dir)
         root = scratch_root or str(Path(output_dir) / ".local_restartable")
         return str(Path(root).expanduser())
 
@@ -1075,12 +929,6 @@ class ManifestDrivenResidualFieldReducerBackend:
 
     def interval_artifacts_required_for_transport(self) -> bool:
         return self.layout.checkpoint_policy.interval_artifacts == "required_transport"
-
-    def shard_checkpoints_require_durable_storage(self) -> bool:
-        return (
-            self.layout.checkpoint_policy.shard_checkpoints
-            == "required_durable_checkpoint"
-        )
 
     def _local_accumulator_key(
         self,
@@ -1126,65 +974,6 @@ class ManifestDrivenResidualFieldReducerBackend:
         partition_id: int | None,
         include_payload: bool = True,
     ) -> tuple[int, dict[str, object]] | None:
-        if self.uses_shared_durable_generations():
-            generation_manifests = [
-                manifest
-                for manifest in self.discover_shard_manifests(
-                    output_dir=output_dir,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                )
-                if parse_residual_field_generation_ref(manifest) is not None
-            ]
-            if partition_id is not None:
-                generation_manifests = [
-                    manifest
-                    for manifest in generation_manifests
-                    if parse_residual_field_generation_ref(manifest)[0] == int(partition_id)
-                ]
-            elif generation_manifests:
-                generation_manifests = [
-                    manifest
-                    for manifest in generation_manifests
-                    if parse_residual_field_generation_ref(manifest)[0] is None
-                ]
-            if not generation_manifests:
-                return None
-            manifest = max(
-                generation_manifests,
-                key=lambda item: parse_residual_field_generation_ref(item)[1],
-            )
-            if include_payload:
-                payload = load_residual_field_generation_payload(manifest)
-                return int(payload["generation_seq"]), payload
-            generation_ref = parse_residual_field_generation_ref(manifest)
-            generation_seq = int(generation_ref[1]) if generation_ref is not None else 0
-            metadata = load_residual_field_generation_metadata(manifest)
-            return generation_seq, {
-                "partition_id": (
-                    int(generation_ref[0])
-                    if generation_ref is not None and generation_ref[0] is not None
-                    else None
-                ),
-                "generation_seq": generation_seq,
-                "incorporated_interval_ids": tuple(
-                    int(interval_id)
-                    for interval_id in manifest.contributing_interval_ids
-                ),
-                "reciprocal_point_count": int(
-                    manifest.contribution_reciprocal_point_count
-                ),
-                "total_reciprocal_points": int(
-                    manifest.total_reciprocal_point_count
-                ),
-                "checkpoint_write_count": int(generation_seq),
-                "checkpoint_bytes_written_total": int(
-                    metadata.get("checkpoint_bytes_written", 0)
-                ),
-                "checkpoint_wall_seconds_total": float(
-                    metadata.get("checkpoint_wall_seconds", 0.0)
-                ),
-            }
         progress = self.load_progress_manifest(
             output_dir=output_dir,
             chunk_id=chunk_id,
@@ -1439,7 +1228,7 @@ class ManifestDrivenResidualFieldReducerBackend:
         planned partition id to ``{"point_start", "point_stop",
         "interval_batches"}``. Returns the number of snapshots invalidated.
         """
-        if not self.uses_local_chunk_accumulator() or self.uses_shared_durable_generations():
+        if not self.uses_local_chunk_accumulator():
             return 0
         with chunk_mutex(chunk_id, lock_root=output_dir):
             progress = self.load_progress_manifest(
@@ -1569,73 +1358,11 @@ class ManifestDrivenResidualFieldReducerBackend:
         # delegator so call sites are unchanged.
         return _checkpoint_cadence_policy(
             total_expected_partials,
-            uses_shared_durable_generations=self.uses_shared_durable_generations(),
             partition_axis=partition_axis,
         )
 
     def _live_trim_cadence(self, checkpoint_cadence: int) -> int:
         return _live_trim_cadence_policy(checkpoint_cadence)
-
-    def _parse_generation_shard_key(
-        self,
-        shard_key: str,
-    ) -> tuple[int | None, int] | None:
-        match = _GENERATION_KEY_RE.search(str(shard_key))
-        if match is None:
-            return None
-        partition_token = match.group("partition_token")
-        partition_id = None if partition_token == "owner" else int(partition_token)
-        return partition_id, int(match.group("generation_seq"))
-
-    def _generation_metrics_for_target(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        partition_id: int | None,
-        scratch_root: str | None = None,
-    ) -> dict[str, object]:
-        manifests = [
-            manifest
-            for manifest in discover_residual_field_shard_manifests(
-                output_dir=output_dir,
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                shard_storage_root=self.resolve_shard_storage_root(
-                    output_dir=output_dir,
-                    scratch_root=scratch_root,
-                ),
-                include_stale_generations=True,
-            )
-            if (
-                parse_residual_field_generation_ref(manifest) is not None
-                and parse_residual_field_generation_ref(manifest)[0]
-                == (int(partition_id) if partition_id is not None else None)
-            )
-        ]
-        summary = summarize_residual_field_generation_metrics(manifests)
-        latest_manifest = None
-        if manifests:
-            latest_manifest = max(
-                manifests,
-                key=lambda item: parse_residual_field_generation_ref(item)[1],
-            )
-        latest_metadata = (
-            load_residual_field_generation_metadata(latest_manifest)
-            if latest_manifest is not None
-            else {}
-        )
-        return {
-            **summary,
-            "latest_generation_seq": int(latest_metadata.get("generation_seq") or 0),
-            "latest_checkpoint_bytes_written": int(
-                latest_metadata.get("checkpoint_bytes_written", 0)
-            ),
-            "latest_checkpoint_wall_seconds": float(
-                latest_metadata.get("checkpoint_wall_seconds", 0.0)
-            ),
-        }
 
     def _snapshot_local_accumulator(
         self,
@@ -1721,105 +1448,47 @@ class ManifestDrivenResidualFieldReducerBackend:
         output_dir = pending.output_dir
         db_path = pending.db_path
         cleanup_policy = pending.cleanup_policy
-        if self.uses_shared_durable_generations():
-            generation_manifest = persist_residual_field_generation_checkpoint(
-                chunk_id=accumulator.chunk_id,
-                parameter_digest=accumulator.parameter_digest,
-                partition_id=accumulator.partition_id,
-                generation_seq=snapshot_seq,
-                incorporated_interval_ids=tuple(
-                    int(v) for v in snapshot_payload["incorporated_interval_ids"]
+        local_snapshot_path = write_local_accumulator_snapshot(
+            output_dir,
+            chunk_id=accumulator.chunk_id,
+            parameter_digest=accumulator.parameter_digest,
+            partition_id=accumulator.partition_id,
+            snapshot_seq=snapshot_seq,
+            point_ids=snapshot_payload["point_ids"],
+            grid_shape_nd=snapshot_payload["grid_shape_nd"],
+            amplitudes_delta=snapshot_payload["amplitudes_delta"],
+            amplitudes_average=snapshot_payload["amplitudes_average"],
+            reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
+            total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
+            incorporated_interval_ids=snapshot_payload["incorporated_interval_ids"],
+            storage_mode=str(snapshot_payload["storage_mode"]),
+            checkpoint_write_count=int(accumulator.checkpoint_write_count) + 1,
+            checkpoint_bytes_written_total=int(
+                accumulator.checkpoint_bytes_written_total
+            ),
+            checkpoint_wall_seconds_total=float(
+                accumulator.checkpoint_wall_seconds_total
+            ),
+            checkpoint_cadence_batches=int(accumulator.checkpoint_cadence_batches),
+            point_start=accumulator.point_start,
+            point_stop=accumulator.point_stop,
+            accumulator_axis=getattr(accumulator, "accumulator_axis", "points"),
+        )
+        with self._local_accumulator_lock(pending.key):
+            accumulator.record_checkpoint_metrics(
+                bytes_written=int(local_snapshot_path.stat().st_size),
+                wall_seconds=0.0,
+                checkpoint_cadence_batches=max(
+                    1,
+                    int(accumulator.checkpoint_cadence_batches or 1),
                 ),
-                grid_shape_nd=np.asarray(snapshot_payload["grid_shape_nd"], dtype=np.int64),
-                reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-                total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
-                amplitudes_delta=np.asarray(snapshot_payload["amplitudes_delta"], dtype=np.complex128),
-                amplitudes_average=np.asarray(snapshot_payload["amplitudes_average"], dtype=np.complex128),
-                point_ids=np.asarray(snapshot_payload["point_ids"], dtype=np.int64),
-                output_dir=output_dir,
-                scratch_root=None,
-                shard_storage_root=self.resolve_shard_storage_root(
-                    output_dir=output_dir,
-                    scratch_root=None,
-                ),
-                point_start=accumulator.point_start,
-                point_stop=accumulator.point_stop,
-                # complex128 residuals are incompressible; zlib adds
-                # single-threaded CPU latency with <5% size reduction.
-                compress=False,
             )
-            generation_metrics = load_residual_field_generation_metadata(
-                generation_manifest
-            )
-            checkpoint_cadence_batches = max(
-                1,
-                int(accumulator.checkpoint_cadence_batches or 1),
-            )
-            with self._local_accumulator_lock(pending.key):
-                accumulator.record_checkpoint_metrics(
-                    bytes_written=int(
-                        generation_metrics.get("checkpoint_bytes_written", 0)
-                    ),
-                    wall_seconds=float(
-                        generation_metrics.get("checkpoint_wall_seconds", 0.0)
-                    ),
-                    checkpoint_cadence_batches=checkpoint_cadence_batches,
-                )
-            logger.info(
-                "Residual-field durable checkpoint | chunk=%d | partition=%s | seq=%d | cadence_batches=%d | max_recompute_batches=%d | bytes=%d | wall=%.3fs",
-                int(accumulator.chunk_id),
-                "owner"
-                if accumulator.partition_id is None
-                else int(accumulator.partition_id),
-                int(snapshot_seq),
-                checkpoint_cadence_batches,
-                checkpoint_cadence_batches,
-                int(generation_metrics.get("checkpoint_bytes_written", 0)),
-                float(generation_metrics.get("checkpoint_wall_seconds", 0.0)),
-            )
-            new_snapshot_key = generation_manifest.artifact_key
-        else:
-            local_snapshot_path = write_local_accumulator_snapshot(
-                output_dir,
-                chunk_id=accumulator.chunk_id,
-                parameter_digest=accumulator.parameter_digest,
-                partition_id=accumulator.partition_id,
-                snapshot_seq=snapshot_seq,
-                point_ids=snapshot_payload["point_ids"],
-                grid_shape_nd=snapshot_payload["grid_shape_nd"],
-                amplitudes_delta=snapshot_payload["amplitudes_delta"],
-                amplitudes_average=snapshot_payload["amplitudes_average"],
-                reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-                total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
-                incorporated_interval_ids=snapshot_payload["incorporated_interval_ids"],
-                storage_mode=str(snapshot_payload["storage_mode"]),
-                checkpoint_write_count=int(accumulator.checkpoint_write_count) + 1,
-                checkpoint_bytes_written_total=int(
-                    accumulator.checkpoint_bytes_written_total
-                ),
-                checkpoint_wall_seconds_total=float(
-                    accumulator.checkpoint_wall_seconds_total
-                ),
-                checkpoint_cadence_batches=int(accumulator.checkpoint_cadence_batches),
-                point_start=accumulator.point_start,
-                point_stop=accumulator.point_stop,
-                accumulator_axis=getattr(accumulator, "accumulator_axis", "points"),
-            )
-            with self._local_accumulator_lock(pending.key):
-                accumulator.record_checkpoint_metrics(
-                    bytes_written=int(local_snapshot_path.stat().st_size),
-                    wall_seconds=0.0,
-                    checkpoint_cadence_batches=max(
-                        1,
-                        int(accumulator.checkpoint_cadence_batches or 1),
-                    ),
-                )
-            new_snapshot_key = make_local_accumulator_snapshot_key(
-                chunk_id=accumulator.chunk_id,
-                parameter_digest=accumulator.parameter_digest,
-                partition_id=accumulator.partition_id,
-                snapshot_seq=snapshot_seq,
-            )
+        new_snapshot_key = make_local_accumulator_snapshot_key(
+            chunk_id=accumulator.chunk_id,
+            parameter_digest=accumulator.parameter_digest,
+            partition_id=accumulator.partition_id,
+            snapshot_seq=snapshot_seq,
+        )
         with chunk_mutex(accumulator.chunk_id, lock_root=output_dir):
             existing_progress = self.load_progress_manifest(
                 output_dir=output_dir,
@@ -1832,60 +1501,47 @@ class ManifestDrivenResidualFieldReducerBackend:
             if existing_progress is not None:
                 prior_interval_ids = existing_progress.incorporated_interval_ids
                 for key in existing_progress.incorporated_shard_keys:
-                    if self.uses_shared_durable_generations():
-                        generation_ref = self._parse_generation_shard_key(key)
-                        if (
-                            generation_ref is not None
-                            and generation_ref[0]
-                            == (
-                                int(accumulator.partition_id)
-                                if accumulator.partition_id is not None
-                                else None
+                    parsed = parse_local_accumulator_snapshot_key(key)
+                    if parsed is None:
+                        retained_snapshot_keys.append(key)
+                        continue
+                    (
+                        parsed_chunk_id,
+                        parsed_digest,
+                        parsed_partition_id,
+                        parsed_seq,
+                    ) = parsed
+                    if (
+                        parsed_chunk_id == int(accumulator.chunk_id)
+                        and parsed_digest == str(accumulator.parameter_digest)
+                        and parsed_partition_id
+                        == (
+                            int(accumulator.partition_id)
+                            if accumulator.partition_id is not None
+                            else None
+                        )
+                    ):
+                        # Fencing: a partition's manifest seq only ever
+                        # ADVANCES. A replacement owner sequences from
+                        # epoch * STRIDE, so a scheduler-declared-dead-
+                        # but-alive predecessor that tries to commit
+                        # after the remap lands here — loudly — instead
+                        # of racing the live owner's rename and dropping
+                        # its snapshot key from the family (which
+                        # finalize would only discover at the very end
+                        # of the run).
+                        if int(parsed_seq) >= int(snapshot_seq):
+                            raise RuntimeError(
+                                "Residual-field snapshot commit superseded: "
+                                f"chunk={int(accumulator.chunk_id)} "
+                                f"partition={accumulator.partition_id} already "
+                                f"has durable seq {int(parsed_seq)} >= "
+                                f"{int(snapshot_seq)} — a replacement owner "
+                                "has advanced this target; this process's "
+                                "ownership is stale."
                             )
-                        ):
-                            continue
-                    else:
-                        parsed = parse_local_accumulator_snapshot_key(key)
-                        if parsed is None:
-                            retained_snapshot_keys.append(key)
-                            continue
-                        (
-                            parsed_chunk_id,
-                            parsed_digest,
-                            parsed_partition_id,
-                            parsed_seq,
-                        ) = parsed
-                        if (
-                            parsed_chunk_id == int(accumulator.chunk_id)
-                            and parsed_digest == str(accumulator.parameter_digest)
-                            and parsed_partition_id
-                            == (
-                                int(accumulator.partition_id)
-                                if accumulator.partition_id is not None
-                                else None
-                            )
-                        ):
-                            # Fencing: a partition's manifest seq only ever
-                            # ADVANCES. A replacement owner sequences from
-                            # epoch * STRIDE, so a scheduler-declared-dead-
-                            # but-alive predecessor that tries to commit
-                            # after the remap lands here — loudly — instead
-                            # of racing the live owner's rename and dropping
-                            # its snapshot key from the family (which
-                            # finalize would only discover at the very end
-                            # of the run).
-                            if int(parsed_seq) >= int(snapshot_seq):
-                                raise RuntimeError(
-                                    "Residual-field snapshot commit superseded: "
-                                    f"chunk={int(accumulator.chunk_id)} "
-                                    f"partition={accumulator.partition_id} already "
-                                    f"has durable seq {int(parsed_seq)} >= "
-                                    f"{int(snapshot_seq)} — a replacement owner "
-                                    "has advanced this target; this process's "
-                                    "ownership is stale."
-                                )
-                            replaced_snapshot_seqs.append(int(parsed_seq))
-                            continue
+                        replaced_snapshot_seqs.append(int(parsed_seq))
+                        continue
                     retained_snapshot_keys.append(key)
             progress_manifest = _build_residual_field_reducer_progress_manifest(
                 output_dir=output_dir,
@@ -1922,21 +1578,20 @@ class ManifestDrivenResidualFieldReducerBackend:
             status_updater.mark_saved_many(
                 sorted(int(v) for v in newly_durable), int(accumulator.chunk_id)
             )
-        if not self.uses_shared_durable_generations():
-            # The manifest no longer references the replaced seqs; unlink
-            # their files (covers both the standard previous-seq case and a
-            # predecessor tenure's last snapshot after an epoch jump, which
-            # snapshot_seq - 1 alone would orphan on disk).
-            for stale_seq in set(replaced_snapshot_seqs) | {snapshot_seq - 1}:
-                if stale_seq <= 0 or stale_seq == snapshot_seq:
-                    continue
-                build_local_accumulator_snapshot_path(
-                    output_dir,
-                    chunk_id=accumulator.chunk_id,
-                    parameter_digest=accumulator.parameter_digest,
-                    partition_id=accumulator.partition_id,
-                    snapshot_seq=stale_seq,
-                ).unlink(missing_ok=True)
+        # The manifest no longer references the replaced seqs; unlink
+        # their files (covers both the standard previous-seq case and a
+        # predecessor tenure's last snapshot after an epoch jump, which
+        # snapshot_seq - 1 alone would orphan on disk).
+        for stale_seq in set(replaced_snapshot_seqs) | {snapshot_seq - 1}:
+            if stale_seq <= 0 or stale_seq == snapshot_seq:
+                continue
+            build_local_accumulator_snapshot_path(
+                output_dir,
+                chunk_id=accumulator.chunk_id,
+                parameter_digest=accumulator.parameter_digest,
+                partition_id=accumulator.partition_id,
+                snapshot_seq=stale_seq,
+            ).unlink(missing_ok=True)
 
     def accept_partial(
         self,
@@ -2039,7 +1694,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                 # never fire on the workload that motivated it). Where the
                 # scratch FS cannot reflink (ext4), file targets fall back
                 # to the synchronous flush.
-                if async_writes and not self.uses_shared_durable_generations():
+                if async_writes:
                     if not self._snapshot_writer().in_flight(key):
                         pending = None
                         if getattr(accumulator, "storage_mode", "ram") != "file":
@@ -2139,77 +1794,29 @@ class ManifestDrivenResidualFieldReducerBackend:
         snapshot_manifest_path = None
         if snapshot_state is not None:
             snapshot_seq, snapshot_payload = snapshot_state
-            if self.uses_shared_durable_generations():
-                generation_manifests = [
-                    manifest
-                    for manifest in self.discover_shard_manifests(
-                        output_dir=output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                    )
-                    if (
-                        parse_residual_field_generation_ref(manifest) is not None
-                        and parse_residual_field_generation_ref(manifest)[0]
-                        == (
-                            int(partition_id)
-                            if partition_id is not None
-                            else None
-                        )
-                    )
-                ]
-                if generation_manifests:
-                    latest_manifest = max(
-                        generation_manifests,
-                        key=lambda item: parse_residual_field_generation_ref(item)[1],
-                    )
-                    snapshot_path = next(
-                        (
-                            artifact.path
-                            for artifact in latest_manifest.artifacts
-                            if artifact.kind == "residual-shard-data"
-                        ),
-                        None,
-                    )
-                    snapshot_manifest_path = next(
-                        (
-                            artifact.path
-                            for artifact in latest_manifest.artifacts
-                            if artifact.kind == "residual-shard-manifest"
-                        ),
-                        None,
-                    )
-            else:
-                snapshot_path = str(
-                    build_local_accumulator_snapshot_path(
-                        output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        partition_id=partition_id,
-                        snapshot_seq=snapshot_seq,
-                    )
+            snapshot_path = str(
+                build_local_accumulator_snapshot_path(
+                    output_dir,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                    partition_id=partition_id,
+                    snapshot_seq=snapshot_seq,
                 )
-        if self.uses_shared_durable_generations():
-            checkpoint_metrics = self._generation_metrics_for_target(
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-                partition_id=partition_id,
             )
-        else:
-            snapshot_bytes = 0
-            if snapshot_path is not None:
-                try:
-                    snapshot_bytes = int(Path(snapshot_path).stat().st_size)
-                except OSError:
-                    pass
-            checkpoint_metrics = {
-                "total_checkpoint_bytes_written": snapshot_bytes,
-                "total_checkpoint_writes": int(snapshot_seq),
-                "total_checkpoint_wall_seconds": 0.0,
-                "latest_generation_seq": int(snapshot_seq),
-                "latest_checkpoint_bytes_written": snapshot_bytes,
-                "latest_checkpoint_wall_seconds": 0.0,
-            }
+        snapshot_bytes = 0
+        if snapshot_path is not None:
+            try:
+                snapshot_bytes = int(Path(snapshot_path).stat().st_size)
+            except OSError:
+                pass
+        checkpoint_metrics = {
+            "total_checkpoint_bytes_written": snapshot_bytes,
+            "total_checkpoint_writes": int(snapshot_seq),
+            "total_checkpoint_wall_seconds": 0.0,
+            "latest_generation_seq": int(snapshot_seq),
+            "latest_checkpoint_bytes_written": snapshot_bytes,
+            "latest_checkpoint_wall_seconds": 0.0,
+        }
         return {
             "chunk_id": int(chunk_id),
             "parameter_digest": str(parameter_digest),
@@ -2453,171 +2060,6 @@ class ManifestDrivenResidualFieldReducerBackend:
         if repaired_manifest is not None:
             return repaired_manifest
 
-        if self.uses_shared_durable_generations():
-            matching_keys = [
-                key
-                for key in list(self._local_accumulators)
-                if key[0] == int(chunk_id) and key[1] == str(parameter_digest)
-            ]
-            for key in matching_keys:
-                # Snapshot captures live array views (copy_arrays=False), so
-                # it MUST hold the per-target lock: the dead-owner rescue can
-                # leave a zombie fold running on a scheduler-evicted-but-
-                # alive worker, and an unlocked savez interleaving with its
-                # accept_contribution yields internally inconsistent
-                # amplitudes under a VALID interval set — the one corruption
-                # shape family validation cannot detect.
-                with self._local_accumulator_lock(key):
-                    accumulator = self._local_accumulators.get(key)
-                    if accumulator is None:
-                        continue
-                    if accumulator.current_interval_ids != accumulator.durable_interval_ids:
-                        self._snapshot_local_accumulator(
-                            accumulator,
-                            output_dir=output_dir,
-                            db_path=db_path,
-                            cleanup_policy=str(cleanup_policy or "off"),
-                        )
-            generation_manifests = [
-                manifest
-                for manifest in self.discover_shard_manifests(
-                    output_dir=output_dir,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    scratch_root=scratch_root,
-                )
-                if parse_residual_field_generation_ref(manifest) is not None
-            ]
-            if not generation_manifests:
-                return None
-            first_snapshot = load_residual_field_generation_payload(generation_manifests[0])
-            partitioned = first_snapshot.get("partition_id") is not None
-            if partitioned:
-                total_reciprocal_points = int(first_snapshot["total_reciprocal_points"])
-                del first_snapshot
-                sorted_manifests = sorted(
-                    generation_manifests,
-                    key=lambda m: (
-                        -1
-                        if parse_residual_field_generation_ref(m) is None
-                        else parse_residual_field_generation_ref(m)[0] or -1
-                    ),
-                )
-                scratch_dir = _finalize_scratch_dir(
-                    scratch_root,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                )
-                snapshot_payload = assemble_durable_generation_chunk_payload(
-                    sorted_manifests=sorted_manifests,
-                    total_reciprocal_points=total_reciprocal_points,
-                    scratch_dir=scratch_dir,
-                    chunk_id=chunk_id,
-                )
-                applied_set = set(
-                    int(x) for x in snapshot_payload["incorporated_interval_ids"]
-                )
-            else:
-                snapshot_payload = first_snapshot
-                applied_set = set(
-                    int(interval_id)
-                    for interval_id in snapshot_payload["incorporated_interval_ids"]
-                )
-            with chunk_mutex(chunk_id, lock_root=output_dir):
-                store = ResidualFieldArtifactStore(output_dir)
-                _write_residual_field_chunk_payload_components(
-                    store=store,
-                    chunk_id=chunk_id,
-                    point_ids=snapshot_payload["point_ids"],
-                    grid_shape_nd=snapshot_payload["grid_shape_nd"],
-                    amplitudes_delta=snapshot_payload["amplitudes_delta"],
-                    amplitudes_average=snapshot_payload["amplitudes_average"],
-                    reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-                    total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
-                    applied_set=applied_set,
-                )
-            representative_interval_id = max(
-                int(v) for v in snapshot_payload["incorporated_interval_ids"]
-            )
-            work_unit = ResidualFieldWorkUnit.interval_chunk(
-                interval_id=representative_interval_id,
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-            )
-            manifest = build_residual_field_chunk_manifest(
-                work_unit,
-                output_dir=output_dir,
-                completion_status=CompletionStatus.COMMITTED,
-            )
-            final_artifacts_present = _manifest_final_artifacts_present(manifest)
-            if not final_artifacts_present:
-                raise RuntimeError(
-                    "Residual-field generation finalization did not publish all final artifacts "
-                    f"for chunk={int(chunk_id)}."
-                )
-            progress_manifest = _build_residual_field_reducer_progress_manifest(
-                output_dir=output_dir,
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                completion_status=CompletionStatus.COMMITTED,
-                durable_truth_unit="committed_local_snapshot_generation",
-                incorporated_shard_keys=tuple(
-                    sorted(manifest_item.artifact_key for manifest_item in generation_manifests)
-                ),
-                incorporated_interval_ids=tuple(
-                    sorted(int(v) for v in snapshot_payload["incorporated_interval_ids"])
-                ),
-                reclaimable_shard_keys=tuple(
-                    sorted(manifest_item.artifact_key for manifest_item in generation_manifests)
-                ),
-                final_artifacts=manifest.artifacts,
-                pending_shard_keys=(),
-                pending_interval_ids=(),
-                cleanup_policy=str(cleanup_policy or "off"),
-            )
-            self.write_progress_manifest(progress_manifest)
-            if mark_intervals_saved:
-                _mark_residual_intervals_saved(
-                    db_path=db_path,
-                    chunk_id=chunk_id,
-                    interval_ids=tuple(
-                        int(v)
-                        for v in snapshot_payload["incorporated_interval_ids"]
-                    ),
-                )
-            deleted = self.cleanup_reclaimable_shards(
-                output_dir=output_dir,
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                db_path=db_path,
-                scratch_root=scratch_root,
-            )
-            metrics = summarize_residual_field_generation_metrics(
-                discover_residual_field_shard_manifests(
-                    output_dir=output_dir,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    shard_storage_root=self.resolve_shard_storage_root(
-                        output_dir=output_dir,
-                        scratch_root=scratch_root,
-                    ),
-                    include_stale_generations=True,
-                )
-            )
-            log_fn = logger.debug if quiet_logs else logger.info
-            log_fn(
-                "finalize-generations | chunk %d | targets=%d | checkpoint_writes=%d | checkpoint_bytes=%d | checkpoint_wall=%.3fs | deleted=%d",
-                chunk_id,
-                len(generation_manifests),
-                metrics["total_checkpoint_writes"],
-                metrics["total_checkpoint_bytes_written"],
-                metrics["total_checkpoint_wall_seconds"],
-                len(deleted),
-            )
-            for key in matching_keys:
-                self._release_local_accumulator(key)
-            return manifest
         if self.uses_local_chunk_accumulator():
             if scratch_root is None:
                 raise ValueError("Local accumulator finalization requires scratch_root.")
@@ -2628,8 +2070,12 @@ class ManifestDrivenResidualFieldReducerBackend:
             ]
             for key in matching_keys:
                 # Same locking contract as the flush path: capture over live
-                # array views may not interleave with a concurrent fold (see
-                # the durable_shared sweep above for the zombie-fold window).
+                # array views may not interleave with a concurrent fold. The
+                # dead-owner rescue can leave a zombie fold running on a
+                # scheduler-evicted-but-alive worker, and an unlocked savez
+                # interleaving with its accept_contribution yields internally
+                # inconsistent amplitudes under a VALID interval set — the one
+                # corruption shape family validation cannot detect.
                 with self._local_accumulator_lock(key):
                     accumulator = self._local_accumulators.get(key)
                     if accumulator is None:
@@ -2851,19 +2297,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             for key in matching_keys:
                 self._release_local_accumulator(key)
             return manifest
-        return reduce_residual_field_shards_for_chunk(
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            output_dir=output_dir,
-            db_path=db_path,
-            manifests=manifests,
-            cleanup_policy=cleanup_policy,
-            shard_storage_root=self.resolve_shard_storage_root(
-                output_dir=output_dir,
-                scratch_root=scratch_root,
-            ),
-            quiet_logs=quiet_logs,
-        )
+        return None
 
     def cleanup_reclaimable_shards(
         self,
@@ -2896,14 +2330,11 @@ def build_residual_field_reducer_backend(
     shard_storage_root_override: str | None = None,
     local_accumulator_max_ram_bytes: int = DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES,
 ) -> ManifestDrivenResidualFieldReducerBackend:
-    normalized = _normalize_reducer_backend_kind(kind)
-    layout = (
-        LOCAL_RESTARTABLE_LAYOUT
-        if normalized == "local_restartable"
-        else SHARED_DURABLE_LAYOUT
-    )
+    # Normalization raises for the retired durable_shared_restartable kind,
+    # so local_restartable is the only layout that can be built.
+    _normalize_reducer_backend_kind(kind)
     return ManifestDrivenResidualFieldReducerBackend(
-        layout,
+        LOCAL_RESTARTABLE_LAYOUT,
         shard_storage_root_override=shard_storage_root_override,
         local_accumulator_max_ram_bytes=local_accumulator_max_ram_bytes,
     )
@@ -3071,21 +2502,14 @@ def resolve_residual_field_reducer_backend_kind(
         override = os.getenv("MOSAIC_RESIDUAL_FIELD_REDUCER_BACKEND")
     if override is not None:
         return _normalize_reducer_backend_kind(str(override))
-    # Streaming stage-2 REQUIRES the owner-local reducer (amplitudes exist
-    # only inside worker accumulators), and the tile-owner architecture made
-    # it multi-node-safe: working accumulators live on node-local scratch,
-    # durable snapshots/checkpoints land in the shared output directory.
-    # The locality heuristic below predates that and would strand multi-node
-    # (MPI/SLURM) streaming runs on durable_shared, which streaming rejects.
-    from core.scattering.streaming import stage2_streaming_enabled
-
-    if stage2_streaming_enabled({"runtime_info": runtime_info}):
-        return "local_restartable"
-    return (
-        "local_restartable"
-        if is_same_node_local_client(client)
-        else "durable_shared_restartable"
-    )
+    # local_restartable is the only reducer layout. The tile-owner
+    # architecture made it multi-node-safe (working accumulators on
+    # node-local scratch, durable snapshots + progress manifests on the
+    # shared output dir), and the multi-node NON-streaming case was
+    # validated in the cluster sim on 2026-08-01 at max|diff| 1.7e-12 Å
+    # vs reference — retiring the locality heuristic that routed
+    # non-streaming distributed clients to durable_shared_restartable.
+    return "local_restartable"
 
 
 __all__ = [
