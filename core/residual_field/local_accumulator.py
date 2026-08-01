@@ -157,6 +157,45 @@ def _snapshot_member_array(data, npz_path: Path, member: str, dtype) -> np.ndarr
     return np.asarray(data[member], dtype=dtype)
 
 
+class SnapshotCloneUnsupported(RuntimeError):
+    """The scratch filesystem cannot reflink-clone the live memmap files."""
+
+
+_FICLONE = 0x40049409  # <linux/fs.h> FICLONE: same-FS copy-on-write clone
+
+
+def _reflink_clone_file(source: Path, destination: Path) -> None:
+    import fcntl
+
+    try:
+        with open(source, "rb") as src, open(destination, "wb") as dst:
+            fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+    except (OSError, AttributeError) as exc:
+        destination.unlink(missing_ok=True)
+        raise SnapshotCloneUnsupported(
+            f"reflink clone unavailable under {destination.parent}: {exc}"
+        ) from exc
+
+
+def _warn_torn_snapshot(snapshot_path: Path, exc: Exception) -> None:
+    """A TORN snapshot is treated like a missing one.
+
+    On power loss the rename can be durable while the data pages are not
+    (the writer now fsyncs, but pre-fix snapshots and non-journaled FS
+    remain); a fully missing file is handled gracefully everywhere (stale ->
+    recompute), so an unreadable one must be too — previously the BadZipFile
+    propagated and the run hard-failed until the operator deleted
+    residual_checkpoints/ by hand. Mirrors the stage-1 payload store's
+    self-healing reads."""
+    logger.warning(
+        "Residual-field snapshot %s is unreadable (%s: %s); treating it as "
+        "absent and recomputing.",
+        snapshot_path,
+        type(exc).__name__,
+        exc,
+    )
+
+
 def load_local_accumulator_snapshot(
     output_dir: str,
     *,
@@ -174,8 +213,20 @@ def load_local_accumulator_snapshot(
     )
     if not snapshot_path.exists():
         return None
-    with np.load(snapshot_path, allow_pickle=False) as data:
-        return {
+    try:
+        with np.load(snapshot_path, allow_pickle=False) as data:
+            return _snapshot_payload_dict(
+                data, snapshot_path, partition_id=partition_id, snapshot_seq=snapshot_seq
+            )
+    except Exception as exc:
+        _warn_torn_snapshot(snapshot_path, exc)
+        return None
+
+
+def _snapshot_payload_dict(
+    data, snapshot_path: Path, *, partition_id: int | None, snapshot_seq: int
+) -> dict[str, object]:
+    return {
             "point_ids": _snapshot_member_array(
                 data, snapshot_path, "point_ids", np.int64
             ),
@@ -244,8 +295,20 @@ def load_local_accumulator_snapshot_metadata(
     )
     if not snapshot_path.exists():
         return None
-    with np.load(snapshot_path, allow_pickle=False) as data:
-        return {
+    try:
+        with np.load(snapshot_path, allow_pickle=False) as data:
+            return _snapshot_metadata_dict(
+                data, partition_id=partition_id, snapshot_seq=snapshot_seq
+            )
+    except Exception as exc:
+        _warn_torn_snapshot(snapshot_path, exc)
+        return None
+
+
+def _snapshot_metadata_dict(
+    data, *, partition_id: int | None, snapshot_seq: int
+) -> dict[str, object]:
+    return {
             "reciprocal_point_count": int(np.asarray(data["reciprocal_point_count"]).ravel()[0]),
             "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
             "incorporated_interval_ids": tuple(
@@ -355,7 +418,22 @@ def write_local_accumulator_snapshot(
             point_stop=np.array([-1 if point_stop is None else int(point_stop)], dtype=np.int64),
             accumulator_axis=np.array([str(accumulator_axis)]),
         )
+        # fsync BEFORE rename: the progress manifest referencing this seq is
+        # fully fsync'd (file + parent), so without this the manifest's
+        # parent-dir fsync could durably commit the rename of a snapshot
+        # whose data pages never hit disk — a torn file a crash-resume then
+        # trips over.
+        handle.flush()
+        os.fsync(handle.fileno())
     Path(handle.name).replace(snapshot_path)
+    try:
+        dir_fd = os.open(snapshot_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
     return snapshot_path
 
 
@@ -758,6 +836,42 @@ class LiveLocalAccumulator:
         payload["amplitudes_average"] = np.array(
             self.amplitudes_average, dtype=np.complex128, copy=True
         )
+        return payload
+
+    def capture_snapshot_payload_file_clone(self) -> dict[str, object]:
+        """File-mode async capture: reflink-clone (copy-on-write) the live
+        memmap backing files so the writer thread savez's a FROZEN view
+        while folds continue.
+
+        A RAM-style copy of a GB-scale file target would cost as much as
+        the write it hides and allocate the very RSS file mode exists to
+        avoid; a reflink clone is O(1) under the per-target lock on
+        XFS/btrfs/NFS4.2. Raises SnapshotCloneUnsupported where the scratch
+        filesystem cannot reflink (ext4) — the caller falls back to the
+        synchronous flush. The clone files are unlinked after the commit."""
+        if self.storage_mode != "file" or self.live_dir is None:
+            raise SnapshotCloneUnsupported("no file-mode live dir to clone")
+        payload = self.snapshot_payload()
+        capture_tag = f"capture_seq_{self.next_snapshot_seq()}"
+        clone_paths: list[Path] = []
+        try:
+            for member, array in (
+                ("amplitudes_delta", self.amplitudes_delta),
+                ("amplitudes_average", self.amplitudes_average),
+            ):
+                flush = getattr(array, "flush", None)
+                if callable(flush):
+                    flush()
+                source = self.live_dir / f"{member}.npy"
+                clone = self.live_dir / f"{member}.{capture_tag}.clone.npy"
+                _reflink_clone_file(source, clone)
+                clone_paths.append(clone)
+                payload[member] = np.load(clone, mmap_mode="r")
+        except SnapshotCloneUnsupported:
+            for clone_path in clone_paths:
+                clone_path.unlink(missing_ok=True)
+            raise
+        payload["_clone_paths"] = tuple(clone_paths)
         return payload
 
     def mark_snapshot_captured(self) -> None:

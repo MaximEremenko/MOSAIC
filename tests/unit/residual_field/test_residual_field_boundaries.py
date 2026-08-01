@@ -294,6 +294,7 @@ class _FakeLocalReducerBackend:
         cleanup_policy=None,
         scratch_root=None,
         quiet_logs=False,
+        expected_interval_ids=None,
     ):
         return None
 

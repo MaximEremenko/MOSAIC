@@ -11,9 +11,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from core.residual_field.accumulation import (
-    build_existing_materialized_residual_field_state,
-)
 from core.residual_field.artifacts import (
     _ResidualFieldChunkStatusUpdater,
     _build_residual_field_reducer_progress_manifest,
@@ -39,6 +36,7 @@ from core.residual_field.artifacts import (
 from core.residual_field.local_accumulator import (
     LiveLocalAccumulator,
     ResidualFieldLocalAccumulatorPartial,
+    SnapshotCloneUnsupported,
     build_local_accumulator_snapshot_path,
     load_local_accumulator_snapshot,
     load_local_accumulator_snapshot_metadata,
@@ -1653,7 +1651,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             output_dir=output_dir,
             db_path=db_path,
             cleanup_policy=cleanup_policy,
-            copy_arrays=False,
+            capture_mode="view",
         )
         self._commit_local_snapshot(pending)
 
@@ -1664,18 +1662,21 @@ class ManifestDrivenResidualFieldReducerBackend:
         output_dir: str,
         db_path: str,
         cleanup_policy: str,
-        copy_arrays: bool,
+        capture_mode: str,
     ) -> _PendingLocalSnapshot:
-        """Runs UNDER the per-target lock. copy_arrays=True materializes
-        private array copies so the commit may run on the writer thread
-        while folds continue; False keeps live views for the synchronous
-        path (no extra memory)."""
+        """Runs UNDER the per-target lock. capture_mode='copy' materializes
+        private array copies (RAM targets) and 'clone' reflink-clones the
+        memmap backing files (file targets) so the commit may run on the
+        writer thread while folds continue; 'view' keeps live views for the
+        synchronous path (no extra memory). 'clone' raises
+        SnapshotCloneUnsupported on filesystems without reflink."""
         snapshot_seq = accumulator.next_snapshot_seq()
-        payload = (
-            accumulator.capture_snapshot_payload()
-            if copy_arrays
-            else accumulator.snapshot_payload()
-        )
+        if capture_mode == "copy":
+            payload = accumulator.capture_snapshot_payload()
+        elif capture_mode == "clone":
+            payload = accumulator.capture_snapshot_payload_file_clone()
+        else:
+            payload = accumulator.snapshot_payload()
         accumulator.mark_snapshot_captured()
         return _PendingLocalSnapshot(
             key=self._local_accumulator_key(
@@ -1693,6 +1694,19 @@ class ManifestDrivenResidualFieldReducerBackend:
             db_path=str(db_path),
             cleanup_policy=str(cleanup_policy),
         )
+
+    def _commit_and_release_clones(self, pending: _PendingLocalSnapshot) -> None:
+        """Writer-thread commit for clone/copy captures: after the durable
+        commit (or its failure), unlink the reflink clone files a file-mode
+        capture left in the live dir."""
+        try:
+            self._commit_local_snapshot(pending)
+        finally:
+            for clone_path in pending.payload.get("_clone_paths", ()):
+                try:
+                    Path(clone_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _commit_local_snapshot(self, pending: _PendingLocalSnapshot) -> None:
         """The durable commit sequence, byte-identical to the historical
@@ -1898,37 +1912,6 @@ class ManifestDrivenResidualFieldReducerBackend:
             )
             previous_snapshot_path.unlink(missing_ok=True)
 
-    def _build_local_materialized_state(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        snapshot_payload: dict[str, object],
-    ):
-        return build_existing_materialized_residual_field_state(
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            output_artifacts=build_residual_field_output_artifact_refs(output_dir, chunk_id),
-            amplitudes_payload=np.column_stack(
-                (
-                    np.asarray(snapshot_payload["point_ids"], dtype=np.int64).astype(np.complex128),
-                    np.asarray(snapshot_payload["amplitudes_delta"], dtype=np.complex128),
-                )
-            ),
-            amplitudes_average_payload=np.column_stack(
-                (
-                    np.asarray(snapshot_payload["point_ids"], dtype=np.int64).astype(np.complex128),
-                    np.asarray(snapshot_payload["amplitudes_average"], dtype=np.complex128),
-                )
-            ),
-            grid_shape_nd=np.asarray(snapshot_payload["grid_shape_nd"], dtype=np.int64),
-            reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-            applied_interval_ids=tuple(
-                int(interval_id) for interval_id in snapshot_payload["incorporated_interval_ids"]
-            ),
-        )
-
     def accept_partial(
         self,
         partial: ResidualFieldLocalAccumulatorPartial,
@@ -2018,32 +2001,61 @@ class ManifestDrivenResidualFieldReducerBackend:
             flushed = False
             captured = False
             if accumulator.accepted_since_snapshot >= snapshot_every:
-                # Async capture copies the amplitude arrays. That is a win
-                # only for RAM-mode targets (memcpy << savez); a file-backed
-                # target's copy would cost as much as the write it hides AND
-                # allocate the very RSS the file mode exists to avoid — so
-                # file mode keeps the synchronous flush.
-                if (
-                    async_writes
-                    and not self.uses_shared_durable_generations()
-                    and getattr(accumulator, "storage_mode", "ram") != "file"
-                ):
+                # RAM targets capture by private copy (memcpy << savez).
+                # File targets capture by reflink-cloning their memmap
+                # backing files — O(1) copy-on-write on XFS/btrfs/NFS4.2 —
+                # so the multi-second savez of a GB-scale accumulator no
+                # longer blocks folds (hkl40-scale targets are ALWAYS
+                # file-mode; the old RAM-only gate meant the writer could
+                # never fire on the workload that motivated it). Where the
+                # scratch FS cannot reflink (ext4), file targets fall back
+                # to the synchronous flush.
+                if async_writes and not self.uses_shared_durable_generations():
                     if not self._snapshot_writer().in_flight(key):
-                        pending = self._capture_local_snapshot(
-                            accumulator,
-                            output_dir=output_dir,
-                            db_path=db_path,
-                            cleanup_policy=cleanup_policy,
-                            copy_arrays=True,
-                        )
-                        self._snapshot_writer().submit(
-                            key,
-                            lambda pending=pending: self._commit_local_snapshot(
-                                pending
-                            ),
-                        )
-                        accumulator.trim_live_memory()
-                        captured = True
+                        pending = None
+                        if getattr(accumulator, "storage_mode", "ram") != "file":
+                            pending = self._capture_local_snapshot(
+                                accumulator,
+                                output_dir=output_dir,
+                                db_path=db_path,
+                                cleanup_policy=cleanup_policy,
+                                capture_mode="copy",
+                            )
+                        elif getattr(self, "_file_clone_captures_usable", True):
+                            try:
+                                pending = self._capture_local_snapshot(
+                                    accumulator,
+                                    output_dir=output_dir,
+                                    db_path=db_path,
+                                    cleanup_policy=cleanup_policy,
+                                    capture_mode="clone",
+                                )
+                            except SnapshotCloneUnsupported as exc:
+                                self._file_clone_captures_usable = False
+                                logger.info(
+                                    "Residual-field async snapshots: %s; "
+                                    "file-mode targets use the synchronous "
+                                    "flush.",
+                                    exc,
+                                )
+                        if pending is not None:
+                            self._snapshot_writer().submit(
+                                key,
+                                lambda pending=pending: self._commit_and_release_clones(
+                                    pending
+                                ),
+                            )
+                            accumulator.trim_live_memory()
+                            captured = True
+                        else:
+                            flushed = self.flush_local_reducer_target(
+                                chunk_id=work_unit.chunk_id,
+                                parameter_digest=work_unit.parameter_digest,
+                                partition_id=work_unit.partition_id,
+                                output_dir=output_dir,
+                                db_path=db_path,
+                                cleanup_policy=cleanup_policy,
+                            )
                     # else: a write is already in flight — keep folding;
                     # the cadence counter re-arms after that commit.
                 else:
@@ -2419,16 +2431,24 @@ class ManifestDrivenResidualFieldReducerBackend:
                 if key[0] == int(chunk_id) and key[1] == str(parameter_digest)
             ]
             for key in matching_keys:
-                accumulator = self._local_accumulators.get(key)
-                if accumulator is None:
-                    continue
-                if accumulator.current_interval_ids != accumulator.durable_interval_ids:
-                    self._snapshot_local_accumulator(
-                        accumulator,
-                        output_dir=output_dir,
-                        db_path=db_path,
-                        cleanup_policy=str(cleanup_policy or "off"),
-                    )
+                # Snapshot captures live array views (copy_arrays=False), so
+                # it MUST hold the per-target lock: the dead-owner rescue can
+                # leave a zombie fold running on a scheduler-evicted-but-
+                # alive worker, and an unlocked savez interleaving with its
+                # accept_contribution yields internally inconsistent
+                # amplitudes under a VALID interval set — the one corruption
+                # shape family validation cannot detect.
+                with self._local_accumulator_lock(key):
+                    accumulator = self._local_accumulators.get(key)
+                    if accumulator is None:
+                        continue
+                    if accumulator.current_interval_ids != accumulator.durable_interval_ids:
+                        self._snapshot_local_accumulator(
+                            accumulator,
+                            output_dir=output_dir,
+                            db_path=db_path,
+                            cleanup_policy=str(cleanup_policy or "off"),
+                        )
             generation_manifests = [
                 manifest
                 for manifest in self.discover_shard_manifests(
@@ -2578,32 +2598,31 @@ class ManifestDrivenResidualFieldReducerBackend:
                 if key[0] == int(chunk_id) and key[1] == str(parameter_digest)
             ]
             for key in matching_keys:
-                accumulator = self._local_accumulators.get(key)
-                if accumulator is None:
-                    continue
-                if accumulator.current_interval_ids != accumulator.durable_interval_ids:
-                    self._snapshot_local_accumulator(
-                        accumulator,
-                        output_dir=output_dir,
-                        db_path=db_path,
-                        cleanup_policy=str(cleanup_policy or "off"),
-                    )
+                # Same locking contract as the flush path: capture over live
+                # array views may not interleave with a concurrent fold (see
+                # the durable_shared sweep above for the zombie-fold window).
+                with self._local_accumulator_lock(key):
+                    accumulator = self._local_accumulators.get(key)
+                    if accumulator is None:
+                        continue
+                    if accumulator.current_interval_ids != accumulator.durable_interval_ids:
+                        self._snapshot_local_accumulator(
+                            accumulator,
+                            output_dir=output_dir,
+                            db_path=db_path,
+                            cleanup_policy=str(cleanup_policy or "off"),
+                        )
             snapshot_refs = self._latest_local_snapshot_refs(
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
                 output_dir=output_dir,
             )
             if not snapshot_refs:
-                accumulator = self._restore_local_accumulator(
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    output_dir=output_dir,
-                    scratch_root=scratch_root,
-                    partition_id=None,
-                )
-                if accumulator is None:
-                    return None
-                snapshot_refs = [(None, int(accumulator.durable_snapshot_seq))]
+                # No committed snapshot keys in the progress manifest. The
+                # old owner-restore fallback read the SAME manifest and so
+                # could never produce a snapshot either — removed as
+                # unreachable.
+                return None
             snapshot_metadata: list[tuple[int | None, int, dict[str, object]]] = []
             for partition_id, snapshot_seq in snapshot_refs:
                 metadata = load_local_accumulator_snapshot_metadata(
@@ -2635,17 +2654,21 @@ class ManifestDrivenResidualFieldReducerBackend:
                     "directory and re-run to recompute this chunk."
                 )
             family_axis = family_axes.pop() if family_axes else "points"
-            if partitioned and opportunistic:
+            if opportunistic and (partitioned or expected_interval_ids is None):
                 # Startup recovery runs BEFORE planning. Partition snapshots
                 # flush on independent cadences, so a mid-run crash routinely
                 # leaves them with different interval subsets and possibly a
-                # missing tail partition -- states the residual stage recovers
-                # from, but that cannot be validated (or safely published)
-                # without the plan. Defer to the stage.
+                # missing tail partition -- and a NON-partitioned owner-level
+                # snapshot just as routinely covers a strict subset of the
+                # chunk's intervals (cadence flushes). Publishing either as
+                # COMMITTED would credit the partial set and silently drop
+                # the pre-crash amplitudes when the completion run overwrites
+                # the chunk. Coverage is only provable against the plan;
+                # defer to the stage.
                 log_fn = logger.debug if quiet_logs else logger.info
                 log_fn(
-                    "Residual-field startup recovery deferring partitioned "
-                    "chunk %d to the residual stage (family completeness is "
+                    "Residual-field startup recovery deferring chunk %d to "
+                    "the residual stage (family/coverage completeness is "
                     "only provable against the plan).",
                     int(chunk_id),
                 )
@@ -2699,6 +2722,15 @@ class ManifestDrivenResidualFieldReducerBackend:
                     int(interval_id)
                     for interval_id in snapshot_payload["incorporated_interval_ids"]
                 )
+                if expected_interval_ids is not None:
+                    expected_set = {int(v) for v in expected_interval_ids}
+                    if applied_set != expected_set:
+                        raise RuntimeError(
+                            "Residual-field local finalization coverage "
+                            f"mismatch for chunk={int(chunk_id)}: "
+                            f"missing={sorted(expected_set - applied_set)} "
+                            f"unexpected={sorted(applied_set - expected_set)}."
+                        )
             with chunk_mutex(chunk_id, lock_root=output_dir):
                 store = ResidualFieldArtifactStore(output_dir)
                 _write_residual_field_chunk_payload_components(

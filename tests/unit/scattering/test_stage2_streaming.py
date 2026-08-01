@@ -367,3 +367,46 @@ class TestBatchMajorOrdering:
         assert [
             (tuple(unit.interval_ids), int(unit.chunk_id)) for unit in ordered
         ] == [((1, 2), 0), ((1, 2), 1), ((3, 4), 0), ((3, 4), 1)]
+
+    def test_owner_keyed_interleave_covers_workers_when_count_divides_chunks(self):
+        """hkl40's degenerate shape: W workers, C chunks, W divides C.
+
+        The (slot,chunk) owner map collapses to worker = chunk mod W there,
+        and every slot queue's head is the lowest chunk — slot-keyed
+        interleave then submits the first S units to ONE worker. Keying the
+        round-robin by resolved owner must cover all W workers within the
+        first W submissions regardless of prefetch."""
+        from core.residual_field.execution import (
+            _sort_streaming_work_units_batch_major,
+            _streaming_slot_owner_map,
+        )
+
+        workers = [f"tcp://w{i}" for i in range(4)]
+        chunks = range(4)
+        slots = range(8)
+        units = [
+            self._unit((10 * slot + 1, 10 * slot + 2), chunk, slot)
+            for slot in slots
+            for chunk in chunks
+        ]
+        target_keys = [(int(u.chunk_id), u.partition_id) for u in units]
+        owners = _streaming_slot_owner_map(target_keys, workers)
+
+        ordered = _sort_streaming_work_units_batch_major(
+            units, target_owners=owners
+        )
+        first_owners = {
+            owners[(int(unit.chunk_id), unit.partition_id)]
+            for unit in ordered[: len(workers)]
+        }
+        assert first_owners == set(workers), (
+            "first W submissions must land on W distinct workers"
+        )
+        # locality invariant survives: each owner's own queue stays batch-major
+        for worker in workers:
+            per_owner = [
+                (tuple(unit.interval_ids), int(unit.chunk_id))
+                for unit in ordered
+                if owners[(int(unit.chunk_id), unit.partition_id)] == worker
+            ]
+            assert per_owner == sorted(per_owner)

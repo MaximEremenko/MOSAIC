@@ -24,7 +24,6 @@ from core.runtime import (
     nufft_task_resources,
     profile_output_filesystem,
     progress_bar,
-    require_chunk_quiescence,
     require_gpu_admission,
     register_cleanup_plugin,
     resolve_nufft_execution_settings,
@@ -49,14 +48,7 @@ from core.residual_field.contracts import (
     ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
 )
-from core.residual_field.commit import (
-    build_residual_work_unit_digest,
-    discover_residual_attempts,
-    load_residual_attempt_payload,
-    write_residual_stage_commit,
-    write_residual_stage_plan,
-)
-from core.residual_field import commit as residual_commit
+from core.residual_field.commit import build_residual_work_unit_digest
 from core.residual_field.artifacts import (
     discover_residual_field_reducer_progress_manifest,
     summarize_residual_field_output_artifacts,
@@ -80,9 +72,7 @@ from core.storage.digests import digest_dict
 from core.storage.run_state_cache import (
     pending_residual_interval_chunks,
     rebuild_sqlite_cache_from_manifests,
-    scan_run_state,
 )
-from core.runtime.nufft_policy import nufft_task_retries
 from core.residual_field.runtime_policy import (
     DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES,
     _cleanup_residual_attempts_enabled,
@@ -320,32 +310,6 @@ def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
     )
 
 
-def _residual_attempt_digests_for_chunk(
-    planned_work_units: list[ResidualFieldWorkUnit],
-    *,
-    chunk_id: int,
-) -> tuple[str, ...]:
-    digests: list[str] = []
-    for work_unit in planned_work_units:
-        if int(work_unit.chunk_id) != int(chunk_id):
-            continue
-        required = (
-            work_unit.run_digest,
-            work_unit.partition_id,
-            work_unit.point_start,
-            work_unit.point_stop,
-            work_unit.partition_plan_digest,
-            work_unit.source_scattering_commit_digest,
-            work_unit.backend_policy_digest,
-            work_unit.expected_output_digest,
-        )
-        if any(value is None for value in required):
-            return ()
-        digests.append(_residual_work_unit_digest(work_unit))
-    return tuple(sorted(digests))
-
-
-
 def _expected_partition_family_for_chunk(
     planned_work_units: list[ResidualFieldWorkUnit],
     *,
@@ -566,6 +530,7 @@ def _prewarm_stage1_store_if_enabled(
 
 def _sort_streaming_work_units_batch_major(
     work_units: list[ResidualFieldWorkUnit],
+    target_owners: dict[tuple[int, int | None], str] | None = None,
 ) -> list[ResidualFieldWorkUnit]:
     """Batch-major submission order for streaming work units.
 
@@ -577,12 +542,16 @@ def _sort_streaming_work_units_batch_major(
     batch's payloads at a time. Chunk-major (plan) order would instead touch
     every batch once per chunk and thrash the memo.
 
-    Across OWNERS the order is round-robin by subchunk slot: pure batch-major
-    ordering front-loads one shard's units, so with an in-flight window of W
-    only ceil(W / num_chunks) owners ever had work — measured on hkl40 as
-    exactly 2 of 4 GPUs busy at prefetch 2. Interleaving keeps each owner's
-    OWN queue batch-major (the memo/lattice-cache locality is per worker) while
-    the first S submissions cover S distinct slots."""
+    Across queues the round-robin is keyed by the RESOLVED OWNER, not the
+    slot: slot-keyed interleave degenerates whenever worker count divides
+    chunk count (hkl40's 4 chunks on 4 GPUs), because (slot*C + c) mod W
+    collapses to chunk-only placement and every slot queue's head is the
+    lowest chunk — the first S in-flight units all land on ONE worker unless
+    prefetch covers ~3S units. Owner-keyed queues make the first W
+    submissions cover W distinct workers at any prefetch, while each owner's
+    OWN queue stays batch-major (the memo/lattice-cache locality is per
+    worker). Falls back to slot keying when no owner map exists (sync
+    clients)."""
     batch_major = sorted(
         work_units,
         key=lambda work_unit: (
@@ -590,9 +559,18 @@ def _sort_streaming_work_units_batch_major(
             int(work_unit.chunk_id),
         ),
     )
+    if target_owners:
+        def _queue_key(work_unit):
+            return target_owners.get(
+                (int(work_unit.chunk_id), work_unit.partition_id),
+                work_unit.partition_id,
+            )
+    else:
+        def _queue_key(work_unit):
+            return work_unit.partition_id
     slot_queues: "OrderedDict[object, list[ResidualFieldWorkUnit]]" = OrderedDict()
     for work_unit in batch_major:
-        slot_queues.setdefault(work_unit.partition_id, []).append(work_unit)
+        slot_queues.setdefault(_queue_key(work_unit), []).append(work_unit)
     if len(slot_queues) <= 1:
         return batch_major
     interleaved: list[ResidualFieldWorkUnit] = []
@@ -749,6 +727,137 @@ def _validate_local_durable_coverage_or_raise(
     return resolved_states
 
 
+def _dead_cluster_horizon_seconds() -> float:
+    try:
+        return max(
+            60.0,
+            float(os.getenv("MOSAIC_RESIDUAL_DEAD_CLUSTER_HORIZON_SECONDS", "900")),
+        )
+    except ValueError:
+        return 900.0
+
+
+def _barrier_future_ok(future) -> bool:
+    status = getattr(future, "status", None)
+    if status is not None and status != "finished":
+        return False
+    try:
+        result = future.result()
+    except Exception:
+        return False
+    return result is not None and result is not False
+
+
+def _drain_owner_pinned_barrier(
+    *,
+    client,
+    futures_by_key: dict,
+    owner_by_key: dict,
+    resubmit,
+    barrier_name: str,
+    timeout_seconds: float = 45.0,
+):
+    """Yield (key, future, ok) for owner-pinned barrier futures, rescuing any
+    whose pinned worker left the cluster.
+
+    A future pinned with workers=[owner], allow_other_workers=False whose only
+    allowed worker died parks in no-worker state as 'pending' FOREVER (nanny
+    restarts come back on NEW addresses), so a bare as_completed here hangs
+    the driver — the same failure the fold drain loop already rescues; the
+    flush/inspect/finalize barriers after it did not. Waits in bounded slices,
+    cancels futures pinned to dead owners, and resubmits via
+    ``resubmit(key, new_owner)`` on a live worker. Raises if the cluster has
+    no live workers for longer than the dead-cluster horizon."""
+    if client is None or is_sync_client(client):
+        reverse = {future: key for key, future in futures_by_key.items()}
+        for future, _ok in yield_futures_with_results(
+            list(futures_by_key.values()), client
+        ):
+            key = reverse.get(future)
+            if key is not None:
+                yield key, future, _barrier_future_ok(future)
+        return
+    from distributed import wait as _distributed_wait
+
+    pending = dict(futures_by_key)
+    owners = dict(owner_by_key)
+    dead_since: float | None = None
+    rescued = 0
+    while pending:
+        live = _current_worker_addresses(client)
+        if not live:
+            now = time.monotonic()
+            if dead_since is None:
+                dead_since = now
+            elif now - dead_since >= _dead_cluster_horizon_seconds():
+                raise RuntimeError(
+                    f"Residual-field {barrier_name} barrier: no live workers "
+                    f"for {_dead_cluster_horizon_seconds():.0f}s with "
+                    f"{len(pending)} owner-pinned task(s) outstanding."
+                )
+            time.sleep(min(5.0, timeout_seconds))
+            continue
+        dead_since = None
+        live_set = set(live)
+        for key, future in list(pending.items()):
+            status = getattr(future, "status", "")
+            if status in ("finished", "error"):
+                continue
+            owner = owners.get(key)
+            if status not in ("cancelled", "lost") and (
+                owner is None or owner in live_set
+            ):
+                continue
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            new_owner = live[rescued % len(live)]
+            rescued += 1
+            logger.warning(
+                "Residual-field %s barrier: owner %s for %s is gone; "
+                "resubmitting on %s",
+                barrier_name,
+                owner,
+                key,
+                new_owner,
+            )
+            pending[key] = resubmit(key, new_owner)
+            owners[key] = new_owner
+        try:
+            _distributed_wait(
+                list(pending.values()),
+                timeout=timeout_seconds,
+                return_when="FIRST_COMPLETED",
+            )
+        except TimeoutError:
+            continue
+        except Exception:
+            # Comm hiccups/test doubles can make wait() raise immediately —
+            # take one completion through the blocking generator instead of
+            # spinning on retry.
+            for future, ok in yield_futures_with_results(
+                list(pending.values()), client
+            ):
+                for key, pending_future in list(pending.items()):
+                    if pending_future is future:
+                        del pending[key]
+                        yield key, future, ok
+                        break
+                break
+            continue
+        for key, future in list(pending.items()):
+            done = getattr(future, "done", None)
+            try:
+                is_done = future.done() if callable(done) else True
+            except Exception:
+                is_done = True
+            if not is_done:
+                continue
+            del pending[key]
+            yield key, future, _barrier_future_ok(future)
+
+
 def _inspect_owner_local_reducer_targets_or_raise(
     *,
     client,
@@ -766,21 +875,11 @@ def _inspect_owner_local_reducer_targets_or_raise(
             "Residual-field owner-local finalize requires per-target inspection support "
             "before publishing chunk artifacts."
         )
-    inspect_futures = []
-    target_keys_by_future = {}
     worker_addresses = _current_worker_addresses(client)
-    for chunk_id, partition_id in target_keys:
-        owner_address = _resolve_owner_address(
-            target_key=(int(chunk_id), partition_id),
-            target_owners=target_owners,
-            worker_addresses=worker_addresses,
-        )
-        if owner_address is None:
-            raise RuntimeError(
-                "Residual-field owner-local finalize requires target ownership for "
-                f"reducer target {(int(chunk_id), partition_id)}."
-            )
-        future = client.submit(
+
+    def _submit_inspect(target_key, owner_address):
+        chunk_id, partition_id = target_key
+        return client.submit(
             inspect_helper,
             template_backend,
             chunk_id=int(chunk_id),
@@ -791,16 +890,37 @@ def _inspect_owner_local_reducer_targets_or_raise(
             workers=[owner_address],
             allow_other_workers=False,
         )
-        inspect_futures.append(future)
-        target_keys_by_future[future] = (int(chunk_id), partition_id)
+
+    futures_by_key = {}
+    owner_by_key = {}
+    for chunk_id, partition_id in target_keys:
+        target_key = (int(chunk_id), partition_id)
+        owner_address = _resolve_owner_address(
+            target_key=target_key,
+            target_owners=target_owners,
+            worker_addresses=worker_addresses,
+        )
+        if owner_address is None:
+            raise RuntimeError(
+                "Residual-field owner-local finalize requires target ownership for "
+                f"reducer target {target_key}."
+            )
+        futures_by_key[target_key] = _submit_inspect(target_key, owner_address)
+        owner_by_key[target_key] = owner_address
     inspected_target_states: dict[tuple[int, int | None], dict[str, object] | None] = {}
-    for future, result in yield_futures_with_results(inspect_futures, client):
-        if future is None:
-            continue
+    # Inspection reads durable state from the shared output dir, so a dead
+    # owner's inspect is safely remapped to any live worker.
+    for target_key, future, ok in _drain_owner_pinned_barrier(
+        client=client,
+        futures_by_key=futures_by_key,
+        owner_by_key=owner_by_key,
+        resubmit=_submit_inspect,
+        barrier_name="inspect",
+    ):
         try:
-            inspected_target_states[target_keys_by_future[future]] = future.result()
+            inspected_target_states[target_key] = future.result()
         except Exception:
-            inspected_target_states[target_keys_by_future[future]] = None
+            inspected_target_states[target_key] = None
     return inspected_target_states
 
 
@@ -847,12 +967,28 @@ def _flush_local_reducer_targets_or_raise(
                 f"for partitioned chunks: {multi_owner_chunks}"
             )
         return
-    flush_futures = []
     worker_addresses = _current_worker_addresses(client)
-    for chunk_id, partition_id in target_keys:
-        pre_submitted = (pre_submitted_futures or {}).get(
-            (int(chunk_id), partition_id)
+
+    def _submit_flush(target_key, owner_address):
+        chunk_id, partition_id = target_key
+        return client.submit(
+            flush_helper,
+            template_backend,
+            chunk_id=int(chunk_id),
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+            db_path=db_path,
+            partition_id=partition_id,
+            pure=False,
+            workers=[owner_address],
+            allow_other_workers=False,
         )
+
+    futures_by_key = {}
+    owner_by_key = {}
+    for chunk_id, partition_id in target_keys:
+        target_key = (int(chunk_id), partition_id)
+        pre_submitted = (pre_submitted_futures or {}).get(target_key)
         if pre_submitted is not None:
             pre_future, pre_owner = pre_submitted
             pre_status = getattr(pre_future, "status", "")
@@ -862,7 +998,8 @@ def _flush_local_reducer_targets_or_raise(
             ):
                 # Early per-target flush already done or in flight on a
                 # LIVE owner — the barrier just waits on it.
-                flush_futures.append(pre_future)
+                futures_by_key[target_key] = pre_future
+                owner_by_key[target_key] = pre_owner
                 continue
             # Owner died (a worker-pinned future for a dead worker parks in
             # no-worker state as 'pending' FOREVER — reusing it would hang
@@ -874,29 +1011,25 @@ def _flush_local_reducer_targets_or_raise(
                 except Exception:
                     pass
         owner_address = _resolve_owner_address(
-            target_key=(int(chunk_id), partition_id),
+            target_key=target_key,
             target_owners=target_owners,
             worker_addresses=worker_addresses,
         )
         if owner_address is None:
             continue
-        flush_futures.append(
-            client.submit(
-                flush_helper,
-                template_backend,
-                chunk_id=int(chunk_id),
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-                db_path=db_path,
-                partition_id=partition_id,
-                pure=False,
-                workers=[owner_address],
-                allow_other_workers=False,
-            )
-        )
-    for future, result in yield_futures_with_results(flush_futures, client):
-        if future is None:
-            continue
+        futures_by_key[target_key] = _submit_flush(target_key, owner_address)
+        owner_by_key[target_key] = owner_address
+    # A dead owner's RAM state is unrecoverable, so a remapped flush is a
+    # no-op on the new worker — the point is converting a silent barrier
+    # hang into the durable-coverage validation's clean fail-stop.
+    for _key, _future, _ok in _drain_owner_pinned_barrier(
+        client=client,
+        futures_by_key=futures_by_key,
+        owner_by_key=owner_by_key,
+        resubmit=_submit_flush,
+        barrier_name="flush",
+    ):
+        pass
 
 
 def _finalize_residual_field_chunks(
@@ -913,38 +1046,9 @@ def _finalize_residual_field_chunks(
 ) -> None:
     for chunk_id in sorted(set(int(chunk_id) for chunk_id in chunk_ids)):
         shard_manifests = manifests_by_chunk.get(int(chunk_id))
-        if not reducer_backend.uses_local_chunk_accumulator():
-            reconciled_progress = reducer_backend.reconcile_progress(
-                chunk_id=int(chunk_id),
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-                db_path=db_path,
-                manifests=shard_manifests,
-                scratch_root=scratch_root,
-            )
-            expected_interval_ids = set(
-                int(interval_id)
-                for interval_id in expected_interval_ids_by_chunk.get(int(chunk_id), ())
-            )
-            if reconciled_progress is not None:
-                durable_interval_ids = set(
-                    int(interval_id)
-                    for interval_id in reconciled_progress.incorporated_interval_ids
-                )
-                missing_interval_ids = tuple(sorted(expected_interval_ids - durable_interval_ids))
-                if missing_interval_ids:
-                    raise RuntimeError(
-                        "Residual-field distributed finalize missing durable coverage for "
-                        f"chunk {int(chunk_id)}: {missing_interval_ids}"
-                    )
-                logger.info(
-                    "Residual-field reconcile | chunk=%d | truth=%s | committed_shards=%d | pending_shards=%d | pending_intervals=%d",
-                    int(chunk_id),
-                    reconciled_progress.durable_truth_unit,
-                    int(len(reconciled_progress.incorporated_shard_keys)),
-                    int(len(reconciled_progress.pending_shard_keys)),
-                    int(len(reconciled_progress.pending_interval_ids)),
-                )
+        # Only the sync-client owner-local path reaches here; the old
+        # reconcile pre-check served the non-owner-local shard/attempt
+        # universe, which the two backend-kind guards make unreachable.
         shard_summary = summarize_residual_field_shards(shard_manifests or [])
         finalize_start = time.perf_counter()
         manifest = reducer_backend.finalize_chunk(
@@ -956,6 +1060,7 @@ def _finalize_residual_field_chunks(
             cleanup_policy=cleanup_policy,
             scratch_root=scratch_root,
             quiet_logs=False,
+            expected_interval_ids=expected_interval_ids_by_chunk.get(int(chunk_id)),
         )
         if manifest is not None:
             output_summary = summarize_residual_field_output_artifacts(manifest.artifacts)
@@ -1613,11 +1718,8 @@ def run_residual_field_stage(
         # feeds finalize/invalidation expectations, not submission.
         if streaming_context is None:
             work_units = _sort_work_units_by_target(work_units)
-    if streaming_context is not None:
-        # Batch-major ordering means the 1 GiB payload memo only ever needs
-        # the CURRENT batch (the all-in-RAM constraint): every chunk folds a
-        # batch before the next batch's stage-1 payloads are computed.
-        work_units = _sort_streaming_work_units_batch_major(work_units)
+    # Streaming submission order is applied AFTER the owner map is built
+    # (below) so the interleave can round-robin by resolved owner.
 
     total_tasks = len(work_units)
     if total_tasks == 0 and not (owner_local_reducer and planned_work_units):
@@ -1762,19 +1864,11 @@ def run_residual_field_stage(
                     ),
                 )
         else:
-            for chunk_id in chunk_ids:
-                require_chunk_quiescence(
-                    (),
-                    client=None,
-                    output_dir=artifacts.output_dir,
-                    run_digest=str(planned_work_units[0].run_digest),
-                    stage="residual_field",
-                    chunk_id=int(chunk_id),
-                    expected_work_unit_digests=_residual_attempt_digests_for_chunk(
-                        planned_work_units,
-                        chunk_id=int(chunk_id),
-                    ),
-                )
+            # Owner-local reduction is force-enabled for both backend kinds
+            # (the two ValueError guards above are the contract), so tasks
+            # return status-only results and there is no attempt/candidate
+            # universe to quiesce — the old require_chunk_quiescence
+            # ceremony here scanned for attempts that can never exist.
             _finalize_residual_field_chunks(
                 chunk_ids=chunk_ids,
                 parameter_digest=work_units[0].parameter_digest,
@@ -1794,6 +1888,7 @@ def run_residual_field_stage(
 
     fail_streak, fail_threshold = 0, 3
     gpu_tripped = False
+    last_cpu_trip_broadcast = 0.0
     residual_prefetch_factor = _residual_nufft_prefetch_factor(workflow_parameters)
     max_inflight = _cap_async_max_inflight(
         client=client,
@@ -1802,8 +1897,14 @@ def run_residual_field_stage(
     )
 
     def _trip_to_cpu_only() -> None:
-        nonlocal gpu_tripped, max_inflight
-        if gpu_tripped:
+        # A worker the nanny restarts AFTER the trip comes back GPU-enabled
+        # while the driver still believes gpu_tripped. Its failures rebuild
+        # fail_streak past the threshold, which re-enters here — so the
+        # set_cpu_only broadcast is re-sent (rate-limited) instead of
+        # one-shot, pulling restarted workers back into the CPU-only regime.
+        nonlocal gpu_tripped, max_inflight, last_cpu_trip_broadcast
+        now = time.monotonic()
+        if gpu_tripped and now - last_cpu_trip_broadcast < 60.0:
             return
         if hasattr(client, "run"):
             try:
@@ -1812,6 +1913,9 @@ def run_residual_field_stage(
                 client.run(set_cpu_only, True)
             except Exception:
                 pass
+        last_cpu_trip_broadcast = now
+        if gpu_tripped:
+            return
         max_inflight = min(max_inflight, 256)
         gpu_tripped = True
         logger.warning("Circuit-breaker: switching residual-field to CPU-only & throttling.")
@@ -1858,6 +1962,13 @@ def run_residual_field_stage(
         if owner_local_reducer and worker_addresses
         else {}
     )
+    if streaming_context is not None:
+        # Batch-major ordering means the 1 GiB payload memo only ever needs
+        # the CURRENT batch (the all-in-RAM constraint): every chunk folds a
+        # batch before the next batch's stage-1 payloads are computed.
+        work_units = _sort_streaming_work_units_batch_major(
+            work_units, target_owners=target_owners
+        )
     retries_left = {
         (str(work_unit.artifact_key), int(work_unit.chunk_id)): DEFAULT_TASK_RETRIES
         for work_unit in work_units
@@ -1874,6 +1985,18 @@ def run_residual_field_stage(
     except ValueError:
         infra_retry_budget = 12
     infra_failures_seen: dict[tuple[str, int], int] = {}
+    # A unit that repeatedly KILLS its worker is indistinguishable from
+    # infrastructure by error class (KilledWorker) but is really a poison
+    # task — without its own cap it would enjoy the LARGEST retry budget
+    # while physically destroying workers. Same-key worker kills get a
+    # smaller cap; exceeding it fails the unit (no breaker coupling).
+    try:
+        killed_worker_retry_cap = max(
+            1, int(os.getenv("MOSAIC_RESIDUAL_KILLED_WORKER_RETRIES", "4"))
+        )
+    except ValueError:
+        killed_worker_retry_cap = 4
+    killed_worker_seen: dict[tuple[str, int], int] = {}
     deferred_resubmits: list = []  # (eligible_monotonic_time, work_unit)
     target_rifft_futures: dict[tuple[int, int | None], object] = {}
     target_remaining = {
@@ -1883,7 +2006,10 @@ def run_residual_field_stage(
     flying: set = set()
     future_meta: dict = {}
     future_pinned_owner: dict = {}
-    futures_by_chunk: dict[int, list] = {int(chunk_id): [] for chunk_id in chunk_ids}
+    # Wall-clock since the cluster last had a live worker; the drain loop
+    # aborts past the horizon instead of spinning on wait timeouts forever
+    # (SLURM allocation revoked / all nodes dead with the scheduler alive).
+    dead_cluster_since: list = [None]
     exhausted_failures: list[tuple[ResidualFieldWorkUnit, str]] = []
     submitted = 0
     completed = 0
@@ -2023,7 +2149,11 @@ def run_residual_field_stage(
             key=f"residual-{work_unit.artifact_key}",
             pure=False,
             resources=nufft_resources,
-            retries=nufft_task_retries(nufft_settings.execution_policy, DEFAULT_TASK_RETRIES),
+            # The driver owns retry (retries_left + infra budget + breaker).
+            # Dask-level retries would run invisibly underneath it — in cpu
+            # policy a deterministic failure executed up to (1+4)x(1+4)=25
+            # times while fail_streak saw one failure per driver attempt.
+            retries=0,
             runtime_provenance=runtime_provenance,
             nufft_eps=nufft_settings.eps,
             nufft_prefer_cpu=nufft_settings.prefer_cpu,
@@ -2054,7 +2184,6 @@ def run_residual_field_stage(
         flying.add(future)
         future_meta[future] = work_unit
         future_pinned_owner[future] = owner_address
-        futures_by_chunk.setdefault(int(work_unit.chunk_id), []).append(future)
         submitted += 1
         if _should_log_async_progress(
             phase="queue",
@@ -2184,6 +2313,25 @@ def run_residual_field_stage(
             key = (str(work_unit.artifact_key), int(work_unit.chunk_id))
             _release_finished_future(future)
             if infrastructure_failure:
+                if "KilledWorker" in detail:
+                    killed = int(killed_worker_seen.get(key, 0)) + 1
+                    killed_worker_seen[key] = killed
+                    if killed >= killed_worker_retry_cap:
+                        logger.error(
+                            "Residual-field unit killed its worker %d times "
+                            "| chunk=%d | partition=%s | intervals=%s — "
+                            "poison task, failing it instead of burning "
+                            "more workers.",
+                            killed,
+                            work_unit.chunk_id,
+                            "owner"
+                            if work_unit.partition_id is None
+                            else work_unit.partition_id,
+                            _work_unit_interval_label(work_unit),
+                        )
+                        exhausted_failures.append((work_unit, detail))
+                        _mark_target_work_unit_done(work_unit)
+                        return
                 # Own budget + exponential backoff: resubmitting into the
                 # middle of a worker-restart storm just dies again in
                 # seconds and used to exhaust the genuine retry budget.
@@ -2329,6 +2477,22 @@ def run_residual_field_stage(
             _rescue_futures_pinned_to_dead_workers()
             if not flying:
                 return False
+            if not is_sync_client(client):
+                if _current_worker_addresses(client):
+                    dead_cluster_since[0] = None
+                else:
+                    now = time.monotonic()
+                    if dead_cluster_since[0] is None:
+                        dead_cluster_since[0] = now
+                    elif (
+                        now - dead_cluster_since[0]
+                        >= _dead_cluster_horizon_seconds()
+                    ):
+                        raise RuntimeError(
+                            "Residual-field drain: no live workers for "
+                            f"{_dead_cluster_horizon_seconds():.0f}s with "
+                            f"{len(flying)} batch(es) in flight."
+                        )
             try:
                 _distributed_wait(
                     list(flying),
@@ -2465,8 +2629,8 @@ def run_residual_field_stage(
             planned_target_metrics=planned_target_metrics,
             inspected_target_states=inspected_target_states,
         )
-        finalize_futures = []
-        finalize_chunk_by_future: dict = {}
+        finalize_futures_by_chunk: dict = {}
+        finalize_owner_by_chunk_key: dict = {}
         finalize_live_workers = _current_worker_addresses(client)
         # Chunk-keyed finalize placement for streaming: the slot-keyed fold
         # map sends every chunk's finalize to ONE worker (all chunks share
@@ -2478,6 +2642,33 @@ def run_residual_field_stage(
             if streaming_context is not None and finalize_live_workers
             else {}
         )
+
+        def _submit_finalize(finalize_chunk_id, finalize_worker):
+            return client.submit(
+                finalize_process_local_residual_chunk,
+                task_reducer_backend,
+                chunk_id=int(finalize_chunk_id),
+                parameter_digest=planned_work_units[0].parameter_digest,
+                output_dir=artifacts.output_dir,
+                db_path=artifacts.db_manager.db_path,
+                cleanup_policy=cleanup_policy,
+                scratch_root=scratch_root,
+                quiet_logs=False,
+                expected_partitions=_expected_partition_family_for_chunk(
+                    planned_work_units,
+                    chunk_id=int(finalize_chunk_id),
+                ),
+                expected_interval_ids=expected_interval_ids_by_chunk.get(
+                    int(finalize_chunk_id)
+                ),
+                # Streaming finalizes run on multiple workers concurrently;
+                # SQLite marking moves to the driver (single writer).
+                mark_intervals_saved=streaming_context is None,
+                pure=False,
+                workers=[finalize_worker],
+                allow_other_workers=False,
+            )
+
         for chunk_id in chunk_ids:
             finalizer_owner = None
             if streaming_context is not None:
@@ -2500,59 +2691,39 @@ def run_residual_field_stage(
                 raise RuntimeError(
                     f"Owner-local residual finalization requires an available worker for chunk {int(chunk_id)}."
                 )
-            future = client.submit(
-                finalize_process_local_residual_chunk,
-                task_reducer_backend,
-                chunk_id=int(chunk_id),
-                parameter_digest=planned_work_units[0].parameter_digest,
-                output_dir=artifacts.output_dir,
-                db_path=artifacts.db_manager.db_path,
-                cleanup_policy=cleanup_policy,
-                scratch_root=scratch_root,
-                quiet_logs=False,
-                expected_partitions=_expected_partition_family_for_chunk(
-                    planned_work_units,
-                    chunk_id=int(chunk_id),
-                ),
-                expected_interval_ids=expected_interval_ids_by_chunk.get(
-                    int(chunk_id)
-                ),
-                # Streaming finalizes run on multiple workers concurrently;
-                # SQLite marking moves to the driver (single writer).
-                mark_intervals_saved=streaming_context is None,
-                pure=False,
-                workers=[finalizer_owner],
-                allow_other_workers=False,
+            finalize_futures_by_chunk[int(chunk_id)] = _submit_finalize(
+                int(chunk_id), finalizer_owner
             )
-            finalize_futures.append(future)
-            finalize_chunk_by_future[future] = int(chunk_id)
-        for future, result in yield_futures_with_results(finalize_futures, client):
-            if not bool(result):
-                raise RuntimeError("Owner-local residual finalization failed.")
+            finalize_owner_by_chunk_key[int(chunk_id)] = finalizer_owner
+        # Finalize reads durable snapshots from the shared output dir, so a
+        # dead finalizer's chunk is safely remapped to any live worker. This
+        # is the highest-exposure barrier (finalize reads/writes tens of GB
+        # per chunk — the phase most likely to OOM-kill a worker).
+        for finalized_chunk, future, ok in _drain_owner_pinned_barrier(
+            client=client,
+            futures_by_key=finalize_futures_by_chunk,
+            owner_by_key=finalize_owner_by_chunk_key,
+            resubmit=_submit_finalize,
+            barrier_name="finalize",
+        ):
+            if not ok:
+                raise RuntimeError(
+                    "Owner-local residual finalization failed for chunk "
+                    f"{int(finalized_chunk)}."
+                )
             if streaming_context is not None:
-                finalized_chunk = finalize_chunk_by_future.get(future)
-                if finalized_chunk is not None:
-                    _mark_finalized_chunk_intervals_saved(
-                        db_path=artifacts.db_manager.db_path,
-                        chunk_id=finalized_chunk,
-                        interval_ids=expected_interval_ids_by_chunk.get(
-                            finalized_chunk, ()
-                        ),
-                    )
+                _mark_finalized_chunk_intervals_saved(
+                    db_path=artifacts.db_manager.db_path,
+                    chunk_id=finalized_chunk,
+                    interval_ids=expected_interval_ids_by_chunk.get(
+                        finalized_chunk, ()
+                    ),
+                )
     else:
-        for chunk_id in chunk_ids:
-            require_chunk_quiescence(
-                futures_by_chunk.get(int(chunk_id), ()),
-                client=client,
-                output_dir=artifacts.output_dir,
-                run_digest=str(planned_work_units[0].run_digest),
-                stage="residual_field",
-                chunk_id=int(chunk_id),
-                expected_work_unit_digests=_residual_attempt_digests_for_chunk(
-                    planned_work_units,
-                    chunk_id=int(chunk_id),
-                ),
-            )
+        # Sync-client path (no worker addresses). Owner-local reduction is
+        # force-enabled for both backend kinds, tasks return status-only
+        # results, and the attempt/candidate universe is never written —
+        # quiescence scanning here was ceremony for a mode that cannot occur.
         _finalize_residual_field_chunks(
             chunk_ids=chunk_ids,
             parameter_digest=planned_work_units[0].parameter_digest,
