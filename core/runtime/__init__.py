@@ -41,6 +41,7 @@ from .quiescence import QuiescenceReport, require_chunk_quiescence
 from .worker_hooks import (
     chunk_mutex,
     handle_worker_gpu_failure,
+    path_is_tmpfs,
     register_cleanup_plugin,
     resolve_worker_scratch_root,
 )
@@ -67,6 +68,7 @@ __all__ = [
     "quiet_loggers",
     "register_cleanup_plugin",
     "nufft_task_resources",
+    "path_is_tmpfs",
     "require_chunk_quiescence",
     "require_gpu_admission",
     "resolve_worker_scratch_root",

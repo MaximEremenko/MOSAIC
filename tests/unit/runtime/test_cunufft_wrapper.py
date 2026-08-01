@@ -1206,3 +1206,104 @@ def test_adaptive_reserve_enforces_absolute_headroom(monkeypatch):
     )
     assert reserve_small <= int(0.85 * (2 << 30))
     assert frac_small >= 0.05
+
+
+_WORKER_COUNT_VARS = (
+    "MOSAIC_DASK_WORKER_COUNT",
+    "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "SLURM_NTASKS_PER_NODE",
+    "DASK_MAX_WORKERS",
+)
+
+
+def _clear_worker_count_env(monkeypatch):
+    for var in _WORKER_COUNT_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_expected_worker_count_prefers_explicit_override(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "3")
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "2")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "8")
+    assert cunufft_wrapper._expected_worker_count() == 3
+
+
+def test_expected_worker_count_uses_local_ranks_over_cluster_wide(monkeypatch):
+    # Divisor must be per-HOST processes: two co-scheduled MPI ranks, not the
+    # cluster-wide DASK_MAX_WORKERS (which over-divides on this node).
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "2")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "8")
+    assert cunufft_wrapper._expected_worker_count() == 2
+
+
+def test_expected_worker_count_parses_slurm_ntasks_per_node(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("SLURM_NTASKS_PER_NODE", "2(x3)")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "8")
+    assert cunufft_wrapper._expected_worker_count() == 2
+
+
+def test_expected_worker_count_slurm_garbage_falls_through(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("SLURM_NTASKS_PER_NODE", "auto")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "6")
+    assert cunufft_wrapper._expected_worker_count() == 6
+
+
+def test_expected_worker_count_falls_back_to_dask_max_workers(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("DASK_MAX_WORKERS", "6")
+    assert cunufft_wrapper._expected_worker_count() == 6
+
+
+def test_pool_cap_divisor_threads_mode_never_divides(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+    monkeypatch.setenv("DASK_PROCESSES", "0")
+    assert cunufft_wrapper._pool_cap_divisor() == 1
+
+
+def test_pool_cap_divisor_one_process_per_gpu_backends_never_divide(monkeypatch):
+    # dask-cuda spawns one worker process per GPU and the MPI launcher pins
+    # per-rank CUDA_VISIBLE_DEVICES: no two pools share a device, so the
+    # budget must NOT be split even in processes mode.
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    monkeypatch.setenv("DASK_PROCESSES", "1")
+    for backend in ("cuda-local", "mpi"):
+        monkeypatch.setenv("DASK_BACKEND", backend)
+        assert cunufft_wrapper._pool_cap_divisor() == 1
+
+
+def test_pool_cap_divisor_process_workers_share_device(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    monkeypatch.setenv("DASK_PROCESSES", "1")
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+    assert cunufft_wrapper._pool_cap_divisor() == 4
+
+
+def test_headroom_floor_scales_down_on_small_cards(monkeypatch):
+    monkeypatch.delenv("MOSAIC_GPU_HEADROOM_GIB", raising=False)
+    # >= 8 GiB cards keep the historical values byte-for-byte
+    assert cunufft_wrapper._headroom_bytes_for_total(24 << 30) == int(
+        0.15 * float(24 << 30)
+    )
+    assert cunufft_wrapper._headroom_bytes_for_total(8 << 30) == 2 << 30
+    # 4 GiB card: floor is total/4 = 1 GiB, not half the card
+    assert cunufft_wrapper._headroom_bytes_for_total(4 << 30) == 1 << 30
+
+
+def test_min_tile_budget_scales_down_on_small_cards():
+    assert cunufft_wrapper._min_tile_budget_bytes(24 << 30) == 1 << 30
+    assert cunufft_wrapper._min_tile_budget_bytes(8 << 30) == 1 << 30
+    assert cunufft_wrapper._min_tile_budget_bytes(4 << 30) == 512 << 20
+    # never below 256 MiB, and no-GPU probes keep the legacy constant
+    assert cunufft_wrapper._min_tile_budget_bytes(1 << 30) == 256 << 20
+    assert (
+        cunufft_wrapper._min_tile_budget_bytes(0)
+        == cunufft_wrapper._MIN_TILE_BUDGET_BYTES
+    )

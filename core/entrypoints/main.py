@@ -108,8 +108,9 @@ def main(
                 pass
         expected_workers = run_settings.runtime.max_workers
         if not isinstance(expected_workers, int):
-            # "auto" resolves at cluster build (one worker per visible GPU);
-            # ask the same resolver so the wait matches what was spawned.
+            # "auto" resolves at cluster build (per-backend: visible GPUs,
+            # MPI world size, or scheduler allocation size); ask the same
+            # resolver so the wait matches what was spawned.
             from core.runtime.dask_client import _resolve_max_workers
 
             expected_workers = _resolve_max_workers(run_settings.runtime.backend)

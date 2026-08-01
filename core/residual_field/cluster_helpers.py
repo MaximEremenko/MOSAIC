@@ -7,10 +7,8 @@ None of these import from core.residual_field.execution.
 from __future__ import annotations
 
 import logging
-import os
 
 from core.runtime import is_sync_client
-from core.residual_field.backend import is_same_node_local_client
 from core.residual_field.runtime_policy import _memory_backpressure_threshold
 from core.residual_field.tasks import clear_residual_rifft_payload_cache
 
@@ -20,7 +18,6 @@ __all__ = [
     "_cluster_host_memory_pressure",
     "_current_worker_addresses",
     "_resolve_owner_address",
-    "_same_node_local_nufft_capacity",
     "_scheduler_nufft_capacity",
     "_trim_workers_for_memory_pressure",
 ]
@@ -51,14 +48,6 @@ def _scheduler_nufft_capacity(client) -> tuple[int, int] | None:
     return max(1, int(nufft_slots)), len(workers)
 
 
-def _same_node_local_nufft_capacity(client) -> tuple[int, int] | None:
-    if client is None or is_sync_client(client):
-        return None
-    if not is_same_node_local_client(client):
-        return None
-    return _scheduler_nufft_capacity(client)
-
-
 def _cap_async_max_inflight(
     *,
     client,
@@ -70,12 +59,8 @@ def _cap_async_max_inflight(
     if capacity_info is None:
         return requested
     nufft_slots, worker_count = capacity_info
-    raw_factor = os.getenv("MOSAIC_RESIDUAL_PREFETCH_FACTOR")
-    if raw_factor is not None and str(raw_factor).strip() != "":
-        try:
-            prefetch_factor = int(raw_factor)
-        except (TypeError, ValueError):
-            pass
+    # prefetch_factor arrives fully resolved (env/config precedence lives in
+    # runtime_policy._residual_nufft_prefetch_factor — one knob, one place).
     factor = max(1, min(8, int(prefetch_factor)))
     capacity = max(1, int(nufft_slots) * int(factor))
     capped = min(requested, capacity)
@@ -90,32 +75,48 @@ def _cap_async_max_inflight(
     return capped
 
 
+def _worker_host_available_memory_fraction() -> float:
+    """Runs ON a worker: MemAvailable/MemTotal for THIS host, cgroup-aware."""
+    from core.runtime.cpu_resources import available_memory_bytes, total_memory_bytes
+
+    total = total_memory_bytes()
+    if total <= 0:
+        return 1.0
+    return max(0.0, min(1.0, available_memory_bytes() / float(total)))
+
+
 def _cluster_host_memory_pressure(
     client,
     *,
     threshold: float | None = None,
 ) -> bool:
+    """True when any worker HOST is low on memory.
+
+    Probes host truth (cgroup-clamped MemAvailable/MemTotal via client.run)
+    rather than Dask's per-worker memory_limit: the architecture
+    deliberately sets memory_limit=0 on every default backend (memmap pages
+    count into RSS and the nanny killed healthy workers), which made the
+    old scheduler-metrics probe skip every worker — this valve was a
+    permanent no-op and MOSAIC_RESIDUAL_MEMORY_BACKPRESSURE_PCT a dead
+    knob. Pressure = host available fraction below (1 - threshold), the
+    host-side reading of "RSS at threshold percent"."""
     if client is None or is_sync_client(client):
         return False
     threshold = _memory_backpressure_threshold() if threshold is None else float(threshold)
     if threshold <= 0.0:
         return False
+    run = getattr(client, "run", None)
+    if not callable(run):
+        return False
     try:
-        workers = client.scheduler_info().get("workers", {})
+        readings = run(_worker_host_available_memory_fraction)
     except Exception:
         return False
-    for worker in workers.values():
-        try:
-            memory_limit = int(worker.get("memory_limit") or 0)
-            if memory_limit <= 0:
-                continue
-            metrics = worker.get("metrics", {}) or {}
-            rss = int(metrics.get("memory") or worker.get("memory") or 0)
-            if rss > 0 and float(rss) >= (float(memory_limit) * threshold):
-                return True
-        except Exception:
-            continue
-    return False
+    available_floor = max(0.0, 1.0 - threshold)
+    return any(
+        float(fraction) < available_floor
+        for fraction in (readings or {}).values()
+    )
 
 
 def _trim_workers_for_memory_pressure(client) -> None:
@@ -130,13 +131,18 @@ def _trim_workers_for_memory_pressure(client) -> None:
 
 
 def _clear_worker_rifft_payload_caches(client) -> None:
-    try:
-        clear_residual_rifft_payload_cache()
-    except Exception:
-        pass
-    # Streaming (fused stage-1) mode additionally leaves per-process
-    # scattering payload memos behind; they are stage-scoped scratch and must
-    # not outlive the residual stage.
+    # The lattice grid cache is the largest per-process RAM consumer and had
+    # no production release path at all — grids pinned RAM past the stage
+    # end, starving every later admission. All three caches are stage-scoped
+    # scratch and must not outlive the residual stage; the streaming memo
+    # additionally holds stage-1 payloads.
+    from core.residual_field.tasks import clear_residual_lattice_cache
+
+    for clear in (clear_residual_rifft_payload_cache, clear_residual_lattice_cache):
+        try:
+            clear()
+        except Exception:
+            pass
     try:
         from core.scattering.streaming import clear_streaming_payload_memo
 
@@ -148,10 +154,14 @@ def _clear_worker_rifft_payload_caches(client) -> None:
     run = getattr(client, "run", None)
     if not callable(run):
         return
-    try:
-        run(clear_residual_rifft_payload_cache)
-    except Exception:
-        pass
+    for remote_clear in (
+        clear_residual_rifft_payload_cache,
+        clear_residual_lattice_cache,
+    ):
+        try:
+            run(remote_clear)
+        except Exception:
+            pass
     try:
         from core.scattering.streaming import clear_streaming_payload_memo
 

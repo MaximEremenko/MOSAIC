@@ -24,7 +24,10 @@ from pathlib import Path
 from typing import Optional
 from dask.distributed import Client, get_client as _dd_get_client
 
-from core.runtime.dask_helpers import ensure_dask_client
+from core.runtime.dask_helpers import (
+    DEFAULT_DASK_THREADS_PER_WORKER,
+    ensure_dask_client,
+)
 
 # Public symbols re‑exported for convenience
 __all__ = ["get_client", "default_log_dir", "set_log_dir_for_run", "shutdown_dask"]
@@ -54,21 +57,50 @@ def _env_bool(name: str, default: bool | None = None) -> bool | None:
     return default
 
 
-def _build_job_extra(log_dir: Path) -> list[str]:
-    """Construct the *job_extra_directives* list for job‑queue clusters."""
-    extras: list[str] = [
-        "-cwd",
-        "-V",
-    ]
+def _build_job_extra(log_dir: Path, backend: str) -> list[str]:
+    """Construct the *job_extra_directives* list for job‑queue clusters.
+
+    dask-jobqueue prefixes each entry with the target scheduler's directive
+    marker (``#$``, ``#SBATCH``, ``#PBS``, …), so the flags must be valid for
+    that scheduler: an SGE ``-cwd`` rendered as ``#SBATCH -cwd`` is parsed by
+    sbatch as ``-c wd`` and the whole job script is rejected.
+    """
+    extras: list[str] = []
+    if backend == "sge":
+        extras += [
+            "-cwd",
+            "-V",
+            f"-o {log_dir}/worker.o.$JOB_ID.$TASK_ID",
+            f"-e {log_dir}/worker.e.$JOB_ID.$TASK_ID",
+        ]
+    elif backend == "slurm":
+        # SLURM exports the environment and starts in the submit directory by
+        # default — no -V/-cwd equivalents needed.
+        extras += [
+            f"--output={log_dir}/worker.o.%j",
+            f"--error={log_dir}/worker.e.%j",
+        ]
+    elif backend == "pbs":
+        extras += [
+            "-V",
+            f"-o {log_dir}/worker.o",
+            f"-e {log_dir}/worker.e",
+        ]
+    elif backend == "lsf":
+        extras += [
+            f"-o {log_dir}/worker.o.%J",
+            f"-e {log_dir}/worker.e.%J",
+        ]
+    elif backend == "oar":
+        extras += [
+            f"--stdout={log_dir}/worker.o.%jobid%",
+            f"--stderr={log_dir}/worker.e.%jobid%",
+        ]
+
+    # Raw passthrough for site-specific directives (queue/PE/GPU requests).
     for var in ("DASK_GPU", "DASK_PE", "DASK_HOST"):
         if os.getenv(var):
             extras.append(os.environ[var])
-
-    # Log paths – preserve original `$JOB_ID` placeholders
-    extras += [
-        f"-o {log_dir}/worker.o.$JOB_ID.$TASK_ID",
-        f"-e {log_dir}/worker.e.$JOB_ID.$TASK_ID",
-    ]
     return extras
 
 
@@ -162,9 +194,11 @@ def _detected_gpu_count() -> int:
 
 
 def _resolve_max_workers(backend: str | None) -> int:
-    """Worker count portable across machines: an explicit integer wins;
-    ``auto``/unset means one worker per visible GPU for cuda-local (any node
-    size), falling back to 4 elsewhere. Hard-coding a count is what quietly
+    """Worker count portable across machines: an explicit integer wins.
+    ``auto``/unset resolves per backend — cuda-local: one worker per visible
+    GPU; mpi: launch world size minus the scheduler and client ranks;
+    job-queue backends: allocation size from the scheduler environment.
+    Everything else falls back to 4. Hard-coding a count is what quietly
     stranded half the GPUs on a 4-card box and would waste an 8-card node."""
     raw = os.getenv("DASK_MAX_WORKERS", "auto").strip().lower()
     if raw not in {"", "auto"}:
@@ -172,10 +206,40 @@ def _resolve_max_workers(backend: str | None) -> int:
             return int(raw)
         except ValueError:
             logger.warning("Invalid DASK_MAX_WORKERS=%r; using auto.", raw)
-    if str(backend or "").strip().lower() == "cuda-local":
+    kind = str(backend or "").strip().lower()
+    if kind == "cuda-local":
         detected = _detected_gpu_count()
         if detected > 0:
             return detected
+    elif kind == "mpi":
+        # dask-mpi SPMD layout: rank 0 = scheduler, rank 1 = client, every
+        # remaining rank becomes a worker.
+        for var in ("OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "SLURM_NTASKS"):
+            value = os.getenv(var)
+            if value:
+                try:
+                    world = int(value)
+                except ValueError:
+                    continue
+                workers = max(1, world - 2)
+                logger.info(
+                    "max_workers=auto resolved to %d from %s=%d", workers, var, world
+                )
+                return workers
+    elif kind in {"sge", "slurm", "pbs", "lsf", "oar"}:
+        for var in ("SLURM_GPUS", "SLURM_JOB_NUM_NODES"):
+            value = os.getenv(var)
+            if value:
+                try:
+                    count = int(value)
+                except ValueError:
+                    continue
+                if count > 0:
+                    logger.info(
+                        "max_workers=auto resolved to %d from %s", count, var
+                    )
+                    return count
+    logger.info("max_workers=auto resolved to fallback 4 (backend=%s)", kind or "local")
     return 4
 
 
@@ -197,9 +261,11 @@ def get_client() -> Client:
     extra = {}
     configured_backend = os.getenv("DASK_BACKEND")
     if configured_backend in {"sge", "slurm", "pbs", "lsf", "oar"}:
-        extra["job_extra_directives"] = _build_job_extra(log_dir)
+        extra["job_extra_directives"] = _build_job_extra(log_dir, configured_backend)
 
-    threads_per_worker = int(os.getenv("DASK_THREADS_PER_WORKER", "4"))
+    threads_per_worker = int(
+        os.getenv("DASK_THREADS_PER_WORKER", str(DEFAULT_DASK_THREADS_PER_WORKER))
+    )
 
     # NUFFT supply per worker: default to one in-flight cuFINUFFT call per
     # worker. Extra threads help Python-side orchestration, but concurrent

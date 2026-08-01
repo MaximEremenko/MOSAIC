@@ -160,7 +160,7 @@ class TestPlanCacheLeasing:
             wrapper, "_destroy_plan_quietly", lambda plan: destroyed.append(plan)
         )
         entry, cached = wrapper._type1_cache_acquire_or_build(
-            ("k1",), lambda: (object(), [], None, 64)
+            ("k1",), lambda: (object(), [], None, 64, b"")
         )
         assert cached and entry.leases == 1
         clear_lattice_type1_plan_cache()
@@ -176,10 +176,10 @@ class TestPlanCacheLeasing:
         )
         monkeypatch.setenv("MOSAIC_SCATTERING_TYPE1_PLAN_CACHE_MAX", "1")
         leased, _ = wrapper._type1_cache_acquire_or_build(
-            ("k1",), lambda: (object(), [], None, 64)
+            ("k1",), lambda: (object(), [], None, 64, b"")
         )
         other, _ = wrapper._type1_cache_acquire_or_build(
-            ("k2",), lambda: (object(), [], None, 64)
+            ("k2",), lambda: (object(), [], None, 64, b"")
         )
         # inserting k2 evicted k1, but k1 is leased -> doomed, not destroyed
         assert leased.doomed
@@ -195,11 +195,11 @@ class TestPlanCacheLeasing:
         )
         monkeypatch.setenv("MOSAIC_SCATTERING_TYPE1_PLAN_CACHE_MAX", "1")
         first, _ = wrapper._type1_cache_acquire_or_build(
-            ("k1",), lambda: (object(), [], None, 64)
+            ("k1",), lambda: (object(), [], None, 64, b"")
         )
         wrapper._type1_entry_release(first)   # no lease outstanding
         second, _ = wrapper._type1_cache_acquire_or_build(
-            ("k2",), lambda: (object(), [], None, 64)
+            ("k2",), lambda: (object(), [], None, 64, b"")
         )
         assert len(destroyed) == 1            # k1 destroyed at eviction
         wrapper._type1_entry_release(second)
@@ -207,7 +207,7 @@ class TestPlanCacheLeasing:
     def test_cache_disabled_returns_uncached_entry(self, monkeypatch):
         monkeypatch.setenv("MOSAIC_SCATTERING_TYPE1_PLAN_CACHE_MAX", "0")
         entry, cached = wrapper._type1_cache_acquire_or_build(
-            ("k1",), lambda: (object(), [], None, 64)
+            ("k1",), lambda: (object(), [], None, 64, b"")
         )
         assert not cached
         with wrapper._TYPE1_PLAN_CACHE_LOCK:

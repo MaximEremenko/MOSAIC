@@ -171,3 +171,60 @@ def test_lattice_type2_gpu_tiles_targets_when_pool_cap_is_small(caplog):
 
     assert any("target tiles" in record.message for record in caplog.records)
     assert np.abs(out - ref).max() / np.abs(ref).max() < 1e-8
+
+
+def test_lattice_type2_gpu_tile_sizing_sees_concurrent_siblings(caplog, monkeypatch):
+    """Target-tile sizing runs AFTER _transform_enter() and divides the
+    half-pool budget by the live in-flight count. Sized before entering (the
+    old order), two slot siblings both read used_bytes()~0 and each claimed
+    0.5x the whole pool -- 1.0x combined before a single slab ran. With a
+    sibling pinned in flight the same pool cap must now force >=2 tiles where
+    a lone transform runs monolithic, at unchanged numerical parity."""
+    import core.adapters.cunufft_wrapper as wrapper
+
+    cp = pytest.importorskip("cupy")
+    pytest.importorskip("cufinufft")
+    try:
+        if cp.cuda.runtime.getDeviceCount() < 1:
+            pytest.skip("no CUDA device")
+    except Exception:
+        pytest.skip("CUDA runtime unavailable")
+
+    rng = np.random.default_rng(17)
+    step = 2 * np.pi / 24
+    idx = rng.integers(-30, 31, size=(4000, 3))
+    idx = np.unique(idx, axis=0)
+    q = idx.astype(np.float64) * step
+    w = (
+        rng.standard_normal((2, len(q))) + 1j * rng.standard_normal((2, len(q)))
+    ).astype(np.complex128)
+    meta = plan_lattice(q, n_trans=2)
+    assert meta is not None
+    grids = scatter_on_lattice(meta, w)
+    tgt = rng.uniform(0.0, 25.0, size=(600_000, 3))
+
+    ref = execute_type2_on_lattice(meta, grids, tgt, eps=1e-11, prefer_cpu=True)
+
+    pool = cp.get_default_memory_pool()
+    old_limit = int(pool.get_limit() or 0)
+    pool.free_all_blocks()
+    # 600k targets x 128 B/target: a 256 MiB cap leaves the lone transform's
+    # half-pool budget (~128 MiB -> ~970k targets) monolithic, while a sibling
+    # halves it again (~470k targets -> 2 tiles).
+    pool.set_limit(size=256 << 20)
+    try:
+        with caplog.at_level(logging.INFO, logger="core.adapters.cunufft_wrapper"):
+            alone = execute_type2_on_lattice(meta, grids, tgt, eps=1e-11, gpu_only=True)
+        assert not any("target tiles" in r.message for r in caplog.records)
+        caplog.clear()
+        monkeypatch.setattr(wrapper, "_gpu_inflight", 1, raising=False)
+        with caplog.at_level(logging.INFO, logger="core.adapters.cunufft_wrapper"):
+            shared = execute_type2_on_lattice(meta, grids, tgt, eps=1e-11, gpu_only=True)
+        assert any("target tiles" in r.message for r in caplog.records)
+    finally:
+        monkeypatch.setattr(wrapper, "_gpu_inflight", 0, raising=False)
+        pool.set_limit(size=old_limit)
+        pool.free_all_blocks()
+
+    assert np.abs(alone - ref).max() / np.abs(ref).max() < 1e-8
+    assert np.abs(shared - ref).max() / np.abs(ref).max() < 1e-8

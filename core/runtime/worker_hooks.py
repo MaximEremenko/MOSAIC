@@ -184,6 +184,24 @@ def _worker_scratch_base() -> Path:
     return Path(tempfile.gettempdir())
 
 
+def path_is_tmpfs(path) -> bool:
+    """True when the deepest mount containing path is tmpfs/ramfs — where
+    GB-scale scratch memmaps would silently consume RAM."""
+    try:
+        best_mount, best_type = "", ""
+        with open("/proc/mounts") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount, fs_type = parts[1], parts[2]
+                if str(path).startswith(mount) and len(mount) > len(best_mount):
+                    best_mount, best_type = mount, fs_type
+        return best_type in {"tmpfs", "ramfs"}
+    except OSError:
+        return False
+
+
 def resolve_worker_scratch_root(
     *,
     preferred: str | None = None,
@@ -403,11 +421,22 @@ class _PerTaskHeapTrim:
         with self._lock:
             self._n += 1
             scheduled = (self._n % self._every) == 0
+        host_pressure = self._under_host_pressure()
         # Always trim under pressure even if not scheduled.
-        if not (
-            scheduled or self._under_gpu_pressure() or self._under_host_pressure()
-        ):
+        if not (scheduled or host_pressure or self._under_gpu_pressure()):
             return
+        if host_pressure:
+            # The lattice grid cache is the biggest per-process RAM holder
+            # and evicts only on its own caps — under host pressure keeping
+            # cached grids starves every later RAM admission (grids then
+            # spill to disk forever), so release it before the malloc trim
+            # can matter.
+            try:
+                from core.residual_field.tasks import clear_residual_lattice_cache
+
+                clear_residual_lattice_cache()
+            except Exception:
+                pass
         try:
             import cupy as cp  # type: ignore
 

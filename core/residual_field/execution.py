@@ -22,6 +22,7 @@ from core.runtime import (
     is_sync_client,
     logging_redirect_tqdm,
     nufft_task_resources,
+    path_is_tmpfs,
     profile_output_filesystem,
     progress_bar,
     require_gpu_admission,
@@ -107,7 +108,6 @@ from core.residual_field.cluster_helpers import (
     _cluster_host_memory_pressure,
     _current_worker_addresses,
     _resolve_owner_address,
-    _same_node_local_nufft_capacity,
     _scheduler_nufft_capacity,
     _trim_workers_for_memory_pressure,
 )
@@ -1327,14 +1327,27 @@ def run_residual_field_stage(
         _env_shard,
         _configured_shard,
     )
+    if explicit_scratch_root is not None:
+        preferred_scratch = explicit_scratch_root
+    elif preliminary_backend.layout.kind == "local_restartable":
+        # Live accumulators are node-local WORKING state; only durable
+        # snapshots belong on the shared output dir. Defaulting scratch to
+        # output_dir streamed every GB-scale live memmap over NFS on
+        # multi-node runs — the multi-node-safety rationale in the backend
+        # selection assumes node-local scratch. Default to the worker
+        # scratch base instead, unless that base is tmpfs (RAM), where the
+        # shared output dir remains the safer default.
+        import tempfile as _tempfile
+
+        preferred_scratch = None
+        if os.getenv("MOSAIC_WORKER_SCRATCH_ROOT") is None and path_is_tmpfs(
+            _tempfile.gettempdir()
+        ):
+            preferred_scratch = str(Path(artifacts.output_dir) / ".local_restartable")
+    else:
+        preferred_scratch = None
     scratch_root = resolve_worker_scratch_root(
-        preferred=(
-            explicit_scratch_root
-            if explicit_scratch_root is not None
-            else str(Path(artifacts.output_dir) / ".local_restartable")
-            if preliminary_backend.layout.kind == "local_restartable"
-            else None
-        ),
+        preferred=preferred_scratch,
         stage="residual_field",
     )
     reducer_backend = preliminary_backend

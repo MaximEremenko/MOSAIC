@@ -16,6 +16,7 @@ import copy
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
 import warnings
@@ -115,8 +116,10 @@ def _headroom_bytes_for_total(total_vram: int) -> int:
     """Absolute VRAM to keep free for a card of ``total_vram`` bytes.
 
     ``MOSAIC_GPU_HEADROOM_GIB`` (float GiB) overrides; the default is the
-    larger of ``(1 - occupancy ceiling) * total`` and 2 GiB, so big cards keep
-    the historical 15% margin and small cards keep a usable absolute floor."""
+    larger of ``(1 - occupancy ceiling) * total`` and ``min(2 GiB, total/4)``,
+    so cards >= 8 GiB keep the historical margins byte-for-byte while a flat
+    2 GiB floor never claims half of a small card (on a 4 GiB part it left
+    the OOM back-off ladder as the normal path)."""
     if total_vram <= 0:
         return 0
     raw = os.getenv("MOSAIC_GPU_HEADROOM_GIB")
@@ -126,18 +129,32 @@ def _headroom_bytes_for_total(total_vram: int) -> int:
         except ValueError:
             logger.warning("Ignoring invalid MOSAIC_GPU_HEADROOM_GIB=%r", raw)
     derived = (1.0 - _GPU_TOTAL_OCCUPANCY_CEILING) * float(total_vram)
-    return int(max(derived, _MIN_GPU_HEADROOM_BYTES))
+    floor = min(_MIN_GPU_HEADROOM_BYTES, total_vram // 4)
+    return int(max(derived, floor))
 
 
 def _expected_worker_count() -> int:
-    """Best-effort guess at how many workers share this GPU. Used to split
-    the global VRAM budget into per-worker pool caps."""
+    """MOSAIC worker processes on THIS host. The budgets divided by this
+    count (MemAvailable, per-worker pool caps) are per-host resources, so a
+    cluster-wide count over-divides on a node hosting fewer workers, and a
+    per-rank device probe under-divides on co-scheduled MPI ranks: each rank
+    sees 1 GPU through its CUDA_VISIBLE_DEVICES pin and would admit the full
+    host budget."""
     raw = os.getenv("MOSAIC_DASK_WORKER_COUNT")
     if raw:
         try:
             return max(1, int(raw))
         except ValueError:
             pass
+    # Launcher-provided LOCAL counts: ranks/tasks on this node, not the job
+    # total. SLURM_NTASKS_PER_NODE uses formats like "2(x3)" on heterogeneous
+    # allocations; the leading integer is this node's count.
+    for var in ("OMPI_COMM_WORLD_LOCAL_SIZE", "SLURM_NTASKS_PER_NODE"):
+        raw = os.getenv(var)
+        if raw:
+            match = re.match(r"\s*(\d+)", raw)
+            if match:
+                return max(1, int(match.group(1)))
     raw = os.getenv("DASK_MAX_WORKERS")
     if raw:
         try:
@@ -153,6 +170,24 @@ def _expected_worker_count() -> int:
     except Exception:
         pass
     return 4  # matches the project default
+
+
+def _pool_cap_divisor() -> int:
+    """How many worker PROCESSES' CuPy pools share THIS device.
+
+    Splitting the global pool budget is only correct when several processes
+    each own a pool on the same card. Threads-mode Dask (DASK_PROCESSES=0,
+    the project default) runs every worker in one process sharing ONE pool
+    -- dividing shrank the shared pool N-fold (32 GiB card: 2.4 GiB pool,
+    slab and tile sizing strangled, hkl40 batches ~10x slower). The
+    one-process-per-device backends never co-locate pools either: dask-cuda
+    ("cuda-local") hardcodes one worker process per GPU, and the MPI
+    launcher pins per-rank CUDA_VISIBLE_DEVICES."""
+    if os.getenv("DASK_PROCESSES", "0") != "1":
+        return 1
+    if os.getenv("DASK_BACKEND") in ("cuda-local", "mpi"):
+        return 1
+    return _expected_worker_count()
 
 
 def _apply_cupy_pool_cap() -> None:
@@ -216,17 +251,10 @@ def _apply_cupy_pool_cap() -> None:
             pct = min(max(pct, 0.0), 0.95)
             limit_bytes = int(pct * total_vram)
         else:
-            # Per-worker splitting only applies to PROCESS workers, where each
-            # process owns its own CuPy pool. Threads-mode Dask (the project
-            # default, DASK_PROCESSES=0) runs every worker in THIS process
-            # sharing ONE pool -- dividing the global budget by worker count
-            # shrank the shared pool N-fold (32 GiB card: 2.4 GiB pool, slab
-            # and tile sizing strangled, hkl40 batches ~10x slower).
-            n_workers = (
-                _expected_worker_count()
-                if os.getenv("DASK_PROCESSES", "0") == "1"
-                else 1
-            )
+            # Divide only among pools that actually co-reside on this device
+            # (see _pool_cap_divisor for why threads mode and the
+            # one-process-per-GPU backends must not divide).
+            n_workers = _pool_cap_divisor()
             usable_pct = max(
                 0.05,
                 _DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT - _DEFAULT_NON_POOL_HEADROOM_PCT,
@@ -687,7 +715,7 @@ def _current_tile_budget() -> int:
     with _GPU_ADMIT_COND:
         active = max(1, _gpu_inflight)
         pool = _pool_reservable_bytes()
-    return max(pool // active, _MIN_TILE_BUDGET_BYTES)
+    return max(pool // active, _min_tile_budget_bytes(_total_mem_bytes()))
 
 
 def _reserve_tile(nbytes: int) -> None:
@@ -850,6 +878,16 @@ _MAX_TILE_DEPTH = 24
 # GPU transform. If a tile this size still will not fit, the leaf executor's own
 # OOM handling is the final backstop.
 _MIN_TILE_BUDGET_BYTES = 1 << 30
+
+
+def _min_tile_budget_bytes(total_vram: int) -> int:
+    """Tile-budget floor for a card of ``total_vram`` bytes: 1 GiB on cards
+    >= 8 GiB (unchanged), an eighth of the card down to 256 MiB below that --
+    a flat 1 GiB exceeded the whole reservable pool on <= 6 GiB parts, so the
+    floor authorized tiles the card could never satisfy."""
+    if total_vram <= 0:
+        return _MIN_TILE_BUDGET_BYTES
+    return min(_MIN_TILE_BUDGET_BYTES, max(total_vram // 8, 256 << 20))
 
 
 def _type3_inverse_gpu_tiled(
@@ -1692,58 +1730,13 @@ def execute_type2_on_lattice(
     if not use_gpu and gpu_only:
         raise RuntimeError("GPU execution forced but unavailable for lattice type-2.")
 
-    if use_gpu:
-        # Per-target pool bytes while one slab is in flight (device-accum
-        # worst case): d_x (8*dim) + d_tgt (8*dim) + d_out (16*n_trans) +
-        # d_phase (16) + uncommitted row_results (16*n_trans). setpts sort
-        # scratch is raw cudaMalloc outside the pool and is covered by the
-        # 0.5 pool-fraction headroom.
-        bytes_per_tgt = 16 * dim + 32 * n_trans + 16
-        try:
-            pool = cp.get_default_memory_pool()
-            limit = int(pool.get_limit() or 0)
-            pool_free = (
-                max(0, limit - int(pool.used_bytes())) if limit > 0 else _free_mem_bytes()
-            )
-        except Exception:
-            pool_free = _free_mem_bytes()
-        # Every (tile x slab) pair costs one cuFINUFFT execute, and each
-        # execute re-runs the slab's FINE-GRID FFT (the API offers no
-        # FFT-once-interpolate-many). Minimizing executes means maximizing
-        # the tile_len x slab_len PRODUCT under the shared pool budget --
-        # an equal split, with the slab side clamped at the whole grid.
-        # (hkl40 measured: 10M-target tiles starved slabs to the 64 MiB
-        # floor -> 22x40 executes, 805 s/batch; a 75/25 slab-first split
-        # still paid 85x3, 642 s/batch. The equal split with an adequate
-        # pool gives ~1 slab x ~a dozen tiles.) Small grids leave the tile
-        # budget ~whole-pool, so small configs never tile.
-        budget = int(pool_free * 0.5)
-        grid_row_bytes = 16 * int(np.prod(dims[1:])) if dim > 1 else 16
-        desired_slab_bytes = min(int(dims[0]) * grid_row_bytes, budget // 2)
-        tile_len = max(
-            262_144, (budget - desired_slab_bytes) // bytes_per_tgt
-        )
-        tile_len = min(tile_len, n_tgt)
-    else:
-        # CPU path: with a tile consumer the caller is streaming tiles into an
-        # accumulator precisely to bound host memory, so honor that here too
-        # instead of materializing every target-axis temporary at full size.
-        tile_len = (
-            min(n_tgt, _env_int("MOSAIC_NUFFT_CPU_TILE_TARGETS", 8_000_000))
-            if tile_consumer is not None
-            else n_tgt
-        )
-    tile_bounds = [
-        (t0, min(t0 + tile_len, n_tgt)) for t0 in range(0, n_tgt, tile_len)
-    ]
-    if len(tile_bounds) > 1:
-        logger.info(
-            "lattice type-2: %d targets exceed pool tile budget; running %d "
-            "target tiles of <=%d (plans + fine grids reused across tiles)",
-            n_tgt,
-            len(tile_bounds),
-            tile_len,
-        )
+    # Per-target pool bytes while one slab is in flight (device-accum
+    # worst case): d_x (8*dim) + d_tgt (8*dim) + d_out (16*n_trans) +
+    # d_phase (16) + uncommitted row_results (16*n_trans). setpts sort
+    # scratch is raw cudaMalloc outside the pool and is covered by the
+    # 0.5 pool-fraction headroom. Tile sizing itself happens below, AFTER
+    # _transform_enter(), so concurrent siblings are visible to it.
+    bytes_per_tgt = 16 * dim + 32 * n_trans + 16
 
     # Wrapped type-2 coordinates are computed PER TILE inside the loop below
     # (degenerate axes with dq=0 map to x=0, a single mode). Materializing the
@@ -1857,6 +1850,52 @@ def execute_type2_on_lattice(
         oom_errors = (
             (cp.cuda.memory.OutOfMemoryError, RuntimeError) if use_gpu else tuple()
         )
+        if use_gpu:
+            # Every (tile x slab) pair costs one cuFINUFFT execute, and each
+            # execute re-runs the slab's FINE-GRID FFT (the API offers no
+            # FFT-once-interpolate-many). Minimizing executes means maximizing
+            # the tile_len x slab_len PRODUCT under the shared pool budget --
+            # an equal split, with the slab side clamped at the whole grid.
+            # (hkl40 measured: 10M-target tiles starved slabs to the 64 MiB
+            # floor -> 22x40 executes, 805 s/batch; a 75/25 slab-first split
+            # still paid 85x3, 642 s/batch. The equal split with an adequate
+            # pool gives ~1 slab x ~a dozen tiles.) Small grids leave the tile
+            # budget ~whole-pool, so small configs never tile.
+            # The half-pool budget is an equal share among in-flight
+            # transforms (this one included, hence sizing after
+            # _transform_enter): pool_free reads ~identically for concurrent
+            # starters, so without the divisor N slot siblings each sized for
+            # 0.5x the pool -- 1.0x combined at slots=2 before any slab.
+            with _GPU_ADMIT_COND:
+                inflight = max(1, _gpu_inflight)
+            budget = int(_pool_free_bytes() * 0.5) // inflight
+            grid_row_bytes = 16 * int(np.prod(dims[1:])) if dim > 1 else 16
+            desired_slab_bytes = min(int(dims[0]) * grid_row_bytes, budget // 2)
+            tile_len = max(
+                262_144, (budget - desired_slab_bytes) // bytes_per_tgt
+            )
+            tile_len = min(tile_len, n_tgt)
+        else:
+            # CPU path: with a tile consumer the caller is streaming tiles
+            # into an accumulator precisely to bound host memory, so honor
+            # that here too instead of materializing every target-axis
+            # temporary at full size.
+            tile_len = (
+                min(n_tgt, _env_int("MOSAIC_NUFFT_CPU_TILE_TARGETS", 8_000_000))
+                if tile_consumer is not None
+                else n_tgt
+            )
+        tile_bounds = [
+            (t0, min(t0 + tile_len, n_tgt)) for t0 in range(0, n_tgt, tile_len)
+        ]
+        if len(tile_bounds) > 1:
+            logger.info(
+                "lattice type-2: %d targets exceed pool tile budget; running %d "
+                "target tiles of <=%d (plans + fine grids reused across tiles)",
+                n_tgt,
+                len(tile_bounds),
+                tile_len,
+            )
         for tile_idx, (t0, t1) in enumerate(tile_bounds):
             n_t = t1 - t0
             tgt_t = np.asarray(tgt[t0:t1], dtype=np.float64)
@@ -2110,9 +2149,11 @@ class _Type1PlanEntry:
     destroys the plan.
     """
 
-    __slots__ = ("plan", "d_x", "d_r", "lock", "leases", "doomed", "nbytes")
+    __slots__ = (
+        "plan", "d_x", "d_r", "lock", "leases", "doomed", "nbytes", "pts_dq"
+    )
 
-    def __init__(self, plan, d_x, d_r, nbytes=0):
+    def __init__(self, plan, d_x, d_r, nbytes=0, pts_dq=None):
         self.plan = plan
         self.d_x = d_x
         self.d_r = d_r
@@ -2120,6 +2161,9 @@ class _Type1PlanEntry:
         self.leases = 0
         self.doomed = False
         self.nbytes = int(nbytes)
+        # dq bytes the current setpts binding was wrapped with; execute
+        # refreshes the binding when a caller arrives with a different pitch
+        self.pts_dq = pts_dq
 
 
 def _type1_entry_destroy(entry: "_Type1PlanEntry") -> None:
@@ -2194,8 +2238,8 @@ def _type1_cache_acquire_or_build(key: tuple, builder):
     """
     max_entries = _type1_plan_cache_max()
     if max_entries <= 0:
-        plan, d_x, d_r, nbytes = builder()
-        return _Type1PlanEntry(plan, d_x, d_r, nbytes), False
+        plan, d_x, d_r, nbytes, pts_dq = builder()
+        return _Type1PlanEntry(plan, d_x, d_r, nbytes, pts_dq), False
     with _TYPE1_PLAN_CACHE_LOCK:
         entry = _TYPE1_PLAN_CACHE.get(key)
         if entry is not None:
@@ -2206,8 +2250,8 @@ def _type1_cache_acquire_or_build(key: tuple, builder):
             _TYPE1_PLAN_CACHE_ORDER.append(key)
             entry.leases += 1
             return entry, True
-    plan, d_x, d_r, nbytes = builder()
-    entry = _Type1PlanEntry(plan, d_x, d_r, nbytes)
+    plan, d_x, d_r, nbytes, pts_dq = builder()
+    entry = _Type1PlanEntry(plan, d_x, d_r, nbytes, pts_dq)
     victims: list[_Type1PlanEntry] = []
     max_bytes = _type1_plan_cache_max_bytes()
     with _TYPE1_PLAN_CACHE_LOCK:
@@ -2337,10 +2381,17 @@ def execute_type1_on_lattice(
         )
         return np.asarray(f, dtype=np.complex128).reshape(-1)[flat_index]
 
+    # The cuFINUFFT type-1 plan depends on the mode box (dims), eps and dtype
+    # only; the sources enter via setpts and the interval ORIGIN only via the
+    # per-execute weight phase (q_c). dq is deliberately NOT part of the key:
+    # plan_lattice's LSQ step refinement carries origin-dependent ulp noise
+    # into dq, so byte-equal pitches are not guaranteed across intervals with
+    # the same box — keying on dq minted one plan (and fine grid) per
+    # interval. A pitch change only moves the wrapped setpts coords, which
+    # execute rebinds below from THIS call's dq.
     key = (
         hashlib.sha256(np.ascontiguousarray(r).view(np.uint8).tobytes()).digest()[:16],
         dims,
-        dq.tobytes(),
         float(eps),
     )
 
@@ -2365,7 +2416,7 @@ def execute_type1_on_lattice(
             )
             plan.setpts(*d_x)
             _warn_if_below_headroom(f"type1-plan-build{dims}")
-            return plan, d_x, d_r, nbytes
+            return plan, d_x, d_r, nbytes, dq.tobytes()
         finally:
             _release_tile(nbytes)
 
@@ -2383,7 +2434,20 @@ def execute_type1_on_lattice(
                 # threads overlap their host/device prep instead of
                 # serializing whole intervals on the shared per-source plan
                 d_w = cp.asarray(w) * cp.exp(1j * (entry.d_r @ cp.asarray(q_c)))
+                dq_bytes = dq.tobytes()
                 with entry.lock:
+                    if entry.pts_dq != dq_bytes:
+                        # same box, ulp-different pitch: rebind the wrapped
+                        # coords from THIS call's dq before executing. setpts
+                        # and execute share the lock so a concurrent caller
+                        # with another pitch can never execute on our binding.
+                        d_x = [
+                            cp.asarray(np.ascontiguousarray(x[:, a]))
+                            for a in range(dim)
+                        ]
+                        entry.plan.setpts(*d_x)
+                        entry.d_x = d_x
+                        entry.pts_dq = dq_bytes
                     d_f = entry.plan.execute(d_w)
                 result = cp.asnumpy(d_f.reshape(-1)[cp.asarray(flat_index)])
                 return result

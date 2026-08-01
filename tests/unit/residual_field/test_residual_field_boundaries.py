@@ -3094,42 +3094,31 @@ def test_residual_field_async_reuses_one_rifft_payload_future_per_target(
     assert grid_future.release_count == 1
 
 
-def test_residual_field_detects_worker_memory_pressure():
+def test_residual_field_detects_host_memory_pressure():
+    """The probe reads HOST truth via client.run, not Dask's memory_limit:
+    memory_limit is deliberately 0 on every default backend, which made the
+    old metrics-based probe skip all workers and the whole backpressure
+    valve a permanent no-op. threshold=0.72 -> pressure when a host's
+    available fraction drops below 0.28."""
+
     class _FakeClient:
         loop = SimpleNamespace(asyncio_loop=object())
 
-        def scheduler_info(self):
-            return {
-                "workers": {
-                    "worker-ok": {
-                        "memory_limit": 1000,
-                        "metrics": {"memory": 500},
-                    },
-                    "worker-hot": {
-                        "memory_limit": 1000,
-                        "metrics": {"memory": 730},
-                    },
-                }
-            }
+        def run(self, fn):
+            return {"worker-ok": 0.60, "worker-hot": 0.10}
 
     assert _cluster_host_memory_pressure(_FakeClient(), threshold=0.72)
 
 
-def test_residual_field_ignores_disabled_worker_memory_limit():
+def test_residual_field_no_pressure_when_hosts_comfortable():
     class _FakeClient:
         loop = SimpleNamespace(asyncio_loop=object())
 
-        def scheduler_info(self):
-            return {
-                "workers": {
-                    "worker-threaded": {
-                        "memory_limit": 0,
-                        "metrics": {"memory": 10**12},
-                    },
-                }
-            }
+        def run(self, fn):
+            return {"worker-a": 0.55, "worker-b": 0.30}
 
     assert not _cluster_host_memory_pressure(_FakeClient(), threshold=0.72)
+    assert not _cluster_host_memory_pressure(_FakeClient(), threshold=0.0)
 
 
 def test_residual_field_memory_pressure_trim_runs_worker_hook(monkeypatch):

@@ -645,11 +645,27 @@ _LATTICE_EMPTY_Q = np.empty((0, 3))
 
 
 def _lattice_cache_max_bytes() -> int:
+    """Per-process retention budget for in-RAM cached lattice grids.
+
+    The default scales with the host instead of a flat 24 GiB: this ledger
+    is PER PROCESS, so N workers each holding a flat cap could target more
+    RAM than the box has (4 x 24 GiB on a 61 GiB node; 1.5x total RAM on a
+    16 GiB laptop). 35% of host RAM divided by the workers on this host,
+    capped at the old 24 GiB so big-memory nodes keep their behavior."""
     raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES")
     try:
-        return int(raw) if raw else 24 << 30
+        if raw:
+            return int(raw)
     except (TypeError, ValueError):
+        pass
+    from core.adapters.cunufft_wrapper import _expected_worker_count
+    from core.runtime.cpu_resources import total_memory_bytes
+
+    total = int(total_memory_bytes() or 0)
+    if total <= 0:
         return 24 << 30
+    workers = max(1, int(_expected_worker_count()))
+    return min(24 << 30, int(total * 0.35) // workers)
 
 
 def _lattice_entry_bytes(entry: dict) -> int:
@@ -986,9 +1002,14 @@ def _shared_point_ids(point_start: int, count: int) -> np.ndarray:
 def _stage1_prefetch_window() -> int:
     """In-builder stage-1 prefetch depth (payloads computed ahead, bounded).
 
-    ``MOSAIC_STREAMING_STAGE1_PARALLEL`` keeps its historical meaning as THE
-    stage-1 parallelism knob; default 4 (~230 MB of in-flight payloads)."""
-    raw = os.getenv("MOSAIC_STREAMING_STAGE1_PARALLEL")
+    Own knob: this used to piggyback on MOSAIC_STREAMING_STAGE1_PARALLEL,
+    which ALSO sizes the in-task stage-1 thread pool with a different
+    default — tuning one silently perturbed the other. The old name is a
+    fallback so existing launchers keep their behavior; default 4 (~230 MB
+    of in-flight payloads)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_STAGE1_PREFETCH_WINDOW")
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv("MOSAIC_STREAMING_STAGE1_PARALLEL")
     if raw is not None and str(raw).strip() != "":
         try:
             return max(1, int(raw))

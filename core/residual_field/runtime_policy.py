@@ -7,6 +7,7 @@ from core.residual_field.execution, so there are no import cycles.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from core.runtime import (
@@ -14,6 +15,8 @@ from core.runtime import (
     resolve_nufft_execution_settings,
 )
 from core.residual_field.backend import ResidualFieldReducerBackend
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES",
@@ -162,12 +165,28 @@ def _residual_partition_runtime_policy(
 
 
 def _residual_nufft_prefetch_factor(workflow_parameters) -> int:
+    """Single resolution point for the prefetch window factor.
+
+    MOSAIC_RESIDUAL_PREFETCH_FACTOR is the operator override every launcher
+    sets; it used to be applied a second time inside _cap_async_max_inflight,
+    silently shadowing MOSAIC_RESIDUAL_NUFFT_PREFETCH_FACTOR (two names,
+    one number, no documented precedence). Order: operator env > config >
+    legacy env name > default."""
     runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    value = None
-    if hasattr(runtime_info, "get"):
-        value = runtime_info.get("residual_nufft_prefetch_factor")
+    value = os.getenv("MOSAIC_RESIDUAL_PREFETCH_FACTOR")
+    if value is not None and str(value).strip() == "":
+        value = None
+    if value is None and hasattr(runtime_info, "get"):
+        value = runtime_info.get("residual_prefetch_factor")
+        if value is None:
+            value = runtime_info.get("residual_nufft_prefetch_factor")
     if value is None:
         value = os.getenv("MOSAIC_RESIDUAL_NUFFT_PREFETCH_FACTOR")
+        if value is not None:
+            logger.warning(
+                "MOSAIC_RESIDUAL_NUFFT_PREFETCH_FACTOR is deprecated; use "
+                "MOSAIC_RESIDUAL_PREFETCH_FACTOR."
+            )
     try:
         factor = int(value) if value is not None else 2
     except (TypeError, ValueError):

@@ -51,6 +51,9 @@ _BACKENDS = Literal[
 
 logger = logging.getLogger(__name__)
 DEFAULT_TASK_RETRIES = 4
+# Single source of truth for the threads-per-worker default; the CLI entry
+# point (dask_client) and embedded callers must agree on it.
+DEFAULT_DASK_THREADS_PER_WORKER = 16
 
 # --------------------------------------------------------------------------- #
 #  Configuration helpers                                                      #
@@ -347,17 +350,34 @@ def ensure_dask_client(
         if dashboard:
             sched_opts.setdefault("dashboard_address", ":8787")
 
-        # Merge user overrides *after* defaults so user wins.
+        # Merge user overrides *after* defaults so user wins — but list-valued
+        # directive keys concatenate and scheduler_options dict-merges: a plain
+        # dict override would let the client-layer job_extra_directives list
+        # replace the whole key and silently drop the --gpus directive (and a
+        # partial scheduler_options override would lose the fixed endpoint).
         # dask-jobqueue constructors do not accept Worker(resources=...) at
         # the cluster level; that has to be forwarded to the worker command.
-        merged = {**defaults, **cluster_kw}
+        merged = _merge_jobqueue_kwargs(defaults, cluster_kw)
         resource_args = _resource_worker_args(merged.pop("resources", None))
         if resource_args:
             _append(merged, "worker_extra_args", *resource_args)
 
+        # Batch workers run on remote nodes, so the worker-env hygiene keys
+        # must travel in the job script; jobqueue clusters take them as
+        # "export K=V" prologue lines. User-provided prologue lines win.
+        if _worker_env:
+            prologue: List[str] = list(merged.get("job_script_prologue", []))
+            existing = " ".join(str(line) for line in prologue)
+            for key, value in _worker_env.items():
+                if key not in existing:
+                    prologue.append(f"export {key}={value}")
+            merged["job_script_prologue"] = prologue
+
         cluster = Cluster(**merged)
         cluster.scale(jobs=max_workers)
-        return Client(cluster)
+        client = Client(cluster)
+        _register_heap_trim_plugin(client)
+        return client
 
     # ────────── dask‑mpi ──────────
     if backend == "mpi":
@@ -605,6 +625,31 @@ def _append(d: Dict[str, Any], key: str, *items: str) -> None:
     lst: List[str] = list(d.get(key, []))
     lst += [it for it in items if it not in lst]
     d[key] = lst
+
+
+# Cluster kwargs that hold directive lists: overriding them wholesale would
+# discard defaults such as the slurm --gpus directive.
+_JOBQUEUE_LIST_KEYS = ("job_extra_directives", "worker_extra_args")
+
+
+def _merge_jobqueue_kwargs(
+    defaults: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge user cluster kwargs over jobqueue defaults. Scalar keys: user
+    wins. Directive-list keys: concatenated defaults-first with duplicates
+    dropped. ``scheduler_options``: dict-merged, user keys win but default
+    keys (fixed host/port endpoint) survive a partial override."""
+    merged = {**defaults, **overrides}
+    for key in _JOBQUEUE_LIST_KEYS:
+        if key in defaults and key in overrides:
+            combined: List[str] = list(defaults[key])
+            combined += [it for it in overrides[key] if it not in combined]
+            merged[key] = combined
+    default_sched = defaults.get("scheduler_options")
+    override_sched = overrides.get("scheduler_options")
+    if isinstance(default_sched, dict) and isinstance(override_sched, dict):
+        merged["scheduler_options"] = {**default_sched, **override_sched}
+    return merged
 
 
 def _resource_worker_args(resources: Any) -> tuple[str, ...]:
