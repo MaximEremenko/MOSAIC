@@ -1437,6 +1437,9 @@ def test_stage2_replacement_commits_progress_before_sqlite_mark_saved(tmp_path):
             def update_interval_chunk_status(self, *args, **kwargs):
                 raise RuntimeError("sqlite unavailable")
 
+            def update_interval_chunk_status_batch(self, *args, **kwargs):
+                raise RuntimeError("sqlite unavailable")
+
             def close(self):
                 return None
 

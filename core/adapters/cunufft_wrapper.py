@@ -23,6 +23,7 @@ import warnings
 import numpy as np
 
 from core.adapters._direct_dft import direct_dft_type3
+from core.runtime.env import env_bool, env_int
 
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,7 @@ def _headroom_bytes_for_total(total_vram: int) -> int:
     return int(max(derived, floor))
 
 
-def _expected_worker_count() -> int:
+def expected_worker_count() -> int:
     """MOSAIC worker processes on THIS host. The budgets divided by this
     count (MemAvailable, per-worker pool caps) are per-host resources, so a
     cluster-wide count over-divides on a node hosting fewer workers, and a
@@ -170,6 +171,10 @@ def _expected_worker_count() -> int:
     except Exception:
         pass
     return 4  # matches the project default
+
+
+# Back-compat alias for the pre-promotion private name.
+_expected_worker_count = expected_worker_count
 
 
 def _pool_cap_divisor() -> int:
@@ -1023,27 +1028,11 @@ def _resolve_budget_policy(
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid integer %s=%r", name, raw)
-        return default
+    return env_int(name, default, logger=logger, level=logging.WARNING)
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    logger.warning("Ignoring invalid boolean %s=%r", name, raw)
-    return default
+    return bool(env_bool(name, default, logger=logger, level=logging.WARNING))
 
 
 def _experimental_overlap_enabled() -> bool:
@@ -1632,20 +1621,6 @@ def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
     }
 
 
-def scatter_on_lattice(meta: dict, weights: np.ndarray) -> np.ndarray:
-    """Scatter-ADD weight rows onto the dense lattice grid (duplicates sum,
-    matching type-3 linearity exactly). Returns ``(n_trans, *dims)``."""
-    weights = np.asarray(weights, dtype=np.complex128)
-    if weights.ndim == 1:
-        weights = weights[np.newaxis, :]
-    dims = meta["dims"]
-    flat = meta["flat_index"]
-    grids = np.zeros((weights.shape[0], int(np.prod(dims))), dtype=np.complex128)
-    for row in range(weights.shape[0]):
-        np.add.at(grids[row], flat, weights[row])
-    return grids.reshape((weights.shape[0],) + tuple(dims))
-
-
 def _next_fft_size(n: int) -> int:
     return max(2, int(2 * n))                  # upsampled fine-grid axis estimate
 
@@ -2096,29 +2071,6 @@ def cufinufft_nufft3d2(*args, **kwargs):
     return _lazy_cufinufft("nufft3d2")(*args, **kwargs)
 
 
-def execute_lattice_type2_batch(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray,
-    *,
-    eps: float = 1e-12,
-    prefer_cpu: bool = False,
-    gpu_only: bool = False,
-):
-    """Convenience: plan + scatter + type-2. Returns ``None`` when the q-points
-    are not lattice-eligible (caller falls back to the type-3 path)."""
-    weights = np.asarray(weights, dtype=np.complex128)
-    if weights.ndim == 1:
-        weights = weights[np.newaxis, :]
-    meta = plan_lattice(q_coords, n_trans=int(weights.shape[0]))
-    if meta is None:
-        return None
-    grids = scatter_on_lattice(meta, weights)
-    return execute_type2_on_lattice(
-        meta, grids, real_coords, eps=eps, prefer_cpu=prefer_cpu, gpu_only=gpu_only
-    )
-
-
 ###############################################################################
 #  Lattice type-1 (forward): nonuniform sources -> uniform lattice box        #
 #                                                                             #
@@ -2474,196 +2426,6 @@ def execute_type1_on_lattice(
         return None
     finally:
         _transform_exit()
-
-
-def _local_window_inverse_cpu(q, weights, offsets, centers, eps):
-    n_rows, n_q = weights.shape
-    n_atoms = int(len(centers))
-    n_win = int(len(offsets))
-    out = np.empty((n_rows, n_atoms * n_win), dtype=np.complex128)
-    per_atom = max(1, n_rows * n_q * 16)
-    atom_tile = max(1, min(n_atoms, (256 << 20) // per_atom))
-    for a0 in range(0, n_atoms, atom_tile):
-        a1 = min(a0 + atom_tile, n_atoms)
-        phase = np.exp(-1j * (centers[a0:a1] @ q.T))                 # (na, n_q)
-        w_mat = (weights[:, None, :] * phase[None, :, :]).reshape(n_rows * (a1 - a0), n_q)
-        field = execute_inverse_cunufft_super_batch(q, w_mat, offsets, eps=eps, prefer_cpu=True)
-        out[:, a0 * n_win : a1 * n_win] = np.asarray(field).reshape(
-            n_rows, (a1 - a0) * n_win
-        )
-    return out
-
-
-def execute_local_window_inverse(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    offsets: np.ndarray,
-    centers: np.ndarray,
-    *,
-    eps: float = 1e-12,
-    prefer_cpu: bool = False,
-    gpu_only: bool = False,
-) -> np.ndarray:
-    """Inverse type-3 in local window coordinates, batched over atoms.
-
-    ``field(center_a + delta_j) = sum_q [w(q) exp(-i center_a.q)] exp(-i delta_j.q)``.
-
-    Because every atom shares the same q-sources and window-target grid, the
-    cuFINUFFT plan and ``setpts`` are built **once** and only the per-atom weight
-    matrix changes between executes. The centre phase and weight matrix are formed
-    on the GPU, so the O(n_atoms x n_q) intermediate never crosses PCIe -- only the
-    result (n_rows x n_atoms x n_win) is copied back. Returns ``(n_rows,
-    n_atoms*n_win)`` in atom-major order, identical to the global transform to
-    NUFFT eps. The fine grid depends on the *window* extent (~1 A), not the
-    supercell, which is what makes large-cell 3D tractable on the GPU."""
-    if not (_CPU_ONLY or prefer_cpu):
-        _ensure_gpu_backend()
-    q = np.asarray(q_coords, dtype=np.float64)
-    offsets = np.asarray(offsets, dtype=np.float64)
-    centers = np.asarray(centers, dtype=np.float64)
-    weights = np.asarray(weights, dtype=np.complex128)
-    if weights.ndim == 1:
-        weights = weights[np.newaxis, :]
-    n_rows, n_q = weights.shape
-    n_atoms = int(len(centers))
-    n_win = int(len(offsets))
-    dim = int(q.shape[1])
-    out = np.empty((n_rows, n_atoms * n_win), dtype=np.complex128)
-    if n_atoms == 0 or n_win == 0:
-        return out
-
-    use_gpu = not (_CPU_ONLY or prefer_cpu) and _GPU_AVAILABLE
-    if use_gpu:
-        try:
-            _ensure_gpu_kernels()
-        except ImportError:
-            use_gpu = False
-    if not use_gpu:
-        if gpu_only:
-            raise RuntimeError("GPU execution forced but unavailable for local-window inverse.")
-        return _local_window_inverse_cpu(q, weights, offsets, centers, eps)
-
-    import cufinufft  # type: ignore
-
-    d_q = _as_device(q)
-    d_off = _as_device(offsets)
-    d_centers = _as_device(centers)
-    d_w = _as_device(weights)
-    q_cols = [_contig(d_q[:, i]) for i in range(dim)]
-    off_cols = [_contig(d_off[:, i]) for i in range(dim)]
-
-    # Atom-tile so the on-device weight matrix (n_rows*tile, n_q) + phase fit VRAM.
-    def _build(n_trans):
-        plan = cufinufft.Plan(
-            3, dim, n_trans=int(n_trans), eps=eps, isign=-1, dtype="complex128",
-            **_build_gpu_launch_kwargs(gpu_maxsubprobsize=_subprob_order(dim, int(n_trans))[0]),
-        )
-        _set_type3_points(plan, dim=dim, source_cols=q_cols, target_cols=off_cols)
-        return plan
-
-    # Size the atom tile so the on-device working set -- the (n_atoms x n_q) centre
-    # phase, its float matmul temporary, and the (n_rows*na x n_q) weight matrix --
-    # fits the CuPy pool (a few GiB, NOT total VRAM; cuFINUFFT plan scratch lives
-    # outside the pool). Retry with a smaller tile on OOM.
-    workset_per_atom = max(1, n_q * (40 + 16 * n_rows))
-    budget = int(os.getenv("MOSAIC_RESIDUAL_LOCAL_WORKSET_BYTES", str(384 << 20)))
-    atom_tile = max(1, min(n_atoms, budget // workset_per_atom))
-    while True:
-        full_plan = _build(n_rows * atom_tile) if atom_tile <= n_atoms else None
-        try:
-            for a0 in range(0, n_atoms, atom_tile):
-                a1 = min(a0 + atom_tile, n_atoms)
-                na = a1 - a0
-                d_phase = cp.exp(-1j * (d_centers[a0:a1] @ d_q.T))       # (na, n_q)
-                d_w_mat = _contig(
-                    (d_w[:, None, :] * d_phase[None, :, :]).reshape(n_rows * na, n_q)
-                )
-                if na == atom_tile and full_plan is not None:
-                    d_field = full_plan.execute(d_w_mat)
-                else:
-                    tail_plan = _build(n_rows * na)
-                    try:
-                        d_field = tail_plan.execute(d_w_mat)
-                    finally:
-                        _destroy_plan_quietly(tail_plan)
-                field = cp.asnumpy(cp.ascontiguousarray(d_field)).reshape(n_rows, na, n_win)
-                out[:, a0 * n_win : a1 * n_win] = field.reshape(n_rows, na * n_win)
-                del d_phase, d_w_mat, d_field
-            break
-        except cp.cuda.memory.OutOfMemoryError:
-            if atom_tile <= 1:
-                raise
-            atom_tile = max(1, atom_tile // 2)
-            free_gpu_memory()
-        finally:
-            if full_plan is not None:
-                _destroy_plan_quietly(full_plan)
-            _free_cupy_pool_blocks()
-    return out
-
-
-def execute_inverse_cunufft_batch_materialize_once(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray | None = None,
-    *,
-    eps: float = 1e-12,
-    mem_frac: Optional[float] = None,
-    min_chunk: int = 32_000,
-    max_chunk: Optional[int] = 32 * 256_000,
-    prefer_cpu: bool = False,
-    gpu_only: bool = False,
-) -> np.ndarray:
-    """
-    Inverse type-3 helper for task-local GPU accumulation with a single final
-    host materialization when the GPU path succeeds.
-    """
-    return _execute_inverse_cunufft_batch_device(
-        q_coords=q_coords,
-        weights=weights,
-        real_coords=real_coords,
-        eps=eps,
-        mem_frac=mem_frac,
-        min_chunk=min_chunk,
-        max_chunk=max_chunk,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
-    )
-
-
-def _execute_inverse_cunufft_batch_device(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray | None = None,
-    *,
-    eps: float = 1e-12,
-    mem_frac: Optional[float] = None,
-    min_chunk: int = 32_000,
-    max_chunk: Optional[int] = 32 * 256_000,
-    prefer_cpu: bool = False,
-    gpu_only: bool = False,
-):
-    if real_coords is None:
-        raise ValueError("real_coords must be supplied for inverse transform")
-    weights_arr = np.asarray(weights, dtype=np.complex128)
-    if weights_arr.ndim == 1:
-        weights_arr = weights_arr[np.newaxis, :]
-    if weights_arr.ndim != 2:
-        raise ValueError("weights must be 1-D or 2-D with shape (n_trans, n_sources)")
-    if weights_arr.shape[1] != len(q_coords):
-        raise ValueError("weights shape must match q_coords on axis 1")
-    return _execute_inverse_cunufft_batch(
-        q_coords=q_coords,
-        weights_arr=weights_arr,
-        real_coords=real_coords,
-        eps=eps,
-        mem_frac=mem_frac,
-        min_chunk=min_chunk,
-        max_chunk=max_chunk,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
-        device_out=True,
-    )
 
 
 def _execute_inverse_cunufft_batch(

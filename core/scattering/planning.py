@@ -759,15 +759,6 @@ def interval_ids_for_work_units(work_units: list[ScatteringWorkUnit]) -> list[in
     return sorted({int(work_unit.interval_id) for work_unit in work_units})
 
 
-def interval_paths_for_work_units(work_units: list[ScatteringWorkUnit]) -> dict[int, Path]:
-    interval_paths: dict[int, Path] = {}
-    for work_unit in work_units:
-        if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
-            continue
-        interval_paths[int(work_unit.interval_id)] = Path(work_unit.interval_artifact.path)
-    return interval_paths
-
-
 def build_scattering_execution_plan(
     *,
     parameters: dict,
@@ -787,11 +778,7 @@ def build_scattering_execution_plan(
     )
     chunk_work_units = tuple(
         build_scattering_interval_chunk_work_units(
-            list(
-                db_manager.get_interval_chunks()
-                if hasattr(db_manager, "get_interval_chunks")
-                else db_manager.get_unsaved_interval_chunks()
-            ),
+            list(db_manager.get_interval_chunks()),
             dimension=dimension,
             output_dir=output_dir,
             work_identity=work_identity,
@@ -834,7 +821,6 @@ __all__ = [
     "build_source_structure_digest",
     "chunk_ids_for_work_units",
     "interval_ids_for_work_units",
-    "interval_paths_for_work_units",
     "prepare_scattering_run_identity",
     "q_grid_sha256",
     "write_qspace_plan",

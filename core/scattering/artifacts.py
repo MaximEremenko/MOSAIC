@@ -2,18 +2,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Mapping
-from uuid import uuid4
+from typing import Callable
 
 import h5py
 import numpy as np
 
-from core.scattering.accumulation import (
-    build_scattering_partial_result,
-    build_scattering_partial_result_from_payloads,
-    materialize_scattering_payload,
-    merge_scattering_partial_results,
-)
 from core.scattering.contracts import (
     SCATTERING_CHUNK_ARTIFACT_SCHEMA,
     SCATTERING_INTERVAL_ARTIFACT_SCHEMA,
@@ -24,8 +17,6 @@ from core.scattering.contracts import (
 )
 from core.scattering.kernels import IntervalTask
 from core.contracts import ArtifactManifestAssessment, CompletionStatus
-from core.runtime import TIMER, chunk_mutex
-from core.scattering.commit import write_scattering_attempt
 from core.storage.database_manager import create_db_manager_for_thread
 from core.storage.hdf5_atomic import atomic_hdf5_write
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver
@@ -545,182 +536,6 @@ def persist_precomputed_interval_artifact(
     )
 
 
-def persist_scattering_interval_chunk_shard(
-    work_unit: ScatteringWorkUnit,
-    *,
-    grid_shape_nd: np.ndarray,
-    total_reciprocal_points: int,
-    contribution_reciprocal_points: int,
-    amplitudes_delta: np.ndarray,
-    amplitudes_average: np.ndarray,
-    output_dir: str,
-    quiet_logs: bool = False,
-    runtime_provenance: Mapping[str, Any] | None = None,
-) -> ScatteringArtifactManifest:
-    if work_unit.chunk_id is None:
-        raise ValueError("Chunk shard persistence requires a chunk-scoped work unit.")
-    identity_fields = (
-        work_unit.run_digest,
-        work_unit.scientific_digest,
-        work_unit.execution_digest,
-        work_unit.qspace_plan_digest,
-        work_unit.backend_policy_digest,
-        work_unit.source_structure_digest,
-    )
-    if all(isinstance(value, str) and value for value in identity_fields):
-        write_scattering_attempt(
-            output_dir=output_dir,
-            run_digest=str(work_unit.run_digest),
-            interval_id=int(work_unit.interval_id),
-            chunk_id=int(work_unit.chunk_id),
-            attempt_id=f"interval-{int(work_unit.interval_id)}-attempt-{uuid4().hex}",
-            scientific_digest=str(work_unit.scientific_digest),
-            execution_digest=str(work_unit.execution_digest),
-            qspace_plan_digest=str(work_unit.qspace_plan_digest),
-            backend_policy_digest=str(work_unit.backend_policy_digest),
-            source_structure_digest=str(work_unit.source_structure_digest),
-            grid_shape_nd=grid_shape_nd,
-            amplitudes_delta=amplitudes_delta,
-            amplitudes_average=amplitudes_average,
-            contribution_reciprocal_points=contribution_reciprocal_points,
-            runtime_provenance=runtime_provenance,
-        )
-        return build_scattering_chunk_manifest(
-            work_unit,
-            output_dir=output_dir,
-            completion_status=CompletionStatus.MATERIALIZED,
-        )
-    raise ValueError(
-        "Current scattering chunk workers require identity-complete work units "
-        "and run-scoped attempt manifests."
-    )
-
-
-def load_existing_scattering_partial_result(
-    chunk_id: int,
-    *,
-    output_dir: str,
-) -> tuple[object | None, set[int], np.ndarray | None, np.ndarray | None]:
-    store = ScatteringArtifactStore(output_dir)
-    current, current_av, reciprocal_point_count, grid_shape_nd = store.load_chunk_payloads(chunk_id)
-    applied_set = store.load_applied_interval_ids(chunk_id)
-    if current is None or current_av is None:
-        return None, applied_set, current, current_av
-    partial = build_scattering_partial_result_from_payloads(
-        chunk_id=chunk_id,
-        contributing_interval_ids=tuple(sorted(applied_set)),
-        amplitudes_payload=current,
-        amplitudes_average_payload=current_av,
-        grid_shape_nd=(
-            grid_shape_nd if grid_shape_nd is not None else np.array([], dtype=int)
-        ),
-        reciprocal_point_count=reciprocal_point_count,
-    )
-    return partial, applied_set, current, current_av
-
-
-def persist_scattering_interval_chunk_result(
-    work_unit: ScatteringWorkUnit,
-    *,
-    grid_shape_nd: np.ndarray,
-    total_reciprocal_points: int,
-    contribution_reciprocal_points: int,
-    amplitudes_delta: np.ndarray,
-    amplitudes_average: np.ndarray,
-    output_dir: str,
-    db_path: str,
-    quiet_logs: bool = False,
-    artifact_store_factory: Callable[[str], ScatteringArtifactStore] = ScatteringArtifactStore,
-    db_manager_factory: Callable[[str], object] = create_db_manager_for_thread,
-) -> ScatteringArtifactManifest:
-    if work_unit.chunk_id is None:
-        raise ValueError("Chunk accumulation requires a chunk-scoped work unit.")
-
-    t0 = TIMER()
-    store = artifact_store_factory(output_dir)
-    store.ensure_grid_shape(work_unit.chunk_id, grid_shape_nd)
-    store.ensure_total_reciprocal_points(work_unit.chunk_id, total_reciprocal_points)
-
-    existing_partial, applied_set, current_payload, current_average_payload = (
-        load_existing_scattering_partial_result(work_unit.chunk_id, output_dir=output_dir)
-    )
-    already_applied = work_unit.interval_id in applied_set
-
-    if not already_applied:
-        point_ids = (
-            existing_partial.point_ids
-            if existing_partial is not None
-            else None
-        )
-        new_partial = build_scattering_partial_result(
-            chunk_id=work_unit.chunk_id,
-            interval_id=work_unit.interval_id,
-            amplitudes_delta=amplitudes_delta,
-            amplitudes_average=amplitudes_average,
-            grid_shape_nd=grid_shape_nd,
-            reciprocal_point_count=contribution_reciprocal_points,
-            point_ids=point_ids,
-        )
-        merged_partial = (
-            merge_scattering_partial_results(existing_partial, new_partial)
-            if existing_partial is not None
-            else new_partial
-        )
-        amplitudes_payload = materialize_scattering_payload(
-            current_payload,
-            merged_partial.point_ids,
-            merged_partial.amplitudes_delta,
-        )
-        amplitudes_average_payload = materialize_scattering_payload(
-            current_average_payload,
-            merged_partial.point_ids,
-            merged_partial.amplitudes_average,
-        )
-        store.save_chunk_payloads(
-            work_unit.chunk_id,
-            amplitudes_payload=amplitudes_payload,
-            amplitudes_average_payload=amplitudes_average_payload,
-            reciprocal_point_count=merged_partial.reciprocal_point_count,
-        )
-        applied_set.add(work_unit.interval_id)
-        store.save_applied_interval_ids(work_unit.chunk_id, applied_set)
-
-    _IntervalChunkStatusUpdater(
-        db_path,
-        db_manager_factory=db_manager_factory,
-    ).mark_saved(work_unit.interval_id, work_unit.chunk_id)
-    manifest = build_scattering_chunk_manifest(
-        work_unit,
-        output_dir=output_dir,
-        completion_status=CompletionStatus.COMMITTED,
-    )
-
-    if quiet_logs:
-        logger.debug(
-            "write-HDF5 | chunk %d | iv %d %s | %.3f s",
-            work_unit.chunk_id,
-            work_unit.interval_id,
-            "already applied (idempotent skip)" if already_applied else "applied",
-            TIMER() - t0,
-        )
-    else:
-        if already_applied:
-            logger.info(
-                "write-HDF5 | chunk %d | iv %d already applied (idempotent skip) | %.3f s",
-                work_unit.chunk_id,
-                work_unit.interval_id,
-                TIMER() - t0,
-            )
-        else:
-            logger.info(
-                "write-HDF5 | chunk %d | iv %d applied | %.3f s",
-                work_unit.chunk_id,
-                work_unit.interval_id,
-                TIMER() - t0,
-            )
-    return manifest
-
-
 __all__ = [
     "ScatteringArtifactStore",
     "assess_scattering_manifest",
@@ -731,6 +546,4 @@ __all__ = [
     "is_scattering_manifest_complete",
     "mark_empty_interval_precomputed",
     "persist_precomputed_interval_artifact",
-    "persist_scattering_interval_chunk_shard",
-    "persist_scattering_interval_chunk_result",
 ]

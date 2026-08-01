@@ -13,11 +13,50 @@ import numpy as np
 import pytest
 
 from core.adapters.cunufft_wrapper import (
-    execute_lattice_type2_batch,
     execute_type2_on_lattice,
     plan_lattice,
-    scatter_on_lattice,
 )
+
+
+def scatter_on_lattice(meta: dict, weights: np.ndarray) -> np.ndarray:
+    """Reference scatter: plain np.add.at over the whole grid (duplicates sum,
+    matching type-3 linearity exactly). Returns ``(n_trans, *dims)``.
+
+    Test-only reference implementation. Production uses the striped,
+    sort-based scatter in core/residual_field/tasks.py — this serial
+    whole-grid np.add.at must never be reused on production-sized grids."""
+    weights = np.asarray(weights, dtype=np.complex128)
+    if weights.ndim == 1:
+        weights = weights[np.newaxis, :]
+    dims = meta["dims"]
+    flat = meta["flat_index"]
+    grids = np.zeros((weights.shape[0], int(np.prod(dims))), dtype=np.complex128)
+    for row in range(weights.shape[0]):
+        np.add.at(grids[row], flat, weights[row])
+    return grids.reshape((weights.shape[0],) + tuple(dims))
+
+
+def execute_lattice_type2_batch(
+    q_coords: np.ndarray,
+    weights: np.ndarray,
+    real_coords: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    prefer_cpu: bool = False,
+    gpu_only: bool = False,
+):
+    """Reference plan + scatter + type-2 pipeline; ``None`` when the q-points
+    are not lattice-eligible (production falls back to the type-3 path)."""
+    weights = np.asarray(weights, dtype=np.complex128)
+    if weights.ndim == 1:
+        weights = weights[np.newaxis, :]
+    meta = plan_lattice(q_coords, n_trans=int(weights.shape[0]))
+    if meta is None:
+        return None
+    grids = scatter_on_lattice(meta, weights)
+    return execute_type2_on_lattice(
+        meta, grids, real_coords, eps=eps, prefer_cpu=prefer_cpu, gpu_only=gpu_only
+    )
 
 
 def _direct_reference(q, w, tgt):

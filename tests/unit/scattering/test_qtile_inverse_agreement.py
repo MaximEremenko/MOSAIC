@@ -8,11 +8,11 @@ so it agrees with the un-tiled result only within the PREDICTED forward-error to
 
 This test proves that agreement holds within the project's OWN agreement gate, so a future
 (separately science-signed-off) increment can drive execution with q-tiling. It uses the
-EXISTING kernel only -- ``execute_inverse_cunufft_batch_materialize_once`` from
-``core.adapters.cunufft_wrapper`` -- with the SAME kwargs the production task uses
-(``core/scattering/tasks.py::compute_scattering_interval_chunk_arrays``: a stacked
-``[delta, average]`` weight pair, ``eps``, ``prefer_cpu``). It edits no kernel / hot path and
-wires nothing into execution; it only CALLS the kernel and SUMS partials in the test body.
+EXISTING kernel only -- ``execute_inverse_cunufft_super_batch`` from
+``core.adapters.cunufft_wrapper`` -- with the SAME call shape the residual task uses
+(``core/residual_field/tasks.py``: a stacked ``[delta, average]`` weight pair, ``eps``,
+``prefer_cpu``). It edits no kernel / hot path and wires nothing into execution; it only
+CALLS the kernel and SUMS partials in the test body.
 
 Determinism: forced CPU (``MOSAIC_NUFFT_CPU_ONLY=1`` + ``prefer_cpu=True``) so finufft's
 single-threaded type-3 path gives a stable reduction; the agreement assertion is the hard
@@ -98,7 +98,7 @@ def test_qtile_inverse_sum_agrees_within_predicted_tolerance(cunufft_cpu, dim, c
     )
 
     # 1) UN-TILED inverse on the FULL q_grid (same call shape as the production task).
-    untiled = cunufft_cpu.execute_inverse_cunufft_batch_materialize_once(
+    untiled = cunufft_cpu.execute_inverse_cunufft_super_batch(
         q_coords=q_grid,
         weights=weights,
         **common,
@@ -121,7 +121,7 @@ def test_qtile_inverse_sum_agrees_within_predicted_tolerance(cunufft_cpu, dim, c
     # 3) Run the SAME inverse per tile on the q-sub-grid + weight-sub-columns and SUM.
     tiled = np.zeros_like(untiled)
     for start, stop in tiles:
-        partial = cunufft_cpu.execute_inverse_cunufft_batch_materialize_once(
+        partial = cunufft_cpu.execute_inverse_cunufft_super_batch(
             q_coords=q_grid[start:stop],
             weights=weights[:, start:stop],
             **common,

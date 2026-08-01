@@ -15,6 +15,9 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 import numpy as np
 
+# Re-exported for backward compatibility: the policy Literal moved to the
+# producer-side scattering contracts.
+from core.scattering.contracts import ScatteringIntervalArtifactPolicy
 from core.residual_field.local_accumulator import ResidualFieldLocalAccumulatorPartial
 from core.residual_field.contracts import (
     ResidualFieldArtifactManifest,
@@ -34,10 +37,6 @@ if TYPE_CHECKING:
 ResidualFieldReducerBackendKind = Literal[
     "local_restartable",
     "durable_shared_restartable",
-]
-ScatteringIntervalArtifactPolicy = Literal[
-    "required_transport",
-    "optional_output",
 ]
 ResidualShardCheckpointPolicy = Literal[
     "required_local_restart_state",

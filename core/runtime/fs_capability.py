@@ -184,6 +184,57 @@ def cross_host_read_after_rename_probe(
     )
 
 
+def _probe_file_lock(path_text: str) -> dict[str, Any]:
+    """Runs on driver or worker: can this host take an fcntl lock HERE?
+
+    Catches NFS nolock / local_lock=all mounts and dead lockd, where
+    fcntl.flock raises (ENOLCK) and the chunk mutex silently degrades to a
+    per-process lock — the one capability the multi-node reducer-progress
+    commit actually depends on."""
+    host = socket.gethostname()
+    try:
+        import fcntl
+
+        path = Path(path_text)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return {"host": host, "ok": True, "error": None}
+    except Exception as exc:
+        return {"host": host, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def cross_host_file_lock_probe(
+    *,
+    path: str | Path,
+    client=None,
+) -> tuple[dict[str, Any], ...]:
+    results: list[dict[str, Any]] = [_probe_file_lock(str(path))]
+    if client is not None and hasattr(client, "run"):
+        try:
+            raw = client.run(_probe_file_lock, str(path))
+        except Exception as exc:
+            results.append(
+                {
+                    "host": "workers",
+                    "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        else:
+            values = raw.values() if isinstance(raw, Mapping) else (raw,)
+            results.extend(item for item in values if isinstance(item, Mapping))
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in results:
+        host = str(item.get("host", "unknown"))
+        # a failing probe for a host wins over a passing one (two workers on
+        # one host can disagree only transiently; fail closed)
+        if host not in deduped or not item.get("ok"):
+            deduped[host] = dict(item)
+    return tuple(deduped[host] for host in sorted(deduped))
+
+
 def _capability_failure_message(reason: str) -> str:
     return (
         f"Output filesystem capability check failed: {reason}. "
@@ -248,6 +299,27 @@ def profile_output_filesystem(
             raise FilesystemCapabilityError(
                 _capability_failure_message(f"cross-host read-after-rename failed ({failures})")
             )
+        # File locking is the one capability the multi-node design actually
+        # depends on (chunk-mutex exclusion of the reducer-progress
+        # manifest read-modify-write), and the one this profile never used
+        # to test. Fail closed for multi-node runs; single-host runs only
+        # record the result (the in-process thread lock suffices there).
+        lock_probe_results = cross_host_file_lock_probe(
+            path=probe_dir / "lock_probe.dat",
+            client=client,
+        )
+        lock_ok = all(bool(item.get("ok")) for item in lock_probe_results)
+        if needs_cross_host and not lock_ok:
+            failures = ", ".join(
+                f"{item.get('host')}:{item.get('error')}"
+                for item in lock_probe_results
+                if not item.get("ok")
+            )
+            raise FilesystemCapabilityError(
+                _capability_failure_message(
+                    f"file locking unavailable on shared filesystem ({failures})"
+                )
+            )
         capabilities: dict[str, Any] = {
             "filesystem_type": _filesystem_type(output_root),
             "same_directory_atomic_replace_visible": True,
@@ -270,7 +342,9 @@ def profile_output_filesystem(
                 for result in cross_host_results
             ],
             "hardlink_required": False,
-            "file_lock_required": False,
+            "file_lock_required": bool(needs_cross_host),
+            "file_lock_functional": bool(lock_ok),
+            "file_lock_per_host": list(lock_probe_results),
             "symlink_required": False,
         }
         return write_fs_capability_manifest(

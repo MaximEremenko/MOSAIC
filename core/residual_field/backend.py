@@ -3027,23 +3027,25 @@ def resolve_residual_field_reducer_backend(
     client,
 ) -> ManifestDrivenResidualFieldReducerBackend:
     runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    shard_storage_root_override = None
-    local_accumulator_max_ram_bytes = DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES
+    # Precedence rule, uniform for every MOSAIC_* knob: OPERATOR ENV WINS
+    # over JSON config, config over default. This function used to apply
+    # both orderings within twenty lines (config-wins for the shard root,
+    # env-wins for the RAM cap) — pick one and say so.
+    shard_storage_root_override = os.getenv("MOSAIC_RESIDUAL_SHARD_DURABLE_ROOT")
+    local_accumulator_max_ram_bytes = os.getenv("MOSAIC_LOCAL_REDUCER_MAX_RAM_BYTES")
     if hasattr(runtime_info, "get"):
-        shard_storage_root_override = runtime_info.get("residual_shard_durable_root")
-        local_accumulator_max_ram_bytes = int(
-            runtime_info.get(
-                "residual_local_accumulator_max_ram_bytes",
-                local_accumulator_max_ram_bytes,
+        if shard_storage_root_override is None:
+            shard_storage_root_override = runtime_info.get(
+                "residual_shard_durable_root"
             )
-        )
-    if shard_storage_root_override is None:
-        shard_storage_root_override = os.getenv("MOSAIC_RESIDUAL_SHARD_DURABLE_ROOT")
+        if local_accumulator_max_ram_bytes is None:
+            local_accumulator_max_ram_bytes = runtime_info.get(
+                "residual_local_accumulator_max_ram_bytes"
+            )
     local_accumulator_max_ram_bytes = int(
-        os.getenv(
-            "MOSAIC_LOCAL_REDUCER_MAX_RAM_BYTES",
-            str(local_accumulator_max_ram_bytes),
-        )
+        local_accumulator_max_ram_bytes
+        if local_accumulator_max_ram_bytes is not None
+        else DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES
     )
     return build_residual_field_reducer_backend(
         resolve_residual_field_reducer_backend_kind(

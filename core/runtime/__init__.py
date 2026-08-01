@@ -6,7 +6,9 @@ from .dask_client import (
 )
 from .dask_helpers import (
     DEFAULT_TASK_RETRIES,
+    current_worker_addresses,
     ensure_dask_client,
+    is_same_node_local_client,
     is_sync_client,
     yield_futures_with_results,
 )
@@ -56,11 +58,13 @@ __all__ = [
     "chunk_mutex",
     "configure_progress",
     "cross_host_read_after_rename_probe",
+    "current_worker_addresses",
     "default_log_dir",
     "ensure_dask_client",
     "force_progress_enabled",
     "get_client",
     "handle_worker_gpu_failure",
+    "is_same_node_local_client",
     "is_sync_client",
     "logging_redirect_tqdm",
     "progress_bar",

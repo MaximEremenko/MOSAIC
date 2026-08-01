@@ -211,7 +211,6 @@ def test_scattering_handoff_round_trips_through_mapping_bridge():
         "scattering_run_digest": "run-digest",
         "source_scattering_commit_digest": "commit-digest",
         "residual_parameter_digest": "param-digest",
-        "stage2_replacement_expected_by_chunk": {3: (1, 2)},
     }
 
     handoff = ScatteringHandoff.from_mapping(payload)
@@ -219,8 +218,6 @@ def test_scattering_handoff_round_trips_through_mapping_bridge():
     assert handoff.scattering_run_digest == "run-digest"
     assert handoff.source_scattering_commit_digest == "commit-digest"
     assert handoff.residual_parameter_digest == "param-digest"
-    assert handoff.has_stage2_replacement_expected is True
-    assert handoff.expected_by_chunk() == {3: (1, 2)}
     assert handoff.is_empty is False
 
     # to_mapping reproduces exactly the read-relevant key shape and round-trips.
@@ -235,9 +232,6 @@ def test_scattering_handoff_tolerates_partial_and_empty_mappings():
     assert partial.scattering_run_digest is None
     assert partial.source_scattering_commit_digest is None
     assert partial.run_digest is None
-    # Replacement expected coverage was absent: presence flag stays False.
-    assert partial.has_stage2_replacement_expected is False
-    assert partial.expected_by_chunk() == {}
     assert partial.is_empty is False
     assert partial.to_mapping() == {"residual_parameter_digest": "abc123"}
 
@@ -246,13 +240,12 @@ def test_scattering_handoff_tolerates_partial_and_empty_mappings():
     assert ScatteringHandoff.from_mapping({}).is_empty is True
     assert ScatteringHandoff.from_mapping({}).to_mapping() == {}
 
-    # A present-but-empty replacement expected-coverage payload keeps the presence distinction.
-    present_empty = ScatteringHandoff.from_mapping(
-        {"stage2_replacement_expected_by_chunk": {}}
+    # Keys written by older codebase generations are ignored, not round-tripped.
+    legacy_extra = ScatteringHandoff.from_mapping(
+        {"run_digest": "r", "stage2_replacement_expected_by_chunk": {3: (1,)}}
     )
-    assert present_empty.has_stage2_replacement_expected is True
-    assert present_empty.is_empty is False
-    assert present_empty.to_mapping() == {"stage2_replacement_expected_by_chunk": {}}
+    assert legacy_extra.is_empty is False
+    assert legacy_extra.to_mapping() == {"run_digest": "r"}
 
     # The legacy run_digest alias is preserved through the bridge.
     legacy = ScatteringHandoff.from_mapping({"run_digest": "legacy"})

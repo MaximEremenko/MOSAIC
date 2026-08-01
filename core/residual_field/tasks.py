@@ -6,9 +6,7 @@ import sys
 import threading
 import time
 import weakref
-from collections import OrderedDict
 from dataclasses import dataclass
-import inspect
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
@@ -24,7 +22,7 @@ from core.scattering.accumulation import (
     apply_half_space_conjugate_reconstruction,
     half_space_conjugate_reconstruction_required,
 )
-from core.scattering.grid import _generate_grid
+from core.scattering.grid import generate_grid
 from core.scattering.kernels import build_rifft_grid_for_chunk
 from core.scattering.kernels import IntervalTask
 from core.scattering.tasks import (
@@ -39,20 +37,17 @@ from core.residual_field.contracts import (
 )
 from core.adapters.cunufft_wrapper import (
     execute_inverse_cunufft_super_batch,
-    execute_local_window_inverse,
     execute_type2_on_lattice,
     lattice_host_budget_bytes,
 )
 from core.residual_field.commit import write_residual_attempt
 from core.runtime import handle_worker_gpu_failure, task_progress_enabled
+from core.runtime.budgeted_cache import BudgetedLRU, bounded_prefetch
 
 
 logger = logging.getLogger(__name__)
 
 _worker_logging_configured = False
-_RIFFT_PAYLOAD_CACHE: "OrderedDict[tuple, tuple[tuple[np.ndarray, np.ndarray], int]]" = OrderedDict()
-_RIFFT_PAYLOAD_CACHE_BYTES = 0
-_RIFFT_PAYLOAD_CACHE_LOCK = threading.Lock()
 _RIFFT_PAYLOAD_CACHE_MAX_BYTES_DEFAULT = 4 * 1024 * 1024 * 1024
 
 
@@ -246,6 +241,21 @@ def _riff_payload_cache_max_bytes() -> int:
     return max(0, int(value))
 
 
+def _rifft_payload_nbytes(payload: tuple[np.ndarray, np.ndarray]) -> int:
+    # A read-only memmap grid costs page cache, not anonymous RAM: charge it
+    # nothing so large grids stay cached (evicting them would force a shape
+    # recomputation pass on every miss).
+    return int(
+        sum(0 if isinstance(arr, np.memmap) else int(arr.nbytes) for arr in payload)
+    )
+
+
+_RIFFT_PAYLOAD_CACHE = BudgetedLRU(
+    max_bytes=_riff_payload_cache_max_bytes,
+    size_fn=_rifft_payload_nbytes,
+)
+
+
 def _riff_payload_cache_key(
     atoms: np.recarray,
     work_unit: ResidualFieldWorkUnit,
@@ -263,10 +273,7 @@ def _riff_payload_cache_key(
 
 
 def clear_residual_rifft_payload_cache() -> None:
-    global _RIFFT_PAYLOAD_CACHE_BYTES
-    with _RIFFT_PAYLOAD_CACHE_LOCK:
-        _RIFFT_PAYLOAD_CACHE.clear()
-        _RIFFT_PAYLOAD_CACHE_BYTES = 0
+    _RIFFT_PAYLOAD_CACHE.clear()
 
 
 def _rifft_memmap_min_bytes() -> int:
@@ -319,7 +326,7 @@ def _build_rifft_grid_bounded(
     counts: list[int] = []
     shapes: list[np.ndarray] = []
     for center, dist, step in zip(coords, dist_vec, step_vec):
-        grid, shape = _generate_grid(dim, step, center, dist)
+        grid, shape = generate_grid(dim, step, center, dist)
         counts.append(int(grid.shape[0]))
         shapes.append(np.asarray(shape))
         del grid
@@ -346,7 +353,7 @@ def _build_rifft_grid_bounded(
     )
     offset = 0
     for center, dist, step, count in zip(coords, dist_vec, step_vec, counts):
-        grid, _shape = _generate_grid(dim, step, center, dist)
+        grid, _shape = generate_grid(dim, step, center, dist)
         mm[offset : offset + count] = grid
         offset += count
         del grid
@@ -359,42 +366,18 @@ def _build_rifft_grid_bounded(
 def _cached_rifft_payload(key: tuple) -> tuple[np.ndarray, np.ndarray] | None:
     if not _riff_payload_cache_enabled():
         return None
-    with _RIFFT_PAYLOAD_CACHE_LOCK:
-        entry = _RIFFT_PAYLOAD_CACHE.get(key)
-        if entry is None:
-            return None
-        payload, _size = entry
-        _RIFFT_PAYLOAD_CACHE.move_to_end(key)
-        return payload
+    return _RIFFT_PAYLOAD_CACHE.get(key)
 
 
 def _store_rifft_payload_cache(
     key: tuple,
     payload: tuple[np.ndarray, np.ndarray],
 ) -> None:
-    global _RIFFT_PAYLOAD_CACHE_BYTES
     if not _riff_payload_cache_enabled():
         return
-    max_bytes = _riff_payload_cache_max_bytes()
-    if max_bytes <= 0:
+    if _riff_payload_cache_max_bytes() <= 0:
         return
-    # A read-only memmap grid costs page cache, not anonymous RAM: charge it
-    # nothing so large grids stay cached (evicting them would force a shape
-    # recomputation pass on every miss).
-    payload_bytes = int(
-        sum(0 if isinstance(arr, np.memmap) else int(arr.nbytes) for arr in payload)
-    )
-    if payload_bytes > max_bytes:
-        return
-    with _RIFFT_PAYLOAD_CACHE_LOCK:
-        existing = _RIFFT_PAYLOAD_CACHE.pop(key, None)
-        if existing is not None:
-            _RIFFT_PAYLOAD_CACHE_BYTES -= int(existing[1])
-        _RIFFT_PAYLOAD_CACHE[key] = (payload, payload_bytes)
-        _RIFFT_PAYLOAD_CACHE_BYTES += payload_bytes
-        while _RIFFT_PAYLOAD_CACHE_BYTES > max_bytes and _RIFFT_PAYLOAD_CACHE:
-            _old_key, (_old_payload, old_size) = _RIFFT_PAYLOAD_CACHE.popitem(last=False)
-            _RIFFT_PAYLOAD_CACHE_BYTES -= int(old_size)
+    _RIFFT_PAYLOAD_CACHE.store(key, payload)
 
 
 def _normalize_interval_inputs(
@@ -581,37 +564,6 @@ def _validate_same_q_grid_weight_shapes(
             )
 
 
-def _call_inverse_super_batch(
-    *,
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray,
-    eps: float,
-    prefer_cpu: bool,
-    gpu_only: bool,
-) -> np.ndarray:
-    kwargs = {
-        "q_coords": q_coords,
-        "weights": weights,
-        "real_coords": real_coords,
-        "eps": eps,
-    }
-    try:
-        signature = inspect.signature(execute_inverse_cunufft_super_batch)
-    except (TypeError, ValueError):
-        kwargs.update({"prefer_cpu": prefer_cpu, "gpu_only": gpu_only})
-    else:
-        accepts_var_kwargs = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-        if accepts_var_kwargs or "prefer_cpu" in signature.parameters:
-            kwargs["prefer_cpu"] = prefer_cpu
-        if accepts_var_kwargs or "gpu_only" in signature.parameters:
-            kwargs["gpu_only"] = gpu_only
-    return execute_inverse_cunufft_super_batch(**kwargs)
-
-
 def _residual_lattice_fft_enabled() -> bool:
     """Evaluate the residual inverse via scatter + type-2 on the reciprocal
     LATTICE instead of type-3 over scattered points.
@@ -638,9 +590,8 @@ def _residual_lattice_fft_enabled() -> bool:
 # chunk/partition, so every work unit of the same interval shard reuses ONE
 # scatter (hkl32: 140 work units -> 1 scatter of 539M points instead of 140
 # re-loads of ~38 GB each). Guarded by build-events so concurrent worker
-# threads wait for the first build instead of duplicating it.
-_LATTICE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
-_LATTICE_CACHE_BYTES = 0
+# threads wait for the first build instead of duplicating it. The lock only
+# coordinates _LATTICE_CACHE_BUILDING; the cache itself locks internally.
 _LATTICE_CACHE_LOCK = threading.Lock()
 _LATTICE_CACHE_BUILDING: dict[tuple, threading.Event] = {}
 _LATTICE_EMPTY_Q = np.empty((0, 3))
@@ -660,13 +611,13 @@ def _lattice_cache_max_bytes() -> int:
             return int(raw)
     except (TypeError, ValueError):
         pass
-    from core.adapters.cunufft_wrapper import _expected_worker_count
+    from core.adapters.cunufft_wrapper import expected_worker_count
     from core.runtime.cpu_resources import total_memory_bytes
 
     total = int(total_memory_bytes() or 0)
     if total <= 0:
         return 24 << 30
-    workers = max(1, int(_expected_worker_count()))
+    workers = max(1, int(expected_worker_count()))
     return min(24 << 30, int(total * 0.35) // workers)
 
 
@@ -685,14 +636,6 @@ def _lattice_entry_bytes(entry: dict) -> int:
     )
 
 
-def _lattice_cache_get(key: tuple) -> dict | None:
-    with _LATTICE_CACHE_LOCK:
-        entry = _LATTICE_CACHE.get(key)
-        if entry is not None:
-            _LATTICE_CACHE.move_to_end(key)
-        return entry
-
-
 def _lattice_cache_max_entries() -> int:
     raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_ENTRIES")
     try:
@@ -701,34 +644,29 @@ def _lattice_cache_max_entries() -> int:
         return 8
 
 
+# Spilled (memmap) entries cost 0 RAM but hold unlinked-file DISK space
+# until evicted, so the byte budget alone would never evict them and
+# distinct keys could fill the scratch filesystem; the entry-count cap
+# bounds that. min_entries=1: the current shard's entry is never evicted
+# from under its own work units.
+_LATTICE_CACHE = BudgetedLRU(
+    max_bytes=_lattice_cache_max_bytes,
+    size_fn=_lattice_entry_bytes,
+    max_entries=_lattice_cache_max_entries,
+    min_entries=1,
+)
+
+
+def _lattice_cache_get(key: tuple) -> dict | None:
+    return _LATTICE_CACHE.get(key)
+
+
 def _lattice_cache_store(key: tuple, entry: dict) -> None:
-    global _LATTICE_CACHE_BYTES
-    nbytes = _lattice_entry_bytes(entry)
-    if nbytes > _lattice_cache_max_bytes():
-        return
-    with _LATTICE_CACHE_LOCK:
-        old = _LATTICE_CACHE.pop(key, None)
-        if old is not None:
-            _LATTICE_CACHE_BYTES -= _lattice_entry_bytes(old)
-        _LATTICE_CACHE[key] = entry
-        _LATTICE_CACHE_BYTES += nbytes
-        # Spilled (memmap) entries cost 0 RAM but hold unlinked-file DISK
-        # space until evicted, so the byte budget alone would never evict
-        # them and distinct keys could fill the scratch filesystem; the
-        # entry-count cap bounds that.
-        while (
-            _LATTICE_CACHE_BYTES > _lattice_cache_max_bytes()
-            or len(_LATTICE_CACHE) > _lattice_cache_max_entries()
-        ) and len(_LATTICE_CACHE) > 1:
-            _k, victim = _LATTICE_CACHE.popitem(last=False)
-            _LATTICE_CACHE_BYTES -= _lattice_entry_bytes(victim)
+    _LATTICE_CACHE.store(key, entry)
 
 
 def clear_residual_lattice_cache() -> None:
-    global _LATTICE_CACHE_BYTES
-    with _LATTICE_CACHE_LOCK:
-        _LATTICE_CACHE.clear()
-        _LATTICE_CACHE_BYTES = 0
+    _LATTICE_CACHE.clear()
 
 
 def _lattice_scratch_dir() -> str:
@@ -777,9 +715,9 @@ def _lattice_ram_admission_fraction() -> float:
     effectively N*f host-wide (observed: 4 workers x 0.2 admitted ~0.8 of
     the box and the kernel OOM killer took workers down). Divide the
     configured/host default by the expected worker count."""
-    from core.adapters.cunufft_wrapper import _expected_worker_count
+    from core.adapters.cunufft_wrapper import expected_worker_count
 
-    workers = max(1, int(_expected_worker_count()))
+    workers = max(1, int(expected_worker_count()))
     raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION")
     if raw is not None and str(raw).strip() != "":
         try:
@@ -827,7 +765,7 @@ def _lattice_grids_fit_in_ram(total_grid_bytes: int) -> bool:
     # every later admission for as long as they sit in the cache. `live`
     # must only cover grids MemAvailable cannot see yet (allocated but
     # untouched pages).
-    live = max(0, live - int(_LATTICE_CACHE_BYTES))
+    live = max(0, live - int(_LATTICE_CACHE.bytes()))
     return total_grid_bytes + live <= available * _lattice_ram_admission_fraction()
 
 
@@ -1208,36 +1146,18 @@ def _build_lattice_entry_from_inputs(
             return interval_input()
         return load_interval_task_payload(interval_input)
 
-    def _iter_loaded(inputs):
-        """Yield loaded payloads in order, computing up to K ahead.
-
-        Stage-1 loads were strictly sequential here, so a shard's prologue ran
-        on ONE of the machine's cores while every GPU idled (measured: 25+ min
-        for a sparse-mask hkl40 shard). A bounded sliding window keeps peak
-        memory at K payloads (~57 MB each) while overlapping the mask/q-grid/
-        forward work across threads — safe now that ``set_cpu_only`` no longer
-        nulls the shared CuPy handle under running threads."""
-        window = _stage1_prefetch_window()
-        if window <= 1:
-            for interval_input in inputs:
-                yield _load(interval_input)
-            return
-        from collections import deque
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=window) as pool:
-            pending: deque = deque()
-            iterator = iter(inputs)
-            for interval_input in iterator:
-                pending.append(pool.submit(_load, interval_input))
-                if len(pending) >= window:
-                    yield pending.popleft().result()
-            while pending:
-                yield pending.popleft().result()
-
+    # Bounded sliding-window prefetch: stage-1 loads were strictly sequential
+    # here, so a shard's prologue ran on ONE of the machine's cores while
+    # every GPU idled (measured: 25+ min for a sparse-mask hkl40 shard). The
+    # window keeps peak memory at K payloads (~57 MB each) while overlapping
+    # the mask/q-grid/forward work across threads — safe now that
+    # ``set_cpu_only`` no longer nulls the shared CuPy handle under running
+    # threads.
     per_role: dict[str, dict] = {}
     contribution = 0
-    for task in _iter_loaded(loaded_interval_inputs):
+    for task in bounded_prefetch(
+        loaded_interval_inputs, _load, _stage1_prefetch_window()
+    ):
         if task is None:
             continue
         q = np.asarray(task.q_grid, dtype=np.float64)
@@ -1304,32 +1224,16 @@ def _build_lattice_entry_from_inputs(
     # over cell-disjoint stripes — bitwise-identical accumulation order.
     scatter_workers = _lattice_scatter_workers(total_grid_bytes)
 
+    def _prep(interval_input):
+        task = _load(interval_input)
+        if task is None:
+            return None
+        return _prepare_interval_scatter(
+            task, per_role[str(task.half_space_role)], snap_tol
+        )
+
     def _iter_prepared(inputs):
-        window = _stage1_prefetch_window()
-
-        def _prep(interval_input):
-            task = _load(interval_input)
-            if task is None:
-                return None
-            return _prepare_interval_scatter(
-                task, per_role[str(task.half_space_role)], snap_tol
-            )
-
-        if window <= 1:
-            for interval_input in inputs:
-                yield _prep(interval_input)
-            return
-        from collections import deque
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=window) as pool:
-            pending: deque = deque()
-            for interval_input in inputs:
-                pending.append(pool.submit(_prep, interval_input))
-                if len(pending) >= window:
-                    yield pending.popleft().result()
-            while pending:
-                yield pending.popleft().result()
+        return bounded_prefetch(inputs, _prep, _stage1_prefetch_window())
 
     if scatter_workers <= 1:
         for prepared in _iter_prepared(loaded_interval_inputs):
@@ -1418,89 +1322,6 @@ def _compute_from_lattice_entry(
     )
 
 
-def _residual_local_window_enabled() -> bool:
-    """Evaluate the residual field in LOCAL window coordinates.
-
-    Each target is ``center_atom + delta`` where the window offsets ``delta`` are
-    identical across atoms (small, ~1 Angstrom extent). Factoring the per-atom
-    centre phase out of ``exp(-i (center+delta).q)`` turns the transform into one
-    batched inverse over the shared window grid, whose type-3 fine grid depends on
-    the *window* extent, not the supercell extent. That collapses the
-    ``(supercell x hkl)^3`` fine-grid blow-up of large 3D cells (hkl32: 0.2 TiB ->
-    ~8 MiB) while giving an identical field to NUFFT eps. Off by default until the
-    end-to-end result is validated against the global path on the target run."""
-    raw = os.getenv("MOSAIC_RESIDUAL_LOCAL_WINDOW")
-    if raw is None:
-        return False
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _local_window_phase_budget_bytes() -> int:
-    """Cap on the per-tile ``(n_atoms x n_q)`` centre-phase matrix (bytes)."""
-    raw = os.getenv("MOSAIC_RESIDUAL_LOCAL_PHASE_BUDGET")
-    if raw is not None and str(raw).strip() != "":
-        try:
-            return max(1 << 20, int(raw))
-        except (TypeError, ValueError):
-            pass
-    return 512 << 20
-
-
-def _reconstruct_window_centers_offsets(
-    rifft_grid: np.ndarray,
-    grid_shape_nd: np.ndarray,
-):
-    """Recover ``(centers, shared_offsets)`` from an atom-major rifft grid.
-
-    Returns ``None`` when the windows are not uniform across atoms (different
-    shape or non-shared offsets), in which case the caller keeps the global
-    transform. Relies on ``_generate_grid`` building ``pts = offsets + center``
-    with ``offsets`` independent of the centre, and ``_process_chunk`` stacking
-    per-atom windows in order (both verified in core.scattering.grid)."""
-    grid = np.asarray(rifft_grid, dtype=np.float64)
-    shapes = np.asarray(grid_shape_nd)
-    if grid.ndim != 2 or shapes.ndim != 2 or len(shapes) == 0:
-        return None
-    if not bool(np.all(shapes == shapes[0])):
-        return None
-    window = int(np.prod(shapes[0]))
-    n_atoms = int(len(shapes))
-    if window <= 0 or len(grid) != n_atoms * window:
-        return None
-    blocks = grid.reshape(n_atoms, window, grid.shape[1])
-    centers = blocks.mean(axis=1)
-    offsets = blocks[0] - centers[0]
-    # Offsets must genuinely be shared across atoms for the factorisation to hold.
-    if not np.allclose(blocks, centers[:, None, :] + offsets[None, :, :], rtol=0, atol=1e-6):
-        return None
-    return centers, offsets
-
-
-def _local_window_inverse(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    centers: np.ndarray,
-    offsets: np.ndarray,
-    *,
-    eps: float,
-    prefer_cpu: bool,
-    gpu_only: bool,
-) -> np.ndarray:
-    """Local-window inverse type-3, batched over atoms (see
-    :func:`core.adapters.cunufft_wrapper.execute_local_window_inverse`). Returns
-    ``(n_rows, n_atoms*n_win)`` in atom-major order, identical to the global
-    ``_call_inverse_super_batch`` output to NUFFT eps."""
-    return execute_local_window_inverse(
-        q_coords,
-        weights,
-        offsets,
-        centers,
-        eps=eps,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
-    )
-
-
 def compute_residual_field_interval_chunk_arrays(
     interval_tasks: Sequence[IntervalTask],
     *,
@@ -1563,15 +1384,7 @@ def compute_residual_field_interval_chunk_arrays(
         grouped_interval_tasks[key]
         for key in sorted(grouped_interval_tasks, key=str)
     ]
-    # When enabled, evaluate the field in local window coordinates (identical
-    # result, tiny fine grid). Reconstruct the shared centres/offsets once;
-    # None -> non-uniform windows -> keep the global transform.
-    local_window = (
-        _reconstruct_window_centers_offsets(rifft_grid, grid_shape_nd)
-        if _residual_local_window_enabled()
-        else None
-    )
-    if concat_sources and local_window is None and lattice_enabled:
+    if concat_sources and lattice_enabled:
         # Lattice path: scatter each role's (masked) q-values onto the dense
         # reciprocal lattice and run ONE type-2 per role. Identical to the
         # summed type-3 to NUFFT eps; no type-3 fine grid, so no budget split.
@@ -1611,14 +1424,11 @@ def compute_residual_field_interval_chunk_arrays(
                     )
                     regrouped.setdefault(key, []).append(interval_task)
                 ordered_groups = [regrouped[key] for key in sorted(regrouped, key=str)]
-    if concat_sources and local_window is None and ordered_groups:
-        # Global path only: split each half-space role's concatenation into
-        # fine-grid-bounded sub-groups so no single transform blows past a
-        # GPU-sized fine grid on large-cell / wide-hkl runs (summed across
-        # sub-groups -> identical to one giant concat to NUFFT eps). The local
-        # path's fine grid is set by the window extent, not the supercell, so it
-        # needs no such split -- concatenating every interval minimises the number
-        # of batched transforms.
+    if concat_sources and ordered_groups:
+        # Split each half-space role's concatenation into fine-grid-bounded
+        # sub-groups so no single transform blows past a GPU-sized fine grid
+        # on large-cell / wide-hkl runs (summed across sub-groups ->
+        # identical to one giant concat to NUFFT eps).
         budget = _residual_concat_fine_grid_budget_bytes()
         ordered_groups = [
             subgroup
@@ -1687,25 +1497,14 @@ def compute_residual_field_interval_chunk_arrays(
                     )
                 inverse_weights = np.stack(stacked_weights, axis=0)
                 del stacked_weights
-        if local_window is not None:
-            inverse_outputs = _local_window_inverse(
-                reference_q_grid,
-                inverse_weights,
-                local_window[0],
-                local_window[1],
-                eps=nufft_eps,
-                prefer_cpu=nufft_prefer_cpu,
-                gpu_only=nufft_gpu_only,
-            )
-        else:
-            inverse_outputs = _call_inverse_super_batch(
-                q_coords=reference_q_grid,
-                weights=inverse_weights,
-                real_coords=rifft_grid,
-                eps=nufft_eps,
-                prefer_cpu=nufft_prefer_cpu,
-                gpu_only=nufft_gpu_only,
-            )
+        inverse_outputs = execute_inverse_cunufft_super_batch(
+            q_coords=reference_q_grid,
+            weights=inverse_weights,
+            real_coords=rifft_grid,
+            eps=nufft_eps,
+            prefer_cpu=nufft_prefer_cpu,
+            gpu_only=nufft_gpu_only,
+        )
         del inverse_weights
         inverse_outputs = np.asarray(inverse_outputs, dtype=np.complex128)
         if concat_sources or use_presum:
@@ -2061,13 +1860,7 @@ def run_residual_field_interval_chunk_task(
                 point_ids=point_ids,
                 runtime_provenance=runtime_provenance,
             )
-        current_checkpoint = getattr(resolved_backend, "persist" "_shard_checkpoint", None)
-        if current_checkpoint is None:
-            raise ValueError(
-                "Current residual-field tasks require identity-complete work units and "
-                "run-scoped attempt manifests."
-            )
-        return current_checkpoint(
+        return resolved_backend.persist_shard_checkpoint(
             work_unit,
             grid_shape_nd=grid_shape_nd,
             total_reciprocal_points=total_reciprocal_points,

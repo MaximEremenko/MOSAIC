@@ -5,10 +5,77 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from core.models import ReciprocalInterval
 from core.storage.sqlite_repositories import create_database_parts
+
+
+@runtime_checkable
+class DatabaseManagerProtocol(Protocol):
+    """Shared contract of the SQLite-backed DatabaseManager and the in-memory
+    ManifestOnlyDatabaseManager.
+
+    Consumers used to duck-type this surface with per-call-site hasattr/getattr
+    probes and row-at-a-time fallbacks; both implementations provide every
+    method below, so call sites may invoke them directly.
+    """
+
+    db_path: str
+    dimension: int
+    cache_enabled: bool
+
+    def get_point_data_for_chunk(self, chunk_id: int) -> list[dict[str, Any]]: ...
+
+    def get_pending_chunk_ids(self) -> list[int]: ...
+
+    def get_pending_parts(self) -> list[dict[str, Any]]: ...
+
+    def get_point_data_for_point_ids(self, point_ids: list[int]) -> list[dict[str, Any]]: ...
+
+    def get_intervals_by_ids(self, interval_ids: list[int]) -> list[ReciprocalInterval]: ...
+
+    def insert_point_data_batch(self, point_data_list: list[dict[str, Any]]) -> list[int]: ...
+
+    def insert_reciprocal_space_interval_batch(
+        self, interval_list: list[dict[str, Any]]
+    ) -> list[int]: ...
+
+    def insert_interval_chunk_status_batch(
+        self, status_list: list[tuple[int, int, int | bool]]
+    ) -> None: ...
+
+    def associate_point_reciprocal_space_batch(
+        self, associations: list[tuple[int, int]]
+    ) -> None: ...
+
+    def update_saved_status_for_chunk_or_point(
+        self,
+        reciprocal_space_id: int,
+        point_id: int | None = None,
+        chunk_id: int | None = None,
+        saved: int = 0,
+    ) -> None: ...
+
+    def get_unsaved_associations(self) -> list[tuple[int, int]]: ...
+
+    def update_interval_chunk_status(
+        self, interval_id: int, chunk_id: int, saved: int | bool = 1
+    ) -> None: ...
+
+    def update_interval_chunk_status_batch(
+        self, status_rows: "list[tuple[int, int, int | bool]]"
+    ) -> None: ...
+
+    def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]: ...
+
+    def get_interval_chunks(self) -> list[tuple[int, int]]: ...
+
+    def mark_interval_precomputed(self, interval_id: int, done: bool = True) -> None: ...
+
+    def is_interval_precomputed(self, interval_id: int) -> bool: ...
+
+    def close(self) -> None: ...
 
 
 def create_db_manager_for_thread(
@@ -240,6 +307,10 @@ class ManifestOnlyDatabaseManager:
     def insert_interval_chunk_status_batch(
         self, status_list: list[tuple[int, int, int | bool]]
     ) -> None:
+        # setdefault mirrors the SQLite manager's INSERT OR IGNORE:
+        # first-write-wins, an existing row's saved flag is never touched.
+        # (update_interval_chunk_status[_batch] mirror the upsert and DO
+        # overwrite.) Pinned by the DatabaseManager parity test.
         for interval_id, chunk_id, saved in status_list:
             self._status.setdefault((int(interval_id), int(chunk_id)), bool(saved))
 
@@ -279,6 +350,7 @@ class ManifestOnlyDatabaseManager:
     def update_interval_chunk_status_batch(
         self, status_rows: "list[tuple[int, int, int | bool]]"
     ) -> None:
+        # Overwrite (upsert) — mirrors the SQLite ON CONFLICT DO UPDATE.
         for interval_id, chunk_id, saved in status_rows:
             self._status[(int(interval_id), int(chunk_id))] = bool(saved)
 

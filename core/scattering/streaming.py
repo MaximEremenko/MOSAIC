@@ -17,13 +17,12 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping
 
 import numpy as np
 
+from core.runtime.budgeted_cache import BudgetedLRU
 from core.scattering.kernels import IntervalTask, streaming_lattice_default
 from core.scattering.tasks import compute_scattering_interval_payload
 
@@ -116,10 +115,9 @@ def streaming_slot_map(
 # the same worker (the same batch folded into different chunks) reuse one
 # stage-1 computation instead of recomputing per chunk. Entries are
 # (IntervalTask | None); None records a mask-empty interval so its emptiness
-# is not re-derived either.
-_STREAM_MEMO: "OrderedDict[tuple[str, int], tuple[IntervalTask | None, int]]" = OrderedDict()
-_STREAM_MEMO_BYTES = 0
-_STREAM_MEMO_LOCK = threading.Lock()
+# is not re-derived either — _MEMO_MISS distinguishes a miss from that
+# memoized None.
+_MEMO_MISS = object()
 
 
 def _stream_memo_max_bytes() -> int:
@@ -143,38 +141,28 @@ def _interval_task_nbytes(task: IntervalTask | None) -> int:
     return max(64, total)
 
 
+# min_entries=1: the memo always keeps at least the most recent payload so
+# back-to-back folds of the same batch never recompute it.
+_STREAM_MEMO = BudgetedLRU(
+    max_bytes=_stream_memo_max_bytes,
+    size_fn=_interval_task_nbytes,
+    min_entries=1,
+)
+
+
 def clear_streaming_payload_memo() -> None:
-    global _STREAM_MEMO_BYTES
-    with _STREAM_MEMO_LOCK:
-        _STREAM_MEMO.clear()
-        _STREAM_MEMO_BYTES = 0
+    _STREAM_MEMO.clear()
 
 
 def _memo_get(key: tuple[str, int]):
-    with _STREAM_MEMO_LOCK:
-        if key in _STREAM_MEMO:
-            _STREAM_MEMO.move_to_end(key)
-            return _STREAM_MEMO[key]
-    return None
+    """Return the memoized payload (possibly None) or ``_MEMO_MISS``."""
+    return _STREAM_MEMO.get(key, _MEMO_MISS)
 
 
 def _memo_store(key: tuple[str, int], task: IntervalTask | None) -> None:
-    global _STREAM_MEMO_BYTES
-    max_bytes = _stream_memo_max_bytes()
-    if max_bytes <= 0:
+    if _stream_memo_max_bytes() <= 0:
         return
-    nbytes = _interval_task_nbytes(task)
-    if nbytes > max_bytes:
-        return
-    with _STREAM_MEMO_LOCK:
-        old = _STREAM_MEMO.pop(key, None)
-        if old is not None:
-            _STREAM_MEMO_BYTES -= int(old[1])
-        _STREAM_MEMO[key] = (task, nbytes)
-        _STREAM_MEMO_BYTES += nbytes
-        while _STREAM_MEMO_BYTES > max_bytes and len(_STREAM_MEMO) > 1:
-            _k, (_task, old_bytes) = _STREAM_MEMO.popitem(last=False)
-            _STREAM_MEMO_BYTES -= int(old_bytes)
+    _STREAM_MEMO.store(key, task)
 
 
 # ---------------------------------------------------------------------------
@@ -316,25 +304,6 @@ def prewarm_stage1_payload_store(
     return computed
 
 
-def _stage1_parallelism(n_intervals: int) -> int:
-    """In-task thread count for streamed stage-1 interval computes.
-
-    Defaults to a quarter of the worker's thread allotment (min 1, max 8) so
-    concurrent work units on the same worker do not oversubscribe it;
-    ``MOSAIC_STREAMING_STAGE1_PARALLEL`` overrides (1 disables)."""
-    raw = os.getenv("MOSAIC_STREAMING_STAGE1_PARALLEL")
-    if raw is not None and str(raw).strip() != "":
-        try:
-            return max(1, min(int(raw), max(1, int(n_intervals))))
-        except (TypeError, ValueError):
-            pass
-    try:
-        threads = int(os.getenv("DASK_THREADS_PER_WORKER", "16"))
-    except ValueError:
-        threads = 16
-    return max(1, min(threads // 4, 8, max(1, int(n_intervals))))
-
-
 def lazy_streamed_interval_loaders(
     interval_ids,
     context: StreamingComputeContext,
@@ -360,8 +329,8 @@ def lazy_streamed_interval_loaders(
         def _load() -> "IntervalTask | None":
             key = (str(context.cache_token), int(interval_id))
             cached = _memo_get(key)
-            if cached is not None:
-                return cached[0]
+            if cached is not _MEMO_MISS:
+                return cached
             store_dir = getattr(context, "payload_store_dir", None)
             if store_dir:
                 stored = read_stored_interval_payload(store_dir, int(interval_id))
@@ -405,93 +374,6 @@ def lazy_streamed_interval_loaders(
     return tuple(_make(int(interval_id)) for interval_id in interval_ids)
 
 
-def compute_streamed_interval_tasks(
-    interval_ids,
-    context: StreamingComputeContext,
-    *,
-    nufft_eps: float = 1e-12,
-    nufft_prefer_cpu: bool = False,
-    nufft_gpu_only: bool = False,
-) -> tuple[IntervalTask, ...]:
-    """Compute (or reuse) the scattering payloads for one interval batch.
-
-    Mask-empty intervals produce no payload and are omitted from the result;
-    the caller must still record them as incorporated — a zero contribution
-    is exact, and finalize's coverage check counts every planned interval.
-    The context's scattering-stage NUFFT settings take precedence over the
-    caller's (residual-stage) settings."""
-    if context.nufft_eps is not None:
-        nufft_eps = float(context.nufft_eps)
-    if context.nufft_prefer_cpu is not None:
-        nufft_prefer_cpu = bool(context.nufft_prefer_cpu)
-    if context.nufft_gpu_only is not None:
-        nufft_gpu_only = bool(context.nufft_gpu_only)
-    def _compute_one(interval_id: int) -> "IntervalTask | None":
-        key = (str(context.cache_token), int(interval_id))
-        cached = _memo_get(key)
-        if cached is not None:
-            return cached[0]
-        interval = context.interval_lookup.get(int(interval_id))
-        if interval is None:
-            raise KeyError(
-                "Streaming residual work unit references interval "
-                f"{int(interval_id)} that is missing from the scattering "
-                "plan's interval lookup — the residual plan and the "
-                "scattering identity disagree."
-            )
-        task = compute_scattering_interval_payload(
-            interval,
-            B_=context.B_,
-            mask_params=context.mask_params,
-            MaskStrategy=context.MaskStrategy,
-            supercell=context.supercell,
-            original_coords=context.original_coords,
-            cells_origin=context.cells_origin,
-            elements_arr=context.elements_arr,
-            charge=context.charge,
-            use_coeff=context.use_coeff,
-            coeff_val=context.coeff_val,
-            unique_elements=list(context.unique_elements),
-            ff_factory=context.ff_factory,
-            nufft_eps=nufft_eps,
-            nufft_prefer_cpu=nufft_prefer_cpu,
-            nufft_gpu_only=nufft_gpu_only,
-        )
-        _memo_store(key, task)
-        return task
-
-    # Streaming stage-1 runs in-task with no interval IO, so it is
-    # compute-bound: default the lattice type-1 forward path ON for the
-    # duration of this batch's computation (set -> try/finally -> reset via
-    # the ContextVar scope). An explicit MOSAIC_SCATTERING_LATTICE_FFT env
-    # value still wins inside.
-    #
-    # The per-interval computes are independent and mostly release the GIL
-    # (numpy mask/q-grid work, GPU type-1 with the lease-guarded plan cache),
-    # so a small in-task pool overlaps them. One thread per interval was the
-    # dominant wall-clock term of an hkl40 shard (~0.8 s x 293 intervals
-    # sequential). ContextVars do not flow into pool threads on their own;
-    # each submit carries a fresh copy_context() so the lattice-ON default
-    # holds inside workers.
-    parallel = _stage1_parallelism(len(interval_ids))
-    with streaming_lattice_default(True):
-        if parallel <= 1 or len(interval_ids) <= 1:
-            results = [_compute_one(int(i)) for i in interval_ids]
-        else:
-            import contextvars
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=parallel) as pool:
-                futures = [
-                    pool.submit(
-                        contextvars.copy_context().run, _compute_one, int(i)
-                    )
-                    for i in interval_ids
-                ]
-                results = [future.result() for future in futures]
-    return tuple(task for task in results if task is not None)
-
-
 __all__ = [
     "StreamingComputeContext",
     "lazy_streamed_interval_loaders",
@@ -500,7 +382,6 @@ __all__ = [
     "stage1_store_has",
     "write_stored_interval_payload",
     "clear_streaming_payload_memo",
-    "compute_streamed_interval_tasks",
     "stage2_streaming_enabled",
     "streaming_slot_map",
 ]

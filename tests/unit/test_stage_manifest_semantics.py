@@ -4,12 +4,9 @@ import numpy as np
 
 from core.contracts import CompletionStatus
 from core.scattering.artifacts import (
-    ScatteringArtifactStore,
     assess_scattering_manifest,
-    build_scattering_chunk_manifest,
     build_scattering_interval_manifest,
     persist_precomputed_interval_artifact,
-    persist_scattering_interval_chunk_result,
 )
 from core.scattering.contracts import ScatteringWorkUnit
 from core.scattering.kernels import IntervalTask
@@ -47,9 +44,8 @@ def _seed_point_and_interval_state(db: DatabaseManager, chunk_id: int = 3) -> in
     return interval_id
 
 
-def test_scattering_manifest_assessment_tracks_interval_and_chunk_resume(tmp_path):
+def test_scattering_manifest_assessment_tracks_interval_resume(tmp_path):
     db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
-    store = ScatteringArtifactStore(str(tmp_path))
     try:
         interval_id = _seed_point_and_interval_state(db)
         interval_work_unit = ScatteringWorkUnit.precompute_interval(
@@ -80,101 +76,6 @@ def test_scattering_manifest_assessment_tracks_interval_and_chunk_resume(tmp_pat
         interval_assessment = assess_scattering_manifest(interval_manifest, db_path=db.db_path)
         assert interval_assessment.is_complete is True
         assert interval_assessment.can_resume is False
-
-        baseline = np.array([[10 + 0j, 0 + 0j], [11 + 0j, 0 + 0j]], dtype=np.complex128)
-        store.save_chunk_payloads(
-            3,
-            amplitudes_payload=baseline,
-            amplitudes_average_payload=baseline.copy(),
-            reciprocal_point_count=0,
-        )
-        chunk_work_unit = ScatteringWorkUnit.interval_chunk(
-            interval_id=interval_id,
-            chunk_id=3,
-            dimension=1,
-            output_dir=str(tmp_path),
-        )
-        chunk_manifest = build_scattering_chunk_manifest(
-            chunk_work_unit,
-            output_dir=str(tmp_path),
-            completion_status=CompletionStatus.COMMITTED,
-        )
-
-        chunk_assessment = assess_scattering_manifest(chunk_manifest, db_path=db.db_path)
-        assert chunk_assessment.is_complete is False
-        assert chunk_assessment.can_resume is True
-
-        persist_scattering_interval_chunk_result(
-            chunk_work_unit,
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=5,
-            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
-            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
-            output_dir=str(tmp_path),
-            db_path=db.db_path,
-            quiet_logs=True,
-        )
-        chunk_assessment = assess_scattering_manifest(chunk_manifest, db_path=db.db_path)
-        assert chunk_assessment.is_complete is True
-        assert chunk_assessment.can_resume is False
-    finally:
-        db.close()
-
-
-def test_scattering_chunk_replay_is_idempotent(tmp_path):
-    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
-    store = ScatteringArtifactStore(str(tmp_path))
-    try:
-        interval_id = _seed_point_and_interval_state(db)
-        persist_precomputed_interval_artifact(
-            ScatteringWorkUnit.precompute_interval(
-                interval_id=interval_id,
-                dimension=1,
-                output_dir=str(tmp_path),
-            ),
-            IntervalTask(
-                interval_id,
-                "All",
-                np.array([[0.0]]),
-                np.array([1 + 0j]),
-                np.array([0 + 0j]),
-            ),
-            db_path=db.db_path,
-        )
-        baseline = np.array([[10 + 0j, 0 + 0j], [11 + 0j, 0 + 0j]], dtype=np.complex128)
-        store.save_chunk_payloads(
-            3,
-            amplitudes_payload=baseline,
-            amplitudes_average_payload=baseline.copy(),
-            reciprocal_point_count=0,
-        )
-        work_unit = ScatteringWorkUnit.interval_chunk(
-            interval_id=interval_id,
-            chunk_id=3,
-            dimension=1,
-            output_dir=str(tmp_path),
-        )
-
-        kwargs = dict(
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=5,
-            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
-            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
-            output_dir=str(tmp_path),
-            db_path=db.db_path,
-            quiet_logs=True,
-        )
-        persist_scattering_interval_chunk_result(work_unit, **kwargs)
-        persist_scattering_interval_chunk_result(work_unit, **kwargs)
-
-        current, current_av, nrec, _ = store.load_chunk_payloads(3)
-        applied = store.load_applied_interval_ids(3)
-        np.testing.assert_allclose(current[:, 1], np.array([1 + 0j, 2 + 0j]))
-        np.testing.assert_allclose(current_av[:, 1], np.array([0.5 + 0j, 0.75 + 0j]))
-        assert nrec == 5
-        assert applied == {interval_id}
     finally:
         db.close()
 

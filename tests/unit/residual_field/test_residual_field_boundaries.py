@@ -1345,6 +1345,7 @@ def test_residual_field_async_local_handoff_reuses_scattered_interval_payloads(m
     structure = SimpleNamespace(supercell=np.array([1]))
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3)],
             get_point_data_for_chunk=lambda chunk_id: [],
             db_path=str(tmp_path / "state.db"),
@@ -1486,6 +1487,7 @@ def test_residual_field_async_stage_uses_owner_affinity_for_distributed_backend_
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3)],
             get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
             db_path=str(tmp_path / "state.db"),
@@ -1650,6 +1652,7 @@ def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
         structure=SimpleNamespace(supercell=np.array([1])),
         artifacts=SimpleNamespace(
             db_manager=SimpleNamespace(
+                cache_enabled=False,
                 get_unsaved_interval_chunks=lambda: [(1, 3)],
                 get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
                 db_path=str(tmp_path / "state.db"),
@@ -1803,6 +1806,7 @@ def test_residual_field_final_drain_retries_failed_owner_local_batch(
         structure=SimpleNamespace(supercell=np.array([1])),
         artifacts=SimpleNamespace(
             db_manager=SimpleNamespace(
+                cache_enabled=False,
                 get_unsaved_interval_chunks=lambda: [(189, 0)],
                 get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 0}],
                 db_path=str(tmp_path / "state.db"),
@@ -1909,6 +1913,7 @@ def test_residual_field_final_drain_raises_before_finalize_when_retries_exhaust(
             structure=SimpleNamespace(supercell=np.array([1])),
             artifacts=SimpleNamespace(
                 db_manager=SimpleNamespace(
+                    cache_enabled=False,
                     get_unsaved_interval_chunks=lambda: [(189, 0)],
                     get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 0}],
                     db_path=str(tmp_path / "state.db"),
@@ -1976,6 +1981,7 @@ def test_residual_field_distributed_stage_rejects_disabled_owner_affinity(
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [],
             get_point_data_for_chunk=lambda chunk_id: [],
             db_path=str(tmp_path / "state.db"),
@@ -2017,6 +2023,7 @@ def test_residual_field_distributed_stage_rejects_missing_owner_local_backend_su
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [],
             get_point_data_for_chunk=lambda chunk_id: [],
             db_path=str(tmp_path / "state.db"),
@@ -2116,6 +2123,7 @@ def test_residual_field_sync_stage_filters_already_durable_local_work_units_befo
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3), (2, 3)],
             get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
             db_path=str(tmp_path / "state.db"),
@@ -2220,6 +2228,7 @@ def test_residual_field_sync_stage_filters_already_durable_distributed_work_unit
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3), (2, 3)],
             get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
             db_path=str(tmp_path / "state.db"),
@@ -2382,6 +2391,7 @@ def test_residual_field_async_local_stage_uses_owner_affinity_per_unique_reducer
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3), (2, 3), (3, 3)],
             get_point_data_for_chunk=lambda chunk_id: [
                 {
@@ -2582,6 +2592,7 @@ def test_residual_field_async_stage_passes_hysteresis_policy_into_partition_plan
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3)],
             get_point_data_for_chunk=lambda chunk_id: [
                 {"chunk_id": 3, "coordinates": np.array([0.0, 0.0])},
@@ -2754,6 +2765,7 @@ def test_residual_field_async_distributed_stage_flushes_validates_and_logs_metri
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3)],
             get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
             db_path=str(tmp_path / "state.db"),
@@ -2925,6 +2937,7 @@ def test_residual_field_async_distributed_stage_remaps_missing_owner_for_finaliz
         structure=SimpleNamespace(supercell=np.array([1])),
         artifacts=SimpleNamespace(
             db_manager=SimpleNamespace(
+                cache_enabled=False,
                 get_unsaved_interval_chunks=lambda: [(1, 3)],
                 get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
                 db_path=str(tmp_path / "state.db"),
@@ -3136,6 +3149,7 @@ def test_residual_field_async_reuses_one_rifft_payload_future_per_target(
             structure=SimpleNamespace(supercell=np.array([1])),
             artifacts=SimpleNamespace(
                 db_manager=SimpleNamespace(
+                    cache_enabled=False,
                     get_unsaved_interval_chunks=lambda: [(1, 3), (2, 3)],
                     get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
                     db_path=str(tmp_path / "state.db"),
@@ -3308,6 +3322,7 @@ def test_residual_field_async_stage_logs_main_process_progress_when_enabled(
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3)],
             get_point_data_for_chunk=lambda chunk_id: [
                 {
@@ -3415,6 +3430,7 @@ def test_residual_field_sync_stage_uses_worker_owned_local_reducer_boundary(
 
     artifacts = SimpleNamespace(
         db_manager=SimpleNamespace(
+            cache_enabled=False,
             get_unsaved_interval_chunks=lambda: [(1, 3)],
             get_point_data_for_chunk=lambda chunk_id: [{"chunk_id": 3}],
             db_path=str(tmp_path / "state.db"),

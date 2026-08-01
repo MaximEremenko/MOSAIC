@@ -14,7 +14,6 @@ from core.scattering import execution as scattering_execution
 from core.scattering.artifacts import (
     ScatteringArtifactStore,
     persist_precomputed_interval_artifact,
-    persist_scattering_interval_chunk_result,
 )
 from core.scattering.contracts import (
     ScatteringArtifactManifest,
@@ -33,7 +32,6 @@ from core.scattering.tasks import (
     clear_scattering_interval_payload_cache,
     compute_scattering_interval_payload,
     load_interval_task_payload,
-    run_scattering_interval_chunk_task,
 )
 from core.contracts import CompletionStatus
 from core.storage.database_manager import DatabaseManager
@@ -188,64 +186,6 @@ def test_compute_scattering_interval_payload_attaches_hkl_half_space_role(monkey
     assert interval_task.reciprocal_multiplicity == 2
 
 
-def test_artifacts_persist_chunk_result_updates_saved_state_and_artifacts(tmp_path):
-    db = DatabaseManager(str(tmp_path / "state.db"), dimension=1)
-    store = ScatteringArtifactStore(str(tmp_path))
-    try:
-        db.insert_point_data_batch(
-            [
-                {
-                    "central_point_id": 10,
-                    "coordinates": [0.1],
-                    "dist_from_atom_center": [0.2],
-                    "step_in_frac": [0.05],
-                    "chunk_id": 3,
-                    "grid_amplitude_initialized": 1,
-                }
-            ]
-        )
-        interval_id = db.insert_reciprocal_space_interval_batch([{"h_range": (0.0, 1.0)}])[0]
-        db.insert_interval_chunk_status_batch([(interval_id, 3, 0)])
-
-        baseline = np.array([[10 + 0j, 0 + 0j], [11 + 0j, 0 + 0j]], dtype=np.complex128)
-        store.save_chunk_payloads(
-            3,
-            amplitudes_payload=baseline,
-            amplitudes_average_payload=baseline.copy(),
-            reciprocal_point_count=0,
-        )
-        work_unit = ScatteringWorkUnit.interval_chunk(
-            interval_id=interval_id,
-            chunk_id=3,
-            dimension=1,
-            output_dir=str(tmp_path),
-        )
-
-        manifest = persist_scattering_interval_chunk_result(
-            work_unit,
-            grid_shape_nd=np.array([[2]]),
-            total_reciprocal_points=11,
-            contribution_reciprocal_points=5,
-            amplitudes_delta=np.array([1 + 0j, 2 + 0j]),
-            amplitudes_average=np.array([0.5 + 0j, 0.75 + 0j]),
-            output_dir=str(tmp_path),
-            db_path=db.db_path,
-            quiet_logs=True,
-        )
-
-        current, current_av, nrec, _ = store.load_chunk_payloads(3)
-        applied = store.load_applied_interval_ids(3)
-
-        assert (interval_id, 3) not in set(db.get_unsaved_interval_chunks())
-        assert manifest.completion_status is CompletionStatus.COMMITTED
-        assert interval_id in applied
-        np.testing.assert_allclose(current[:, 1], np.array([1 + 0j, 2 + 0j]))
-        np.testing.assert_allclose(current_av[:, 1], np.array([0.5 + 0j, 0.75 + 0j]))
-        assert nrec == 5
-    finally:
-        db.close()
-
-
 def test_execution_serial_precompute_uses_work_units(monkeypatch, tmp_path):
     work_unit = ScatteringWorkUnit.precompute_interval(
         interval_id=1,
@@ -253,10 +193,6 @@ def test_execution_serial_precompute_uses_work_units(monkeypatch, tmp_path):
         output_dir=str(tmp_path),
     )
 
-    monkeypatch.setattr(
-        "core.scattering.execution.is_interval_artifact_committed",
-        lambda *args, **kwargs: False,
-    )
     monkeypatch.setattr(
         "core.scattering.execution.run_scattering_interval_task",
         lambda unit, interval, **kwargs: ScatteringArtifactManifest.from_work_unit(
@@ -282,7 +218,7 @@ def test_execution_serial_precompute_uses_work_units(monkeypatch, tmp_path):
         elements_arr=np.array(["El"], dtype=object),
         charge=0.0,
         ff_factory=SimpleNamespace(),
-        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        db=SimpleNamespace(cache_enabled=True, db_path=str(tmp_path / "state.db")),
         client=None,
     )
 
@@ -307,10 +243,6 @@ def test_execution_local_fast_precompute_caches_payload_without_writing_interval
         np.array([0 + 0j]),
     )
 
-    monkeypatch.setattr(
-        "core.scattering.execution.is_interval_artifact_committed",
-        lambda *args, **kwargs: False,
-    )
     monkeypatch.setattr(
         "core.scattering.execution.compute_scattering_interval_payload",
         lambda *args, **kwargs: interval_task,
@@ -337,7 +269,7 @@ def test_execution_local_fast_precompute_caches_payload_without_writing_interval
         elements_arr=np.array(["El"], dtype=object),
         charge=0.0,
         ff_factory=SimpleNamespace(),
-        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        db=SimpleNamespace(cache_enabled=True, db_path=str(tmp_path / "state.db")),
         client=None,
         transient_interval_payloads=payload_cache,
     )
@@ -400,10 +332,6 @@ def test_execution_async_local_fast_precompute_caches_scattered_payload_once(
 
     monkeypatch.setenv("DASK_BACKEND", "local")
     monkeypatch.setattr(
-        "core.scattering.execution.is_interval_artifact_committed",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
         "core.scattering.execution.yield_futures_with_results",
         lambda futures, client: ((future, True) for future in futures),
     )
@@ -429,7 +357,7 @@ def test_execution_async_local_fast_precompute_caches_scattered_payload_once(
         elements_arr=np.array(["El"], dtype=object),
         charge=0.0,
         ff_factory=SimpleNamespace(),
-        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        db=SimpleNamespace(cache_enabled=True, db_path=str(tmp_path / "state.db")),
         client=client,
         transient_interval_payloads=payload_cache,
     )
@@ -499,10 +427,6 @@ def test_execution_async_local_fast_precompute_falls_back_to_required_transport_
 
     monkeypatch.setenv("DASK_BACKEND", "local")
     monkeypatch.setattr(
-        "core.scattering.execution.is_interval_artifact_committed",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
         "core.scattering.execution.yield_futures_with_results",
         lambda futures, client: ((future, True) for future in futures),
     )
@@ -533,7 +457,7 @@ def test_execution_async_local_fast_precompute_falls_back_to_required_transport_
         elements_arr=np.array(["El", "El"], dtype=object),
         charge=0.0,
         ff_factory=SimpleNamespace(),
-        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        db=SimpleNamespace(cache_enabled=True, db_path=str(tmp_path / "state.db")),
         client=client,
         transient_interval_payloads=payload_cache,
     )
@@ -598,10 +522,6 @@ def test_execution_async_local_fast_precompute_falls_back_to_required_transport_
 
     monkeypatch.setenv("DASK_BACKEND", "local")
     monkeypatch.setattr(
-        "core.scattering.execution.is_interval_artifact_committed",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
         "core.scattering.execution.yield_futures_with_results",
         lambda futures, client: ((future, True) for future in futures),
     )
@@ -634,7 +554,7 @@ def test_execution_async_local_fast_precompute_falls_back_to_required_transport_
         elements_arr=np.array(["El"], dtype=object),
         charge=0.0,
         ff_factory=SimpleNamespace(),
-        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        db=SimpleNamespace(cache_enabled=True, db_path=str(tmp_path / "state.db")),
         client=client,
         transient_interval_payloads=payload_cache,
     )
@@ -696,10 +616,6 @@ def test_execution_durable_precompute_scatter_shared_inputs_once_and_keeps_requi
     )
 
     monkeypatch.setattr(
-        "core.scattering.execution.is_interval_artifact_committed",
-        lambda *args, **kwargs: False,
-    )
-    monkeypatch.setattr(
         "core.scattering.execution.yield_futures_with_results",
         lambda futures, client: ((future, True) for future in futures),
     )
@@ -721,7 +637,7 @@ def test_execution_durable_precompute_scatter_shared_inputs_once_and_keeps_requi
         elements_arr=np.array(["El", "El"], dtype=object),
         charge=0.0,
         ff_factory=SimpleNamespace(),
-        db=SimpleNamespace(db_path=str(tmp_path / "state.db")),
+        db=SimpleNamespace(cache_enabled=True, db_path=str(tmp_path / "state.db")),
         client=client,
     )
 
@@ -762,11 +678,6 @@ def test_run_scattering_stage_default_leaves_pairs_for_residual_stage(
     )
     monkeypatch.setattr(
         scattering_execution,
-        "_runtime_provenance_for_scattering",
-        lambda **kwargs: {},
-    )
-    monkeypatch.setattr(
-        scattering_execution,
         "build_scattering_execution_plan",
         lambda **kwargs: SimpleNamespace(
             interval_work_units=(
@@ -786,20 +697,8 @@ def test_run_scattering_stage_default_leaves_pairs_for_residual_stage(
     )
     monkeypatch.setattr(
         scattering_execution,
-        "pending_scattering_interval_chunks",
-        lambda snapshot, pairs: list(pairs),
-    )
-    monkeypatch.setattr(
-        scattering_execution,
         "run_interval_precompute",
         lambda *args, **kwargs: calls.append("precompute") or [],
-    )
-    monkeypatch.setattr(
-        scattering_execution,
-        "run_interval_chunk_execution",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("legacy Stage-2 pair execution should be opt-in")
-        ),
     )
 
     db_manager = SimpleNamespace(get_interval_chunks=lambda: [(1, 3)])
@@ -834,7 +733,8 @@ def test_run_scattering_stage_default_leaves_pairs_for_residual_stage(
     )
 
     assert calls == ["precompute"]
-    assert result["stage2_replacement_expected_by_chunk"] == {}
+    assert result["scattering_run_digest"] == "run123"
+    assert result["source_scattering_commit_digest"]
 
 
 def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path):
@@ -849,116 +749,6 @@ def test_total_reciprocal_points_artifact_recovers_from_corrupted_file(tmp_path)
     data = store.saver.load_data(fn.name)
     assert int(np.asarray(data["ntotal_reciprocal_space_points"]).ravel()[0]) == 11
     assert int(np.asarray(data["ntotal_reciprocal_points"]).ravel()[0]) == 11
-
-
-def test_scattering_interval_chunk_task_uses_batched_inverse(monkeypatch, tmp_path):
-    interval_path = tmp_path / "interval_1.hdf5"
-    _write_current_interval_payload(
-        interval_path,
-        q_grid=np.array([[0.0]], dtype=np.float64),
-        q_amp=np.array([2.0 + 0.0j]),
-        q_amp_av=np.array([1.0 + 0.0j]),
-    )
-    atoms = np.array(
-        [([0.0], [0.1], [0.05])],
-        dtype=[
-            ("coordinates", object),
-            ("dist_from_atom_center", object),
-            ("step_in_frac", object),
-        ],
-    )
-    captured = {}
-
-    monkeypatch.setattr(
-        "core.scattering.tasks.build_rifft_grid_for_chunk",
-        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
-    )
-    calls = {"count": 0}
-    monkeypatch.setattr(
-        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
-        lambda **kwargs: calls.__setitem__("count", calls["count"] + 1) or np.array([[3.0 + 0.0j], [4.0 + 0.0j]]),
-    )
-    monkeypatch.setattr(
-        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
-        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
-    )
-
-    result = run_scattering_interval_chunk_task(
-        ScatteringWorkUnit.interval_chunk(
-            interval_id=1,
-            chunk_id=3,
-            dimension=1,
-            output_dir=str(tmp_path),
-        ),
-        interval_path,
-        atoms,
-        total_reciprocal_points=11,
-        output_dir=str(tmp_path),
-        db_path=str(tmp_path / "state.db"),
-        quiet_logs=True,
-    )
-
-    assert result == "manifest"
-    assert calls["count"] == 1
-    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([3.0 + 0.0j]))
-    np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))
-
-
-def test_scattering_interval_chunk_task_threads_nufft_settings(monkeypatch, tmp_path):
-    interval_path = tmp_path / "interval_1.hdf5"
-    _write_current_interval_payload(
-        interval_path,
-        q_grid=np.array([[0.0]], dtype=np.float64),
-        q_amp=np.array([2.0 + 0.0j]),
-        q_amp_av=np.array([1.0 + 0.0j]),
-    )
-    atoms = np.array(
-        [([0.0], [0.1], [0.05])],
-        dtype=[
-            ("coordinates", object),
-            ("dist_from_atom_center", object),
-            ("step_in_frac", object),
-        ],
-    )
-    captured_inverse = {}
-
-    monkeypatch.setattr(
-        "core.scattering.tasks.build_rifft_grid_for_chunk",
-        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
-    )
-
-    def fake_inverse(**kwargs):
-        captured_inverse.update(kwargs)
-        return np.array([[3.0 + 0.0j], [4.0 + 0.0j]])
-
-    monkeypatch.setattr(
-        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
-        fake_inverse,
-    )
-    monkeypatch.setattr(
-        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
-        lambda work_unit, **kwargs: "manifest",
-    )
-
-    run_scattering_interval_chunk_task(
-        ScatteringWorkUnit.interval_chunk(
-            interval_id=1,
-            chunk_id=3,
-            dimension=1,
-            output_dir=str(tmp_path),
-        ),
-        interval_path,
-        atoms,
-        total_reciprocal_points=11,
-        output_dir=str(tmp_path),
-        nufft_eps=1e-7,
-        nufft_prefer_cpu=True,
-        nufft_gpu_only=False,
-    )
-
-    assert captured_inverse["eps"] == 1e-7
-    assert captured_inverse["prefer_cpu"] is True
-    assert captured_inverse["gpu_only"] is False
 
 
 def test_interval_payload_ref_uses_digest_backed_cache(monkeypatch, tmp_path):
@@ -1008,115 +798,3 @@ def test_interval_payload_ref_rejects_digest_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="file_sha256 mismatch"):
         load_interval_task_payload(ref)
-
-
-def test_scattering_interval_chunk_task_accepts_transient_interval_payload(
-    monkeypatch,
-    tmp_path,
-):
-    interval_payload = IntervalTask(
-        1,
-        "All",
-        np.array([[0.0]], dtype=np.float64),
-        np.array([2.0 + 0.0j]),
-        np.array([1.0 + 0.0j]),
-    )
-    atoms = np.array(
-        [([0.0], [0.1], [0.05])],
-        dtype=[
-            ("coordinates", object),
-            ("dist_from_atom_center", object),
-            ("step_in_frac", object),
-        ],
-    )
-    captured = {}
-
-    monkeypatch.setattr(
-        "core.scattering.tasks.build_rifft_grid_for_chunk",
-        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
-    )
-    monkeypatch.setattr(
-        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
-        lambda **kwargs: np.array([[3.0 + 0.0j], [4.0 + 0.0j]]),
-    )
-    monkeypatch.setattr(
-        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
-        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
-    )
-
-    result = run_scattering_interval_chunk_task(
-        ScatteringWorkUnit.interval_chunk(
-            interval_id=1,
-            chunk_id=3,
-            dimension=1,
-            output_dir=str(tmp_path),
-        ),
-        interval_payload,
-        atoms,
-        total_reciprocal_points=11,
-        output_dir=str(tmp_path),
-        db_path=str(tmp_path / "state.db"),
-        quiet_logs=True,
-    )
-
-    assert result == "manifest"
-    assert captured["contribution_reciprocal_points"] == 1
-    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([3.0 + 0.0j]))
-    np.testing.assert_allclose(captured["amplitudes_average"], np.array([4.0 + 0.0j]))
-
-
-def test_scattering_interval_chunk_task_reconstructs_positive_half_space(
-    monkeypatch,
-    tmp_path,
-):
-    interval_path = tmp_path / "interval_1.hdf5"
-    _write_current_interval_payload(
-        interval_path,
-        q_grid=np.array([[0.0, 0.0, 0.0]], dtype=np.float64),
-        q_amp=np.array([2.0 + 0.0j]),
-        q_amp_av=np.array([1.0 + 0.0j]),
-        half_space_role=HALF_SPACE_ROLE_POSITIVE_HALF,
-        reciprocal_multiplicity=2,
-    )
-    atoms = np.array(
-        [([0.0], [0.1], [0.05])],
-        dtype=[
-            ("coordinates", object),
-            ("dist_from_atom_center", object),
-            ("step_in_frac", object),
-        ],
-    )
-    captured = {}
-
-    monkeypatch.setattr(
-        "core.scattering.tasks.build_rifft_grid_for_chunk",
-        lambda chunk_data: (np.array([[0.0]], dtype=np.float64), np.array([[1]], dtype=np.int64)),
-    )
-    monkeypatch.setattr(
-        "core.scattering.tasks.execute_inverse_cunufft_batch_materialize_once",
-        lambda **kwargs: np.array([[3.0 + 2.0j], [4.0 - 1.0j]], dtype=np.complex128),
-    )
-    monkeypatch.setattr(
-        "core.scattering.tasks.persist_scattering_interval_chunk_shard",
-        lambda work_unit, **kwargs: captured.update(kwargs) or "manifest",
-    )
-
-    result = run_scattering_interval_chunk_task(
-        ScatteringWorkUnit.interval_chunk(
-            interval_id=1,
-            chunk_id=3,
-            dimension=3,
-            output_dir=str(tmp_path),
-        ),
-        interval_path,
-        atoms,
-        total_reciprocal_points=11,
-        output_dir=str(tmp_path),
-        db_path=str(tmp_path / "state.db"),
-        quiet_logs=True,
-    )
-
-    assert result == "manifest"
-    np.testing.assert_allclose(captured["amplitudes_delta"], np.array([6.0 + 0.0j]))
-    np.testing.assert_allclose(captured["amplitudes_average"], np.array([8.0 + 0.0j]))
-    assert captured["contribution_reciprocal_points"] == 2

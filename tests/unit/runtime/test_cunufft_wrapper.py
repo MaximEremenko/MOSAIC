@@ -273,69 +273,6 @@ def test_execute_inverse_cunufft_batch_stacks_cpu_results(monkeypatch: pytest.Mo
     np.testing.assert_allclose(result[1], np.array([7.0 + 0.0j, 7.0 + 1.0j]))
 
 
-def test_execute_inverse_cunufft_batch_device_materializes_once(monkeypatch: pytest.MonkeyPatch):
-    fake_cp = SimpleNamespace(
-        cuda=SimpleNamespace(
-            memory=SimpleNamespace(
-                OutOfMemoryError=RuntimeError,
-            ),
-            runtime=SimpleNamespace(CUDARuntimeError=RuntimeError),
-            driver=SimpleNamespace(CUDADriverError=RuntimeError),
-        ),
-        asnumpy=lambda x: np.asarray(x),
-    )
-    asnumpy_calls = {"count": 0}
-    fake_cp.asnumpy = lambda x: asnumpy_calls.__setitem__("count", asnumpy_calls["count"] + 1) or np.asarray(x)
-
-    monkeypatch.setattr(cunufft_wrapper, "cp", fake_cp)
-    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", True)
-    monkeypatch.setattr(cunufft_wrapper, "_ensure_gpu_kernels", lambda: None)
-    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 10**9)
-    monkeypatch.setattr(cunufft_wrapper, "_as_device", lambda arr, allow_fail=False: np.asarray(arr))
-    monkeypatch.setattr(cunufft_wrapper, "_contig", lambda x: x)
-    monkeypatch.setattr(
-        cunufft_wrapper,
-        "_execute_inverse_batch_gpu",
-        lambda **kwargs: np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
-    )
-
-    result = cunufft_wrapper._execute_inverse_cunufft_batch_device(
-        q_coords=np.array([[0.0]], dtype=np.float64),
-        weights=np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
-        real_coords=np.array([[0.0]], dtype=np.float64),
-        eps=1e-12,
-    )
-
-    np.testing.assert_allclose(result, np.array([[1.0 + 0.0j], [2.0 + 0.0j]]))
-    assert asnumpy_calls["count"] == 1
-
-
-def test_execute_inverse_cunufft_batch_device_falls_back_safely(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", True)
-    monkeypatch.setattr(cunufft_wrapper, "_ensure_gpu_kernels", lambda: None)
-    monkeypatch.setattr(
-        cunufft_wrapper,
-        "_as_device",
-        lambda arr, allow_fail=False: None if allow_fail else np.asarray(arr),
-    )
-    monkeypatch.setattr(
-        cunufft_wrapper,
-        "_cpu_fallback",
-        lambda real_coords, weights, q_coords, eps, inverse: np.array(
-            [weights.sum() + 0.0j],
-            dtype=np.complex128,
-        ),
-    )
-
-    result = cunufft_wrapper._execute_inverse_cunufft_batch_device(
-        q_coords=np.array([[0.0]], dtype=np.float64),
-        weights=np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
-        real_coords=np.array([[0.0]], dtype=np.float64),
-    )
-
-    np.testing.assert_allclose(result, np.array([[1.0 + 0.0j], [2.0 + 0.0j]]))
-
-
 def test_execute_inverse_cunufft_super_batch_preserves_shape(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         cunufft_wrapper,

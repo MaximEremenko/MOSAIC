@@ -39,6 +39,7 @@ from core.contracts import (
     CompletionStatus,
 )
 from core.runtime import chunk_mutex
+from core.storage.atomic import fsync_parent, fsync_path
 from core.storage.database_manager import create_db_manager_for_thread
 
 # ---------------------------------------------------------------------------
@@ -62,15 +63,6 @@ from core.residual_field.manifest_io import (  # noqa: E402
     parse_residual_field_generation_ref,
     write_residual_field_reducer_progress_manifest,
 )
-from core.residual_field.stage2_replacement import (  # noqa: E402
-    build_stage2_replacement_expected_artifact,
-    load_stage2_replacement_expected_manifest,
-    load_stage2_replacement_expected_metadata,
-    normalize_stage2_replacement_expected_by_chunk,
-    normalize_stage2_replacement_expected_metadata,
-    stage2_replacement_expected_digest,
-    write_stage2_replacement_expected_manifest,
-)
 from core.residual_field.shard_discovery import (  # noqa: E402
     _merge_residual_field_shard_manifests,
     _shard_manifests_by_key,
@@ -82,28 +74,6 @@ from core.residual_field.shard_discovery import (  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
-
-
-def _fsync_path(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _fsync_parent(path: Path) -> None:
-    try:
-        fd = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 class _ResidualFieldChunkStatusUpdater:
@@ -124,21 +94,13 @@ class _ResidualFieldChunkStatusUpdater:
             db.close()
 
     def mark_saved_many(self, interval_ids, chunk_id: int) -> None:
-        """One connection + one transaction for a whole chunk's rows.
-
-        Falls back to per-row mark_saved semantics when the manager lacks
-        the batch method (test doubles, monkeypatched single-row seams)."""
+        """One connection + one transaction for a whole chunk's rows."""
         rows = [(int(iv), int(chunk_id), 1) for iv in interval_ids]
         if not rows:
             return
         db = self.db_manager_factory(self.db_path)
         try:
-            batch = getattr(db, "update_interval_chunk_status_batch", None)
-            if batch is not None:
-                batch(rows)
-            else:
-                for interval_id, chunk, _saved in rows:
-                    db.update_interval_chunk_status(interval_id, chunk, saved=True)
+            db.update_interval_chunk_status_batch(rows)
         finally:
             db.close()
 
@@ -397,7 +359,7 @@ def _write_hdf5_payload_atomic(
                 for name, value in attrs.items():
                     h5file.attrs[name] = value
             h5file.flush()
-        _fsync_path(temp_path)
+        fsync_path(temp_path)
         with h5py.File(temp_path, "r") as h5file:
             for name, value in payload.items():
                 if name not in h5file:
@@ -408,7 +370,7 @@ def _write_hdf5_payload_atomic(
                         f"{h5file[name].shape} != {np.asarray(value).shape}"
                     )
         temp_path.replace(target_path)
-        _fsync_parent(target_path)
+        fsync_parent(target_path)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -1825,16 +1787,12 @@ __all__ = [
     "discover_stale_residual_field_generation_manifests",
     "is_residual_field_manifest_complete",
     "is_residual_field_replacement_complete",
-    "load_stage2_replacement_expected_manifest",
-    "load_stage2_replacement_expected_metadata",
     "load_residual_field_generation_metadata",
     "load_residual_field_generation_payload",
-    "normalize_stage2_replacement_expected_metadata",
     "load_residual_field_reducer_progress_manifest",
     "parse_residual_field_generation_ref",
     "persist_residual_field_generation_checkpoint",
     "reconcile_residual_field_reducer_progress",
     "summarize_residual_field_generation_metrics",
     "write_residual_field_reducer_progress_manifest",
-    "write_stage2_replacement_expected_manifest",
 ]

@@ -9,6 +9,9 @@ from __future__ import annotations
 import logging
 
 from core.runtime import is_sync_client
+# Private alias kept for the residual-field call sites; the guarded helper
+# (a sync client must report no workers) now lives in core.runtime.
+from core.runtime import current_worker_addresses as _current_worker_addresses
 from core.residual_field.runtime_policy import _memory_backpressure_threshold
 from core.residual_field.tasks import clear_residual_rifft_payload_cache
 
@@ -168,16 +171,6 @@ def _clear_worker_rifft_payload_caches(client) -> None:
         run(clear_streaming_payload_memo)
     except Exception:
         pass
-
-
-def _current_worker_addresses(client) -> list[str]:
-    if client is None or is_sync_client(client):
-        return []
-    try:
-        workers = client.scheduler_info().get("workers", {})
-    except Exception:
-        workers = {}
-    return sorted(workers)
 
 
 def _resolve_owner_address(

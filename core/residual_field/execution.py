@@ -41,7 +41,6 @@ from core.residual_field.backend import (
     ResidualFieldReducerBackend,
     ResidualFieldLocalAccumulatorPartial,
     build_residual_field_reducer_backend,
-    is_same_node_local_client,
     resolve_residual_field_reducer_backend,
 )
 from core.residual_field.contracts import (
@@ -49,7 +48,6 @@ from core.residual_field.contracts import (
     ResidualFieldShardManifest,
     ResidualFieldWorkUnit,
 )
-from core.residual_field.commit import build_residual_work_unit_digest
 from core.residual_field.artifacts import (
     discover_residual_field_reducer_progress_manifest,
     summarize_residual_field_output_artifacts,
@@ -292,24 +290,6 @@ def _runtime_provenance_for_residual(
     )
     provenance["nufft_execution_settings"] = settings.identity_payload()
     return provenance
-
-
-def _residual_work_unit_digest(work_unit: ResidualFieldWorkUnit) -> str:
-    # Device-independent checkpoint address (backend policy is metadata,
-    # not identity) so CPU and GPU residual work units share one address.
-    return build_residual_work_unit_digest(
-        run_digest=str(work_unit.run_digest),
-        chunk_id=int(work_unit.chunk_id),
-        partition_id=int(work_unit.partition_id),
-        point_start=int(work_unit.point_start),
-        point_stop=int(work_unit.point_stop),
-        interval_ids=tuple(int(item) for item in work_unit.interval_ids),
-        parameter_digest=str(work_unit.parameter_digest),
-        partition_plan_digest=str(work_unit.partition_plan_digest),
-        source_scattering_commit_digest=str(work_unit.source_scattering_commit_digest),
-        source_replacement_digest=work_unit.source_replacement_digest,
-        expected_output_digest=str(work_unit.expected_output_digest),
-    )
 
 
 def _expected_partition_family_for_chunk(
@@ -1240,10 +1220,13 @@ def run_residual_field_stage(
     client: "Client | None",
     max_inflight: int = 5_000,
 ) -> None:
-    explicit_scratch_root = workflow_parameters.runtime_info.get(
-        "residual_shard_scratch_root",
-        os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT"),
-    )
+    # Uniform precedence: operator env wins over config (see
+    # resolve_residual_field_reducer_backend for the rule).
+    explicit_scratch_root = os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT")
+    if explicit_scratch_root is None:
+        explicit_scratch_root = workflow_parameters.runtime_info.get(
+            "residual_shard_scratch_root"
+        )
     preliminary_backend = resolve_residual_field_reducer_backend(
         workflow_parameters=workflow_parameters,
         client=client,

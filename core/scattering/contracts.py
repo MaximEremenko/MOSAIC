@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -14,6 +15,14 @@ from core.contracts import (
     RetryIdempotencySemantics,
 )
 
+
+# Whether scattering interval artifacts are required transport toward the
+# residual stage or merely optional saved output. Producer-side policy, so it
+# lives with the scattering contracts; the residual reducer layouts consume it.
+ScatteringIntervalArtifactPolicy = Literal[
+    "required_transport",
+    "optional_output",
+]
 
 SCATTERING_CONTRACT_SCHEMA_VERSION = 1
 SCATTERING_INTERVAL_ARTIFACT_SCHEMA = ArtifactSchemaSpec(

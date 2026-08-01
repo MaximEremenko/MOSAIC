@@ -11,6 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Tuple
 import numpy as np
 
 from core.qspace.masking.mask_strategies import EqBasedStrategy, get_last_eq_mask_telemetry
+from core.runtime.env import env_bool, env_int
 from core.scattering.half_space import (
     HALF_SPACE_ROLE_FULL,
     classify_interval_half_space_role,
@@ -117,27 +118,11 @@ def _call_generate_mask(mask_strategy, hkl: np.ndarray, mask_params: Dict[str, A
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.debug("Ignoring invalid integer %s=%r", name, raw)
-        return default
+    return env_int(name, default, logger=logger)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    logger.debug("Ignoring invalid boolean %s=%r", name, raw)
-    return default
+    return bool(env_bool(name, default, logger=logger))
 
 
 def _qspace_telemetry_enabled() -> bool:
@@ -507,7 +492,7 @@ def generate_q_space_grid_sync(*args, **kwargs):
     return generate_q_space_grid(*args, **kwargs)
 
 
-def _generate_grid(
+def generate_grid(
     dimensionality: int,
     step_sizes: np.ndarray,
     central_point: np.ndarray,
@@ -530,6 +515,10 @@ def _generate_grid(
     pts = np.vstack([m.ravel() for m in mesh]).T + central_point
     shape_nd = np.array(mesh[0].shape)
     return pts, shape_nd
+
+
+# Back-compat alias for the pre-promotion private name.
+_generate_grid = generate_grid
 
 
 def _process_chunk(chunk_data: List[dict]) -> Tuple[np.ndarray, np.ndarray]:

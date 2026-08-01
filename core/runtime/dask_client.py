@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 from dask.distributed import Client, get_client as _dd_get_client
 
+from core.runtime.env import env_bool
 from core.runtime.dask_helpers import (
     DEFAULT_DASK_THREADS_PER_WORKER,
     ensure_dask_client,
@@ -39,22 +40,7 @@ _CLIENT: Optional[Client] = None
 
 
 def _env_bool(name: str, default: bool | None = None) -> bool | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    import logging as _lg
-    _lg.getLogger(__name__).warning(
-        "Ignoring invalid boolean %s=%r; using %s",
-        name,
-        raw,
-        default,
-    )
-    return default
+    return env_bool(name, default, logger=logger, level=logging.WARNING)
 
 
 def _build_job_extra(log_dir: Path, backend: str) -> list[str]:

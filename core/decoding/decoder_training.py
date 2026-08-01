@@ -577,7 +577,7 @@ class DisplacementDecoderSourceService:
         processor.prepared_inputs_cache = None
         unique_decoder_keys: list[DisplacementDecoderKey] = []
         db_manager = getattr(artifacts, "db_manager", None)
-        if db_manager is not None and hasattr(db_manager, "get_pending_chunk_ids"):
+        if db_manager is not None:
             pending_chunk_ids = sorted(db_manager.get_pending_chunk_ids())
             point_data_list = []
             for chunk_id in pending_chunk_ids:

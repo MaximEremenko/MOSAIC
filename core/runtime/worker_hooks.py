@@ -60,6 +60,7 @@ class _NoopLock(AbstractContextManager):
 
 _FILE_LOCKS_GUARD = threading.Lock()
 _FILE_LOCKS: dict[str, threading.RLock] = {}
+_FLOCK_DEGRADED_WARNED = False
 
 
 class _FileChunkLock(AbstractContextManager):
@@ -79,10 +80,26 @@ class _FileChunkLock(AbstractContextManager):
             import fcntl
 
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
+        except Exception as exc:
             # The thread lock still serializes in-process writers on platforms
             # without fcntl; Linux/WSL/HPC shared filesystems use fcntl here.
-            pass
+            # NEVER degrade silently: cross-node exclusion of the reducer
+            # progress manifest rests on this flock — on a mount where
+            # locking is unavailable (NFS nolock/local_lock=all, lockd down)
+            # the mutex quietly becomes per-process and concurrent
+            # committers can drop each other's snapshot keys. The capability
+            # profile also probes this and fails closed for multi-node runs.
+            global _FLOCK_DEGRADED_WARNED
+            if not _FLOCK_DEGRADED_WARNED:
+                _FLOCK_DEGRADED_WARNED = True
+                logging.getLogger(__name__).warning(
+                    "fcntl.flock unavailable on %s (%s: %s); chunk mutexes "
+                    "degrade to per-process locks — UNSAFE for multi-node "
+                    "writers on this filesystem.",
+                    self.path.parent,
+                    type(exc).__name__,
+                    exc,
+                )
         return self
 
     def __exit__(self, *exc):

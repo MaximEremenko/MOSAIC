@@ -5,27 +5,6 @@ from enum import Enum
 from typing import Mapping
 
 
-def _normalize_expected_by_chunk(
-    raw: object,
-) -> dict[int, tuple[int, ...]]:
-    """Coerce an expected-by-chunk payload to ``{int: tuple[int, ...]}``.
-
-    Tolerant of shape: chunk ids and interval ids are coerced to ``int`` and
-    interval collections to a tuple. A non-mapping value (such as a ``{}``
-    default) yields an empty mapping.
-    """
-    if not isinstance(raw, Mapping):
-        return {}
-    normalized: dict[int, tuple[int, ...]] = {}
-    for chunk_id, interval_ids in raw.items():
-        if isinstance(interval_ids, (list, tuple)):
-            coerced = tuple(int(interval_id) for interval_id in interval_ids)
-        else:
-            coerced = (int(interval_ids),)
-        normalized[int(chunk_id)] = coerced
-    return normalized
-
-
 class CompletionStatus(str, Enum):
     """Minimal artifact lifecycle states for staged artifacts."""
 
@@ -126,24 +105,9 @@ class ScatteringHandoff:
     # Alias the residual stage falls back to when ``scattering_run_digest``
     # is absent (residual_field/stage.py read of ``run_digest``).
     run_digest: str | None = None
-    # ``None`` means replacement expected coverage was absent
-    # from the source mapping; a mapping (even empty) means it was present. This
-    # presence distinction drives the residual stage's expected-metadata branch.
-    stage2_replacement_expected_by_chunk: dict[int, tuple[int, ...]] | None = None
     # ``True`` when the originating handoff carried no payload at all (an empty
     # or ``None`` source mapping).
     is_empty: bool = field(default=False)
-
-    @property
-    def has_stage2_replacement_expected(self) -> bool:
-        """Whether replacement expected coverage was supplied."""
-        return self.stage2_replacement_expected_by_chunk is not None
-
-    def expected_by_chunk(self) -> dict[int, tuple[int, ...]]:
-        """Return the expected-by-chunk mapping, empty when the key was absent."""
-        if self.stage2_replacement_expected_by_chunk is None:
-            return {}
-        return dict(self.stage2_replacement_expected_by_chunk)
 
     def to_mapping(self) -> dict[str, object]:
         """Reproduce the read-relevant dict shape for mapping consumers.
@@ -165,8 +129,6 @@ class ScatteringHandoff:
             )
         if self.residual_parameter_digest is not None:
             payload["residual_parameter_digest"] = self.residual_parameter_digest
-        if self.stage2_replacement_expected_by_chunk is not None:
-            payload["stage2_replacement_expected_by_chunk"] = self.expected_by_chunk()
         return payload
 
     @classmethod
@@ -175,9 +137,9 @@ class ScatteringHandoff:
     ) -> "ScatteringHandoff":
         """Build a handoff from a mapping, tolerant of missing keys.
 
-        Absent keys become ``None`` (and expected replacement coverage stays
-        ``None`` to record its absence), matching ``.get()`` default semantics.
-        An empty or ``None`` payload yields ``is_empty=True``.
+        Absent keys become ``None``, matching ``.get()`` default semantics.
+        An empty or ``None`` payload yields ``is_empty=True``. Unknown keys
+        (including ones written by older codebase generations) are ignored.
         """
         if payload is None or not payload:
             return cls(is_empty=True)
@@ -186,22 +148,11 @@ class ScatteringHandoff:
             value = payload.get(key)
             return None if value is None else str(value)
 
-        expected_raw = (
-            payload.get("stage2_replacement_expected_by_chunk")
-            if "stage2_replacement_expected_by_chunk" in payload
-            else None
-        )
-        expected = (
-            None
-            if expected_raw is None
-            else _normalize_expected_by_chunk(expected_raw)
-        )
         return cls(
             scattering_run_digest=_opt_str("scattering_run_digest"),
             source_scattering_commit_digest=_opt_str("source_scattering_commit_digest"),
             residual_parameter_digest=_opt_str("residual_parameter_digest"),
             run_digest=_opt_str("run_digest"),
-            stage2_replacement_expected_by_chunk=expected,
             is_empty=False,
         )
 

@@ -21,7 +21,9 @@ from core.residual_field.artifacts import (
     _ResidualFieldChunkStatusUpdater,
 )
 from core.residual_field.contracts import ResidualFieldArtifactManifest
-from core.runtime import is_sync_client
+# Re-exported here for backward compatibility; the helper now lives with the
+# other Dask client predicates in core.runtime.dask_helpers.
+from core.runtime import is_same_node_local_client
 
 
 # ---------------------------------------------------------------------------
@@ -91,17 +93,6 @@ def _mark_residual_intervals_saved(
     status_updater.mark_saved_many(
         sorted({int(value) for value in interval_ids}), int(chunk_id)
     )
-
-
-def is_same_node_local_client(client) -> bool:
-    if client is None or is_sync_client(client):
-        return True
-    backend = str(os.getenv("DASK_BACKEND", "")).strip().lower()
-    if backend in {"local", "cuda-local", "sync", "synchronous", "single-threaded"}:
-        return True
-    cluster = getattr(client, "cluster", None)
-    cluster_name = type(cluster).__name__.lower() if cluster is not None else ""
-    return "localcluster" in cluster_name
 
 
 def _normalize_reducer_backend_kind(value: str) -> str:

@@ -28,6 +28,7 @@ from core.scattering.commit import (
     validate_scattering_commit_candidate,
     write_scattering_stage_commit,
 )
+from core.storage.database_manager import DatabaseManagerProtocol
 from core.storage.attempt_store import (
     chunk_commit_path,
     run_manifest_path,
@@ -524,7 +525,7 @@ def _committed_streaming_residual_credits(
 
 
 def rebuild_sqlite_cache_from_manifests(
-    db_manager,
+    db_manager: DatabaseManagerProtocol,
     *,
     output_dir: str | Path,
     run_digest: str,
@@ -537,20 +538,14 @@ def rebuild_sqlite_cache_from_manifests(
         run_digest=run_digest,
         recovery_scan_seconds=time.perf_counter() - scan_started,
     )
-    if not getattr(db_manager, "cache_enabled", True):
-        return snapshot
-    get_pairs = getattr(db_manager, "get_interval_chunks", None)
-    if not callable(get_pairs):
-        get_pairs = getattr(db_manager, "get_unsaved_interval_chunks", None)
-    update_status = getattr(db_manager, "update_interval_chunk_status", None)
-    if not callable(get_pairs) or not callable(update_status):
+    if not db_manager.cache_enabled:
         return snapshot
     # Last-write-wins overlay reproducing the sequential loops' final
-    # state, applied in ONE transaction where the manager supports it
-    # (the sequential form was up to ~18k single-row fsync commits).
+    # state, applied in ONE transaction (the sequential form was up to
+    # ~18k single-row fsync commits).
     final_state: dict[tuple[int, int], bool] = {
         (int(interval_id), int(chunk_id)): False
-        for interval_id, chunk_id in get_pairs()
+        for interval_id, chunk_id in db_manager.get_interval_chunks()
     }
     for stage in (snapshot.scattering, snapshot.residual_field):
         for payload in stage.selected_payloads:
@@ -562,17 +557,12 @@ def rebuild_sqlite_cache_from_manifests(
         ):
             for interval_id in interval_ids:
                 final_state[(int(interval_id), int(chunk_id))] = True
-    batch = getattr(db_manager, "update_interval_chunk_status_batch", None)
-    if callable(batch):
-        batch(
-            [
-                (interval_id, chunk_id, int(saved))
-                for (interval_id, chunk_id), saved in sorted(final_state.items())
-            ]
-        )
-    else:
-        for (interval_id, chunk_id), saved in sorted(final_state.items()):
-            update_status(interval_id, chunk_id, saved=saved)
+    db_manager.update_interval_chunk_status_batch(
+        [
+            (interval_id, chunk_id, int(saved))
+            for (interval_id, chunk_id), saved in sorted(final_state.items())
+        ]
+    )
     return snapshot
 
 

@@ -10,7 +10,6 @@ from core.scattering.commit import (
     write_scattering_attempt,
 )
 from core.scattering.contracts import ScatteringWorkUnit, validate_scattering_work_unit
-from core.scattering.artifacts import persist_scattering_interval_chunk_shard
 
 
 IDENTITY = {
@@ -112,44 +111,3 @@ def test_scattering_work_unit_carries_complete_p3_identity(tmp_path):
     assert work_unit.scientific_digest == IDENTITY["scientific_digest"]
     assert work_unit.execution_digest == IDENTITY["execution_digest"]
     assert work_unit.qspace_plan_digest == IDENTITY["qspace_plan_digest"]
-
-
-def test_identity_work_unit_shard_entrypoint_writes_attempt_not_old_shard(tmp_path):
-    work_unit = ScatteringWorkUnit.interval_chunk(
-        interval_id=2,
-        chunk_id=7,
-        dimension=3,
-        output_dir=str(tmp_path),
-        **IDENTITY,
-    )
-
-    persist_scattering_interval_chunk_shard(
-        work_unit,
-        grid_shape_nd=np.array([[2, 1]], dtype=np.int64),
-        total_reciprocal_points=5,
-        contribution_reciprocal_points=4,
-        amplitudes_delta=np.array([1.0 + 0.0j, 2.0 + 0.0j]),
-        amplitudes_average=np.array([0.5 + 0.0j, 0.25 + 0.0j]),
-        output_dir=str(tmp_path),
-        quiet_logs=True,
-    )
-    persist_scattering_interval_chunk_shard(
-        work_unit,
-        grid_shape_nd=np.array([[2, 1]], dtype=np.int64),
-        total_reciprocal_points=5,
-        contribution_reciprocal_points=4,
-        amplitudes_delta=np.array([1.0 + 0.0j, 2.0 + 0.0j]),
-        amplitudes_average=np.array([0.5 + 0.0j, 0.25 + 0.0j]),
-        output_dir=str(tmp_path),
-        quiet_logs=True,
-    )
-
-    attempts = discover_scattering_attempts(
-        output_dir=tmp_path,
-        run_digest="run123",
-        chunk_id=7,
-    )
-    assert len(attempts) == 2
-    assert {attempt.interval_id for attempt in attempts} == {2}
-    assert len({attempt.attempt_id for attempt in attempts}) == 2
-    assert not (tmp_path / "scattering_shards" / "chunk_7" / "interval_2.hdf5").exists()

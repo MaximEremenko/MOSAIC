@@ -32,7 +32,7 @@ IDENTITY = ScatteringWorkIdentity(
 
 def test_build_scattering_execution_plan_uses_contract_work_units(tmp_path):
     class FakeDbManager:
-        def get_unsaved_interval_chunks(self):
+        def get_interval_chunks(self):
             return [(1, 3), (2, 3), (2, 4)]
 
     parameters = {

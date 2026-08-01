@@ -94,10 +94,12 @@ every phase; summation order is free; local branch only, no push.
    fix has to merge across the motion: run_residual_field_stage closures →
    run-loop class (residual_field/run_loop.py); backend assembly →
    assembly.py; _LocalSnapshotWriter → snapshot_writer.py; run_state_cache →
-   core/workflow (storage becomes a leaf); M8 single documented
-   config-over-env precedence at the two flip sites, resolved values recorded
-   in the stage plan manifest; M3 flock failure logged + capability probe
-   covers locking.
+   core/workflow (storage becomes a leaf); M8 one documented precedence —
+   OPERATOR ENV WINS over JSON config, config over default (the rule every
+   launcher already assumes) — applied at the flip sites; identity-bearing
+   resolved values are covered by the digest (phase 3), so no separate plan
+   manifest record is needed; M3 flock failure logged loudly + capability
+   probe covers locking and fails closed for multi-node runs.
 
 ## Explicit non-fixes (decision recorded, per the review's own verdicts)
 

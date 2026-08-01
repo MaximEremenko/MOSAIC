@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import os
 from typing import Literal, cast
 
+from core.runtime.env import env_int
+
 
 NufftExecutionPolicy = Literal[
     "auto",
@@ -163,16 +165,6 @@ def _env_truthy(env: Mapping[str, str], name: str) -> bool:
     return raw is not None and str(raw).strip().lower() in _TRUE_VALUES
 
 
-def _env_int(env: Mapping[str, str], name: str, default: int = 0) -> int:
-    raw = env.get(name)
-    if raw is None or str(raw).strip() == "":
-        return int(default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return int(default)
-
-
 def normalize_nufft_policy(value: object) -> NufftExecutionPolicy:
     normalized = str(value).strip().lower().replace("_", "-")
     if normalized in VALID_NUFFT_POLICIES:
@@ -198,7 +190,7 @@ def gpu_launch_requested(*, env: Mapping[str, str] | None = None) -> bool:
     return (
         backend == "cuda-local"
         or worker_command in _GPU_LAUNCH_WORKER_COMMANDS
-        or _env_int(environment, "GPUS_PER_JOB", 0) > 0
+        or env_int("GPUS_PER_JOB", 0, source=environment) > 0
     )
 
 

@@ -10,15 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import h5py
 import numpy as np
+
+from core.storage.atomic import atomic_write_json
 
 from core.residual_field.contracts import (
     RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
@@ -61,50 +61,13 @@ _GENERATION_FILENAME_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# fsync helpers (private to this module)
-# ---------------------------------------------------------------------------
-
-def _fsync_path(path: Path) -> None:
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _fsync_parent(path: Path) -> None:
-    try:
-        fd = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-# ---------------------------------------------------------------------------
 # Atomic write primitives
 # ---------------------------------------------------------------------------
 
 def _write_json_atomic(target_path: Path, payload: dict[str, object]) -> None:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        dir=target_path.parent,
-        prefix=f"{target_path.stem}_",
-        suffix=".tmp",
-        delete=False,
-        mode="w",
-        encoding="utf-8",
-    ) as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-    Path(handle.name).replace(target_path)
-    _fsync_parent(target_path)
+    # indent=2 keeps the residual-field manifest byte format stable:
+    # existing manifests are re-read and re-written mid-run.
+    atomic_write_json(target_path, payload, indent=2)
 
 
 def _load_array_payload(path: str | Path) -> dict[str, np.ndarray]:

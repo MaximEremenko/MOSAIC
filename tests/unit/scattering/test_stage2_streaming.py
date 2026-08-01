@@ -19,10 +19,14 @@ from core.scattering import streaming as streaming_mod
 from core.scattering.streaming import (
     StreamingComputeContext,
     clear_streaming_payload_memo,
-    compute_streamed_interval_tasks,
+    lazy_streamed_interval_loaders,
     stage2_streaming_enabled,
     streaming_slot_map,
 )
+
+
+def _load_all(interval_ids, context):
+    return [loader() for loader in lazy_streamed_interval_loaders(interval_ids, context)]
 
 
 @pytest.fixture(autouse=True)
@@ -101,8 +105,8 @@ def _context(lookup=None, token="tok"):
     )
 
 
-class TestComputeStreamedIntervalTasks:
-    def test_computes_memoizes_and_omits_empty(self, monkeypatch):
+class TestLazyStreamedIntervalLoaders:
+    def test_computes_memoizes_and_records_empty(self, monkeypatch):
         calls = []
 
         def fake_compute(interval, **kwargs):
@@ -119,11 +123,11 @@ class TestComputeStreamedIntervalTasks:
             streaming_mod, "compute_scattering_interval_payload", fake_compute
         )
         ctx = _context(lookup={1: {"id": 1}, 2: {"id": 2}, 3: {"id": 3}})
-        out = compute_streamed_interval_tasks((1, 2, 3), ctx)
-        assert len(out) == 2                      # empty interval omitted
+        out = _load_all((1, 2, 3), ctx)
+        assert [task is None for task in out] == [False, True, False]
         assert calls == [1, 2, 3]
-        out2 = compute_streamed_interval_tasks((1, 2, 3), ctx)
-        assert len(out2) == 2
+        out2 = _load_all((1, 2, 3), ctx)
+        assert [task is None for task in out2] == [False, True, False]
         assert calls == [1, 2, 3]                 # memo: no recompute (incl. None)
 
     def test_unknown_interval_raises(self, monkeypatch):
@@ -134,7 +138,7 @@ class TestComputeStreamedIntervalTasks:
         )
         ctx = _context(lookup={1: {"id": 1}})
         with pytest.raises(KeyError, match="missing from the scattering"):
-            compute_streamed_interval_tasks((1, 99), ctx)
+            _load_all((1, 99), ctx)
 
     def test_memo_scoped_by_cache_token(self, monkeypatch):
         calls = []
@@ -146,8 +150,8 @@ class TestComputeStreamedIntervalTasks:
         monkeypatch.setattr(
             streaming_mod, "compute_scattering_interval_payload", fake_compute
         )
-        compute_streamed_interval_tasks((1,), _context(lookup={1: {"id": 1}}, token="a"))
-        compute_streamed_interval_tasks((1,), _context(lookup={1: {"id": 1}}, token="b"))
+        _load_all((1,), _context(lookup={1: {"id": 1}}, token="a"))
+        _load_all((1,), _context(lookup={1: {"id": 1}}, token="b"))
         assert calls == [1, 1]                    # different runs never share
 
     def test_memo_byte_cap_evicts(self, monkeypatch):
@@ -163,10 +167,9 @@ class TestComputeStreamedIntervalTasks:
         )
         monkeypatch.setenv("MOSAIC_STREAMING_PAYLOAD_MEMO_MAX_BYTES", "60000")
         lookup = {i: {"id": i} for i in range(1, 6)}
-        compute_streamed_interval_tasks(tuple(lookup), _context(lookup=lookup))
-        with streaming_mod._STREAM_MEMO_LOCK:
-            assert streaming_mod._STREAM_MEMO_BYTES <= 60000
-            assert len(streaming_mod._STREAM_MEMO) < 5
+        _load_all(tuple(lookup), _context(lookup=lookup))
+        assert streaming_mod._STREAM_MEMO.bytes() <= 60000
+        assert len(streaming_mod._STREAM_MEMO) < 5
 
 
 class TestSubchunkWorkUnitContract:
@@ -223,7 +226,7 @@ class TestStreamingLatticeDefault:
         monkeypatch.setattr(
             streaming_mod, "compute_scattering_interval_payload", fake_compute
         )
-        compute_streamed_interval_tasks((1,), _context(lookup={1: {"id": 1}}))
+        _load_all((1,), _context(lookup={1: {"id": 1}}))
         assert seen == [True]
         # reset after the streaming compute returns
         assert kernels_mod._scattering_lattice_enabled() is False
@@ -235,7 +238,7 @@ class TestStreamingLatticeDefault:
             assert kernels_mod._scattering_lattice_enabled()
         assert not kernels_mod._scattering_lattice_enabled()
 
-    def test_reset_even_when_compute_raises(self, monkeypatch):
+    def test_reset_even_when_loader_raises(self, monkeypatch):
         monkeypatch.delenv("MOSAIC_SCATTERING_LATTICE_FFT", raising=False)
         monkeypatch.setattr(
             streaming_mod,
@@ -243,7 +246,7 @@ class TestStreamingLatticeDefault:
             lambda interval, **kwargs: None,
         )
         with pytest.raises(KeyError):
-            compute_streamed_interval_tasks((99,), _context(lookup={1: {"id": 1}}))
+            _load_all((99,), _context(lookup={1: {"id": 1}}))
         assert kernels_mod._scattering_lattice_enabled() is False
 
     def test_explicit_env_zero_wins_even_inside_streaming(self, monkeypatch):
@@ -258,7 +261,7 @@ class TestStreamingLatticeDefault:
         monkeypatch.setattr(
             streaming_mod, "compute_scattering_interval_payload", fake_compute
         )
-        compute_streamed_interval_tasks((1,), _context(lookup={1: {"id": 1}}))
+        _load_all((1,), _context(lookup={1: {"id": 1}}))
         assert seen == [False]
         with kernels_mod.streaming_lattice_default(True):
             assert not kernels_mod._scattering_lattice_enabled()

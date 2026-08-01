@@ -18,6 +18,7 @@ from core.qspace.masking.logic_parser import (
     preprocess,
     symbol_map,
 )
+from core.runtime.env import env_bool, env_int
 import pandas as pd
 
 
@@ -49,27 +50,11 @@ def _env_str(name: str, default: str) -> str:
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.debug("Ignoring invalid integer %s=%r", name, raw)
-        return default
+    return env_int(name, default, logger=logger)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    logger.debug("Ignoring invalid boolean %s=%r", name, raw)
-    return default
+    return bool(env_bool(name, default, logger=logger))
 
 
 def _mask_telemetry_enabled() -> bool:

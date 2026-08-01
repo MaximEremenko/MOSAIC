@@ -126,13 +126,31 @@ def atomic_write_json(
     path: str | Path,
     payload: Mapping,
     *,
-    output_dir: str | Path,
+    output_dir: str | Path | None = None,
     validator: Callable[[Mapping[str, Any]], None] | None = None,
+    indent: int | None = None,
 ) -> None:
-    target = assert_path_contained(path, output_dir=output_dir)
+    """Atomically write ``payload`` as JSON (tmp file + fsync + rename).
+
+    ``output_dir`` enables the containment check; callers writing to
+    already-validated absolute paths (residual-field manifests) may omit it.
+    ``indent=None`` produces the canonical compact ``serialize_json_payload``
+    bytes; ``indent=N`` produces ``json.dumps(..., indent=N, sort_keys=True)``
+    with no trailing newline — the residual-field manifest byte format, which
+    must stay stable because existing manifests are re-read and re-written
+    mid-run.
+    """
+    if output_dir is not None:
+        target = assert_path_contained(path, output_dir=output_dir)
+    else:
+        # temp_sibling_path creates the parent directory.
+        target = Path(path)
     if validator is not None:
         validator(payload)
-    data = serialize_json_payload(payload)
+    if indent is None:
+        data = serialize_json_payload(payload)
+    else:
+        data = json.dumps(payload, indent=indent, sort_keys=True).encode("utf-8")
     temp_path = temp_sibling_path(target, suffix=".tmp")
     try:
         with temp_path.open("wb") as handle:

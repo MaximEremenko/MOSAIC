@@ -423,6 +423,31 @@ def is_sync_client(client) -> bool:
         return True
 
 
+def is_same_node_local_client(client) -> bool:
+    """True when driver and workers share one host (sync/local backends), so
+    worker-local scratch is directly readable by the driver."""
+    if client is None or is_sync_client(client):
+        return True
+    backend = str(os.getenv("DASK_BACKEND", "")).strip().lower()
+    if backend in {"local", "cuda-local", "sync", "synchronous", "single-threaded"}:
+        return True
+    cluster = getattr(client, "cluster", None)
+    cluster_name = type(cluster).__name__.lower() if cluster is not None else ""
+    return "localcluster" in cluster_name
+
+
+def current_worker_addresses(client) -> list[str]:
+    """Sorted live worker addresses; a sync/None client must report none
+    (there are no remote workers to address or pin work to)."""
+    if client is None or is_sync_client(client):
+        return []
+    try:
+        workers = client.scheduler_info().get("workers", {})
+    except Exception:
+        workers = {}
+    return sorted(workers)
+
+
 def yield_futures_with_results(futs, client: Client | None):
     loop = getattr(client, "loop", None)
     for future, result in as_completed(
