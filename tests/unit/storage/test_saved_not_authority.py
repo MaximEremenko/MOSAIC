@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from core.storage.database_manager import DatabaseManager
-from core.storage.run_state_cache import pending_scattering_interval_chunks, scan_run_state
+from core.workflow.run_state_cache import pending_scattering_interval_chunks, scan_run_state
 
 
 def test_saved_rows_do_not_make_missing_manifests_complete(tmp_path):

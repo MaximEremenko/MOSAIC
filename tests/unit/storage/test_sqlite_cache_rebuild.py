@@ -10,7 +10,7 @@ from core.scattering.commit import (
     write_scattering_stage_plan,
 )
 from core.storage.database_manager import DatabaseManager
-from core.storage.run_state_cache import (
+from core.workflow.run_state_cache import (
     rebuild_sqlite_cache_from_manifests,
     scan_run_state,
 )

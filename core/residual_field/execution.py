@@ -70,7 +70,7 @@ from core.residual_field.tasks import (
     run_residual_field_interval_chunk_task,
 )
 from core.storage.digests import digest_dict
-from core.storage.run_state_cache import (
+from core.workflow.run_state_cache import (
     pending_residual_interval_chunks,
     rebuild_sqlite_cache_from_manifests,
 )
@@ -109,6 +109,7 @@ from core.residual_field.cluster_helpers import (
     _scheduler_nufft_capacity,
     _trim_workers_for_memory_pressure,
 )
+from core.residual_field.run_loop import ResidualRunLoop
 from core.residual_field.work_unit_utils import (
     _hex64_or_digest,
     _interval_inputs_for_work_unit,
@@ -1849,39 +1850,12 @@ def run_residual_field_stage(
         logger.info("Residual-field finished (sync).")
         return
 
-    fail_streak, fail_threshold = 0, 3
-    gpu_tripped = False
-    last_cpu_trip_broadcast = 0.0
     residual_prefetch_factor = _residual_nufft_prefetch_factor(workflow_parameters)
     max_inflight = _cap_async_max_inflight(
         client=client,
         requested=max_inflight,
         prefetch_factor=residual_prefetch_factor,
     )
-
-    def _trip_to_cpu_only() -> None:
-        # A worker the nanny restarts AFTER the trip comes back GPU-enabled
-        # while the driver still believes gpu_tripped. Its failures rebuild
-        # fail_streak past the threshold, which re-enters here — so the
-        # set_cpu_only broadcast is re-sent (rate-limited) instead of
-        # one-shot, pulling restarted workers back into the CPU-only regime.
-        nonlocal gpu_tripped, max_inflight, last_cpu_trip_broadcast
-        now = time.monotonic()
-        if gpu_tripped and now - last_cpu_trip_broadcast < 60.0:
-            return
-        if hasattr(client, "run"):
-            try:
-                from core.adapters.cunufft_wrapper import set_cpu_only
-
-                client.run(set_cpu_only, True)
-            except Exception:
-                pass
-        last_cpu_trip_broadcast = now
-        if gpu_tripped:
-            return
-        max_inflight = min(max_inflight, 256)
-        gpu_tripped = True
-        logger.warning("Circuit-breaker: switching residual-field to CPU-only & throttling.")
 
     rec = point_list_to_recarray(point_data_list)
     chunk_futures = {
@@ -1947,7 +1921,6 @@ def run_residual_field_stage(
         )
     except ValueError:
         infra_retry_budget = 12
-    infra_failures_seen: dict[tuple[str, int], int] = {}
     # A unit that repeatedly KILLS its worker is indistinguishable from
     # infrastructure by error class (KilledWorker) but is really a poison
     # task — without its own cap it would enjoy the LARGEST retry budget
@@ -1959,35 +1932,6 @@ def run_residual_field_stage(
         )
     except ValueError:
         killed_worker_retry_cap = 4
-    killed_worker_seen: dict[tuple[str, int], int] = {}
-    # Fencing epochs per reducer target: bumped whenever ownership MOVES
-    # (dead-owner rescue, retry remap). Passed into the fold task; the
-    # accumulator sequences each tenure's snapshots from epoch * STRIDE and
-    # the manifest union refuses to move a partition's seq backwards, so a
-    # scheduler-declared-dead-but-alive predecessor cannot overwrite or
-    # race the replacement's snapshots (it fails loudly at commit instead).
-    target_owner_epochs: dict[tuple[int, int | None], int] = {}
-    target_last_owner: dict[tuple[int, int | None], str] = {}
-    deferred_resubmits: list = []  # (eligible_monotonic_time, work_unit)
-    target_rifft_futures: dict[tuple[int, int | None], object] = {}
-    target_remaining = {
-        target_key: sum(1 for work_unit in work_units if _reducer_target_key(work_unit) == target_key)
-        for target_key in _unique_reducer_target_keys(work_units)
-    }
-    flying: set = set()
-    future_meta: dict = {}
-    future_pinned_owner: dict = {}
-    # Wall-clock since the cluster last had a live worker; the drain loop
-    # aborts past the horizon instead of spinning on wait timeouts forever
-    # (SLURM allocation revoked / all nodes dead with the scheduler alive).
-    dead_cluster_since: list = [None]
-    exhausted_failures: list[tuple[ResidualFieldWorkUnit, str]] = []
-    submitted = 0
-    completed = 0
-    last_memory_pressure_trim = 0.0
-    last_memory_pressure_check = time.monotonic()
-
-    _residual_start_time = time.monotonic()
 
     if stage_task_logs:
         logger.info(
@@ -1999,589 +1943,41 @@ def run_residual_field_stage(
             cleanup_policy,
         )
 
-    def _target_rifft_payload_future(
-        work_unit: ResidualFieldWorkUnit,
-        *,
-        owner_address: str | None = None,
-    ):
-        if not reuse_rifft_payload:
-            return None
-        target_key = _reducer_target_key(work_unit)
-        existing = target_rifft_futures.get(target_key)
-        if existing is not None:
-            return existing
-        submit_kwargs = dict(
-            key=(
-                "riff-grid:residual:"
-                f"chunk-{int(work_unit.chunk_id)}:"
-                f"partition-{work_unit.partition_id if work_unit.partition_id is not None else 'owner'}"
-            ),
-            pure=False,
-        )
-        if owner_address is not None:
-            submit_kwargs["workers"] = [owner_address]
-            submit_kwargs["allow_other_workers"] = False
-        future = client.submit(
-            build_residual_rifft_payload,
-            chunk_futures[int(work_unit.chunk_id)],
-            work_unit=work_unit,
-            quiet_logs=False,
-            **submit_kwargs,
-        )
-        target_rifft_futures[target_key] = future
-        return future
-
-    early_flush_futures: dict[tuple[int, int | None], object] = {}
-
-    def _submit_early_target_flush(target_key) -> None:
-        """Flush a reducer target the moment its LAST work unit completes.
-
-        The end-of-stage barrier previously wrote ~271 GB of snapshots with
-        zero compute overlap (90-135 s, GPUs idle). Targets finish staggered
-        (slot-interleaved submission), so streaming their final snapshots
-        during the tail degrades the barrier to a short wait on writes that
-        are already running. Failure here is harmless: the key stays absent
-        and the barrier resubmits fresh."""
-        if (
-            not owner_local_reducer
-            or not worker_addresses
-            or flush_process_local_residual_reducer_target is None
-            or target_key not in target_owners
-            or target_key in early_flush_futures
-        ):
-            return
-        try:
-            owner_address = _resolve_owner_address(
-                target_key=target_key,
-                target_owners=target_owners,
-                worker_addresses=_current_worker_addresses(client),
-            )
-            if owner_address is None:
-                return
-            # Store the pinned owner with the future: the barrier must not
-            # wait on a future whose only allowed worker has since died.
-            early_flush_futures[target_key] = (
-                client.submit(
-                    flush_process_local_residual_reducer_target,
-                    task_reducer_backend,
-                    chunk_id=int(target_key[0]),
-                    parameter_digest=planned_work_units[0].parameter_digest,
-                    output_dir=artifacts.output_dir,
-                    db_path=artifacts.db_manager.db_path,
-                    partition_id=target_key[1],
-                    pure=False,
-                    workers=[owner_address],
-                    allow_other_workers=False,
-                ),
-                owner_address,
-            )
-        except Exception:
-            early_flush_futures.pop(target_key, None)
-
-    def _mark_target_work_unit_done(work_unit: ResidualFieldWorkUnit | None) -> None:
-        if work_unit is None:
-            return
-        target_key = _reducer_target_key(work_unit)
-        if target_key not in target_remaining:
-            return
-        target_remaining[target_key] = int(target_remaining[target_key]) - 1
-        if target_remaining[target_key] > 0:
-            return
-        target_remaining.pop(target_key, None)
-        if reuse_rifft_payload:
-            rifft_future = target_rifft_futures.pop(target_key, None)
-            release = getattr(rifft_future, "release", None)
-            if callable(release):
-                try:
-                    release()
-                except Exception:
-                    pass
-        _submit_early_target_flush(target_key)
-
-    def _submit(work_unit: ResidualFieldWorkUnit) -> None:
-        nonlocal submitted
-        target_key = _reducer_target_key(work_unit)
-        owner_address = None
-        if target_key in target_owners:
-            owner_address = _resolve_owner_address(
-                target_key=target_key,
-                target_owners=target_owners,
-                worker_addresses=_current_worker_addresses(client),
-            )
-        if owner_address is not None:
-            previous_owner = target_last_owner.get(target_key)
-            if previous_owner is not None and previous_owner != owner_address:
-                target_owner_epochs[target_key] = (
-                    int(target_owner_epochs.get(target_key, 0)) + 1
-                )
-                logger.warning(
-                    "Residual-field owner epoch bump | target=%s | %s -> %s "
-                    "| epoch=%d",
-                    target_key,
-                    previous_owner,
-                    owner_address,
-                    target_owner_epochs[target_key],
-                )
-            target_last_owner[target_key] = owner_address
-        submit_kwargs = dict(
-            total_reciprocal_points=total_reciprocal_points,
-            output_dir=artifacts.output_dir,
-            db_path=artifacts.db_manager.db_path if owner_local_reducer else None,
-            scratch_root=scratch_root,
-            reducer_backend=task_reducer_backend,
-            total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
-            owner_local_reducer=owner_local_reducer,
-            quiet_logs=False,
-            key=f"residual-{work_unit.artifact_key}",
-            pure=False,
-            resources=nufft_resources,
-            # The driver owns retry (retries_left + infra budget + breaker).
-            # Dask-level retries would run invisibly underneath it — in cpu
-            # policy a deterministic failure executed up to (1+4)x(1+4)=25
-            # times while fail_streak saw one failure per driver attempt.
-            retries=0,
-            runtime_provenance=runtime_provenance,
-            nufft_eps=nufft_settings.eps,
-            nufft_prefer_cpu=nufft_settings.prefer_cpu,
-            nufft_gpu_only=nufft_settings.gpu_only,
-            owner_epoch=int(target_owner_epochs.get(target_key, 0)),
-        )
-        if streaming_context_future is not None:
-            submit_kwargs["streaming_compute_context"] = streaming_context_future
-        if reuse_rifft_payload:
-            submit_kwargs["rifft_payload"] = _target_rifft_payload_future(
-                work_unit,
-                owner_address=owner_address,
-            )
-        if owner_address is not None:
-            submit_kwargs["workers"] = [owner_address]
-            submit_kwargs["allow_other_workers"] = False
-        future = client.submit(
-            run_residual_field_interval_chunk_task,
-            work_unit,
-            ()
-            if streaming_context_future is not None
-            else _interval_inputs_for_work_unit(
-                work_unit,
-                transient_interval_payloads=transient_interval_payloads,
-            ),
-            None if reuse_rifft_payload else chunk_futures[int(work_unit.chunk_id)],
-            **submit_kwargs,
-        )
-        flying.add(future)
-        future_meta[future] = work_unit
-        future_pinned_owner[future] = owner_address
-        submitted += 1
-        if _should_log_async_progress(
-            phase="queue",
-            count=submitted,
-            total=total_tasks,
-        ):
-            _log_async_residual_progress(
-                enabled=stage_task_logs,
-                event="queue",
-                work_unit=work_unit,
-                completed=completed,
-                total=total_tasks,
-                submitted=submitted,
-                running=len(flying),
-            )
-
-    def _incorporate_completed_result(
-        future,
-        completed_work_unit: ResidualFieldWorkUnit | None,
-    ) -> None:
-        if completed_work_unit is None:
-            return
-        payload = future.result()
-        _record_residual_task_result(
-            payload=payload,
-            work_unit=completed_work_unit,
-            manifests_by_chunk=manifests_by_chunk,
-        )
-
-    def _future_completed_successfully(future, result_marker) -> bool:
-        if result_marker is False:
-            return False
-        status = getattr(future, "status", None)
-        if status is not None:
-            return status == "finished" and result_marker is not None
-        return result_marker is not None and result_marker is not False
-
-    def _future_failure_detail(future, result_marker) -> str:
-        exception = None
-        exception_method = getattr(future, "exception", None)
-        if callable(exception_method):
-            try:
-                # timeout=0 through distributed's sync bridge ALWAYS raises
-                # a fabricated 'timed out after 0 s' from a non-loop thread,
-                # masking the real KilledWorker/Cancelled and making every
-                # failure classify as infrastructure. The state is already
-                # resolved locally (as_completed delivered it), so a
-                # positive timeout returns on the first loop tick.
-                exception = exception_method(timeout=30)
-            except TypeError:
-                try:
-                    exception = exception_method()
-                except Exception as err:
-                    exception = err
-            except Exception as err:
-                exception = err
-        if exception is not None:
-            return f"{type(exception).__name__}: {exception}"
-        try:
-            value = future.result()
-        except Exception as err:
-            return f"{type(err).__name__}: {err}"
-        if value is None:
-            return "task returned None"
-        return f"task status={getattr(future, 'status', 'unknown')} result={result_marker!r}"
-
-    def _format_failed_batch(work_unit: ResidualFieldWorkUnit, detail: str) -> str:
-        partition = (
-            "owner"
-            if work_unit.partition_id is None
-            else str(int(work_unit.partition_id))
-        )
-        return (
-            f"chunk={int(work_unit.chunk_id)} "
-            f"partition={partition} "
-            f"intervals={_work_unit_interval_label(work_unit)} "
-            f"reason={detail}"
-        )
-
-    def _release_finished_future(future) -> None:
-        release = getattr(future, "release", None)
-        if not callable(release):
-            return
-        try:
-            release()
-        except Exception:
-            pass
-
-    def _handle_completed_future(future, result_marker, bump, pbar=None) -> None:
-        nonlocal completed, fail_streak
-        flying.discard(future)
-        future_pinned_owner.pop(future, None)
-        work_unit = future_meta.pop(future, None)
-        ok = _future_completed_successfully(future, result_marker)
-        bump()
-        completed += 1
-        detail = "" if ok else _future_failure_detail(future, result_marker)
-        if work_unit is not None and pbar is not None:
-            _update_pbar_postfix(pbar, work_unit, ok=ok)
-            if not ok:
-                logger.warning(
-                    "Residual-field batch FAILED | chunk=%d | partition=%s | intervals=%s | %s",
-                    work_unit.chunk_id,
-                    "owner" if work_unit.partition_id is None else work_unit.partition_id,
-                    _work_unit_interval_label(work_unit),
-                    detail,
-                )
-        if not ok and work_unit is not None:
-            # Only GENUINE task failures count toward the GPU circuit
-            # breaker. Infrastructure casualties — a nanny restarting a
-            # worker over its memory budget, cancelled/lost futures, comm
-            # drops — say nothing about GPU health, and counting them is
-            # what turned every memory hiccup into a full CPU-only run
-            # (measured: one 95%-budget restart cascaded into thousands of
-            # cancelled batches, all "failures", breaker tripped, run dead).
-            infrastructure_failure = any(
-                marker in detail
-                for marker in (
-                    "KilledWorker",
-                    "Cancelled",
-                    "CommClosed",
-                    "TimeoutError",
-                    "WorkerProcessDied",
-                    "Nanny",
-                )
-            )
-            key = (str(work_unit.artifact_key), int(work_unit.chunk_id))
-            _release_finished_future(future)
-            if infrastructure_failure:
-                if "KilledWorker" in detail:
-                    killed = int(killed_worker_seen.get(key, 0)) + 1
-                    killed_worker_seen[key] = killed
-                    if killed >= killed_worker_retry_cap:
-                        logger.error(
-                            "Residual-field unit killed its worker %d times "
-                            "| chunk=%d | partition=%s | intervals=%s — "
-                            "poison task, failing it instead of burning "
-                            "more workers.",
-                            killed,
-                            work_unit.chunk_id,
-                            "owner"
-                            if work_unit.partition_id is None
-                            else work_unit.partition_id,
-                            _work_unit_interval_label(work_unit),
-                        )
-                        exhausted_failures.append((work_unit, detail))
-                        _mark_target_work_unit_done(work_unit)
-                        return
-                # Own budget + exponential backoff: resubmitting into the
-                # middle of a worker-restart storm just dies again in
-                # seconds and used to exhaust the genuine retry budget.
-                used = int(infra_failures_seen.get(key, 0))
-                infra_failures_seen[key] = used + 1
-                if used < infra_retry_budget:
-                    delay = min(60.0, 2.0 ** used)
-                    deferred_resubmits.append(
-                        (time.monotonic() + delay, work_unit)
-                    )
-                    logger.warning(
-                        "Residual-field infra failure | chunk=%d | partition=%s "
-                        "| resubmit deferred %.0fs (infra attempt %d/%d)",
-                        work_unit.chunk_id,
-                        "owner"
-                        if work_unit.partition_id is None
-                        else work_unit.partition_id,
-                        delay,
-                        used + 1,
-                        infra_retry_budget,
-                    )
-                    return
-                exhausted_failures.append((work_unit, detail))
-                _mark_target_work_unit_done(work_unit)
-                return
-            fail_streak += 1
-            if fail_streak >= fail_threshold:
-                _trip_to_cpu_only()
-            remaining = int(retries_left.get(key, 0))
-            if remaining > 0:
-                retries_left[key] = remaining - 1
-                logger.warning(
-                    "Retrying residual-field batch | chunk=%d | partition=%s | intervals=%s | remaining=%d",
-                    work_unit.chunk_id,
-                    "owner" if work_unit.partition_id is None else work_unit.partition_id,
-                    _work_unit_interval_label(work_unit),
-                    int(retries_left[key]),
-                )
-                _submit(work_unit)
-                return
-            exhausted_failures.append((work_unit, detail))
-            _mark_target_work_unit_done(work_unit)
-            return
-        fail_streak = 0
-        if work_unit is not None:
-            try:
-                _incorporate_completed_result(future, work_unit)
-            finally:
-                _release_finished_future(future)
-                _mark_target_work_unit_done(work_unit)
-
-    def _process_deferred_resubmits() -> None:
-        if not deferred_resubmits:
-            return
-        now = time.monotonic()
-        ready = [item for item in deferred_resubmits if item[0] <= now]
-        for item in ready:
-            deferred_resubmits.remove(item)
-            _submit(item[1])
-
-    def _ensure_streaming_context_replicas() -> None:
-        """Re-scatter the streaming compute context when every worker that
-        held a replica died — dependents of a lost scattered future fail
-        with immediate comm timeouts, and a restarted worker never receives
-        the broadcast."""
-        nonlocal streaming_context_future
-        if streaming_context is None or streaming_context_future is None:
-            return
-        try:
-            key = getattr(streaming_context_future, "key", None)
-            holders = client.who_has(streaming_context_future)
-            held = holders.get(key) if isinstance(holders, dict) else None
-            if held:
-                return
-        except Exception:
-            return
-        try:
-            logger.warning(
-                "Streaming context replicas lost with dead workers; re-scattering."
-            )
-            streaming_context_future = client.scatter(
-                streaming_context, broadcast=True, hash=False
-            )
-        except Exception:
-            logger.exception("Streaming context re-scatter failed.")
-
-    def _rescue_futures_pinned_to_dead_workers() -> None:
-        """A queued fold task pinned (allow_other_workers=False) to a dead
-        worker parks in no-worker state FOREVER — nanny restarts come back
-        on NEW addresses, so nothing ever schedules it and the drain hangs
-        (observed: kernel OOM killed 2 of 4 workers; 30 'running' units
-        never moved again). Cancel and resubmit through the owner remap.
-        Infrastructure recovery, not a task failure: no retry budget spent,
-        no circuit-breaker count."""
-        live = set(_current_worker_addresses(client))
-        if not live:
-            return
-        _ensure_streaming_context_replicas()
-        for future in list(flying):
-            pinned = future_pinned_owner.get(future)
-            if pinned is None or pinned in live:
-                continue
-            if getattr(future, "status", "") in ("finished", "error", "cancelled"):
-                continue  # completion path will handle it
-            work_unit = future_meta.get(future)
-            try:
-                future.cancel()
-            except Exception:
-                pass
-            flying.discard(future)
-            future_pinned_owner.pop(future, None)
-            future_meta.pop(future, None)
-            if work_unit is None:
-                continue
-            target_key = _reducer_target_key(work_unit)
-            # The cached rifft-payload future is pinned to the dead owner
-            # too — drop it so _submit rebuilds it on the new owner.
-            stale_rifft = target_rifft_futures.pop(target_key, None)
-            release = getattr(stale_rifft, "release", None)
-            if callable(release):
-                try:
-                    release()
-                except Exception:
-                    pass
-            logger.warning(
-                "Residual-field owner %s is gone; resubmitting chunk=%d "
-                "partition=%s via owner remap",
-                pinned,
-                int(work_unit.chunk_id),
-                "owner" if work_unit.partition_id is None else work_unit.partition_id,
-            )
-            _submit(work_unit)
-
-    def _drain_one_completion(bump, pbar=None, timeout_seconds: float = 45.0) -> bool:
-        """Handle ONE completion, waiting in bounded slices so tasks pinned
-        to since-dead workers get rescued instead of blocking as_completed
-        forever. Returns False only when nothing is in flight (or the
-        scheduler yields nothing for a completed set — anomaly)."""
-        from distributed import wait as _distributed_wait
-
-        while flying:
-            _process_deferred_resubmits()
-            _rescue_futures_pinned_to_dead_workers()
-            if not flying:
-                return False
-            if not is_sync_client(client):
-                if _current_worker_addresses(client):
-                    dead_cluster_since[0] = None
-                else:
-                    now = time.monotonic()
-                    if dead_cluster_since[0] is None:
-                        dead_cluster_since[0] = now
-                    elif (
-                        now - dead_cluster_since[0]
-                        >= _dead_cluster_horizon_seconds()
-                    ):
-                        raise RuntimeError(
-                            "Residual-field drain: no live workers for "
-                            f"{_dead_cluster_horizon_seconds():.0f}s with "
-                            f"{len(flying)} batch(es) in flight."
-                        )
-            try:
-                _distributed_wait(
-                    list(flying),
-                    timeout=timeout_seconds,
-                    return_when="FIRST_COMPLETED",
-                )
-            except TimeoutError:
-                continue
-            except Exception:
-                # Sync/test clients (or comm hiccups) can make wait() raise
-                # immediately — fall through to the blocking generator path
-                # rather than spinning on retry.
-                pass
-            for future, result in yield_futures_with_results(list(flying), client):
-                _handle_completed_future(future, result, bump, pbar=pbar)
-                return True
-            return False
-        return False
-
-    def _harvest_finished_nonblocking(bump, pbar=None) -> None:
-        done_now = [future for future in list(flying) if future.done()]
-        for future in done_now:
-            try:
-                result_marker = future.result()
-            except Exception:
-                result_marker = False
-            _handle_completed_future(future, result_marker, bump, pbar=pbar)
-
-    def _apply_memory_backpressure(bump, pbar=None) -> None:
-        nonlocal last_memory_pressure_check, last_memory_pressure_trim
-        poll_seconds = _memory_backpressure_poll_seconds()
-        if poll_seconds <= 0.0:
-            return
-        now = time.monotonic()
-        if now - last_memory_pressure_check < poll_seconds:
-            return
-        last_memory_pressure_check = now
-        if not _cluster_host_memory_pressure(client):
-            return
-        if now - last_memory_pressure_trim >= 5.0:
-            _trim_workers_for_memory_pressure(client)
-            last_memory_pressure_trim = now
-            logger.warning(
-                "Residual-field memory backpressure: worker RSS is near Dask pause threshold; "
-                "trimming native pools and waiting for in-flight work before submitting more batches."
-            )
-        while flying and _cluster_host_memory_pressure(client):
-            if not _drain_one_completion(bump, pbar=pbar):
-                break
-
-    def _update_pbar_postfix(pbar, work_unit, ok=True):
-        elapsed = time.monotonic() - _residual_start_time
-        timing = _format_elapsed_eta(elapsed, completed, total_tasks)
-        partition = (
-            "owner" if work_unit.partition_id is None else f"p{int(work_unit.partition_id)}"
-        )
-        status = "" if ok else " | FAILED"
-        fails = f" | fails={len(exhausted_failures)}" if exhausted_failures else ""
-        pbar.set_postfix_str(
-            f"done=chunk{int(work_unit.chunk_id)}/{partition}"
-            f":{_work_unit_interval_label(work_unit)}"
-            f" | running={len(flying)} | {timing}{fails}{status}"
-        )
-
-    with logging_redirect_tqdm():
-        with progress_bar(total_tasks, desc="Residual-field", unit="batch", force=True) as pbar:
-
-            def bump() -> None:
-                pbar.update(1)
-
-            for work_unit in work_units:
-                _submit(work_unit)
-                _harvest_finished_nonblocking(bump, pbar=pbar)
-                _apply_memory_backpressure(bump, pbar=pbar)
-                while len(flying) >= max_inflight:
-                    # Drain ONE completion then break so the outer
-                    # submit-loop can enqueue the next work_unit immediately;
-                    # bounded waits inside keep dead-owner rescue running.
-                    if not _drain_one_completion(bump, pbar=pbar):
-                        break
-
-            while flying or deferred_resubmits:
-                _process_deferred_resubmits()
-                if not flying:
-                    # Everything in flight is waiting out an infra backoff.
-                    time.sleep(0.5)
-                    continue
-                if not _drain_one_completion(bump, pbar=pbar) and flying:
-                    raise RuntimeError(
-                        "Residual-field scheduler made no progress while draining "
-                        f"{len(flying)} in-flight batch(es)."
-                    )
-
-    if exhausted_failures:
-        formatted = "; ".join(
-            _format_failed_batch(work_unit, detail)
-            for work_unit, detail in exhausted_failures
-        )
-        raise RuntimeError(
-            "Residual-field batch failed after retries before finalize: "
-            f"{formatted}"
-        )
+    # The scheduler loop (submission, completion, retry, rescue) owns its
+    # own state; the stage keeps planning, the barriers and finalize.
+    run_loop = ResidualRunLoop(
+        client=client,
+        artifacts=artifacts,
+        chunk_futures=chunk_futures,
+        chunk_ids=chunk_ids,
+        streaming_context=streaming_context,
+        streaming_context_future=streaming_context_future,
+        task_reducer_backend=task_reducer_backend,
+        planned_work_units=planned_work_units,
+        work_units=work_units,
+        total_tasks=total_tasks,
+        total_reciprocal_points=total_reciprocal_points,
+        total_partials_by_target=total_partials_by_target,
+        scratch_root=scratch_root,
+        owner_local_reducer=owner_local_reducer,
+        worker_addresses=worker_addresses,
+        target_owners=target_owners,
+        nufft_resources=nufft_resources,
+        nufft_settings=nufft_settings,
+        runtime_provenance=runtime_provenance,
+        reuse_rifft_payload=reuse_rifft_payload,
+        transient_interval_payloads=transient_interval_payloads,
+        manifests_by_chunk=manifests_by_chunk,
+        stage_task_logs=stage_task_logs,
+        max_inflight=max_inflight,
+        retries_left=retries_left,
+        infra_retry_budget=infra_retry_budget,
+        killed_worker_retry_cap=killed_worker_retry_cap,
+    )
+    run_loop.run()
+    run_loop.raise_if_batches_failed()
+    submitted = run_loop.submitted
+    early_flush_futures = run_loop.early_flush_futures
 
     if owner_local_reducer and worker_addresses:
         _flush_local_reducer_targets_or_raise(

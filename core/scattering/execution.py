@@ -53,7 +53,7 @@ from core.scattering.tasks import (
 )
 from core.storage.database_manager import DatabaseManager
 from core.storage.digests import digest_dict
-from core.storage.run_state_cache import rebuild_sqlite_cache_from_manifests
+from core.workflow.run_state_cache import rebuild_sqlite_cache_from_manifests
 from core.scattering.streaming import (
     StreamingComputeContext,
     stage2_streaming_enabled,

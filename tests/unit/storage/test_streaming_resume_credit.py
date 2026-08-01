@@ -15,7 +15,7 @@ from core.residual_field.manifest_io import (
     _build_residual_field_reducer_progress_manifest,
     write_residual_field_reducer_progress_manifest,
 )
-from core.storage.run_state_cache import _committed_streaming_residual_credits
+from core.workflow.run_state_cache import _committed_streaming_residual_credits
 
 DIGEST = "abc123def456"
 
@@ -93,7 +93,7 @@ def test_credits_survive_output_dir_relocation(tmp_path):
 
 
 def test_rebuild_overlay_applies_credit(tmp_path, monkeypatch):
-    from core.storage import run_state_cache as rsc
+    from core.workflow import run_state_cache as rsc
     from core.storage.database_manager import ManifestOnlyDatabaseManager
 
     _write_manifest(tmp_path, 0, interval_ids=(1, 2))
