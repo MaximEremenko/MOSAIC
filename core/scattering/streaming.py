@@ -23,6 +23,11 @@ from typing import Any, Dict, Mapping
 import numpy as np
 
 from core.runtime.budgeted_cache import BudgetedLRU
+from core.scattering.interval_payload import (
+    PAYLOAD_MISS,
+    read_interval_payload,
+    write_interval_payload,
+)
 from core.scattering.kernels import IntervalTask, streaming_lattice_default
 from core.scattering.tasks import compute_scattering_interval_payload
 
@@ -168,10 +173,13 @@ def _memo_store(key: tuple[str, int], task: IntervalTask | None) -> None:
 # ---------------------------------------------------------------------------
 # Durable stage-1 payload store
 # ---------------------------------------------------------------------------
-# One uncompressed .npz per interval under the context's payload_store_dir.
-# Array members are read back as in-place memmaps (page cache, not RSS), so a
-# store hit costs no stage-1 compute AND almost no anonymous memory. Mask-empty
-# intervals are recorded as a marker file so their emptiness is durable too.
+# One interval payload per file under the context's payload_store_dir, in the
+# SAME format the precompute mode's interval artifacts use (see
+# scattering/interval_payload) — one writer, one reader, one commit protocol
+# for both durable modes. Array members are read back as in-place memmaps
+# (page cache, not RSS), so a store hit costs no stage-1 compute AND almost no
+# anonymous memory. Mask-empty intervals are recorded too, so their emptiness
+# is durable and never re-derived.
 
 _STORE_MISS = object()
 
@@ -179,45 +187,67 @@ _STORE_MISS = object()
 def _store_payload_path(store_dir: str, interval_id: int) -> "Path":
     from pathlib import Path
 
+    return Path(store_dir) / f"interval_{int(interval_id):06d}.h5"
+
+
+def _legacy_npz_store_path(store_dir: str, interval_id: int) -> "Path":
+    """Pre-consolidation entries. Still READ so an existing store keeps its
+    value across the format change; nothing writes this shape any more."""
+    from pathlib import Path
+
     return Path(store_dir) / f"interval_{int(interval_id):06d}.npz"
 
 
 def stage1_store_has(store_dir: str, interval_id: int) -> bool:
-    return _store_payload_path(store_dir, interval_id).exists()
+    return (
+        _store_payload_path(store_dir, interval_id).exists()
+        or _legacy_npz_store_path(store_dir, interval_id).exists()
+    )
 
 
-def read_stored_interval_payload(store_dir: str, interval_id: int):
-    """Return the stored payload, ``None`` for a recorded mask-empty interval,
-    or the ``_STORE_MISS`` sentinel when nothing durable exists yet."""
+def _read_legacy_npz_payload(path):
     import json
 
     from core.storage.npz_mmap import mmap_npz_member
 
+    with np.load(path, allow_pickle=False) as data:
+        meta = json.loads(str(np.asarray(data["meta"]).item()))
+    if meta.get("empty"):
+        return None
+    arrays = {}
+    for member in ("q_grid", "q_amp", "q_amp_av"):
+        mapped = mmap_npz_member(path, member)
+        if mapped is None:
+            with np.load(path, allow_pickle=False) as data:
+                mapped = np.asarray(data[member])
+        arrays[member] = mapped
+    return IntervalTask(
+        irecip_id=int(meta["irecip_id"]),
+        element=str(meta["element"]),
+        q_grid=arrays["q_grid"],
+        q_amp=arrays["q_amp"],
+        q_amp_av=arrays["q_amp_av"],
+        q_grid_digest=meta.get("q_grid_digest"),
+        half_space_role=str(meta["half_space_role"]),
+        reciprocal_multiplicity=int(meta.get("reciprocal_multiplicity", 1)),
+    )
+
+
+def read_stored_interval_payload(store_dir: str, interval_id: int):
+    """Return the stored payload, ``None`` for a recorded mask-empty interval,
+    or the ``_STORE_MISS`` sentinel when nothing durable exists yet.
+
+    Reads are memory-mapped: a store hit costs page cache, not the anonymous
+    RSS that materializing multi-GB members would."""
     path = _store_payload_path(store_dir, interval_id)
-    if not path.exists():
-        return _STORE_MISS
+    legacy_path = _legacy_npz_store_path(store_dir, interval_id)
     try:
-        with np.load(path, allow_pickle=False) as data:
-            meta = json.loads(str(np.asarray(data["meta"]).item()))
-        if meta.get("empty"):
-            return None
-        arrays = {}
-        for member in ("q_grid", "q_amp", "q_amp_av"):
-            mapped = mmap_npz_member(path, member)
-            if mapped is None:
-                with np.load(path, allow_pickle=False) as data:
-                    mapped = np.asarray(data[member])
-            arrays[member] = mapped
-        return IntervalTask(
-            irecip_id=int(meta["irecip_id"]),
-            element=str(meta["element"]),
-            q_grid=arrays["q_grid"],
-            q_amp=arrays["q_amp"],
-            q_amp_av=arrays["q_amp_av"],
-            q_grid_digest=meta.get("q_grid_digest"),
-            half_space_role=str(meta["half_space_role"]),
-            reciprocal_multiplicity=int(meta.get("reciprocal_multiplicity", 1)),
-        )
+        if path.exists():
+            payload = read_interval_payload(path, mmap=True)
+            return _STORE_MISS if payload is PAYLOAD_MISS else payload
+        if legacy_path.exists():
+            return _read_legacy_npz_payload(legacy_path)
+        return _STORE_MISS
     except Exception:
         logger.warning(
             "Unreadable stage-1 store entry %s; recomputing.", path, exc_info=True
@@ -228,53 +258,24 @@ def read_stored_interval_payload(store_dir: str, interval_id: int):
 def write_stored_interval_payload(
     store_dir: str, interval_id: int, task: "IntervalTask | None"
 ) -> None:
-    """Atomically persist one interval payload (idempotent, race-safe)."""
-    import json
-    from uuid import uuid4
+    """Persist one interval payload (idempotent, race-safe).
 
+    Same format and same commit protocol as the precompute-mode interval
+    artifact — temp file, fsync, reopen-and-validate, rename — so the store
+    inherits the artifact writer's durability instead of the weaker
+    savez+replace it used to have."""
     path = _store_payload_path(store_dir, interval_id)
     if path.exists():
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
     try:
-        if task is None:
-            np.savez(tmp, meta=np.asarray(json.dumps({"empty": True})))
-        else:
-            meta = {
-                "empty": False,
-                "irecip_id": int(task.irecip_id),
-                "element": str(task.element),
-                "q_grid_digest": task.q_grid_digest,
-                "half_space_role": str(task.half_space_role),
-                "reciprocal_multiplicity": int(task.reciprocal_multiplicity),
-            }
-            np.savez(
-                tmp,
-                meta=np.asarray(json.dumps(meta)),
-                q_grid=np.ascontiguousarray(task.q_grid, dtype=np.float64),
-                q_amp=np.ascontiguousarray(
-                    np.asarray(task.q_amp).reshape(-1), dtype=np.complex128
-                ),
-                q_amp_av=np.ascontiguousarray(
-                    np.asarray(task.q_amp_av).reshape(-1), dtype=np.complex128
-                ),
-            )
-        # np.savez appends .npz when the target lacks it; our tmp ends in .tmp
-        produced = tmp if tmp.exists() else tmp.with_name(tmp.name + ".npz")
-        os.replace(produced, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_interval_payload(path, task, interval_id=int(interval_id))
     except Exception:
         logger.warning(
             "Failed to persist stage-1 store entry %s; run continues without it.",
             path,
             exc_info=True,
         )
-    finally:
-        for candidate in (tmp, tmp.with_name(tmp.name + ".npz")):
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def prewarm_stage1_payload_store(

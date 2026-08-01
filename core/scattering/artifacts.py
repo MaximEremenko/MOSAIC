@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-import h5py
 import numpy as np
 
 from core.scattering.contracts import (
@@ -16,6 +15,7 @@ from core.scattering.contracts import (
     validate_scattering_artifact_manifest,
 )
 from core.scattering.kernels import IntervalTask
+from core.scattering.interval_payload import write_interval_payload
 from core.contracts import ArtifactManifestAssessment, CompletionStatus
 from core.storage.database_manager import create_db_manager_for_thread
 from core.storage.hdf5_atomic import atomic_hdf5_write
@@ -501,30 +501,8 @@ def persist_precomputed_interval_artifact(
     if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
         raise ValueError("Precompute work unit must include an interval artifact path.")
     out_path = Path(work_unit.interval_artifact.path)
-    atomic_hdf5_write(
-        out_path,
-        {
-            "irecip_id": np.array([int(interval_task.irecip_id)], dtype=np.int64),
-            "element": np.asarray(str(interval_task.element), dtype=h5py.string_dtype("utf-8")),
-            "q_grid": np.asarray(interval_task.q_grid),
-            "q_amp": np.asarray(interval_task.q_amp),
-            "q_amp_av": np.asarray(interval_task.q_amp_av),
-            "q_grid_digest": np.asarray(_q_grid_digest(interval_task.q_grid), dtype=h5py.string_dtype("ascii")),
-            "half_space_role": np.asarray(
-                str(interval_task.half_space_role),
-                dtype=h5py.string_dtype("ascii"),
-            ),
-            "reciprocal_multiplicity": np.array(
-                [int(interval_task.reciprocal_multiplicity)],
-                dtype=np.int64,
-            ),
-        },
-        attrs={
-            "schema_version": 2,
-            "interval_id": int(interval_task.irecip_id),
-            "format": "mosaic.scattering.interval",
-        },
-    )
+    # One format for both durable modes — see scattering/interval_payload.
+    write_interval_payload(out_path, interval_task)
     if db_path is not None:
         _IntervalPrecomputeStateUpdater(
             db_path,

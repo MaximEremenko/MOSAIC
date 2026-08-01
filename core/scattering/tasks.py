@@ -20,6 +20,7 @@ from core.scattering.artifacts import (
     persist_precomputed_interval_artifact,
 )
 from core.scattering.contracts import ScatteringArtifactManifest, ScatteringWorkUnit
+from core.scattering.interval_payload import PAYLOAD_MISS, read_interval_payload
 from core.scattering.kernels import (
     IntervalTask,
     aggregate_interval_contributions,
@@ -101,34 +102,13 @@ def _store_interval_payload_cache(key: tuple[str, str], payload: IntervalTask) -
 def _read_interval_task_payload(path: Path) -> IntervalTask:
     if path.suffix not in {".h5", ".hdf5"}:
         raise ValueError("Current-run interval payloads must be HDF5 artifacts.")
-    with h5py.File(path, "r") as data:
-        if "half_space_role" not in data or "reciprocal_multiplicity" not in data:
-            raise ValueError(
-                "Current-run interval payloads must include half_space_role "
-                "and reciprocal_multiplicity metadata."
-            )
-        element = data["element"][()]
-        if isinstance(element, bytes):
-            element = element.decode("utf-8")
-        q_grid_digest = None
-        if "q_grid_digest" in data:
-            q_grid_digest = data["q_grid_digest"][()]
-            if isinstance(q_grid_digest, bytes):
-                q_grid_digest = q_grid_digest.decode("ascii")
-            else:
-                q_grid_digest = str(q_grid_digest)
-        half_space_role = normalize_half_space_role(data["half_space_role"][()])
-        reciprocal_multiplicity = int(np.asarray(data["reciprocal_multiplicity"]).reshape(-1)[0])
-        return IntervalTask(
-            int(np.asarray(data["irecip_id"]).reshape(-1)[0]),
-            str(element),
-            np.asarray(data["q_grid"]),
-            np.asarray(data["q_amp"]),
-            np.asarray(data["q_amp_av"]),
-            q_grid_digest=q_grid_digest,
-            half_space_role=half_space_role,
-            reciprocal_multiplicity=reciprocal_multiplicity,
-        )
+    # Materializing read (mmap is the streaming store's concern): this
+    # payload feeds the precompute-mode consumers, whose write access to
+    # the arrays a read-only mapping would break.
+    payload = read_interval_payload(path)
+    if payload is None or payload is PAYLOAD_MISS:
+        raise ValueError(f"Interval payload is missing or empty: {path}")
+    return payload
 
 
 def load_interval_task_payload(
