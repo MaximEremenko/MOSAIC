@@ -15,7 +15,6 @@ Enable with ``runtime_info.scattering_stage2_mode = "streaming"`` or
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import threading
@@ -87,16 +86,30 @@ class StreamingComputeContext:
     payload_store_dir: str | None = None
 
 
-def streaming_slot_for_batch(interval_ids, n_slots: int) -> int:
-    """Deterministic subchunk slot for an interval batch.
+def streaming_slot_map(
+    batch_interval_ids, n_slots: int
+) -> dict[tuple[int, ...], int]:
+    """Deterministic subchunk slot per interval batch: rank in canonical
+    batch order, mod n_slots.
 
-    Content-addressed (not index-based) so the same batch lands on the same
-    slot across chunks, resumes, and worker restarts — which is what lets a
-    slot's owner worker reuse one computed payload for every chunk it folds
-    the batch into, and lets resume validation reason about slot families."""
-    token = ",".join(str(int(interval_id)) for interval_id in interval_ids)
-    digest = hashlib.sha256(token.encode("ascii")).hexdigest()
-    return int(digest[:8], 16) % max(1, int(n_slots))
+    Replaces sha256(interval_ids) mod n_slots (retired with digest schema
+    3): the hash gave binomially skewed — possibly empty — slots, which
+    concentrated the rod case's scattering volume in ONE slot and forced
+    the per-(chunk,slot) owner spread as a compensating layer. Rank order
+    is exactly as stable as the hash was: the batch list is a
+    config-deterministic, worker-count-invariant function of the plan, and
+    resume rebuilds the identical batch universe per pending chunk
+    (interval saves are all-or-nothing at chunk finalize) — while balancing
+    batch counts across slots exactly, with no empty slots whenever
+    batches >= slots."""
+    ordered = sorted(
+        {
+            tuple(int(interval_id) for interval_id in interval_ids)
+            for interval_ids in batch_interval_ids
+        }
+    )
+    slots = max(1, int(n_slots))
+    return {interval_ids: rank % slots for rank, interval_ids in enumerate(ordered)}
 
 
 # Per-process memo of computed interval payloads: consecutive work units on
@@ -489,5 +502,5 @@ __all__ = [
     "clear_streaming_payload_memo",
     "compute_streamed_interval_tasks",
     "stage2_streaming_enabled",
-    "streaming_slot_for_batch",
+    "streaming_slot_map",
 ]

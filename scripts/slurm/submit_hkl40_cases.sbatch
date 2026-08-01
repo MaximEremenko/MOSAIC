@@ -7,19 +7,25 @@
 #SBATCH --time=04:00:00
 #
 # One independent MOSAIC case per array task. This is the cluster shape of
-# scripts/run_catio3_hkl40_pipelined.py: cases are scientifically independent,
-# resume from durable state on any node, and share the stage-1 payload store
-# when MOSAIC_STREAMING_PAYLOAD_STORE points at a parallel filesystem.
+# scripts/run_catio3_hkl40_pipelined.py: cases are scientifically independent
+# and resume from durable state on any node. NOTE the stage-1 payload store
+# is scoped by the run's scientific digest, which includes the MASK — the
+# four cases differ exactly in their mask equations, so each array task
+# keeps its OWN store subtree (~75 GB each at hkl40 scale, 4x total, not one
+# shared copy). Point MOSAIC_STREAMING_PAYLOAD_STORE at a parallel FS with
+# room for all four; only reruns of the SAME case reuse a store.
 #
 # Nothing below is machine-specific:
 #   - runtime.dask.max_workers is "auto" -> one worker per GPU SLURM grants
 #   - all budgets (VRAM pool, RAM admission, tile sizes) probe the node
 #   - checkpoint identity is worker-count invariant: a job preempted on a
-#     4-GPU node resumes on an 8-GPU node without recomputation
+#     4-GPU node resumes on an 8-GPU node without recomputation (streaming
+#     slot count and partition capacity are plan constants in the parameter
+#     digest, never live worker counts)
 #
 # For MULTI-NODE-PER-CASE runs, switch the config's runtime.dask.backend to
-# "slurm" (dask-jobqueue) or "mpi" (dask-mpi): both are already wired in
-# core/runtime/dask_helpers.py; the store must then be on the shared FS.
+# "slurm" (dask-jobqueue) or "mpi" (dask-mpi); the store must then be on the
+# shared FS.
 
 set -euo pipefail
 

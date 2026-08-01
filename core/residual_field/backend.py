@@ -1827,6 +1827,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                 parameter_digest=accumulator.parameter_digest,
             )
             retained_snapshot_keys: list[str] = []
+            replaced_snapshot_seqs: list[int] = []
             prior_interval_ids: tuple[int, ...] = ()
             if existing_progress is not None:
                 prior_interval_ids = existing_progress.incorporated_interval_ids
@@ -1852,7 +1853,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                             parsed_chunk_id,
                             parsed_digest,
                             parsed_partition_id,
-                            _,
+                            parsed_seq,
                         ) = parsed
                         if (
                             parsed_chunk_id == int(accumulator.chunk_id)
@@ -1864,6 +1865,26 @@ class ManifestDrivenResidualFieldReducerBackend:
                                 else None
                             )
                         ):
+                            # Fencing: a partition's manifest seq only ever
+                            # ADVANCES. A replacement owner sequences from
+                            # epoch * STRIDE, so a scheduler-declared-dead-
+                            # but-alive predecessor that tries to commit
+                            # after the remap lands here — loudly — instead
+                            # of racing the live owner's rename and dropping
+                            # its snapshot key from the family (which
+                            # finalize would only discover at the very end
+                            # of the run).
+                            if int(parsed_seq) >= int(snapshot_seq):
+                                raise RuntimeError(
+                                    "Residual-field snapshot commit superseded: "
+                                    f"chunk={int(accumulator.chunk_id)} "
+                                    f"partition={accumulator.partition_id} already "
+                                    f"has durable seq {int(parsed_seq)} >= "
+                                    f"{int(snapshot_seq)} — a replacement owner "
+                                    "has advanced this target; this process's "
+                                    "ownership is stale."
+                                )
+                            replaced_snapshot_seqs.append(int(parsed_seq))
                             continue
                     retained_snapshot_keys.append(key)
             progress_manifest = _build_residual_field_reducer_progress_manifest(
@@ -1901,16 +1922,21 @@ class ManifestDrivenResidualFieldReducerBackend:
             status_updater.mark_saved_many(
                 sorted(int(v) for v in newly_durable), int(accumulator.chunk_id)
             )
-        previous_snapshot_seq = snapshot_seq - 1
-        if previous_snapshot_seq > 0 and not self.uses_shared_durable_generations():
-            previous_snapshot_path = build_local_accumulator_snapshot_path(
-                output_dir,
-                chunk_id=accumulator.chunk_id,
-                parameter_digest=accumulator.parameter_digest,
-                partition_id=accumulator.partition_id,
-                snapshot_seq=previous_snapshot_seq,
-            )
-            previous_snapshot_path.unlink(missing_ok=True)
+        if not self.uses_shared_durable_generations():
+            # The manifest no longer references the replaced seqs; unlink
+            # their files (covers both the standard previous-seq case and a
+            # predecessor tenure's last snapshot after an epoch jump, which
+            # snapshot_seq - 1 alone would orphan on disk).
+            for stale_seq in set(replaced_snapshot_seqs) | {snapshot_seq - 1}:
+                if stale_seq <= 0 or stale_seq == snapshot_seq:
+                    continue
+                build_local_accumulator_snapshot_path(
+                    output_dir,
+                    chunk_id=accumulator.chunk_id,
+                    parameter_digest=accumulator.parameter_digest,
+                    partition_id=accumulator.partition_id,
+                    snapshot_seq=stale_seq,
+                ).unlink(missing_ok=True)
 
     def accept_partial(
         self,
@@ -1952,6 +1978,7 @@ class ManifestDrivenResidualFieldReducerBackend:
         db_path: str,
         total_expected_partials: int,
         cleanup_policy: str = "off",
+        owner_epoch: int = 0,
     ) -> None:
         if not self.uses_owner_local_accumulator():
             raise ValueError(
@@ -1973,6 +2000,8 @@ class ManifestDrivenResidualFieldReducerBackend:
                 output_dir=output_dir,
                 scratch_root=scratch_root,
             )
+            if owner_epoch:
+                accumulator.raise_owner_epoch_floor(owner_epoch)
             before = tuple(sorted(accumulator.current_interval_ids))
             accumulator.accept_contribution(
                 work_unit,

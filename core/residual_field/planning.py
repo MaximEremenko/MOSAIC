@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from dataclasses import replace
 from dataclasses import asdict, is_dataclass
@@ -66,12 +67,98 @@ def _stable_point_payload(point: object) -> dict[str, object]:
     }
 
 
+RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT = 4 * 1024**3
+RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN = 1024**2
+RESIDUAL_SHARD_SOURCE_BUDGET_DEFAULT = 30_000_000
+
+
+def resolve_residual_shard_grid_budget_bytes() -> int:
+    """Projected-grid-bytes budget for one lattice shard (default 4 GiB).
+
+    Deliberately a fixed constant with NO host-dependent default: it enters
+    checkpoint identity (below), so it must resolve identically on every
+    machine and worker count. Env override:
+    ``MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES`` (clamped to a 1 MiB minimum;
+    invalid values fall back to the default)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES")
+    if raw is None:
+        return RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
+    return max(RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN, value)
+
+
+def resolve_residual_shard_source_budget() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET")
+    try:
+        return int(raw) if raw is not None else RESIDUAL_SHARD_SOURCE_BUDGET_DEFAULT
+    except ValueError:
+        return RESIDUAL_SHARD_SOURCE_BUDGET_DEFAULT
+
+
+def residual_lattice_fft_enabled() -> bool:
+    """Whether the residual inverse runs as scatter + type-2 on the
+    reciprocal LATTICE instead of type-3 over scattered points. Selects
+    which shard-sizing rule runs, so it is checkpoint identity."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_FFT")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _residual_execution_identity_payload(parameters: object) -> dict:
+    """Identity-bearing EXECUTION knobs, digested alongside the science.
+
+    Each of these changes batch composition or the durable slot layout, so
+    two runs that differ in any of them must land in DISJOINT checkpoint
+    families. Before digest schema 3 they were outside the digest, and
+    invalidate_incompatible_local_checkpoints resolved the mismatch by
+    DELETING the existing family — an sbatch resume that forgot one env var
+    silently recomputed hours of work. The raw config/env values are
+    digested; the adaptive shard fold is a deterministic function of these
+    plus the digested science inputs, so resolved values add nothing."""
+    runtime_info = _parameter_value(parameters, "runtime_info", {}) or {}
+    get = getattr(runtime_info, "get", None)
+
+    def _rt(key):
+        return get(key) if callable(get) else None
+
+    intervals_per_shard = os.getenv("MOSAIC_RESIDUAL_INTERVALS_PER_SHARD")
+    if intervals_per_shard is None:
+        intervals_per_shard = _rt("residual_shard_batch_size")
+    try:
+        intervals_per_shard = (
+            int(intervals_per_shard) if intervals_per_shard is not None else "adaptive"
+        )
+    except (TypeError, ValueError):
+        intervals_per_shard = str(intervals_per_shard)
+    try:
+        partition_capacity = (
+            max(1, int(_rt("residual_partition_capacity")))
+            if _rt("residual_partition_capacity") is not None
+            else 8
+        )
+    except (TypeError, ValueError):
+        partition_capacity = str(_rt("residual_partition_capacity"))
+    return {
+        "streaming_subchunks": _to_jsonable(_rt("residual_streaming_subchunks")),
+        "intervals_per_shard": intervals_per_shard,
+        "partition_capacity": partition_capacity,
+        "shard_grid_budget_bytes": int(resolve_residual_shard_grid_budget_bytes()),
+        "shard_source_budget": int(resolve_residual_shard_source_budget()),
+        "lattice_fft": bool(residual_lattice_fft_enabled()),
+    }
+
+
 def build_residual_field_parameter_digest(parameters: object) -> str:
     rspace_info = _parameter_value(parameters, "rspace_info", {}) or {}
     struct_info = _parameter_value(parameters, "struct_info", {}) or {}
     peak_info = _parameter_value(parameters, "peak_info", {}) or {}
     payload = {
-        "digest_schema_version": 2,
+        "digest_schema_version": 3,
+        "execution_identity": _residual_execution_identity_payload(parameters),
         "postprocessing_mode": (
             _parameter_value(parameters, "postprocessing_mode")
             if _parameter_value(parameters, "postprocessing_mode") is not None

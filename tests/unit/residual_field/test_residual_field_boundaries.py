@@ -478,6 +478,50 @@ def test_residual_field_parameter_digest_ignores_decoder_and_resume_flags():
     assert build_residual_field_parameter_digest(base) == build_residual_field_parameter_digest(modified)
 
 
+def test_residual_field_parameter_digest_covers_execution_identity(monkeypatch):
+    """Identity-bearing execution knobs must namespace DISJOINT checkpoint
+    families (digest schema 3): before, changing one of them kept the same
+    digest and the family invalidation resolved the mismatch by DELETING
+    the existing snapshots — a resume that forgot one env var silently
+    recomputed hours of work."""
+    base = {
+        "postprocessing_mode": "displacement",
+        "supercell": np.array([4, 4, 4]),
+        "rspace_info": {"mode": "displacement"},
+        "struct_info": {"dimension": 3},
+        "peak_info": {"mask_equation": "h > 0"},
+        "runtime_info": {},
+    }
+    for name in (
+        "MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES",
+        "MOSAIC_RESIDUAL_INTERVALS_PER_SHARD",
+        "MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET",
+        "MOSAIC_RESIDUAL_LATTICE_FFT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    reference = build_residual_field_parameter_digest(base)
+    assert build_residual_field_parameter_digest(base) == reference
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES", str(8 << 30))
+    budget_changed = build_residual_field_parameter_digest(base)
+    monkeypatch.delenv("MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES")
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_INTERVALS_PER_SHARD", "3")
+    shard_changed = build_residual_field_parameter_digest(base)
+    monkeypatch.delenv("MOSAIC_RESIDUAL_INTERVALS_PER_SHARD")
+
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_FFT", "0")
+    lattice_changed = build_residual_field_parameter_digest(base)
+    monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_FFT")
+
+    slots_changed = build_residual_field_parameter_digest(
+        {**base, "runtime_info": {"residual_streaming_subchunks": 4}}
+    )
+
+    digests = {reference, budget_changed, shard_changed, lattice_changed, slots_changed}
+    assert len(digests) == 5, "every identity knob must move the digest"
+
+
 def test_residual_field_planning_can_partition_work_units_for_local_owner(tmp_path):
     parameters = {
         "postprocessing_mode": "displacement",
@@ -1493,30 +1537,43 @@ def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
         "worker-a": {"resources": {"nufft": 1}},
         "worker-b": {"resources": {"nufft": 1}},
     }
-    scheduler_states = [both_workers, both_workers, both_workers, both_workers, {"worker-b": {"resources": {"nufft": 1}}}]
 
     class _FakeClient:
         loop = SimpleNamespace(asyncio_loop=object())
 
         def __init__(self):
+            outer = self
+
+            class _FailureDelivered(_FakeFuture):
+                def result(self):
+                    outer.failure_delivered = True
+                    return super().result()
+
             self.task_results = [
-                None,
-                ResidualFieldAccumulatorStatus(
-                    artifact_key=work_unit.artifact_key,
-                    chunk_id=work_unit.chunk_id,
-                    parameter_digest=work_unit.parameter_digest,
-                    interval_ids=work_unit.interval_ids,
-                    partition_id=work_unit.partition_id,
-                    contribution_reciprocal_point_count=1,
-                    total_reciprocal_points=1,
+                _FailureDelivered(None),
+                _FakeFuture(
+                    ResidualFieldAccumulatorStatus(
+                        artifact_key=work_unit.artifact_key,
+                        chunk_id=work_unit.chunk_id,
+                        parameter_digest=work_unit.parameter_digest,
+                        interval_ids=work_unit.interval_ids,
+                        partition_id=work_unit.partition_id,
+                        contribution_reciprocal_point_count=1,
+                        total_reciprocal_points=1,
+                    )
                 ),
             ]
-            self.scheduler_call_count = 0
+            self.failure_delivered = False
 
         def scheduler_info(self):
-            index = min(self.scheduler_call_count, len(scheduler_states) - 1)
-            self.scheduler_call_count += 1
-            return {"workers": scheduler_states[index]}
+            # worker-a dies exactly when the first (failed) result is
+            # DELIVERED, not at a scripted liveness-poll count: the number
+            # of polls between submit and retry is an implementation detail
+            # (rescue scans, dead-cluster horizon) that must not decide
+            # whether the retry submit observes the death.
+            if self.failure_delivered:
+                return {"workers": {"worker-b": {"resources": {"nufft": 1}}}}
+            return {"workers": both_workers}
 
         def scatter(self, data, **kwargs):
             return data
@@ -1524,7 +1581,7 @@ def test_residual_field_async_stage_remaps_missing_owner_before_retry_submit(
         def submit(self, func, *args, **kwargs):
             if kwargs.get("key", "").startswith("residual-"):
                 task_submit_workers.append(kwargs.get("workers"))
-                return _FakeFuture(self.task_results.pop(0))
+                return self.task_results.pop(0)
             call_kwargs = dict(kwargs)
             for reserved_key in (
                 "key",
@@ -2555,7 +2612,10 @@ def test_residual_field_async_stage_passes_hysteresis_policy_into_partition_plan
 
     assert planner_kwargs["hysteresis_low_factor"] == pytest.approx(0.7)
     assert planner_kwargs["hysteresis_high_factor"] == pytest.approx(1.3)
-    assert planner_kwargs["effective_nufft_workers"] == 1
+    # Capacity CONSTANT (default 8), not live scheduler capacity: the
+    # partition plan enters checkpoint identity, so it must not change with
+    # the number of workers alive (M4).
+    assert planner_kwargs["effective_nufft_workers"] == 8
     assert any(
         "Residual-field partition plan | chunk=3" in message
         and "hysteresis_band=70-130" in message

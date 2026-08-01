@@ -21,7 +21,7 @@ from core.scattering.streaming import (
     clear_streaming_payload_memo,
     compute_streamed_interval_tasks,
     stage2_streaming_enabled,
-    streaming_slot_for_batch,
+    streaming_slot_map,
 )
 
 
@@ -56,27 +56,30 @@ class TestEnabledFlag:
 
 class TestSlotRouting:
     def test_deterministic_and_in_range(self):
+        batches = [(1,), (1, 2, 3), tuple(range(100, 140))]
         for n_slots in (1, 2, 7):
-            for batch in [(1,), (1, 2, 3), tuple(range(100, 140))]:
-                slot = streaming_slot_for_batch(batch, n_slots)
-                assert 0 <= slot < n_slots
-                assert slot == streaming_slot_for_batch(batch, n_slots)
+            mapping = streaming_slot_map(batches, n_slots)
+            assert mapping == streaming_slot_map(reversed(batches), n_slots)
+            for batch in batches:
+                assert 0 <= mapping[batch] < n_slots
 
-    def test_content_addressed_not_order_dependent_input(self):
-        # same ids -> same slot regardless of how the caller sorted them is
-        # NOT promised (batches are canonically sorted upstream); what IS
-        # promised: the same canonical batch maps identically across calls,
-        # chunks, and processes.
-        assert streaming_slot_for_batch((5, 6), 4) == streaming_slot_for_batch(
-            (5, 6), 4
-        )
+    def test_duplicate_batches_across_chunks_share_a_slot(self):
+        # every chunk submits the same batch universe; the map must be keyed
+        # by batch content so all chunks' copies of a batch share one slot.
+        mapping = streaming_slot_map([(5, 6), (7, 8), (5, 6), (7, 8)], 4)
+        assert set(mapping) == {(5, 6), (7, 8)}
 
-    def test_spreads_batches(self):
-        slots = {
-            streaming_slot_for_batch(tuple(range(i * 10, i * 10 + 5)), 4)
-            for i in range(32)
-        }
-        assert len(slots) > 1
+    def test_balances_batches_exactly(self):
+        """The whole point of retiring the sha256 assignment: rank-mod-slots
+        balances batch counts per slot exactly (the hash was binomially
+        skewed and could leave slots empty — the rod case concentrated its
+        real scattering volume in ONE slot)."""
+        batches = [tuple(range(i * 10, i * 10 + 5)) for i in range(32)]
+        mapping = streaming_slot_map(batches, 4)
+        counts = [0, 0, 0, 0]
+        for slot in mapping.values():
+            counts[slot] += 1
+        assert counts == [8, 8, 8, 8]
 
 
 def _context(lookup=None, token="tok"):

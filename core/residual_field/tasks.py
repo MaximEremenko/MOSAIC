@@ -624,11 +624,13 @@ def _residual_lattice_fft_enabled() -> bool:
     coordinates) and removes the type-3 fine-grid blow-up entirely -- measured
     27x per transform on hkl32-scale shards. Eligibility is checked per work
     unit (lattice snap + memory budget); ineligible data falls back to type-3
-    automatically."""
-    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_FFT")
-    if raw is None:
-        return True
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
+    automatically.
+
+    The switch selects which shard-sizing rule runs, so it is checkpoint
+    identity — resolution lives in planning (digested there)."""
+    from core.residual_field.planning import residual_lattice_fft_enabled
+
+    return residual_lattice_fft_enabled()
 
 
 # Cache of scattered lattice grids keyed by (parameter_digest, interval_ids).
@@ -1769,6 +1771,7 @@ def run_residual_field_interval_chunk_task(
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
     streaming_compute_context=None,
+    owner_epoch: int = 0,
 ) -> ResidualFieldShardManifest | ResidualFieldAccumulatorStatus | None:
     _ensure_worker_logging()
     interval_ids = work_unit.interval_ids or ((work_unit.interval_id,) if work_unit.interval_id is not None else ())
@@ -1885,6 +1888,7 @@ def run_residual_field_interval_chunk_task(
                 db_path=db_path,
                 total_expected_partials=total_expected_partials,
                 cleanup_policy="off",
+                owner_epoch=owner_epoch,
             )
             return ResidualFieldAccumulatorStatus(
                 artifact_key=work_unit.artifact_key,
@@ -2017,6 +2021,7 @@ def run_residual_field_interval_chunk_task(
                 db_path=db_path,
                 total_expected_partials=total_expected_partials,
                 cleanup_policy="off",
+                owner_epoch=owner_epoch,
             )
             return ResidualFieldAccumulatorStatus(
                 artifact_key=work_unit.artifact_key,

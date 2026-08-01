@@ -479,7 +479,21 @@ def _committed_streaming_residual_credits(
     (observed: ~53 min of GPU recompute on an already-published hkl40
     case). Digest scoping comes from the manifest FILENAME, so a stale
     config family can never credit rows for the current one; missing
-    final artifacts leave rows unsaved (manifests stay the authority)."""
+    final artifacts leave rows unsaved (manifests stay the authority).
+
+    Parsing goes through the typed manifest loader (one place owns the
+    status/pending semantics), and final-artifact presence is re-derived
+    from output_dir instead of the write-time-absolute paths embedded in
+    the manifest — a moved or remounted output directory keeps its credits
+    instead of silently re-deriving the whole stage."""
+    from core.contracts import CompletionStatus
+    from core.residual_field.artifacts import (
+        build_residual_field_output_artifact_refs,
+    )
+    from core.residual_field.manifest_io import (
+        load_residual_field_reducer_progress_manifest,
+    )
+
     credits: list[tuple[int, tuple[int, ...]]] = []
     root = Path(output_dir) / "residual_checkpoints"
     if not root.is_dir():
@@ -487,29 +501,25 @@ def _committed_streaming_residual_credits(
     pattern = f"chunk_*/reducer_progress_params_{parameter_digest}.manifest.json"
     for manifest_path in sorted(root.glob(pattern)):
         try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, ValueError):
+            manifest = load_residual_field_reducer_progress_manifest(manifest_path)
+        except Exception:
+            continue  # unreadable or schema-invalid manifests never credit
+        if manifest.completion_status is not CompletionStatus.COMMITTED:
             continue
-        if str(manifest.get("completion_status", "")).lower() != "committed":
+        if manifest.pending_interval_ids or manifest.pending_shard_keys:
             continue
-        if manifest.get("pending_interval_ids") or manifest.get("pending_shard_keys"):
-            continue
-        final_artifacts = manifest.get("final_artifacts") or []
-        if not final_artifacts or not all(
-            ref.get("path") and Path(ref["path"]).exists()
-            for ref in final_artifacts
+        expected_refs = build_residual_field_output_artifact_refs(
+            str(output_dir), int(manifest.chunk_id)
+        )
+        if not expected_refs or not all(
+            Path(ref.path).exists() for ref in expected_refs
         ):
             continue
-        try:
-            chunk_id = int(manifest.get("chunk_id"))
-            interval_ids = tuple(
-                int(value)
-                for value in manifest.get("incorporated_interval_ids") or ()
-            )
-        except (TypeError, ValueError):
-            continue
+        interval_ids = tuple(
+            int(value) for value in manifest.incorporated_interval_ids
+        )
         if interval_ids:
-            credits.append((chunk_id, interval_ids))
+            credits.append((int(manifest.chunk_id), interval_ids))
     return credits
 
 

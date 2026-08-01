@@ -874,6 +874,27 @@ class LiveLocalAccumulator:
         payload["_clone_paths"] = tuple(clone_paths)
         return payload
 
+    # Seq-space stride between owner tenures: a replacement owner's first
+    # snapshot seq jumps to epoch * STRIDE, so a zombie predecessor would
+    # need a million snapshots during the overlap window to catch up.
+    OWNER_EPOCH_SEQ_STRIDE = 1_000_000
+
+    def raise_owner_epoch_floor(self, owner_epoch: int) -> None:
+        """Fence stale owners by SEQ ORDERING, not a key-schema change.
+
+        The driver bumps a target's owner epoch on every ownership remap
+        (dead-owner rescue, retry on a vanished worker). Sequencing each
+        tenure from epoch * STRIDE makes the replacement's seqs strictly
+        greater than anything a scheduler-declared-dead-but-alive
+        predecessor can still write, and the commit path's manifest union
+        refuses to move a partition's seq backwards — the zombie's next
+        commit becomes a loud superseded-owner error instead of a
+        same-seq rename race with the live owner. Epoch 0 (no remap ever)
+        keeps historical seq numbering and filenames byte-identical."""
+        floor = int(owner_epoch) * self.OWNER_EPOCH_SEQ_STRIDE
+        if self.durable_snapshot_seq < floor:
+            self.durable_snapshot_seq = floor
+
     def mark_snapshot_captured(self) -> None:
         """Reset the cadence counter at CAPTURE time so an in-flight
         async write does not retrigger a capture every subsequent fold."""

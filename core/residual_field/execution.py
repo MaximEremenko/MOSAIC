@@ -62,6 +62,8 @@ from core.residual_field.planning import (
     build_residual_field_parameter_digest,
     build_residual_field_work_units,
     partition_residual_field_work_units,
+    resolve_residual_shard_grid_budget_bytes,
+    resolve_residual_shard_source_budget,
 )
 from core.residual_field.tasks import (
     _residual_lattice_fft_enabled,
@@ -1161,29 +1163,6 @@ def _drop_mask_emptied_interval_chunks(
     return kept
 
 
-_RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT = 4 * 1024**3
-_RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN = 1024**2
-
-
-def _resolve_residual_shard_grid_budget_bytes() -> int:
-    """Projected-grid-bytes budget for one lattice shard (default 4 GiB).
-
-    Env override: ``MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES`` (clamped to a
-    1 MiB minimum; invalid values fall back to the default).
-    """
-    raw = os.getenv("MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES")
-    if raw is None:
-        return _RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.debug(
-            "Ignoring invalid MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES=%r", raw
-        )
-        return _RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
-    return max(_RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN, value)
-
-
 def _lattice_grid_capped_intervals_per_shard(
     intervals,
     supercell,
@@ -1293,7 +1272,7 @@ def run_residual_field_stage(
                 # not build a whole-extent dense grid by default.
                 _lattice_intervals = list(artifacts.padded_intervals)
                 max_intervals_per_shard = max(1, len(_lattice_intervals))
-                _grid_budget = _resolve_residual_shard_grid_budget_bytes()
+                _grid_budget = resolve_residual_shard_grid_budget_bytes()
                 _grid_cap, _full_grid_bytes = _lattice_grid_capped_intervals_per_shard(
                     _lattice_intervals,
                     structure.supercell,
@@ -1311,7 +1290,7 @@ def run_residual_field_stage(
                     )
                     max_intervals_per_shard = _grid_cap
             else:
-                _budget = int(os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET", str(30_000_000)))
+                _budget = resolve_residual_shard_source_budget()
                 max_intervals_per_shard = _adaptive_residual_intervals_per_shard(
                     artifacts=artifacts,
                     structure=structure,
@@ -1490,7 +1469,7 @@ def run_residual_field_stage(
     _shard_packing_kwargs = {
         "interval_geometry": interval_geometry,
         "supercell": getattr(structure, "supercell", None),
-        "grid_budget_bytes": _resolve_residual_shard_grid_budget_bytes(),
+        "grid_budget_bytes": resolve_residual_shard_grid_budget_bytes(),
     }
     initial_work_units = build_residual_field_work_units(
         all_interval_chunk_pairs,
@@ -1563,18 +1542,28 @@ def run_residual_field_stage(
         # is routed to a content-addressed slot; each slot's accumulator sums
         # a disjoint interval subset, and finalize merges slots by summation
         # (validated by the disjoint-union family checks).
-        from core.scattering.streaming import streaming_slot_for_batch
+        from core.scattering.streaming import streaming_slot_map
 
         point_counts_by_chunk: dict[int, int] = {}
         for point_data in point_data_list:
             chunk_key = int(point_data["chunk_id"])
             point_counts_by_chunk[chunk_key] = point_counts_by_chunk.get(chunk_key, 0) + 1
         n_slots = _streaming_subchunk_slot_count(workflow_parameters, client)
+        slot_by_batch = streaming_slot_map(
+            (
+                _work_unit_expected_interval_ids(work_unit)
+                for work_unit in work_units
+            ),
+            n_slots,
+        )
         work_units = [
             work_unit.with_subchunk(
-                subchunk_id=streaming_slot_for_batch(
-                    _work_unit_expected_interval_ids(work_unit), n_slots
-                ),
+                subchunk_id=slot_by_batch[
+                    tuple(
+                        int(interval_id)
+                        for interval_id in _work_unit_expected_interval_ids(work_unit)
+                    )
+                ],
                 point_count=point_counts_by_chunk[int(work_unit.chunk_id)],
             )
             for work_unit in work_units
@@ -1596,11 +1585,22 @@ def run_residual_field_stage(
             ]
             for chunk_id in chunk_ids
         }
-        local_capacity_info = _scheduler_nufft_capacity(client)
+        # Capacity CONSTANT, not live scheduler capacity: partition point
+        # ranges are written into snapshots and compared on resume, so
+        # deriving this from client.scheduler_info() made durable-mode
+        # checkpoints worker-count DEPENDENT — a 4-GPU run resumed on an
+        # 8-GPU node changed every atom range and discarded every partition
+        # snapshot. Fixed default 8 mirrors the streaming slot count (any
+        # realistic worker count keeps folding concurrently);
+        # runtime_info.residual_partition_capacity overrides, and the knob
+        # is part of the parameter digest.
+        raw_partition_capacity = workflow_parameters.runtime_info.get(
+            "residual_partition_capacity"
+        )
         local_partition_capacity = (
-            int(local_capacity_info[0])
-            if local_capacity_info is not None
-            else max(1, int(max_inflight))
+            max(1, int(raw_partition_capacity))
+            if raw_partition_capacity is not None
+            else 8
         )
         partition_policy = _residual_partition_runtime_policy(
             workflow_parameters,
@@ -2010,6 +2010,14 @@ def run_residual_field_stage(
     except ValueError:
         killed_worker_retry_cap = 4
     killed_worker_seen: dict[tuple[str, int], int] = {}
+    # Fencing epochs per reducer target: bumped whenever ownership MOVES
+    # (dead-owner rescue, retry remap). Passed into the fold task; the
+    # accumulator sequences each tenure's snapshots from epoch * STRIDE and
+    # the manifest union refuses to move a partition's seq backwards, so a
+    # scheduler-declared-dead-but-alive predecessor cannot overwrite or
+    # race the replacement's snapshots (it fails loudly at commit instead).
+    target_owner_epochs: dict[tuple[int, int | None], int] = {}
+    target_last_owner: dict[tuple[int, int | None], str] = {}
     deferred_resubmits: list = []  # (eligible_monotonic_time, work_unit)
     target_rifft_futures: dict[tuple[int, int | None], object] = {}
     target_remaining = {
@@ -2150,6 +2158,21 @@ def run_residual_field_stage(
                 target_owners=target_owners,
                 worker_addresses=_current_worker_addresses(client),
             )
+        if owner_address is not None:
+            previous_owner = target_last_owner.get(target_key)
+            if previous_owner is not None and previous_owner != owner_address:
+                target_owner_epochs[target_key] = (
+                    int(target_owner_epochs.get(target_key, 0)) + 1
+                )
+                logger.warning(
+                    "Residual-field owner epoch bump | target=%s | %s -> %s "
+                    "| epoch=%d",
+                    target_key,
+                    previous_owner,
+                    owner_address,
+                    target_owner_epochs[target_key],
+                )
+            target_last_owner[target_key] = owner_address
         submit_kwargs = dict(
             total_reciprocal_points=total_reciprocal_points,
             output_dir=artifacts.output_dir,
@@ -2171,6 +2194,7 @@ def run_residual_field_stage(
             nufft_eps=nufft_settings.eps,
             nufft_prefer_cpu=nufft_settings.prefer_cpu,
             nufft_gpu_only=nufft_settings.gpu_only,
+            owner_epoch=int(target_owner_epochs.get(target_key, 0)),
         )
         if streaming_context_future is not None:
             submit_kwargs["streaming_compute_context"] = streaming_context_future
