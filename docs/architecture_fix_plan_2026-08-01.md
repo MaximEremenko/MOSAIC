@@ -16,17 +16,25 @@ every phase; summation order is free; local branch only, no push.
 | 5 durable_shared retirement | `ca334d4` | 1475 | 3.7e-15 + 3-node sim 1.7e-12 |
 | 6 god-module split | `2a16884` | 1485 | 4.0e-15 |
 
-47 of 48 findings fixed; M14 (two stage-1 payload formats) is the recorded
-non-fix below. Net ≈ −5,900 lines. Module sizes after phase 6:
+All 48 findings fixed (M14 followed the six phases — see below). Net ≈ −5,900 lines. Module sizes after phase 6:
 `execution.py` 2731 → 2127, `backend.py` 3108 → 1946, with `run_loop.py` (816),
 `assembly.py` (509) and `snapshot_writer.py` (123) carrying the extracted parts.
 
-Known environment issue, NOT a code regression: multi-node `mpirun` + GPU in
-the docker cluster sim fails with `cudaErrorDevicesUnavailable`; the
-pre-campaign baseline (`8b3ad2c`) fails identically while single-node
-in-container GPU and a bare CUDA probe under the same mpirun layout both
-pass. Phase 5's multi-node validation therefore ran cpu-only, which still
-exercises the reducer layout it needed to prove.
+Post-campaign follow-ups (same branch):
+
+- **M14** — the recorded non-fix was subsequently done (`f941373`): one
+  codec (`scattering/interval_payload.py`) owns the stage-1 payload format
+  for both durable modes, so the streaming store inherits the artifact
+  writer's fsync'd commit protocol and either mode's writer produces a file
+  the other's reader accepts. Legacy `.npz` store entries stay readable.
+- **Multi-node GPU** — what this plan first recorded as an environmental
+  sim issue turned out to be a real bug on the documented multi-node MPI
+  path (`f917927`): stage-1 payloads were memory-mapped from the SHARED
+  filesystem and handed to CUDA, whose DMA from network-faulting pages
+  fails (`cudaErrorDevicesUnavailable` on every GPU fold). Payloads on a
+  network filesystem are now read materialized. The original failing
+  configuration — 6 ranks, 3 nodes, 4 GPUs, NFS store — completes clean and
+  matches the host reference at 4.9e-15.
 
 ## Phase order and rationale
 
@@ -126,10 +134,12 @@ exercises the reducer layout it needed to prove.
 
 ## Explicit non-fixes (decision recorded, per the review's own verdicts)
 
-- **M14 two stage-1 payload formats**: both are live (HDF5 serves every
-  non-streaming example, npz serves streaming); consolidation is a store
-  format break with hot-path perf implications. Deferred to the next store
-  version; documented here as accepted debt.
+- **M14 two stage-1 payload formats**: initially deferred as a store-format
+  break with hot-path perf implications; subsequently DONE (`f941373`, see
+  the follow-ups above). What remains deliberately undone is automatic
+  cross-mode reuse of a durable run's `precomputed_intervals/`: the shared
+  format now permits it, but those paths are not digest-scoped, so reading
+  them blind could serve stale amplitudes after a physics change.
 - Findings L7/L14 ("sound, do not disturb") are constraints on the above, not
   work items.
 
