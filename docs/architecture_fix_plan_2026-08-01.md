@@ -5,6 +5,29 @@ Constraints carried over: FP64 (complex128) + NUFFT eps=1e-12 untouched; numeric
 gate is max|diff| < 1e-10 Å on chunk site displacements (host-regress.sh) after
 every phase; summation order is free; local branch only, no push.
 
+## Outcome (all six phases complete)
+
+| Phase | Commit | Unit suite | Gate (max diff vs reference) |
+|---|---|---|---|
+| 1 correctness seams | `73abf73` | pass | 4.6e-15 |
+| 2 deployment/resources | `ed4d823` | pass | 3.7e-15 |
+| 3 identity break (digest v3) | `e453e12` | pass | 4.1e-15 + kill/resume |
+| 4 deletion/consolidation/layering | `085fb82`, `6ac5245` | 1500 | 5.4e-15 |
+| 5 durable_shared retirement | `ca334d4` | 1475 | 3.7e-15 + 3-node sim 1.7e-12 |
+| 6 god-module split | `2a16884` | 1485 | 4.0e-15 |
+
+47 of 48 findings fixed; M14 (two stage-1 payload formats) is the recorded
+non-fix below. Net ≈ −5,900 lines. Module sizes after phase 6:
+`execution.py` 2731 → 2127, `backend.py` 3108 → 1946, with `run_loop.py` (816),
+`assembly.py` (509) and `snapshot_writer.py` (123) carrying the extracted parts.
+
+Known environment issue, NOT a code regression: multi-node `mpirun` + GPU in
+the docker cluster sim fails with `cudaErrorDevicesUnavailable`; the
+pre-campaign baseline (`8b3ad2c`) fails identically while single-node
+in-container GPU and a bare CUDA probe under the same mpirun layout both
+pass. Phase 5's multi-node validation therefore ran cpu-only, which still
+exercises the reducer layout it needed to prove.
+
 ## Phase order and rationale
 
 1. **Correctness seams** (residual core, sequential edits — the two god-files):
