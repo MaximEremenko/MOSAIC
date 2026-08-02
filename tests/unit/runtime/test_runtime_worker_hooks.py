@@ -131,8 +131,10 @@ def test_resolve_worker_scratch_root_uses_preferred_or_env(monkeypatch, tmp_path
         stage="residual_field",
     )
 
-    assert resolved_preferred == os.fspath(preferred / "mosaic" / "residual_field" / "local")
-    assert resolved_env == os.fspath(env_root / "mosaic" / "residual_field" / "local")
+    # No worker segment: this resolves on the DRIVER, which has no worker
+    # identity. worker_local_scratch_dir adds it on the worker.
+    assert resolved_preferred == os.fspath(preferred / "mosaic" / "residual_field")
+    assert resolved_env == os.fspath(env_root / "mosaic" / "residual_field")
 
 
 def test_chunk_mutex_does_not_instantiate_distributed_lock_when_lock_root_available(

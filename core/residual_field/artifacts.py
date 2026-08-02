@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -38,7 +39,7 @@ from core.contracts import (
     CompletionStatus,
 )
 from core.runtime import chunk_mutex
-from core.storage.atomic import fsync_parent, fsync_path
+from core.storage.atomic import atomic_write_json, fsync_parent, fsync_path
 from core.storage.database_manager import create_db_manager_for_thread
 
 # ---------------------------------------------------------------------------
@@ -546,10 +547,12 @@ def _write_residual_field_chunk_state(
     merged_state,
     total_reciprocal_points: int | None,
     applied_set: set[int],
+    parameter_digest: str | None = None,
 ) -> None:
     _write_residual_field_chunk_payload_components(
         store=store,
         chunk_id=chunk_id,
+        parameter_digest=parameter_digest,
         point_ids=merged_state.payload.point_ids,
         grid_shape_nd=merged_state.payload.grid_shape_nd,
         amplitudes_delta=merged_state.payload.amplitudes_delta,
@@ -564,6 +567,7 @@ def _write_residual_field_chunk_payload_components(
     *,
     store: ResidualFieldArtifactStore,
     chunk_id: int,
+    parameter_digest: str | None = None,
     point_ids: np.ndarray,
     grid_shape_nd: np.ndarray,
     amplitudes_delta: np.ndarray,
@@ -590,6 +594,10 @@ def _write_residual_field_chunk_payload_components(
         reciprocal_point_count=reciprocal_point_count,
     )
     store.save_applied_interval_ids(chunk_id, applied_set)
+    if parameter_digest is not None:
+        record_residual_chunk_digest(
+            store.output_dir, chunk_id=chunk_id, parameter_digest=parameter_digest
+        )
 
 
 def reconcile_residual_field_reducer_progress(
@@ -670,6 +678,7 @@ def reconcile_residual_field_reducer_progress(
             merged_state=merged_state,
             total_reciprocal_points=total_reciprocal_points,
             applied_set=set(int(interval_id) for interval_id in target_interval_ids),
+            parameter_digest=parameter_digest,
         )
 
     representative_interval_id = (
@@ -1034,6 +1043,56 @@ def summarize_residual_field_output_artifacts(
     }
 
 
+RESIDUAL_CHUNK_DIGEST_FILENAME = "residual_chunk_{chunk_id}_parameter_digest.json"
+
+
+def _residual_chunk_digest_path(output_dir: str, chunk_id: int) -> Path:
+    return Path(output_dir) / RESIDUAL_CHUNK_DIGEST_FILENAME.format(
+        chunk_id=int(chunk_id)
+    )
+
+
+def record_residual_chunk_digest(
+    output_dir: str, *, chunk_id: int, parameter_digest: str
+) -> None:
+    """Stamp the parameter digest the on-disk chunk artifacts belong to."""
+    atomic_write_json(
+        _residual_chunk_digest_path(output_dir, chunk_id),
+        {
+            "schema": "mosaic.residual_field.chunk_parameter_digest",
+            "schema_version": 1,
+            "chunk_id": int(chunk_id),
+            "parameter_digest": str(parameter_digest),
+        },
+        indent=2,
+    )
+
+
+def _chunk_artifacts_match_digest(
+    store: "ResidualFieldArtifactStore",
+    *,
+    chunk_id: int,
+    parameter_digest: str,
+) -> bool:
+    """Whether the chunk artifacts on disk were produced by this digest.
+
+    Absent stamp with no artifacts -> nothing to disagree with. Absent stamp
+    WITH artifacts means they predate stamping and cannot be attributed, so
+    they are refused: the cost is recomputing one chunk, and the
+    alternative is publishing the previous configuration's field."""
+    path = _residual_chunk_digest_path(store.output_dir, chunk_id)
+    if not path.exists():
+        refs = build_residual_field_output_artifact_refs(store.output_dir, chunk_id)
+        return not any(
+            ref.path is not None and Path(ref.path).exists() for ref in refs
+        )
+    try:
+        recorded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return str(recorded.get("parameter_digest", "")) == str(parameter_digest)
+
+
 def load_existing_materialized_state(
     chunk_id: int,
     *,
@@ -1041,6 +1100,21 @@ def load_existing_materialized_state(
     parameter_digest: str,
 ):
     store = ResidualFieldArtifactStore(output_dir)
+    if not _chunk_artifacts_match_digest(
+        store, chunk_id=chunk_id, parameter_digest=parameter_digest
+    ):
+        # These artifacts are addressed by chunk id alone, so a run with a
+        # DIFFERENT parameter digest used to inherit the previous run's
+        # applied-interval set, find every interval "already applied", and
+        # never rewrite the payload -- the residual recomputed into its new
+        # checkpoint family but the published artifacts stayed on the old
+        # answer. The digest was accepted here and never used for lookup.
+        logger.info(
+            "Residual chunk %d artifacts belong to a different parameter "
+            "digest; recomputing this chunk from scratch.",
+            int(chunk_id),
+        )
+        return None, set(), None, None
     current, current_av, reciprocal_point_count, grid_shape_nd = store.load_chunk_payloads(chunk_id)
     applied_set = store.load_applied_interval_ids(chunk_id)
     if current is None or current_av is None:
@@ -1117,6 +1191,11 @@ def persist_residual_field_chunk_result(
             )
             applied_set.add(work_unit.interval_id)
             store.save_applied_interval_ids(work_unit.chunk_id, applied_set)
+            record_residual_chunk_digest(
+                output_dir,
+                chunk_id=work_unit.chunk_id,
+                parameter_digest=work_unit.parameter_digest,
+            )
 
     _ResidualFieldChunkStatusUpdater(
         db_path,

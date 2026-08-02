@@ -1625,6 +1625,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                 _write_residual_field_chunk_payload_components(
                     store=store,
                     chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
                     point_ids=snapshot_payload["point_ids"],
                     grid_shape_nd=snapshot_payload["grid_shape_nd"],
                     amplitudes_delta=snapshot_payload["amplitudes_delta"],

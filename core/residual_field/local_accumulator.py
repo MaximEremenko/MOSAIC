@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from core.residual_field.contracts import ResidualFieldWorkUnit
+from core.runtime.worker_hooks import worker_local_scratch_dir
 
 logger = logging.getLogger(__name__)
 
@@ -992,8 +993,12 @@ def _allocate_live_arrays(
             return delta.copy(), average.copy(), None
         return np.zeros_like(delta), np.zeros_like(average), None
 
+    # Namespaced HERE, on the worker that will own these files — the driver
+    # cannot know the token, and these are opened mode="w+" (truncate), so a
+    # shared path means a remapped owner destroys the previous owner's live
+    # accumulator mid-fold.
     live_dir = (
-        Path(scratch_root).expanduser()
+        worker_local_scratch_dir(scratch_root)
         / "residual_accumulators"
         / f"chunk_{chunk_id}"
         / (

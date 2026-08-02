@@ -27,6 +27,7 @@ from core.residual_field.artifacts import (
     reconcile_residual_field_reducer_progress,
     write_residual_field_reducer_progress_manifest,
 )
+from core.runtime.worker_hooks import worker_local_scratch_dir
 from core.residual_field.local_accumulator import (
     LiveLocalAccumulator,
     build_local_accumulator_snapshot_path,
@@ -817,8 +818,12 @@ def test_local_backend_file_backed_accumulator_path_works(tmp_path, monkeypatch)
             total_expected_partials=1,
         )
 
+        # worker_local_scratch_dir namespaces the live arrays to the OWNING
+        # worker: they are opened mode="w+", so two workers on one node
+        # sharing this directory means the second truncates the first's
+        # accumulator mid-fold. Off-worker (this test) the token is "local".
         live_dir = (
-            Path(scratch_root)
+            worker_local_scratch_dir(scratch_root)
             / "residual_accumulators"
             / "chunk_3"
             / "params_abc123"
@@ -888,13 +893,13 @@ def test_local_backend_file_backed_partition_targets_use_distinct_live_dirs(tmp_
         )
 
         live_dir_1 = (
-            Path(scratch_root)
+            worker_local_scratch_dir(scratch_root)
             / "residual_accumulators"
             / "chunk_3"
             / "params_abc123_partition_0"
         )
         live_dir_2 = (
-            Path(scratch_root)
+            worker_local_scratch_dir(scratch_root)
             / "residual_accumulators"
             / "chunk_3"
             / "params_abc123_partition_1"
@@ -1080,3 +1085,38 @@ def test_residual_field_reclaimable_shard_cleanup_requires_committed_progress(tm
         assert Path(persisted_shard.artifacts[1].path).exists()
     finally:
         db.close()
+
+
+def test_driver_resolved_scratch_root_carries_no_worker_token():
+    """The driver resolves the scratch ROOT and ships one string to every
+    worker; it cannot know a worker identity, and baking one in collapsed
+    every worker on a node onto the literal "local" — one live-accumulator
+    path, opened mode="w+", shared by all of them."""
+    from core.runtime.worker_hooks import (
+        current_worker_token,
+        resolve_worker_scratch_root,
+        worker_local_scratch_dir,
+    )
+
+    root = resolve_worker_scratch_root(preferred="/scratch", stage="residual_field")
+    assert root.endswith("/mosaic/residual_field")
+    assert not root.endswith("/local"), "driver must not name a worker"
+    # Off-worker there is no identity to use; the namespacing happens on the
+    # worker, where there is.
+    assert current_worker_token() is None
+    assert worker_local_scratch_dir(root).name == "local"
+
+
+def test_worker_scratch_dirs_separate_by_worker(monkeypatch):
+    from core.runtime import worker_hooks
+
+    seen = []
+
+    def _token():
+        return seen.pop(0)
+
+    monkeypatch.setattr(worker_hooks, "current_worker_token", _token)
+    seen[:] = ["tcp_10.0.0.1_8786", "tcp_10.0.0.2_8786"]
+    first = worker_hooks.worker_local_scratch_dir("/scratch/mosaic/residual_field")
+    second = worker_hooks.worker_local_scratch_dir("/scratch/mosaic/residual_field")
+    assert first != second

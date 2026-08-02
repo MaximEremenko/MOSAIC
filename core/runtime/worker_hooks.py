@@ -265,24 +265,40 @@ def resolve_worker_scratch_root(
         or _worker_scratch_base()
     )
     base_path = Path(base).expanduser() if isinstance(base, str) else Path(base)
+    # Deliberately NOT per-worker. This is called on the DRIVER, where
+    # get_worker() raises, so a per-worker token resolved here collapsed to
+    # the literal "local" for every worker and the single resulting string
+    # was shipped to all of them — putting every worker on a node on ONE
+    # live-accumulator path that _allocate_live_arrays opens with mode="w+".
+    # The per-worker segment is appended by worker_local_scratch_dir, on the
+    # worker, where the identity is actually knowable.
+    return str((base_path / "mosaic" / stage).resolve())
+
+
+def current_worker_token() -> str | None:
+    """This worker's stable filesystem token, or None off-worker."""
     try:
         from distributed import get_worker
 
         worker = get_worker()
-        worker_token = (
-            getattr(worker, "name", None)
-            or getattr(worker, "address", None)
-            or "worker"
-        )
-        safe_worker_token = (
-            str(worker_token)
-            .replace("://", "_")
-            .replace(":", "_")
-            .replace("/", "_")
-        )
-        return str((base_path / "mosaic" / stage / safe_worker_token).resolve())
     except Exception:
-        return str((base_path / "mosaic" / stage / "local").resolve())
+        return None
+    token = (
+        getattr(worker, "name", None) or getattr(worker, "address", None) or "worker"
+    )
+    return str(token).replace("://", "_").replace(":", "_").replace("/", "_")
+
+
+def worker_local_scratch_dir(scratch_root: str | Path) -> Path:
+    """Namespace a scratch root to the CALLING worker.
+
+    Must be called from the worker that will own the files. Two workers on
+    one node sharing a directory here is not a tidiness problem: the live
+    accumulator arrays are opened ``mode="w+"``, so the second worker
+    truncates the first one's accumulator mid-fold."""
+    root = Path(scratch_root).expanduser()
+    token = current_worker_token()
+    return root / (token or "local")
 
 
 def is_gpu_runtime_error(error: Exception | str) -> bool:

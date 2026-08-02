@@ -46,6 +46,7 @@ from .worker_hooks import (
     path_is_tmpfs,
     register_cleanup_plugin,
     resolve_worker_scratch_root,
+    worker_local_scratch_dir,
 )
 
 __all__ = [
@@ -76,6 +77,7 @@ __all__ = [
     "require_chunk_quiescence",
     "require_gpu_admission",
     "resolve_worker_scratch_root",
+    "worker_local_scratch_dir",
     "resolve_nufft_execution_settings",
     "runtime_provenance_for_attempt",
     "set_log_dir_for_run",
