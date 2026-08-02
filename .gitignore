@@ -71,3 +71,6 @@ ChangeLog
 .venv/
 .dask-local/
 .vscode/
+
+# Launcher scratch (MOSAIC_WORKER_SCRATCH_ROOT / lattice / shard)
+.mosaic-scratch/
