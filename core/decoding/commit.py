@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Mapping
@@ -51,6 +53,9 @@ class DecoderCommitManifest:
         )
 
 
+logger = logging.getLogger(__name__)
+
+
 def decoder_commit_path(output_dir: str | Path, run_digest: str) -> Path:
     return stage_root(output_dir, run_digest, "decoding") / "decoder_commit.json"
 
@@ -61,6 +66,7 @@ def write_decoder_commit(
     run_digest: str,
     decoder_cache_path: str | Path,
     decoder_cache_identity: Mapping[str, Any],
+    supersede: bool = False,
 ) -> DecoderCommitManifest:
     cache_path = assert_path_contained(decoder_cache_path, output_dir=output_dir)
     relative_cache_path = cache_path.relative_to(Path(output_dir).resolve()).as_posix()
@@ -89,8 +95,19 @@ def write_decoder_commit(
     if target.exists():
         existing = read_manifest(target, codec=DecoderCommitManifest, output_dir=output_dir)
         if existing != manifest:
-            raise RuntimeError("decoder_commit.json already exists with different identity.")
-        return existing
+            if not supersede:
+                raise RuntimeError(
+                    "decoder_commit.json already exists with different identity."
+                )
+            # The caller just trained the cache this manifest describes, so a
+            # commit here for different inputs is SUPERSEDED, not a competing
+            # writer. Without this a changed decoder source could never be
+            # committed and the run aborted on its own output path.
+            logger.info(
+                "Replacing the decoder commit for superseded inputs at %s.", target
+            )
+        else:
+            return existing
     write_manifest(target, manifest, output_dir=output_dir)
     return manifest
 

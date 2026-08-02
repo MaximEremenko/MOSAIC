@@ -354,32 +354,49 @@ def _build_current_decoder_cache_identity(
     )
 
 
-def _require_matching_decoder_commit(
+def _decoder_commit_matches(
     *,
     output_dir: str,
     run_digest: str,
     cache_path: str,
     cache_identity: dict,
-) -> None:
+    logger=None,
+) -> bool:
+    """Whether the committed decoder cache is THIS run's, and reusable.
+
+    Returns False rather than raising. The safety property is "never reuse
+    an unvalidated cache", and RETRAINING satisfies it — aborting satisfies
+    it too, but turns every legitimate identity change into a hard stop
+    that needs the operator to delete files by hand. Observed in the 3-node
+    sim: a scoped decoder-commit address left an existing cache with no
+    commit at the new address, and the run died instead of retraining."""
+
+    def _no(reason: str) -> bool:
+        if logger is not None:
+            logger.info("Retraining the decoder: %s", reason)
+        return False
+
     manifest_path = decoder_commit_path(output_dir, run_digest)
     if not manifest_path.exists():
-        raise RuntimeError(
-            "Current decoder cache exists without decoder_commit.json; refusing stale cache reuse."
+        return _no("a decoder cache exists but no decoder_commit.json vouches for it")
+    try:
+        commit = read_manifest(
+            manifest_path,
+            codec=DecoderCommitManifest,
+            output_dir=output_dir,
         )
-    commit = read_manifest(
-        manifest_path,
-        codec=DecoderCommitManifest,
-        output_dir=output_dir,
-    )
+    except Exception as exc:
+        return _no(f"decoder_commit.json is unreadable ({exc})")
     relative_cache_path = Path(cache_path).resolve().relative_to(Path(output_dir).resolve()).as_posix()
     if commit.decoder_cache_path != relative_cache_path:
-        raise RuntimeError("decoder_commit.json points at a different decoder cache.")
+        return _no("decoder_commit.json points at a different decoder cache")
     if commit.decoder_cache_identity != cache_identity:
-        raise RuntimeError("decoder_commit.json identity does not match current decoder source.")
+        return _no("decoder_commit.json identity does not match the current decoder source")
     if commit.decoder_cache_file_sha256 != file_sha256(cache_path):
-        raise RuntimeError("decoder_commit.json file hash does not match current decoder cache.")
+        return _no("decoder_commit.json file hash does not match the cache on disk")
     if int(commit.decoder_cache_nbytes) != int(Path(cache_path).stat().st_size):
-        raise RuntimeError("decoder_commit.json byte size does not match current decoder cache.")
+        return _no("decoder_commit.json byte size does not match the cache on disk")
+    return True
 
 
 def _set_prepared_decoder_from_source(processor, *, decoder, feature_dim) -> None:
@@ -971,13 +988,14 @@ class DisplacementDecoderSourceService:
             policy.assignment == "single"
             and not force_decoder_fresh
             and Path(cache_path).is_file()
-        ):
-            _require_matching_decoder_commit(
+            and _decoder_commit_matches(
                 output_dir=output_dir,
                 run_digest=run_digest,
                 cache_path=cache_path,
                 cache_identity=cache_identity,
+                logger=logger,
             )
+        ):
             decoder, feature_dim = load_required_decoder(cache_path, logger)
             _set_prepared_decoder_from_source(
                 processor,
@@ -1024,6 +1042,9 @@ class DisplacementDecoderSourceService:
                 run_digest=run_digest,
                 decoder_cache_path=cache_path,
                 decoder_cache_identity=cache_identity,
+                # We just trained this cache; a commit at the same address
+                # for superseded inputs is stale, not a conflicting writer.
+                supersede=True,
             )
         processor.decoder_source_provenance = provenance
         return provenance
