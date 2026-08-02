@@ -119,6 +119,33 @@ class FromAveragePointProcessor:
             except Exception as e:
                 self.logger.warning("Failed to remove %s for fresh_start: %s", short_path(self.hdf5_file_path), e)
 
+        # Point data carries the per-site DISPLACEMENT TARGETS the decoder is
+        # trained against, so reusing it across a structure change teaches the
+        # decoder the previous structure's answer — the published output then
+        # reproduces the old structure even though every upstream stage
+        # correctly recomputed (measured: identical to 3e-15 where a fresh
+        # directory differed by 1.3e-03). Existence is not evidence of
+        # provenance; the stamp is.
+        if (
+            not fresh_start
+            and os.path.exists(self.hdf5_file_path)
+            and not self._point_data_matches_structure(self.hdf5_file_path)
+        ):
+            self.logger.warning(
+                "Point data %s was built from a different structure; "
+                "regenerating it.",
+                short_path(self.hdf5_file_path),
+            )
+            try:
+                os.remove(self.hdf5_file_path)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot regenerate point data at {self.hdf5_file_path}: {exc}. "
+                    "Remove it by hand — reusing it would train the decoder on "
+                    "another structure's displacements."
+                ) from exc
+            fresh_start = True
+
         # Check if HDF5 file exists and handle accordingly
         if os.path.exists(self.hdf5_file_path) and not fresh_start:
             self.logger.info("HDF5 file found: %s. Attempting to load existing data for appending.", short_path(self.hdf5_file_path))
@@ -378,6 +405,34 @@ class FromAveragePointProcessor:
     def get_point_data(self) -> PointData:
         return self.point_data
 
+    def _current_structure_digest(self) -> str | None:
+        runtime_info = self.parameters.get("runtime_info", {}) or {}
+        getter = getattr(runtime_info, "get", None)
+        if not callable(getter):
+            return None
+        value = getter("source_structure_digest")
+        return str(value) if value else None
+
+    def _point_data_matches_structure(self, hdf5_file_path: str) -> bool:
+        """Whether existing point data belongs to the current structure.
+
+        Unknown on either side means reuse: a run that publishes no
+        structure identity, or a file written before stamping, keeps the
+        historical behaviour rather than discarding work it cannot judge."""
+        current = self._current_structure_digest()
+        if current is None:
+            return True
+        try:
+            with h5py.File(hdf5_file_path, "r") as h5file:
+                stored = h5file.attrs.get("source_structure_digest")
+        except Exception:
+            return True  # unreadable: the existing load path reports it
+        if stored is None:
+            return True
+        if isinstance(stored, bytes):
+            stored = stored.decode("ascii")
+        return str(stored) == current
+
     def save_point_data_to_hdf5(self, hdf5_file_path: str):
         """
         Append / update the PointData table in *hdf5_file_path*.
@@ -430,6 +485,10 @@ class FromAveragePointProcessor:
 
         # open for append – creates the file if absent
         with h5py.File(hdf5_file_path, "a") as h5:
+            # Provenance for the reuse gate in process_parameters.
+            structure_digest = self._current_structure_digest()
+            if structure_digest is not None:
+                h5.attrs["source_structure_digest"] = structure_digest
             for key, arr in data_dict.items():
                 ds, n_old = _ensure_appendable(h5, key, arr)
                 # if our in-memory array is shorter than the file, don't shrink; only append tail if longer

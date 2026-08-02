@@ -10,6 +10,10 @@ from core.patch_centers.service import PointSelectionService
 from core.decoding.stage import DecodingStage
 from core.qspace.service import ReciprocalSpacePreparationService
 from core.residual_field.stage import ResidualFieldStage
+from core.structure.identity import (
+    enforce_output_dir_structure,
+    structure_content_digest_from_structure,
+)
 from core.structure.service import StructureLoadingService
 from core.models import RunSettings, WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
@@ -54,11 +58,26 @@ class WorkflowService:
             workflow_parameters,
             str(run_settings.working_path),
         )
+        # One structure identity per run, computed before any stage and
+        # published to all of them. Every downstream identity that
+        # addresses reusable work folds it in; without it a re-run of the
+        # same output directory with different coordinates resolves to the
+        # same run tree and republishes the previous structure's results.
+        workflow_parameters.runtime_info.extra["source_structure_digest"] = (
+            structure_content_digest_from_structure(structure)
+        )
         output_dir = (
             Path(workflow_parameters.struct_info.working_directory)
             / "processed_point_data"
         )
         self._prepare_output_dir(output_dir, workflow_parameters)
+        # After _prepare_output_dir, so fresh_start (which removes the
+        # directory) stays the supported way to retarget one at a new
+        # structure, and before any stage computes anything.
+        enforce_output_dir_structure(
+            output_dir,
+            workflow_parameters.runtime_info.extra["source_structure_digest"],
+        )
         runtime_info = workflow_parameters.runtime_info.to_mapping()
         db_cache_config = resolve_db_cache_config(
             run_settings=run_settings,

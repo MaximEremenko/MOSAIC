@@ -214,10 +214,11 @@ base onto a path whose scoping is the operator's problem.
 - Findings L7/L14 ("sound, do not disturb") are constraints on the above, not
   work items.
 
-## Open finding, NOT fixed here: run_digest ignores the structure
+## An output directory belongs to one structure
 
 Discovered while scoping the payload identity above, and larger than the
-item it was found under.
+item it was found under. Now fixed — see "The guard" below for why the fix
+is a door-check rather than another digest.
 
 `run_digest` addresses the whole durable run tree — `.mosaic/runs/<digest>/`
 chunk commits, the streaming payload store, resume credits. It is built
@@ -243,18 +244,51 @@ is credited from them, and the stage can be reported complete with the
 PREVIOUS structure's results. `fresh_start` defaults to False, so this is
 the default resume path, not an opt-in one.
 
-Stage-1 payloads are no longer exposed to it — that is exactly what
-`payload_identity` closes, and the cross-mode check's phase D demonstrates
-the refusal on a real structure change. The chunk/commit layer above them
-is still exposed.
+Measured, end to end: a completed CaTiO3-small case, its structure file
+overwritten in place with one atom displaced 0.01 fractional units, then
+re-run in the same directory. It logged `Residual-field skipped – no
+unsaved (interval, chunk) pairs` and republished the previous structure's
+displacements **byte-identically** (0.000e+00), where a clean run of the
+new structure differs by 1.317e-03.
 
-Not fixed here because the fix is a second checkpoint-identity break:
-folding `source_structure_digest` into `_build_run_identity_digest` changes
-every run digest, so every existing `.mosaic/runs/` tree, payload store and
-resume credit goes cold and recomputes — including the published hkl40
-case. That is non-destructive (a disjoint family, per the phase-3
-principle) but it is a deliberate, costly decision that belongs to the
-operator, not to a follow-up commit. Recommended as its own change.
+### It is not one digest
+
+Making the identities structure-aware was necessary but not sufficient.
+Reuse in this pipeline is decided in at least five places, and most of
+them asked only whether a file EXISTS:
+
+| layer | decides | carries |
+|---|---|---|
+| scattering scientific digest | the run tree, work units, payload store | amplitudes |
+| residual parameter digest | reducer-progress credits | incorporated intervals |
+| decoder commit scope | decoder cache address | trained decoder |
+| `point_data.hdf5` | point selection reuse | the decoder's displacement TARGETS |
+| loose `residual_chunk_*` | residual materialization | what the decoder trains on |
+
+All five are now structure-aware except the last, which was still being
+skipped on existence — the recomputed residual never reached disk, so the
+decoder trained on the previous structure's residual and the published
+answer stayed pristine even after everything upstream correctly recomputed.
+
+### The guard
+
+Fixing each layer individually leaves the NEXT cache anyone adds exposed
+by default, so the enforcing check is one the additions cannot slip past:
+an output directory records the structure it was built from
+(`.mosaic/structure_identity.json`), and a run against a different one
+stops before computing anything. `fresh_start` removes the directory and
+with it the record, which is the supported way to retarget one.
+
+Verified: the swap is refused, the refusal leaves the existing output
+untouched, and a `fresh_start` rerun in the same directory reproduces a
+clean run of the new structure to 3.386e-15. Kill/resume is unaffected —
+run 3 of the resume harness still skips the residual stage entirely.
+
+The deeper break — folding `source_structure_digest` into
+`_build_run_identity_digest` so two structures get disjoint run trees and
+can coexist in one directory — is still available and still costs a
+one-time recompute of every existing tree. The guard makes it an
+ergonomics choice rather than a correctness one.
 
 ## Gates
 

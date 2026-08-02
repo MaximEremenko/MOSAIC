@@ -287,6 +287,30 @@ def _decoder_architecture_digest(parameters: dict, *, assignment: str) -> str:
     )
 
 
+def _structure_scoped_commit_digest(run_digest: str, parameters: dict) -> str:
+    """Bind a decoder commit address to the structure it was trained on.
+
+    Returns ``run_digest`` unchanged when no structure identity is
+    published (the value is stamped at structure load), so callers that
+    never had one keep their existing addresses."""
+    structure_digest = parameters.get("source_structure_digest")
+    if not structure_digest:
+        runtime_info = parameters.get("runtime_info", {}) or {}
+        getter = getattr(runtime_info, "get", None)
+        structure_digest = (
+            getter("source_structure_digest") if callable(getter) else None
+        )
+    if not structure_digest:
+        return str(run_digest)
+    return digest_dict(
+        {
+            "run_digest": str(run_digest),
+            "source_structure_digest": str(structure_digest),
+        },
+        domain="mosaic.decoder.commit_scope.v1",
+    )
+
+
 def _build_current_decoder_cache_identity(
     *,
     parameters: dict,
@@ -924,6 +948,18 @@ class DisplacementDecoderSourceService:
             parameters=processor.parameters,
             source_identity=source_identity,
             assignment=policy.assignment,
+        )
+        # The commit is addressed by the residual SOURCE identity, but the
+        # manifest it stores records structure-derived digests too. Those two
+        # can disagree — a structure change moves the recorded identity while
+        # the source identity (loose-artifact size+mtime) may not — and the
+        # writer then finds its own path occupied by a manifest it does not
+        # match and aborts the run. Scope the address by the structure as
+        # well, so different structures land at different addresses and the
+        # "same address, different identity" guard keeps meaning a genuine
+        # conflict.
+        run_digest = _structure_scoped_commit_digest(
+            run_digest, processor.parameters
         )
         cache_path = build_decoder_cache_path(
             processor.parameters,

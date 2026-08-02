@@ -41,6 +41,18 @@ def _parameter_value(parameters: object, key: str, default=None):
     return getattr(parameters, key, default)
 
 
+def _runtime_value(runtime_info: object, key: str, default=None):
+    """Read an operator-supplied runtime key.
+
+    ``WorkflowRuntimeInfo`` keeps these in ``.extra`` and exposes them only
+    through ``.get`` — plain ``getattr`` returns the default for every one
+    of them, which silently drops whatever it was asked for."""
+    getter = getattr(runtime_info, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return default
+
+
 def _stable_point_payload(point: object) -> dict[str, object]:
     return {
         "filename": _parameter_value(point, "filename"),
@@ -156,8 +168,17 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
     rspace_info = _parameter_value(parameters, "rspace_info", {}) or {}
     struct_info = _parameter_value(parameters, "struct_info", {}) or {}
     peak_info = _parameter_value(parameters, "peak_info", {}) or {}
+    runtime_info = _parameter_value(parameters, "runtime_info", {}) or {}
     payload = {
-        "digest_schema_version": 3,
+        # 4: the structure CONTENT joins the identity. Until then this
+        # keyed on the structure FILENAME, so overwriting a structure file
+        # in place left every reducer-progress manifest addressed
+        # identically and a re-run credited the previous structure's
+        # incorporated intervals (measured: a completed case republished
+        # byte-identical displacements for changed coordinates). These
+        # manifests live outside .mosaic/runs/, so the run digest cannot
+        # scope them -- this digest has to carry the structure itself.
+        "digest_schema_version": 4,
         "execution_identity": _residual_execution_identity_payload(parameters),
         "postprocessing_mode": (
             _parameter_value(parameters, "postprocessing_mode")
@@ -169,6 +190,13 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
             "dimension": _parameter_value(struct_info, "dimension"),
             "filename": _parameter_value(struct_info, "filename"),
             "filename_av": _parameter_value(struct_info, "filename_av"),
+            # Stamped once at structure load (core/structure/identity.py),
+            # so every call site of this digest -- including the one inside
+            # the scattering stage that labels the manifests the residual
+            # stage later reads -- sees the same value.
+            "content_digest": _runtime_value(
+                runtime_info, "source_structure_digest"
+            ),
             "cells_limits_min": _to_jsonable(
                 _parameter_value(struct_info, "cells_limits_min")
             ),

@@ -4,6 +4,7 @@ import numpy as np
 
 from core.scattering.coefficients import to_numpy
 from core.scattering.context import ScatteringExecutionContext
+from core.structure.identity import structure_content_digest_from_structure
 from core.residual_field.planning import build_residual_field_parameter_digest
 
 
@@ -25,6 +26,14 @@ def build_base_amplitude_parameters(
             }
             for row in context.point_rows
         ],
+        # Identity of the atoms being summed over. It is the first entry of
+        # _SCIENTIFIC_KEYS, so supplying it here is what makes
+        # scientific_digest -- and every address derived from it: run_digest,
+        # the qspace plan, work-unit digests, the stage-1 payload identity --
+        # depend on the coordinates. See core/structure/identity.py.
+        "structure_content_digest": structure_content_digest_from_structure(
+            context.structure
+        ),
         "original_coords": to_numpy(context.structure.original_coords),
         "average_coords": to_numpy(context.structure.average_coords),
         "cells_origin": to_numpy(context.structure.cells_origin),
