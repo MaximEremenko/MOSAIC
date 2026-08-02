@@ -148,6 +148,16 @@ class TestStability:
             structure
         ) == build_structure_content_digest(source)
 
+    def test_a_missing_member_raises_instead_of_digesting_none(self):
+        """Reading identity members with a default is how
+        structure_content_digest came to be declared everywhere and
+        populated nowhere; a renamed field must not drop out silently."""
+        source = _source()
+        del source["refnumbers"]
+        structure = type("S", (), source)()
+        with pytest.raises(AttributeError, match="refnumbers"):
+            structure_content_digest_from_structure(structure)
+
 
 class TestNonArrayMembers:
     """A loaded structure is not all ndarrays: `coeff` arrives as a pandas
@@ -219,14 +229,22 @@ class TestOutputDirectoryGuard:
         recorded = json.loads(structure_identity_path(tmp_path).read_text())
         assert recorded["source_structure_digest"] == "a" * 64
 
-    def test_an_unreadable_record_does_not_block_the_run(self, tmp_path):
+    def test_an_unreadable_record_fails_closed(self, tmp_path):
+        """The record is written atomically, so an unreadable one is not an
+        ordinary torn write — and treating it as absent would let through
+        exactly the case the guard exists to stop."""
         path = structure_identity_path(tmp_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("{ truncated")
-        enforce_output_dir_structure(tmp_path, "a" * 64)
-        assert (
-            json.loads(path.read_text())["source_structure_digest"] == "a" * 64
-        )
+        with pytest.raises(StructureIdentityConflict):
+            enforce_output_dir_structure(tmp_path, "a" * 64)
+
+    def test_a_record_without_a_digest_fails_closed(self, tmp_path):
+        path = structure_identity_path(tmp_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"schema": "mosaic.structure_identity"}')
+        with pytest.raises(StructureIdentityConflict):
+            enforce_output_dir_structure(tmp_path, "a" * 64)
 
     def test_a_wiped_directory_starts_over(self, tmp_path):
         """What fresh_start does: remove the directory, and with it the

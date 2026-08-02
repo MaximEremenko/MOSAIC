@@ -12,6 +12,7 @@ from core.residual_field.backend import (
     resolve_residual_field_reducer_backend_kind,
 )
 from core.scattering.artifacts import (
+    discard_stale_interval_artifact,
     interval_artifact_reusable,
     mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
@@ -351,7 +352,9 @@ def _import_stage1_store_payloads(
         try:
             if stored is None:
                 # The store records mask-emptiness durably; precompute mode
-                # expresses the same answer as "no artifact, marked done".
+                # expresses the same answer as "no artifact, marked done" --
+                # which requires clearing any artifact a previous mask left.
+                discard_stale_interval_artifact(work_unit)
                 mark_empty_interval_precomputed(
                     work_unit.interval_id, db_path=db_path
                 )
@@ -585,6 +588,7 @@ def run_interval_precompute(
                                 if artifact_path is not None:
                                     written_files.append(Path(artifact_path))
                     else:
+                        discard_stale_interval_artifact(work_unit)
                         mark_empty_interval_precomputed(
                             work_unit.interval_id, db_path=_sqlite_cache_path(db),
                         )
@@ -642,6 +646,7 @@ def run_interval_precompute(
                             if artifact_path is not None:
                                 written_files.append(Path(artifact_path))
                 else:
+                    discard_stale_interval_artifact(work_unit)
                     mark_empty_interval_precomputed(
                         work_unit.interval_id, db_path=_sqlite_cache_path(db),
                     )

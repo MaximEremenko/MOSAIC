@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import logging
 from dataclasses import dataclass, field
@@ -58,8 +59,18 @@ _SCIENTIFIC_KEYS = (
     "point_chunk_size",
     "point_chunks",
     "postprocessing_mode",
-    "scattering_weights_digest",
-    "scattering_calculator_version",
+    # Everything else that decides the value of a stage-1 amplitude but is
+    # not a coordinate: the form-factor family, the coefficient weighting
+    # and the chemical-filtered substitution. See
+    # build_amplitude_weighting_digest.
+    #
+    # This replaces "scattering_weights_digest" and
+    # "scattering_calculator_version", which were declared here and NEVER
+    # written by anything -- so the form-factor family changed the physics
+    # while leaving every digest byte-identical. A reserved-but-unpopulated
+    # key is worse than no key: it reads as covered. Only populated keys
+    # belong in this tuple.
+    "amplitude_weighting_digest",
 )
 
 
@@ -339,6 +350,75 @@ def build_run_identity(
         scientific_digest=scientific_digest,
         execution_digest=execution_digest,
         run_digest=run_digest,
+    )
+
+
+def _array_digest(value: Any) -> str | None:
+    """Content digest of a numeric array, without JSON-ifying it.
+
+    The coefficient array is per-atom; routing it through
+    normalize_digest_input would turn a multi-million-element array into a
+    Python list and a JSON string on every run."""
+    if value is None:
+        return None
+    array = np.ascontiguousarray(np.asarray(value))
+    if array.dtype.hasobject:
+        return digest_dict(
+            normalize_digest_input({"value": array.tolist()}),
+            domain="mosaic.scattering.array.v1",
+        )
+    return hashlib.sha256(
+        b"|".join(
+            (
+                str(array.dtype).encode("ascii"),
+                str(array.shape).encode("ascii"),
+                array.tobytes(),
+            )
+        )
+    ).hexdigest()
+
+
+def build_amplitude_weighting_digest(
+    *,
+    weight_kind: str,
+    weight_calculator: str,
+    use_coeff: bool,
+    chemical_filtered: bool,
+    coeff_center_by: Any,
+    charge: Any,
+    coeff: Any,
+) -> str:
+    """Identity of everything that scales a stage-1 amplitude.
+
+    A payload is ``sum_k w_k exp(+i q.r_k)``. The coordinates are covered by
+    the structure identity; the WEIGHTS are covered here — the form-factor
+    family that produces them, whether coefficient weighting is applied,
+    how coefficients are centered, and the charge.
+
+    ``chemical_filtered`` belongs here too: it substitutes the AVERAGE
+    coordinates for the instantaneous ones in the amplitude adapter, so it
+    selects which of two digested coordinate sets is actually summed.
+
+    Before this existed, none of it reached any digest.
+    ``build_source_structure_digest`` used to hash the adapter-modified
+    ``coeff`` and ``original_coords`` in its fallback, but that fallback
+    became dead the moment ``structure_content_digest`` started being
+    supplied, and the fallback never covered the form-factor family at
+    all."""
+    return digest_dict(
+        {
+            "schema_version": SCATTERING_IDENTITY_SCHEMA_VERSION,
+            "weight_kind": str(weight_kind),
+            "weight_calculator": str(weight_calculator),
+            "use_coeff": bool(use_coeff),
+            "chemical_filtered_ordering": bool(chemical_filtered),
+            "coeff_center_by": (
+                None if coeff_center_by is None else str(coeff_center_by)
+            ),
+            "charge": float(charge or 0.0),
+            "coeff_digest": _array_digest(coeff) if use_coeff else None,
+        },
+        domain="mosaic.scattering.amplitude_weighting.v1",
     )
 
 

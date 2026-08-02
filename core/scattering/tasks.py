@@ -15,6 +15,7 @@ from core.scattering.half_space import (
 )
 from core.scattering.artifacts import (
     build_scattering_interval_manifest,
+    discard_stale_interval_artifact,
     is_interval_artifact_committed,
     mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
@@ -304,6 +305,9 @@ def run_scattering_interval_task(
         # Mask eliminated all Q-points in this interval.  Mark it as
         # precomputed so that downstream consumers (chunk accumulation and
         # residual-field) do not attempt to load a non-existent interval artifact.
+        # "Non-existent" is only true if a PREVIOUS run's artifact is cleared:
+        # the residual stage loads that path without an identity check.
+        discard_stale_interval_artifact(work_unit)
         if db_path is not None:
             mark_empty_interval_precomputed(
                 work_unit.interval_id, db_path=db_path

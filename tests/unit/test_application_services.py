@@ -537,7 +537,11 @@ def test_workflow_service_uses_injected_services_and_closes_artifacts(tmp_path):
     class FakeStructureService:
         def load(self, workflow_parameters, working_path):
             calls.append(("load_structure", working_path))
-            return SimpleNamespace(supercell=np.array([4]))
+            # A real StructureData, not a namespace carrying only what this
+            # test happens to read: the workflow digests the structure's
+            # identity members, and a stub missing them used to digest them
+            # all as None.
+            return _build_structure()
 
     class FakePointSelectionService:
         def select(self, request):
@@ -618,7 +622,7 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
 
     class FakeStructureService:
         def load(self, workflow_parameters, working_path):
-            return SimpleNamespace(supercell=np.array([4]))
+            return _build_structure()
 
     class FakePointSelectionService:
         def select(self, request):
@@ -669,7 +673,7 @@ def test_workflow_service_recovers_local_residual_state_before_scattering(tmp_pa
 
     class FakeStructureService:
         def load(self, workflow_parameters, working_path):
-            return SimpleNamespace(supercell=np.array([4]))
+            return _build_structure()
 
     class FakePointSelectionService:
         def select(self, request):

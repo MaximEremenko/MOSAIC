@@ -4,6 +4,7 @@ import numpy as np
 
 from core.scattering.coefficients import to_numpy
 from core.scattering.context import ScatteringExecutionContext
+from core.scattering.planning import build_amplitude_weighting_digest
 from core.structure.identity import structure_content_digest_from_structure
 from core.residual_field.planning import build_residual_field_parameter_digest
 
@@ -39,6 +40,11 @@ def build_base_amplitude_parameters(
         "cells_origin": to_numpy(context.structure.cells_origin),
         "elements": to_numpy(context.structure.elements),
         "refnumbers": to_numpy(context.structure.refnumbers),
+        # Declared in _SCIENTIFIC_KEYS but previously never supplied here,
+        # so it entered no digest while execution.py read it with a default.
+        "charge": getattr(context.structure, "charge", None)
+        if getattr(context.structure, "charge", None) is not None
+        else context.workflow_parameters.rspace_info.to_mapping().get("charge", 0.0),
         "rspace_info": context.workflow_parameters.rspace_info.to_mapping(),
         "runtime_info": context.workflow_parameters.runtime_info.to_mapping(),
         "transient_interval_payloads": context.artifacts.transient_interval_payloads,
@@ -65,4 +71,22 @@ def build_amplitude_adapter_payload(
         amplitude_parameters["original_coords"] = to_numpy(
             context.structure.average_coords
         )
+    # Identity of the WEIGHTS, computed here because this is where the
+    # adapter's final coefficient array exists. Without it the form-factor
+    # family, the coefficient centering and the chemical-filtered
+    # coordinate substitution all change the amplitudes while leaving every
+    # digest byte-identical -- so a rerun in the same output directory
+    # republishes the previous configuration's displacements.
+    rspace = context.workflow_parameters.rspace_info
+    amplitude_parameters["amplitude_weighting_digest"] = (
+        build_amplitude_weighting_digest(
+            weight_kind=context.scattering_weight_selection.kind,
+            weight_calculator=context.scattering_weight_selection.calculator,
+            use_coeff=context.use_coeff,
+            chemical_filtered=context.chemical_filtered,
+            coeff_center_by=getattr(rspace, "coeff_center_by", None),
+            charge=amplitude_parameters.get("charge"),
+            coeff=amplitude_parameters.get("coeff"),
+        )
+    )
     return amplitude_parameters

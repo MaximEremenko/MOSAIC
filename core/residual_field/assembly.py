@@ -280,7 +280,20 @@ def assemble_local_snapshot_chunk_payload(
             snapshot_seq=snapshot_seq,
         )
         if snapshot is None:
-            continue
+            # A partition whose METADATA loaded but whose payload will not
+            # is not an absent partition — it is a partition this chunk is
+            # made of. Skipping it here assembled a chunk missing that
+            # partition's points, published it COMMITTED, and then unlinked
+            # the snapshot, so the loss became permanent and surfaced far
+            # downstream as an opaque shape error. Fail here instead: the
+            # snapshot is still on disk and the chunk can be recomputed.
+            raise RuntimeError(
+                f"Residual chunk {int(chunk_id)} partition "
+                f"{'owner' if partition_id is None else int(partition_id)} "
+                f"snapshot seq={int(snapshot_seq)} is listed in the progress "
+                "manifest but its payload could not be loaded. Refusing to "
+                "publish a chunk assembled from the remaining partitions."
+            )
         n_points = int(
             np.asarray(snapshot["amplitudes_delta"]).reshape(-1).shape[0]
         )

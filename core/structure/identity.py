@@ -87,9 +87,21 @@ def build_structure_content_digest(source: Mapping[str, Any]) -> str:
 
 
 def structure_content_digest_from_structure(structure: Any) -> str:
-    """Digest a loaded :class:`StructureData` (the workflow's copy)."""
+    """Digest a loaded :class:`StructureData` (the workflow's copy).
+
+    A member this function cannot find is an ERROR, not a None: reading it
+    with a default is how ``structure_content_digest`` came to be declared
+    everywhere and populated nowhere, and a renamed field would silently
+    drop out of the identity that addresses the whole run tree."""
+    missing = [key for key in _STRUCTURE_KEYS if not hasattr(structure, key)]
+    if missing:
+        raise AttributeError(
+            f"{type(structure).__name__} is missing structure identity "
+            f"member(s) {', '.join(missing)}. The digest addresses durable "
+            "state, so a member it cannot see must not be digested as absent."
+        )
     return build_structure_content_digest(
-        {key: getattr(structure, key, None) for key in _STRUCTURE_KEYS}
+        {key: getattr(structure, key) for key in _STRUCTURE_KEYS}
     )
 
 
@@ -125,9 +137,27 @@ def enforce_output_dir_structure(output_dir: Any, structure_digest: str) -> None
         try:
             recorded = json.loads(path.read_text(encoding="utf-8"))
             previous = str(recorded.get("source_structure_digest", ""))
-        except Exception:
-            previous = ""
-        if previous and previous != digest:
+        except Exception as exc:
+            # Fail CLOSED. This record is the only thing standing between a
+            # reused directory and another structure's results, and it is
+            # written atomically (temp -> fsync -> rename), so an unreadable
+            # one is not an ordinary torn write. Treating it as "no record"
+            # would let the very case it guards against proceed silently.
+            raise StructureIdentityConflict(
+                f"Output directory {Path(output_dir)} has an unreadable "
+                f"structure identity record {path} ({exc}). It cannot be "
+                "shown to belong to this structure. Set "
+                "processing.fresh_start=true to rebuild the directory, or "
+                "remove that file if you are certain the contents match."
+            ) from exc
+        if not previous:
+            raise StructureIdentityConflict(
+                f"Output directory {Path(output_dir)} has a structure "
+                f"identity record {path} with no digest in it; it cannot be "
+                "shown to belong to this structure. Set "
+                "processing.fresh_start=true to rebuild the directory."
+            )
+        if previous != digest:
             raise StructureIdentityConflict(
                 f"Output directory {Path(output_dir)} holds results for a "
                 f"different structure (recorded {previous[:16]}…, current "

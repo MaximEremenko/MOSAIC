@@ -134,11 +134,34 @@ class ScatteringArtifactStore:
         return self._artifact_filename(ref_by_kind[kind].path)
 
     def ensure_grid_shape(self, chunk_id: int, grid_shape_nd: np.ndarray) -> None:
+        """Record this run's grid shape, replacing a stale one.
+
+        This used to write only when the file was ABSENT, so a rerun whose
+        grid differs kept the previous run's shape at a path addressed by
+        chunk id alone."""
         fn_shape = self._filename_for_kind(chunk_id, self.chunk_grid_shape_kind())
+        wanted = np.asarray(grid_shape_nd)
         try:
-            self.saver.load_data(fn_shape)
+            stored = np.asarray(self.saver.load_data(fn_shape)["shapeNd"])
         except FileNotFoundError:
-            self.saver.save_data({"shapeNd": np.asarray(grid_shape_nd)}, fn_shape)
+            stored = None
+        except Exception as exc:
+            logger.warning(
+                "Recreating unreadable grid-shape artifact for chunk %d: %s",
+                chunk_id,
+                exc,
+            )
+            stored = None
+        if stored is not None and np.array_equal(stored, wanted):
+            return
+        if stored is not None:
+            logger.info(
+                "Replacing chunk %d grid shape %s with %s.",
+                chunk_id,
+                tuple(np.ravel(stored).tolist()),
+                tuple(np.ravel(wanted).tolist()),
+            )
+        self.saver.save_data({"shapeNd": wanted}, fn_shape)
 
     def load_grid_shape(self, chunk_id: int) -> np.ndarray | None:
         ref_by_kind = self._ref_by_kind(chunk_id)
@@ -172,17 +195,37 @@ class ScatteringArtifactStore:
             data = self.saver.load_data(fn_tot)
 
             def _needs_update(store: dict, key: str) -> bool:
+                """Any value other than this run's is stale.
+
+                This used to accept ANY existing non-sentinel value, so a
+                rerun with a different reciprocal-space extent normalized
+                its residual field by the PREVIOUS run's total -- a wrong
+                NUMBER, not just a stale file, since the artifact is
+                addressed by chunk id alone."""
                 arr = store.get(key, None)
                 if arr is None:
                     return True
                 try:
-                    return int(np.array(arr).ravel()[0]) == -1
+                    return int(np.array(arr).ravel()[0]) != val
                 except Exception:
                     return True
 
             if _needs_update(data, "ntotal_reciprocal_space_points") or _needs_update(
                 data, "ntotal_reciprocal_points"
             ):
+                previous = data.get("ntotal_reciprocal_space_points")
+                if previous is not None:
+                    try:
+                        previous_val = int(np.array(previous).ravel()[0])
+                    except Exception:
+                        previous_val = None
+                    if previous_val is not None and previous_val not in (-1, val):
+                        logger.info(
+                            "Replacing chunk %d total reciprocal points %d with %d.",
+                            chunk_id,
+                            previous_val,
+                            val,
+                        )
                 data["ntotal_reciprocal_space_points"] = np.array([val], dtype=np.int64)
                 data["ntotal_reciprocal_points"] = np.array([val], dtype=np.int64)
                 self.saver.save_data(data, fn_tot)
@@ -267,6 +310,36 @@ class ScatteringArtifactStore:
             self._artifact_filename(
                 ref_by_kind[self.chunk_reciprocal_point_count_kind()].path
             ),
+        )
+
+
+def discard_stale_interval_artifact(work_unit: ScatteringWorkUnit) -> None:
+    """Remove an interval artifact this run has proven wrong.
+
+    An interval that was non-empty under a previous mask and is empty under
+    this one writes NO artifact — so the previous run's
+    `precomputed_intervals/interval_<id>.hdf5` stays at the path, and the
+    residual stage loads it by path without an identity check. The
+    interval's own emptiness is the proof that the file on disk is not this
+    run's answer, so it goes."""
+    if work_unit.interval_artifact is None or work_unit.interval_artifact.path is None:
+        return
+    path = Path(work_unit.interval_artifact.path)
+    try:
+        removed = path.exists()
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Interval {int(work_unit.interval_id)} is empty under the current "
+            f"mask but its previous artifact {path} could not be removed "
+            f"({exc}); the residual stage would consume it."
+        ) from exc
+    if removed:
+        logger.info(
+            "Interval %d is empty under the current mask; removed the previous "
+            "run's artifact %s.",
+            int(work_unit.interval_id),
+            path,
         )
 
 
