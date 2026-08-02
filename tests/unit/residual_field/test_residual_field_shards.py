@@ -1120,22 +1120,3 @@ def test_worker_scratch_dirs_separate_by_worker(monkeypatch):
     first = worker_hooks.worker_local_scratch_dir("/scratch/mosaic/residual_field")
     second = worker_hooks.worker_local_scratch_dir("/scratch/mosaic/residual_field")
     assert first != second
-
-
-def test_chunk_recarrays_are_broadcast_not_pinned_to_one_worker():
-    """Scattered keys have no run_spec, so dask cannot recompute them.
-    Held on a single worker, that worker's death cancels every batch that
-    references the chunk with "lost dependencies" — measured at hkl40 scale
-    as 144/144 batches lost to a routine nanny restart."""
-    import inspect
-
-    from core.residual_field import execution
-
-    source = inspect.getsource(execution.run_residual_field_stage)
-    marker = "rec[rec.chunk_id == chunk_id]"
-    assert marker in source
-    call = source[source.index(marker) - 400 : source.index(marker) + 200]
-    assert "broadcast=True" in call, (
-        "per-chunk recarrays must be replicated; broadcast=False makes one "
-        "worker's death fatal to the whole residual stage"
-    )

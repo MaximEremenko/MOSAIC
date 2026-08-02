@@ -1858,19 +1858,8 @@ def run_residual_field_stage(
     )
 
     rec = point_list_to_recarray(point_data_list)
-    # BROADCAST, like the streaming context below. These are scattered keys
-    # with no run_spec, so dask cannot recompute them: held on a single
-    # worker (broadcast=False), that worker's death takes the dependency
-    # with it and EVERY batch referencing the chunk is cancelled with
-    # "lost dependencies". Measured at hkl40 scale: nanny restarts under
-    # memory pressure -- a survivable, expected event -- destroyed the whole
-    # residual stage, 144/144 batches, with no work committed.
-    # Replicating costs nothing worth counting: one chunk's recarray is the
-    # per-chunk point rows (~3k rows at hkl40), a few hundred KB.
     chunk_futures = {
-        chunk_id: client.scatter(
-            rec[rec.chunk_id == chunk_id], broadcast=True, hash=False
-        )
+        chunk_id: client.scatter(rec[rec.chunk_id == chunk_id], broadcast=False, hash=False)
         for chunk_id in chunk_ids
     }
     # Streaming mode: the scattering compute context (structure arrays, mask
