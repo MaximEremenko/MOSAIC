@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import time
@@ -11,6 +12,9 @@ from core.storage.attempt_store import run_root
 from core.storage.atomic import assert_path_contained
 from core.storage.fingerprint import file_sha256
 from core.storage.fs_capability import FSCapabilityManifest, write_fs_capability_manifest
+
+
+logger = logging.getLogger(__name__)
 
 
 class FilesystemCapabilityError(RuntimeError):
@@ -129,13 +133,25 @@ def _read_probe_file(path_text: str, expected_hash: str) -> dict[str, Any]:
         }
 
 
-def _client_worker_hosts(client) -> tuple[str, ...]:
+def _client_worker_hosts(client) -> tuple[str, ...] | None:
+    """Hosts this run spans, or None when that cannot be determined.
+
+    None is NOT "one host". This value decides whether the fail-closed
+    cross-host and file-lock guards run at all, so a transient client.run()
+    failure that returned the local hostname silently downgraded a
+    multi-node run to single-host and skipped both."""
     if client is None or not hasattr(client, "run"):
         return (socket.gethostname(),)
     try:
         results = client.run(lambda: socket.gethostname())
-    except Exception:
-        return (socket.gethostname(),)
+    except Exception as exc:
+        logger.warning(
+            "Could not enumerate worker hosts (%s: %s); treating the run as "
+            "multi-host so the shared-filesystem guards still apply.",
+            type(exc).__name__,
+            exc,
+        )
+        return None
     if isinstance(results, Mapping):
         hosts = [str(value) for value in results.values()]
     else:
@@ -188,10 +204,13 @@ def _probe_file_lock(dir_text: str) -> dict[str, Any]:
     """Runs on driver or worker: can this process take an fcntl lock on the
     shared filesystem?
 
-    Catches NFS nolock / local_lock=all mounts and dead lockd, where
-    fcntl.flock raises (ENOLCK) and the chunk mutex silently degrades to a
-    per-process lock — the one capability the multi-node reducer-progress
-    commit actually depends on. The probe file is PER PROCESS: all probers
+    Catches a dead lockd and mounts where flock is unsupported, i.e. the
+    cases that RAISE. It does NOT catch NFS mounted -o nolock or
+    local_lock=all, where the kernel satisfies the lock locally and this
+    probe passes while the lock coordinates nothing -- every prober locks a
+    file private to itself, so there is nothing here to be excluded from.
+    cross_host_lock_exclusion_probe is the test with that power. The probe
+    file is PER PROCESS: all probers
     run concurrently via client.run, and a shared path turns a sibling's
     perfectly functional lock into a spurious EAGAIN (observed in the
     cluster sim: node2's 'failure' was node1 holding the probe lock —
@@ -209,6 +228,99 @@ def _probe_file_lock(dir_text: str) -> dict[str, Any]:
         return {"host": host, "ok": True, "error": None}
     except Exception as exc:
         return {"host": host, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+_LOCK_EXCLUSION_PROBE_NAME = "lock_exclusion.dat"
+
+
+def _probe_lock_is_excluded(path_text: str) -> dict[str, Any]:
+    """Try to take a lock the driver is HOLDING. Failing is the pass."""
+    host = socket.gethostname()
+    try:
+        import fcntl
+
+        path = Path(path_text)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+b") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return {"host": host, "acquired": False, "error": None}
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return {"host": host, "acquired": True, "error": None}
+    except Exception as exc:
+        return {
+            "host": host,
+            "acquired": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def cross_host_lock_exclusion_probe(
+    *,
+    probe_dir: str | Path,
+    client=None,
+) -> tuple[dict[str, Any], ...]:
+    """Does a held lock actually EXCLUDE anyone else?
+
+    :func:`_probe_file_lock` cannot answer this: every prober locks a file
+    private to itself, so the only thing that can make it fail is ENOLCK or
+    an unsupported mount. On NFS mounted ``-o nolock`` or ``local_lock=all``
+    the kernel satisfies flock locally and the probe passes while the lock
+    coordinates nothing — exactly the mounts it claims to catch.
+
+    So hold a lock on a SHARED file here and ask every worker to take the
+    same lock non-blocking. Each one must FAIL. Any worker that acquires it
+    while we hold it proves the lock does not exclude, and the chunk mutex
+    guarding the reducer-progress read-modify-write is decorative."""
+    import fcntl
+
+    probe_path = Path(probe_dir) / _LOCK_EXCLUSION_PROBE_NAME
+    probe_path.parent.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    try:
+        with probe_path.open("a+b") as holder:
+            try:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                return (
+                    {
+                        "host": socket.gethostname(),
+                        "ok": False,
+                        "error": f"driver could not take the probe lock: {exc}",
+                    },
+                )
+            try:
+                if client is not None and hasattr(client, "run"):
+                    raw = client.run(_probe_lock_is_excluded, str(probe_path))
+                    values = raw.values() if isinstance(raw, Mapping) else (raw,)
+                    for item in values:
+                        if not isinstance(item, Mapping):
+                            continue
+                        results.append(
+                            {
+                                "host": str(item.get("host", "unknown")),
+                                "ok": not bool(item.get("acquired")),
+                                "error": (
+                                    "acquired a lock the driver was holding"
+                                    if item.get("acquired")
+                                    else item.get("error")
+                                ),
+                            }
+                        )
+            finally:
+                fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+    except Exception as exc:
+        return (
+            {
+                "host": socket.gethostname(),
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+    finally:
+        probe_path.unlink(missing_ok=True)
+    return tuple(results)
 
 
 def cross_host_file_lock_probe(
@@ -289,7 +401,12 @@ def profile_output_filesystem(
             timeout_seconds=visibility_timeout_seconds,
         )
         hosts = _client_worker_hosts(client)
-        needs_cross_host = bool(require_cross_host or len(hosts) > 1)
+        # Unknown topology counts as multi-host: the guards below are the
+        # fail-closed ones, and skipping them because we could not ask is
+        # the failure this treats as a failure.
+        needs_cross_host = bool(
+            require_cross_host or hosts is None or len(hosts) > 1
+        )
         cross_host_results = cross_host_read_after_rename_probe(
             path=final_path,
             expected_hash=expected_hash,
@@ -326,6 +443,28 @@ def profile_output_filesystem(
                     f"file locking unavailable on shared filesystem ({failures})"
                 )
             )
+        # Taking a lock is not the capability we need; EXCLUDING someone
+        # else is. The probe above cannot tell them apart.
+        lock_exclusion_results = cross_host_lock_exclusion_probe(
+            probe_dir=probe_dir,
+            client=client,
+        )
+        lock_exclusion_ok = all(
+            bool(item.get("ok")) for item in lock_exclusion_results
+        )
+        if needs_cross_host and lock_exclusion_results and not lock_exclusion_ok:
+            failures = ", ".join(
+                f"{item.get('host')}:{item.get('error')}"
+                for item in lock_exclusion_results
+                if not item.get("ok")
+            )
+            raise FilesystemCapabilityError(
+                _capability_failure_message(
+                    "file locks do not exclude across the shared filesystem "
+                    f"({failures}); a nolock / local_lock=all mount satisfies "
+                    "flock locally while coordinating nothing"
+                )
+            )
         capabilities: dict[str, Any] = {
             "filesystem_type": _filesystem_type(output_root),
             "same_directory_atomic_replace_visible": True,
@@ -336,7 +475,7 @@ def profile_output_filesystem(
             "symlink_policy": _probe_symlink_policy(probe_dir, final_path),
             "max_metadata_visibility_latency_seconds": float(visibility_latency),
             "driver_host": socket.gethostname(),
-            "worker_hosts": list(hosts),
+            "worker_hosts": None if hosts is None else list(hosts),
             "cross_host_required": bool(needs_cross_host),
             "cross_host_read_after_rename": [
                 {
@@ -351,6 +490,8 @@ def profile_output_filesystem(
             "file_lock_required": bool(needs_cross_host),
             "file_lock_functional": bool(lock_ok),
             "file_lock_per_host": list(lock_probe_results),
+            "file_lock_excludes_across_hosts": bool(lock_exclusion_ok),
+            "file_lock_exclusion_per_host": list(lock_exclusion_results),
             "symlink_required": False,
         }
         return write_fs_capability_manifest(

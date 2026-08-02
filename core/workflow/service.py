@@ -9,6 +9,7 @@ from core.scattering.stage import ScatteringStage
 from core.patch_centers.service import PointSelectionService
 from core.decoding.stage import DecodingStage
 from core.qspace.service import ReciprocalSpacePreparationService
+from core.residual_field.execution import _streaming_subchunk_slot_count
 from core.residual_field.stage import ResidualFieldStage
 from core.structure.identity import (
     enforce_output_dir_structure,
@@ -66,6 +67,14 @@ class WorkflowService:
         workflow_parameters.runtime_info.extra["source_structure_digest"] = (
             structure_content_digest_from_structure(structure)
         )
+        # The RESOLVED subchunk slot count, stamped before any stage so both
+        # the scattering-stage and residual-stage callers of
+        # build_residual_field_parameter_digest see the same value. Digesting
+        # the raw override let a sync run and a distributed run share one
+        # parameter digest while producing disjoint partition_id sets.
+        workflow_parameters.runtime_info.extra[
+            "residual_streaming_subchunks_resolved"
+        ] = _streaming_subchunk_slot_count(workflow_parameters, client)
         output_dir = (
             Path(workflow_parameters.struct_info.working_directory)
             / "processed_point_data"

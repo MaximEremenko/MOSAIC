@@ -65,22 +65,25 @@ and on a multi-node cluster.
 
 ## Known remaining inefficiencies (next steps, in value order)
 
-1. **Durable stage-1 store (Phase 0)**: ~75 GB on NVMe/parallel FS computed
-   once; deletes the per-shard stage-1 prologues (the multi-minute all-GPU-idle
-   windows) and makes resume independent of the streaming context. This is the
-   HPC-decisive step: stage 2 becomes read-only fan-out with zero cross-rank
-   traffic.
-2. **Tail serialization**: a shard's 4 chunk-units are pinned to one owner;
-   the run ends with one GPU grinding ~7 min/unit while three idle. Chunk-level
-   ownership (or work-stealing for the tail) fixes it.
-3. **Batch-major submission window**: with prefetch < number of slots, only
-   that many workers get work; prefetch 8 is the workaround, interleaved
-   submission the fix.
-4. **Finalize assembler**: still builds ~22 GB anonymous per chunk cycle
-   (survivable now, wasteful always); stream it through the existing memmap
-   outputs.
-5. **Decoder/extraction stage**: single-threaded, ~3 min per chunk on one of
-   96 cores; trivially parallel per chunk.
+All five items previously listed here were implemented during the
+2026-08-01 fix campaign and its follow-ups; the list is kept for the
+record, marked with what closed it.
+
+1. ~~**Durable stage-1 store (Phase 0)**~~ — DONE. Payloads persist under
+   `stage1_payload_store/<payload_identity>/`, computed once per interval
+   across shards, owners, restarts and cluster sizes, and reusable from the
+   precompute mode's artifacts as well (`afc2dc9`).
+2. ~~**Tail serialization**~~ — DONE. Ownership is per (chunk, slot) and the
+   submission interleave is ordered by RESOLVED owner, so placement stays
+   spread when worker count divides chunk count (campaign M21).
+3. ~~**Batch-major submission window**~~ — DONE by the same change; prefetch
+   is no longer the workaround.
+4. ~~**Finalize assembler**~~ — DONE. The points-axis concat assembler
+   streams partitions through the memmap outputs, holding roughly one
+   partition plus the output buffers rather than all partitions at once.
+5. ~~**Decoder/extraction stage**~~ — DONE. Per-chunk decode is parallel and
+   carries prepared inputs from the training pass instead of redoing the
+   per-chunk pipeline.
 
 ## Operational notes
 

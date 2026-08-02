@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from core.runtime.log_utils import short_path
+from core.storage.atomic import atomic_write_json
 from core.storage.attempt_store import relative_to_output, stage_commit_path
 from core.storage.digests import digest_dict
 from core.storage.manifest import read_manifest
@@ -346,19 +347,11 @@ def save_decoder_cache_source_identity(
     residual content is unchanged before trusting the cache."""
     path = decoder_cache_source_identity_path(cache_path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-        )
-        os.close(fd)
-        temp_path = Path(temp_name)
-        temp_path.write_text(
-            json.dumps(source_identity, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        os.replace(temp_path, path)
+        # The consolidated writer (temp -> fsync -> rename -> fsync parent).
+        # This used to hand-roll the same protocol MINUS both fsyncs, so the
+        # sidecar that decides whether a trained decoder may be reused could
+        # survive a crash as an empty or partial file.
+        atomic_write_json(path, source_identity, indent=2)
     except Exception as exc:
         logger.warning(
             "Failed to save decoder cache source identity to '%s': %s",
@@ -392,8 +385,7 @@ def save_decoder_provenance(output_dir: str, provenance: dict, logger) -> None:
                     raise RuntimeError(
                         f"Decoder provenance references an unreadable cache: {resolved_cache}"
                     )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_json(path, provenance, indent=2)
         logger.info("Decoder source provenance saved to '%s'.", short_path(path))
     except Exception as exc:
         logger.warning("Failed to save decoder provenance to '%s': %s", short_path(path), exc)

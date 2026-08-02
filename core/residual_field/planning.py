@@ -155,12 +155,41 @@ def _residual_execution_identity_payload(parameters: object) -> dict:
     except (TypeError, ValueError):
         partition_capacity = str(_rt("residual_partition_capacity"))
     return {
-        "streaming_subchunks": _to_jsonable(_rt("residual_streaming_subchunks")),
+        # The RESOLVED slot count, not the raw override. Unset resolves to 1
+        # for a sync client and 8 for a distributed one, and in the
+        # non-streaming owner-local path a sync client skips the partition
+        # plan entirely -- so digesting the raw None let two runs share a
+        # parameter digest while producing DISJOINT partition_id sets. The
+        # workflow stamps the resolved value before any stage runs; the raw
+        # value is kept as a fallback for callers that never had a client.
+        "streaming_subchunks": _to_jsonable(
+            _runtime_value(runtime_info, "residual_streaming_subchunks_resolved")
+            if _runtime_value(runtime_info, "residual_streaming_subchunks_resolved")
+            is not None
+            else _rt("residual_streaming_subchunks")
+        ),
         "intervals_per_shard": intervals_per_shard,
         "partition_capacity": partition_capacity,
         "shard_grid_budget_bytes": int(resolve_residual_shard_grid_budget_bytes()),
         "shard_source_budget": int(resolve_residual_shard_source_budget()),
         "lattice_fft": bool(residual_lattice_fft_enabled()),
+        # The upstream numerical contract. These enter the stage-1 payload
+        # identity and run_digest but used to miss this digest entirely, so a
+        # changed eps or dtype left the reducer-progress manifests addressed
+        # identically and the streaming resume credit -- which tests only
+        # artifact EXISTENCE -- handed the new run the old run's intervals.
+        "scattering_nufft_eps": _runtime_value(
+            runtime_info, "scattering_nufft_eps", _runtime_value(
+                runtime_info, "nufft_eps", 1e-12
+            )
+        ),
+        "scattering_dtype": str(
+            _runtime_value(
+                runtime_info,
+                "scattering_dtype",
+                _runtime_value(runtime_info, "nufft_dtype", "complex128"),
+            )
+        ),
     }
 
 
@@ -178,7 +207,7 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
         # byte-identical displacements for changed coordinates). These
         # manifests live outside .mosaic/runs/, so the run digest cannot
         # scope them -- this digest has to carry the structure itself.
-        "digest_schema_version": 4,
+        "digest_schema_version": 5,
         "execution_identity": _residual_execution_identity_payload(parameters),
         "postprocessing_mode": (
             _parameter_value(parameters, "postprocessing_mode")

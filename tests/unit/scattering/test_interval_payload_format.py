@@ -5,7 +5,7 @@ They used to do it two ways — HDF5 artifacts vs an npz store with a JSON
 meta member — so every integrity property had to be implemented twice.
 These tests pin the consolidation: either mode's writer produces a file
 the other mode's reader accepts, mask-emptiness is durable, reads can be
-memory-mapped, and pre-consolidation npz stores stay readable.
+memory-mapped.
 """
 import numpy as np
 import pytest
@@ -120,36 +120,6 @@ def test_write_is_idempotent_and_never_rewrites(tmp_path):
     stamp = path.stat().st_mtime_ns
     write_stored_interval_payload(str(tmp_path), 8, _task(interval_id=8))
     assert path.stat().st_mtime_ns == stamp
-
-
-def test_legacy_npz_store_entries_stay_readable(tmp_path):
-    """An existing store keeps its value across the format change: entries
-    written before consolidation are still served (a cold store would mean
-    recomputing every interval)."""
-    import json
-
-    task = _task(interval_id=21)
-    legacy = tmp_path / "interval_000021.npz"
-    np.savez(
-        legacy,
-        meta=np.asarray(
-            json.dumps(
-                {
-                    "empty": False,
-                    "irecip_id": 21,
-                    "element": "O",
-                    "q_grid_digest": "d" * 16,
-                    "half_space_role": "positive_half",
-                    "reciprocal_multiplicity": 2,
-                }
-            )
-        ),
-        q_grid=task.q_grid,
-        q_amp=task.q_amp,
-        q_amp_av=task.q_amp_av,
-    )
-    assert stage1_store_has(str(tmp_path), 21)
-    _assert_same_payload(read_stored_interval_payload(str(tmp_path), 21), task)
 
 
 def test_torn_entry_reads_as_a_miss_instead_of_failing_the_run(tmp_path):

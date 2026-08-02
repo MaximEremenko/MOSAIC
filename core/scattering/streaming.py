@@ -191,6 +191,11 @@ def _memo_store(key: tuple[str, int], task: IntervalTask | None) -> None:
 # (page cache, not RSS), so a store hit costs no stage-1 compute AND almost no
 # anonymous memory. Mask-empty intervals are recorded too, so their emptiness
 # is durable and never re-derived.
+#
+# Pre-consolidation .npz entries are NOT read. They were, until the store's
+# leaf moved from <run_digest> to <payload_identity> (afc2dc9) — after which
+# no legacy file could be at a path this store looks in, and the reader that
+# promised to keep an existing store's value could not deliver it.
 
 _STORE_MISS = object()
 
@@ -199,14 +204,6 @@ def _store_payload_path(store_dir: str, interval_id: int) -> "Path":
     from pathlib import Path
 
     return Path(store_dir) / f"interval_{int(interval_id):06d}.h5"
-
-
-def _legacy_npz_store_path(store_dir: str, interval_id: int) -> "Path":
-    """Pre-consolidation entries. Still READ so an existing store keeps its
-    value across the format change; nothing writes this shape any more."""
-    from pathlib import Path
-
-    return Path(store_dir) / f"interval_{int(interval_id):06d}.npz"
 
 
 def _precomputed_artifact_path(artifact_dir: str, interval_id: int) -> "Path":
@@ -248,42 +245,7 @@ def resolve_stage1_payload_store_dir(
 
 
 def stage1_store_has(store_dir: str, interval_id: int) -> bool:
-    return (
-        _store_payload_path(store_dir, interval_id).exists()
-        or _legacy_npz_store_path(store_dir, interval_id).exists()
-    )
-
-
-def _read_legacy_npz_payload(path):
-    import json
-
-    from core.scattering.interval_payload import mmap_is_safe_for_gpu_transfer
-    from core.storage.npz_mmap import mmap_npz_member
-
-    with np.load(path, allow_pickle=False) as data:
-        meta = json.loads(str(np.asarray(data["meta"]).item()))
-    if meta.get("empty"):
-        return None
-    # Same constraint as the current format: never hand CUDA a mapping of a
-    # network-filesystem file (see mmap_is_safe_for_gpu_transfer).
-    allow_mmap = mmap_is_safe_for_gpu_transfer(path)
-    arrays = {}
-    for member in ("q_grid", "q_amp", "q_amp_av"):
-        mapped = mmap_npz_member(path, member) if allow_mmap else None
-        if mapped is None:
-            with np.load(path, allow_pickle=False) as data:
-                mapped = np.asarray(data[member])
-        arrays[member] = mapped
-    return IntervalTask(
-        irecip_id=int(meta["irecip_id"]),
-        element=str(meta["element"]),
-        q_grid=arrays["q_grid"],
-        q_amp=arrays["q_amp"],
-        q_amp_av=arrays["q_amp_av"],
-        q_grid_digest=meta.get("q_grid_digest"),
-        half_space_role=str(meta["half_space_role"]),
-        reciprocal_multiplicity=int(meta.get("reciprocal_multiplicity", 1)),
-    )
+    return _store_payload_path(store_dir, interval_id).exists()
 
 
 def read_stored_interval_payload(
@@ -304,7 +266,6 @@ def read_stored_interval_payload(
     onto a shared path by MOSAIC_STREAMING_PAYLOAD_STORE loses the
     directory's guarantee, and defence in depth costs one attribute read)."""
     path = _store_payload_path(store_dir, interval_id)
-    legacy_path = _legacy_npz_store_path(store_dir, interval_id)
     try:
         if path.exists():
             payload = read_interval_payload(
@@ -314,8 +275,6 @@ def read_stored_interval_payload(
                 accept_unstamped=True,
             )
             return _STORE_MISS if payload is PAYLOAD_MISS else payload
-        if legacy_path.exists():
-            return _read_legacy_npz_payload(legacy_path)
         return _STORE_MISS
     except IntervalPayloadIdentityMismatch as exc:
         logger.warning("Stage-1 store entry rejected: %s", exc)

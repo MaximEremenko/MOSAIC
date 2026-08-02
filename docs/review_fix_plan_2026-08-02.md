@@ -26,7 +26,7 @@ patterns, plus a tail of dead code:
 Both patterns fail OPEN — they serve stale or partial data and publish it.
 Every phase below is ordered so the fail-open cases close first.
 
-## Phase 1 — identity completeness (7 findings, 3 HIGH)
+## Phase 1 — identity completeness (DONE, `0c36b28`)
 
 The keys that decide whether stage-1 work may be reused.
 
@@ -50,7 +50,7 @@ fail-closed.
 and separately `coeff_center_by` in a reused directory; both must recompute
 and match a fresh-directory run.
 
-## Phase 2 — wrong numbers and silent corruption (4 findings, 4 HIGH)
+## Phase 2 — wrong numbers and silent corruption (DONE, `dae0892`)
 
 | id | severity | finding |
 |---|---|---|
@@ -70,7 +70,7 @@ the same stamp-and-validate shape as the payload identity.
 credit path) + swap-check. New E2E: change a residual knob in a reused
 directory; artifacts must be rewritten and match a fresh-directory run.
 
-## Phase 3 — durability and degradation (5 findings, MEDIUM)
+## Phase 3 — durability and degradation (DONE, `1b0c0f5`)
 
 - Final residual chunk payload renamed without fsync while the manifest
   that credits it is fsynced (artifacts.py:203) — crash-ordering inversion.
@@ -85,7 +85,7 @@ directory; artifacts must be rewritten and match a fresh-directory run.
 - Non-streaming finalize marks the shared SQLite cache from N workers
   concurrently, after the durable commit (execution.py:2049).
 
-## Phase 4 — legacy and dead code (20 findings, LOW)
+## Phase 4 — legacy and dead code (DONE, `1b0c0f5`)
 
 Dead modules (`scattering/precompute.py`, `scattering/chunk_processing.py`,
 `decoding/mode.py`, `qspace/masking/shape_gpu.py`, `storage/contracts.py`,
@@ -114,3 +114,33 @@ after every phase. Phases 1-2 additionally run resume-check.sh (kill
 mid-residual, resume, run 3 must resubmit zero batches) and swap-check.sh
 (the structure guard must still refuse and fresh_start must still rebuild
 correctly).
+
+
+## Outcome
+
+| phase | commit | unit suite | host gate | resume |
+|---|---|---|---|---|
+| 1 identity completeness | `0c36b28` | 1556 | 4.052e-15 / 1.305e-15 | held |
+| 2 wrong numbers, corruption | `dae0892` | 1558 | 5.773e-15 / 9.021e-16 | held |
+| 3+4 durability, legacy | (this) | 1547 | 5.287e-15 / 1.749e-15 | held |
+
+Two Phase-4 findings were NOT taken as reported, after checking:
+
+- `core/storage/hdf5_data_storage.py` is not a dead module — its
+  `HDF5ConfigDataLoader` has a live consumer in
+  `core/config/processors/hdf5_processor.py`. Only the unreferenced
+  `HDF5ConfigDataSaver` class was removed.
+- The tracked demo run tree was UNTRACKED (`git rm --cached`), not deleted:
+  the files stay on disk. The neighbouring `output_disp_small_*` trees are
+  the numeric gate's reference data and were left alone.
+
+One finding is deferred with a reason: the residual stage's scattered
+per-chunk recarrays still have no re-scatter recovery
+(`execution.py:1861`), unlike the streaming context. Its blast radius is a
+recoverable run abort rather than wrong or lost data, and the fix belongs
+with the future-handling code rather than with this sweep.
+
+A pre-existing import cycle was found and NOT introduced by this work:
+importing `core.storage.hdf5_data_storage` before `core.config` raises
+ImportError. It reproduces at `8b3ad2c`, and the normal import order is
+unaffected, so the cycle test does not see it.

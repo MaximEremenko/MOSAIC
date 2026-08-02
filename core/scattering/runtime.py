@@ -4,17 +4,9 @@ from contextlib import contextmanager
 from typing import Any, Dict
 
 from core.runtime import (
-    DEFAULT_TASK_RETRIES,
-    TIMER,
-    chunk_mutex,
-    is_sync_client as _is_sync_client,
-    progress_bar as _tqdm,
     quiet_loggers,
     resolve_nufft_execution_settings,
-    timed as _timed,
-    yield_futures_with_results as _yield_futures_with_results,
 )
-from core.runtime.worker_hooks import CuPyCleanup
 
 
 @contextmanager
@@ -62,17 +54,12 @@ def _nufft_execution_settings(parameters: Dict[str, Any]):
     return resolve_nufft_execution_settings(requested, eps=eps, dtype=dtype)
 
 
+# Nine further names were re-exported here for the stage2_replacement
+# module deleted in 085fb82. Nothing has imported them through this module
+# since; every consumer takes them from core.runtime directly.
 __all__ = [
-    "CuPyCleanup",
-    "DEFAULT_TASK_RETRIES",
-    "TIMER",
-    "_is_sync_client",
     "_nufft_execution_settings",
     "_quiet_db_info",
     "_require_scheduler_resource_capacity",
     "_runtime_info",
-    "_timed",
-    "_tqdm",
-    "_yield_futures_with_results",
-    "chunk_mutex",
 ]

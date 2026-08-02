@@ -201,7 +201,16 @@ class ResidualFieldArtifactStore(ScatteringArtifactStore):
                     block[:, 0] = point_ids_arr[start:stop]
                     block[:, 1] = values_arr[start:stop]
                     dataset[start:stop] = block
+                h5file.flush()
+            # These are the stage's largest and most valuable durable
+            # artifacts, and the manifest that CREDITS them is fsynced.
+            # Without these two calls the ordering inverts on power loss:
+            # the credit is durable while the payload it credits is not, so
+            # recovery reads a manifest pointing at a file whose contents
+            # never reached the platter.
+            fsync_path(tmp_path)
             tmp_path.replace(file_path)
+            fsync_parent(file_path)
         finally:
             tmp_path.unlink(missing_ok=True)
 
