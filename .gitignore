@@ -75,3 +75,8 @@ ChangeLog
 .venv/
 .dask-local/
 .vscode/
+
+# LaTeX build artifacts
+*.aux
+*.out
+docs/**/*.log
