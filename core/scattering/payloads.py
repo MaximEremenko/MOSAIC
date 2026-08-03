@@ -12,7 +12,7 @@ from core.residual_field.planning import build_residual_field_parameter_digest
 def build_base_amplitude_parameters(
     context: ScatteringExecutionContext,
 ) -> dict[str, object]:
-    return {
+    base: dict[str, object] = {
         "reciprocal_space_intervals": context.intervals,
         "reciprocal_space_intervals_all": context.artifacts.padded_intervals,
         "point_data_list": [
@@ -56,6 +56,15 @@ def build_base_amplitude_parameters(
             context.workflow_parameters
         ),
     }
+    # Reference channel for the average amplitude. The crystal default
+    # ('factorized') is deliberately NOT written: the scientific-identity
+    # builder skips absent keys, so every pre-existing crystal digest stays
+    # byte-identical. The amorphous modes ('direct'/'homogeneous') change
+    # what q_amp_av holds, so they MUST be digested — writing the key here
+    # is what puts it into scientific_digest (see _SCIENTIFIC_KEYS).
+    if context.reference_mode != "factorized":
+        base["reference_mode"] = context.reference_mode
+    return base
 
 
 def build_amplitude_adapter_payload(

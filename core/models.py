@@ -254,6 +254,7 @@ class RSpaceInfo(_MappingView):
     coeff_center_by: str | None = None
     use_coeff: bool | None = None
     decoder: dict[str, Any] | None = None
+    reference_mode: str | None = None
 
     def __post_init__(self) -> None:
         self.num_chunks = int(self.num_chunks)
@@ -286,6 +287,7 @@ class RSpaceInfo(_MappingView):
             coeff_center_by=mapping.get("coeff_center_by"),
             use_coeff=mapping.get("use_coeff"),
             decoder=dict(mapping.get("decoder")) if isinstance(mapping.get("decoder"), Mapping) else None,
+            reference_mode=mapping.get("reference_mode"),
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -314,6 +316,8 @@ class RSpaceInfo(_MappingView):
             payload["use_coeff"] = self.use_coeff
         if self.decoder is not None:
             payload["decoder"] = dict(self.decoder)
+        if self.reference_mode is not None:
+            payload["reference_mode"] = self.reference_mode
         return payload
 
 

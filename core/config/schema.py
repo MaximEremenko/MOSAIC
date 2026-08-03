@@ -227,6 +227,14 @@ def normalize_input_schema(parameters: dict[str, Any]) -> dict[str, Any]:
     if chemical_filtered is not None:
         rspace_info["chemical_filtered_ordering"] = as_bool(chemical_filtered)
 
+    # Reference channel for the average amplitude (amorphous runs):
+    # 'factorized' (crystal default), 'direct', or 'homogeneous'. Only
+    # written when configured, so existing crystal run mappings — and the
+    # digests derived from them — are unchanged.
+    reference_mode = first_present(processing, ("reference_mode", "referenceMode"))
+    if reference_mode is not None:
+        rspace_info["reference_mode"] = str(reference_mode)
+
     coeff_center_by = first_present(
         processing_coeff, ("center_by", "coeff_center_by", "coeffCenterBy")
     ) or first_present(

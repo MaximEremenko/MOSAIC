@@ -24,6 +24,7 @@ from core.scattering.contracts import ScatteringArtifactManifest, ScatteringWork
 from core.scattering.interval_payload import PAYLOAD_MISS, read_interval_payload
 from core.scattering.kernels import (
     IntervalTask,
+    ReferenceSpec,
     aggregate_interval_contributions,
     build_interval_lattice_meta,
     compute_interval_coeff_contribution,
@@ -185,6 +186,7 @@ def compute_scattering_interval_payload(
     nufft_eps: float = 1e-12,
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
+    reference: ReferenceSpec | None = None,
 ) -> IntervalTask | None:
     q_grid = generate_q_space_grid_sync(interval, B_, mask_params, MaskStrategy, supercell)
     if q_grid.size == 0:
@@ -207,19 +209,26 @@ def compute_scattering_interval_payload(
                 nufft_prefer_cpu=nufft_prefer_cpu,
                 nufft_gpu_only=nufft_gpu_only,
                 lattice_meta=lattice_meta,
+                reference=reference,
             )
         )
     else:
         # the average-structure transform is identical for every element:
-        # compute it once per interval instead of once per element
-        shared_q_av = forward_interval_amplitudes(
-            cells_origin,
-            np.ones(original_coords.shape[0]),
-            q_grid,
-            lattice_meta=lattice_meta,
-            nufft_eps=nufft_eps,
-            nufft_prefer_cpu=nufft_prefer_cpu,
-            nufft_gpu_only=nufft_gpu_only,
+        # compute it once per interval instead of once per element. With an
+        # explicit reference the average channel is per-species (direct) or
+        # zero (homogeneous) — the hoisted factorized transform is unused.
+        shared_q_av = (
+            forward_interval_amplitudes(
+                cells_origin,
+                np.ones(original_coords.shape[0]),
+                q_grid,
+                lattice_meta=lattice_meta,
+                nufft_eps=nufft_eps,
+                nufft_prefer_cpu=nufft_prefer_cpu,
+                nufft_gpu_only=nufft_gpu_only,
+            )
+            if reference is None
+            else None
         )
         for element in unique_elements:
             contribution = compute_interval_element_contribution(
@@ -236,6 +245,7 @@ def compute_scattering_interval_payload(
                 nufft_gpu_only=nufft_gpu_only,
                 lattice_meta=lattice_meta,
                 q_av=shared_q_av,
+                reference=reference,
             )
             if contribution is not None:
                 contributions.append(contribution)
@@ -274,6 +284,7 @@ def run_scattering_interval_task(
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
     payload_identity: str | None = None,
+    reference: ReferenceSpec | None = None,
 ) -> ScatteringArtifactManifest | None:
     if db_path is not None and is_interval_artifact_committed(
         work_unit, db_path=db_path, payload_identity=payload_identity
@@ -300,6 +311,7 @@ def run_scattering_interval_task(
         nufft_eps=nufft_eps,
         nufft_prefer_cpu=nufft_prefer_cpu,
         nufft_gpu_only=nufft_gpu_only,
+        reference=reference,
     )
     if interval_task is None:
         # Mask eliminated all Q-points in this interval.  Mark it as

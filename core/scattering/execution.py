@@ -24,6 +24,7 @@ from core.scattering.contracts import (
 )
 from core.scattering.kernels import (
     IntervalTask,
+    ReferenceSpec,
     reciprocal_space_points_counter,
     to_interval_dict,
 )
@@ -234,6 +235,7 @@ def _scatter_shared_precompute_inputs(
     cells_origin: np.ndarray,
     elements_arr: np.ndarray,
     coeff_val,
+    reference: "ReferenceSpec | None" = None,
 ):
     payloads = {
         "B_": client.scatter(B_, broadcast=True, hash=False),
@@ -246,7 +248,40 @@ def _scatter_shared_precompute_inputs(
         payloads["coeff_val"] = client.scatter(coeff_val, broadcast=True, hash=False)
     else:
         payloads["coeff_val"] = None
+    if reference is not None:
+        payloads["reference"] = client.scatter(reference, broadcast=True, hash=False)
+    else:
+        payloads["reference"] = None
     return payloads
+
+
+def _resolve_reference_spec(parameters: Dict[str, Any]) -> "ReferenceSpec | None":
+    """Reference for the average-amplitude channel, from run parameters.
+
+    'factorized' (or absent) keeps the crystal average and returns None —
+    the key is deliberately not written into the parameters for that mode,
+    so pre-existing crystal digests stay byte-identical. 'direct' binds the
+    reference to average_coords (the amorphous reference configuration);
+    'homogeneous' zeroes the average channel."""
+    mode = str(parameters.get("reference_mode") or "factorized").strip().lower()
+    if mode == "factorized":
+        return None
+    if mode == "homogeneous":
+        return ReferenceSpec(mode="homogeneous")
+    if mode == "direct":
+        reference_coords = parameters.get("average_coords")
+        if reference_coords is None:
+            raise ValueError(
+                "reference_mode 'direct' requires average_coords (the "
+                "reference configuration) in the scattering parameters."
+            )
+        return ReferenceSpec(
+            mode="direct", coords=np.asarray(reference_coords, dtype=float)
+        )
+    raise ValueError(
+        f"Unknown reference_mode {mode!r}; expected 'factorized', 'direct' "
+        "or 'homogeneous'."
+    )
 
 
 def _store_transient_interval_payload(
@@ -447,6 +482,7 @@ def run_interval_precompute(
     transient_interval_payloads: dict[int, IntervalTask] | None = None,
     payload_identity: str | None = None,
     stage1_store_dir: str | None = None,
+    reference: ReferenceSpec | None = None,
 ) -> list[Path]:
     payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
     nufft_settings = _nufft_execution_settings(parameters)
@@ -528,6 +564,7 @@ def run_interval_precompute(
             cells_origin=cells_origin,
             elements_arr=elements_arr,
             coeff_val=parameters.get("coeff"),
+            reference=reference,
         )
         futures = [
             client.submit(
@@ -551,6 +588,7 @@ def run_interval_precompute(
                 nufft_eps=nufft_settings.eps,
                 nufft_prefer_cpu=nufft_settings.prefer_cpu,
                 nufft_gpu_only=nufft_settings.gpu_only,
+                reference=shared_inputs["reference"],
                 pure=False,
                 resources=_nufft_resources_for_parameters(parameters),
             )
@@ -625,6 +663,7 @@ def run_interval_precompute(
                     nufft_eps=nufft_settings.eps,
                     nufft_prefer_cpu=nufft_settings.prefer_cpu,
                     nufft_gpu_only=nufft_settings.gpu_only,
+                    reference=reference,
                 )
                 if interval_task is not None:
                     _store_transient_interval_payload(
@@ -674,6 +713,7 @@ def run_interval_precompute(
             cells_origin=cells_origin,
             elements_arr=elements_arr,
             coeff_val=parameters.get("coeff"),
+            reference=reference,
         )
         futures = [
             client.submit(
@@ -698,6 +738,7 @@ def run_interval_precompute(
                 nufft_prefer_cpu=nufft_settings.prefer_cpu,
                 nufft_gpu_only=nufft_settings.gpu_only,
                 payload_identity=payload_identity,
+                reference=shared_inputs["reference"],
                 pure=False,
                 resources=_nufft_resources_for_parameters(parameters),
             )
@@ -754,6 +795,7 @@ def run_interval_precompute(
                 nufft_prefer_cpu=nufft_settings.prefer_cpu,
                 nufft_gpu_only=nufft_settings.gpu_only,
                 payload_identity=payload_identity,
+                reference=reference,
             )
             if manifest is not None and manifest.artifacts:
                 artifact_path = manifest.artifacts[0].path
@@ -796,6 +838,7 @@ def run_scattering_stage(
 
     B_ = np.linalg.inv(vectors / supercell)
     unique_elements = np.unique(elements_arr)
+    reference = _resolve_reference_spec(parameters)
     work_identity = _current_scattering_identity(
         parameters=parameters,
         output_dir=output_dir,
@@ -880,6 +923,7 @@ def run_scattering_stage(
             payload_store_dir=payload_store_dir,
             precomputed_artifact_dir=str(interval_artifact_dir(output_dir)),
             payload_identity=payload_identity,
+            reference=reference,
         )
         logger.info(
             "Scattering stage-1/stage-2 skipped (streaming mode): %d interval(s) "
@@ -923,6 +967,7 @@ def run_scattering_stage(
                     if payload_identity
                     else None
                 ),
+                reference=reference,
             )
         finally:
             # The type-1 plans only fill during interval precompute; release

@@ -4,6 +4,7 @@ import logging
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Tuple
 
 import numpy as np
@@ -138,6 +139,44 @@ def point_list_to_recarray(point_data_list: list[dict]) -> np.recarray:
     return _point_list_to_recarray(point_data_list)
 
 
+@dataclass(frozen=True)
+class ReferenceSpec:
+    """Reference for the average-amplitude channel of a stage-1 payload.
+
+    ``None`` (the default everywhere) keeps the crystal behaviour: the
+    factorized average ``ff * FT(cells_origin) * FT(r - cells_origin) / N``
+    — the lattice sum times the mean cell content. That factorization is
+    meaningless for an amorphous one-cell box: with ``supercell=(1,1,1)``
+    every ``cells_origin`` entry is the same point, the product collapses
+    to ``q_amp`` itself, and the delta channel silently becomes zero.
+
+    ``mode='direct'``: the average amplitude is the DIRECT transform of a
+    chosen reference configuration, ``ff * FT(reference coords)`` — the
+    aperiodic analogue of the average structure. The delta channel is then
+    A(displaced) - A(reference), linear in the displacements.
+
+    ``mode='homogeneous'``: the reference is homogeneous density, whose
+    amplitude lives only at q = 0 — the average channel is identically
+    zero and the entire amplitude at q != 0 is diffuse (the glass
+    total-diffuse channel; exclude q = 0 with the mask).
+    """
+
+    mode: str
+    coords: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("direct", "homogeneous"):
+            raise ValueError(
+                f"Unknown reference mode {self.mode!r}; expected 'direct' "
+                "or 'homogeneous' (the factorized crystal average is "
+                "selected by passing no ReferenceSpec at all)."
+            )
+        if self.mode == "direct" and self.coords is None:
+            raise ValueError(
+                "reference mode 'direct' requires the reference coordinates."
+            )
+
+
 def compute_interval_element_contribution(
     interval: dict,
     q_grid: np.ndarray,
@@ -153,6 +192,7 @@ def compute_interval_element_contribution(
     nufft_gpu_only: bool = False,
     lattice_meta: dict | None = None,
     q_av: np.ndarray | None = None,
+    reference: ReferenceSpec | None = None,
 ) -> Tuple | None:
     ff = ff_factory.calculate(q_grid, element, charge=charge)
     mask = elements_arr == element
@@ -167,6 +207,22 @@ def compute_interval_element_contribution(
         nufft_prefer_cpu=nufft_prefer_cpu,
         nufft_gpu_only=nufft_gpu_only,
     )
+    if reference is not None:
+        if reference.mode == "homogeneous":
+            return (interval["id"], element, q_grid, q_amp, np.zeros_like(q_amp))
+        # 'direct': the average channel is the same per-species transform
+        # over the REFERENCE coordinates — A_ref = ff * FT(R), no
+        # factorization through cells_origin.
+        q_av_final = ff * forward_interval_amplitudes(
+            reference.coords[mask],
+            np.ones(mask.sum()),
+            q_grid,
+            lattice_meta=lattice_meta,
+            nufft_eps=nufft_eps,
+            nufft_prefer_cpu=nufft_prefer_cpu,
+            nufft_gpu_only=nufft_gpu_only,
+        )
+        return (interval["id"], element, q_grid, q_amp, q_av_final)
     if q_av is None:
         # identical for every element of the interval; callers hoist it
         q_av = forward_interval_amplitudes(
@@ -202,6 +258,7 @@ def compute_interval_coeff_contribution(
     nufft_prefer_cpu: bool = False,
     nufft_gpu_only: bool = False,
     lattice_meta: dict | None = None,
+    reference: ReferenceSpec | None = None,
 ) -> Tuple:
     n_points = original_coords.shape[0]
     coeff_arr = coeff * (np.ones(n_points) + 1j * np.zeros(n_points))
@@ -214,6 +271,20 @@ def compute_interval_coeff_contribution(
         nufft_prefer_cpu=nufft_prefer_cpu,
         nufft_gpu_only=nufft_gpu_only,
     )
+    if reference is not None:
+        if reference.mode == "homogeneous":
+            return (interval["id"], "All", q_grid, q_amplitudes, np.zeros_like(q_amplitudes))
+        # 'direct': same coefficient weights over the reference coordinates.
+        q_amplitudes_av_final = forward_interval_amplitudes(
+            reference.coords,
+            coeff_arr,
+            q_grid,
+            lattice_meta=lattice_meta,
+            nufft_eps=nufft_eps,
+            nufft_prefer_cpu=nufft_prefer_cpu,
+            nufft_gpu_only=nufft_gpu_only,
+        )
+        return (interval["id"], "All", q_grid, q_amplitudes, q_amplitudes_av_final)
     q_amplitudes_av = forward_interval_amplitudes(
         cells_origin,
         coeff_arr * 0.0 + 1.0,
@@ -263,6 +334,7 @@ def aggregate_interval_contributions(
 
 __all__ = [
     "IntervalTask",
+    "ReferenceSpec",
     "aggregate_interval_contributions",
     "build_interval_lattice_meta",
     "build_rifft_grid_for_chunk",

@@ -30,7 +30,11 @@ from core.scattering.interval_payload import (
     read_interval_payload,
     write_interval_payload,
 )
-from core.scattering.kernels import IntervalTask, streaming_lattice_default
+from core.scattering.kernels import (
+    IntervalTask,
+    ReferenceSpec,
+    streaming_lattice_default,
+)
 from core.scattering.tasks import compute_scattering_interval_payload
 
 logger = logging.getLogger(__name__)
@@ -99,6 +103,9 @@ class StreamingComputeContext:
     # Identity every reused payload must carry (see
     # scattering.interval_payload.build_interval_payload_identity).
     payload_identity: str | None = None
+    # Reference for the average-amplitude channel (amorphous runs); None
+    # keeps the factorized crystal average. See kernels.ReferenceSpec.
+    reference: "ReferenceSpec | None" = None
 
 
 def streaming_slot_map(
@@ -458,6 +465,8 @@ def lazy_streamed_interval_loaders(
                     nufft_eps=nufft_eps,
                     nufft_prefer_cpu=nufft_prefer_cpu,
                     nufft_gpu_only=nufft_gpu_only,
+                    # getattr: contexts pickled by an older run lack the field.
+                    reference=getattr(context, "reference", None),
                 )
             if store_dir:
                 write_stored_interval_payload(

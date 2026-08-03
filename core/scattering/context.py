@@ -25,6 +25,11 @@ class ScatteringExecutionContext:
     centered_coefficients: np.ndarray
     mask_strategy: object
     scattering_weight_selection: ScatteringWeightSelection
+    # Reference for the average-amplitude channel: 'factorized' (crystal
+    # default), 'direct' (average_coords transformed directly — the
+    # amorphous reference configuration), or 'homogeneous' (zero average;
+    # everything at q != 0 is diffuse). See kernels.ReferenceSpec.
+    reference_mode: str = "factorized"
 
 
 def build_scattering_execution_context(
@@ -52,6 +57,28 @@ def build_scattering_execution_context(
     )
     chemical_filtered = bool(rspace.chemical_filtered_ordering)
     use_coeff = bool(rspace.use_coeff if rspace.use_coeff is not None else True) or chemical_filtered
+    reference_mode = (
+        str(getattr(rspace, "reference_mode", None) or "factorized")
+        .strip()
+        .lower()
+    )
+    if reference_mode not in {"factorized", "direct", "homogeneous"}:
+        raise ValueError(
+            f"Unknown processing.reference_mode {reference_mode!r}; expected "
+            "'factorized', 'direct' or 'homogeneous'."
+        )
+    if reference_mode == "direct" and chemical_filtered:
+        raise ValueError(
+            "reference_mode 'direct' subtracts A(average_coords) from "
+            "A(original_coords); chemical_filtered_ordering substitutes "
+            "average_coords FOR original_coords, which would make the delta "
+            "channel identically zero. The two options are incompatible."
+        )
+    _require_usable_mask_for_one_cell_box(
+        dimension=dimension,
+        supercell=to_numpy(structure.supercell),
+        peak_info=workflow_parameters.peak_info,
+    )
     coeff_center_mode = rspace.coeff_center_by or ("global" if chemical_filtered else "none")
     centered_coeff = coefficient_centering_service.center(
         np.asarray(to_numpy(structure.coeff), float),
@@ -78,7 +105,45 @@ def build_scattering_execution_context(
         scattering_weight_selection=parameter_loading_service.resolve_scattering_weight_settings(
             workflow_parameters
         ),
+        reference_mode=reference_mode,
     )
+
+
+def _require_usable_mask_for_one_cell_box(
+    *,
+    dimension: int,
+    supercell,
+    peak_info,
+) -> None:
+    """Refuse the built-in Bragg-node mask on a one-cell (amorphous) box.
+
+    The 3D special-points fallback mask classifies q-points by distance
+    from the nearest INTEGER hkl of the unit cell (``Mod(h,1.0) - 0.5``).
+    With ``supercell=(1,1,1)`` every grid point IS integer hkl, the Mod
+    terms are identically zero, and the mask silently rejects the entire
+    grid — the run would complete with no q-points. An explicit mask
+    equation (e.g. an |q| shell in box hkl) is unaffected."""
+    if dimension != 3:
+        return
+    if not np.all(np.asarray(supercell, dtype=float) == 1):
+        return
+    mapping = (
+        peak_info.to_mapping() if hasattr(peak_info, "to_mapping") else dict(peak_info or {})
+    )
+    has_equation = any(
+        mapping.get(key)
+        for key in ("mask_equation", "maskEquation", "equation", "condition")
+    )
+    special_points = mapping.get("specialPoints") or mapping.get("special_points")
+    if not has_equation and isinstance(special_points, list) and special_points:
+        raise ValueError(
+            "The built-in special-points mask is a Bragg-node classifier "
+            "(Mod(h,1.0)) and rejects every point of a one-cell box "
+            "(supercell=(1,1,1), the amorphous encoding). Provide an "
+            "explicit reciprocal_space.mask.equation in box hkl instead — "
+            "e.g. an |q| shell: '(h**2 + k**2 + l**2 >= R1**2) & "
+            "(h**2 + k**2 + l**2 <= R2**2)'."
+        )
 
 
 __all__ = ["ScatteringExecutionContext", "build_scattering_execution_context"]

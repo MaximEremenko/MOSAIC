@@ -71,6 +71,12 @@ _SCIENTIFIC_KEYS = (
     # key is worse than no key: it reads as covered. Only populated keys
     # belong in this tuple.
     "amplitude_weighting_digest",
+    # Reference channel of the average amplitude (amorphous runs). Written
+    # by build_base_amplitude_parameters ONLY when non-default, so crystal
+    # digests are unchanged while 'direct'/'homogeneous' runs get their own
+    # identity. The reference COORDINATES are covered by
+    # structure_content_digest (average_coords is a digested member).
+    "reference_mode",
 )
 
 
