@@ -61,6 +61,10 @@ examples/config_3D/chemical_ordering/output_demo_lifeo2_*/
 src/
 tmp_scripts/
 ChangeLog
+# Run scratch root (rifft target grids, residual result memmaps). Tens of GB
+# per run; the notebook launcher points MOSAIC_SCRATCH_ROOT here to keep it
+# off the tmpfs /tmp.
+.mosaic-scratch/
 
 # Jupyter
 .ipynb_checkpoints/
