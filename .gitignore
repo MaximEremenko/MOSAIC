@@ -80,3 +80,6 @@ ChangeLog
 *.aux
 *.out
 docs/**/*.log
+
+# Amorphous demo run tree (regenerated per run)
+examples/config_3D/amorphous_sio2/output_amorphous_*/
