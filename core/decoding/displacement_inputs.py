@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -651,6 +652,16 @@ def prepare_displacement_decoder_inputs(
         weight_g=weight_g,
         max_train=max_train,
     )
+
+    if os.environ.get("MOSAIC_DECODER_DEBUG_DUMP"):
+        # Diagnostic escape hatch: persist exactly what the trainer sees.
+        dump_path = Path(output_dir) / f"decoder_debug_chunk_{chunk_id}.npz"
+        np.savez(
+            dump_path,
+            features_train=np.asarray(features_train, float),
+            u_train=np.asarray(u_train, float),
+            cids=np.asarray(cids_all, int),
+        )
 
     return {
         "output_dir": output_dir,
