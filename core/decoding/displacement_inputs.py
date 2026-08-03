@@ -6,7 +6,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from core.decoding.features import build_feature_vector_from_patch
+from core.decoding.features import (
+    build_feature_vector_from_patch,
+    resolve_q_window_size,
+)
 from core.decoding.grid import (
     apply_rq_pipeline_local,
     center_patch_subvoxel,
@@ -605,7 +608,11 @@ def prepare_displacement_decoder_inputs(
     guard_frac = float(processor.parameters.get("edge_guard_frac", 0.10))
     q_window_kind = str(processor.parameters.get("q_window_kind", "cheb")).lower()
     q_window_at_db = float(processor.parameters.get("q_window_at_db", 100.0))
-    size_aver = np.asarray(processor.parameters["supercell"], dtype=int)
+    # For a one-cell (amorphous) box the PSF grid length comes from the hkl
+    # extent, not the supercell — see resolve_q_window_size.
+    size_aver = resolve_q_window_size(
+        processor.parameters["supercell"], hkl_max_xyz
+    )
 
     original_coords = processor.original_coords
     average_coords = processor.average_coords
