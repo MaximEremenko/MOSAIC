@@ -27,8 +27,18 @@ class StructureLoadingService:
         struct = workflow_parameters.struct_info
         cfg_path = os.path.join(working_path, struct.filename)
         cfg_type = determine_configuration_file_type(struct.filename)
+        # The average-structure file, when configured. The rmc6f path
+        # ignores it under 'calculate' (its average is derived by cell
+        # averaging — behavior unchanged); the LAMMPS path REQUIRES it to
+        # define the reference configuration, because an amorphous
+        # structure has no derivable average.
+        average_path = (
+            os.path.join(working_path, struct.filename_av)
+            if struct.filename_av
+            else None
+        )
         cfg_proc = self.registry.get_factory(cfg_type).create_processor(
-            cfg_path, "calculate"
+            cfg_path, "calculate", average_path
         )
         cfg_proc.process()
 

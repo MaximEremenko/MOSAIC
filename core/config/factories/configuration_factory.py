@@ -23,6 +23,7 @@ from core.config.processors.rmc6f_average_structure_reader import (
     RMC6fAverageStructureReader,
 )
 from core.config.processors.rmc6f_processor import RMC6fProcessor
+from core.config.processors.lammps_processor import LammpsDataProcessor
 from typing import Optional
 
 from core.config.factories.hdf5_factory import HDF5ProcessorFactory
@@ -51,12 +52,23 @@ class Processor1DFactory(IConfigurationProcessorFactory):
     def create_processor(self, file_path: str, processor_type: str = 'read', average_file_path: str = None):
         return ConfigurationFileProcessor1D(file_path)
 
+class LammpsProcessorFactory(IConfigurationProcessorFactory):
+    def create_processor(self,
+                         file_path: str,
+                         processor_type: str = 'calculate',
+                         average_file_path: Optional[str] = None) -> LammpsDataProcessor:
+        # An amorphous configuration has no derivable average structure, so
+        # the average file (structure.filename_av) IS the reference
+        # configuration; processor_type is irrelevant.
+        return LammpsDataProcessor(file_path, average_file_path=average_file_path)
+
 class ConfigurationProcessorFactoryProvider:
     _factories = {
         'rmc6f': RMC6fProcessorFactory(),
         'hdf5': HDF5ProcessorFactory(),
         'f2d': Processor2DFactory(),
         'f1d': Processor1DFactory(),
+        'lammps': LammpsProcessorFactory(),
     }
 
     @staticmethod

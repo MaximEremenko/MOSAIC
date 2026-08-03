@@ -421,9 +421,10 @@ def test_structure_loading_service_uses_injected_registry(monkeypatch, tmp_path)
             return SimpleNamespace(to_numpy=lambda: np.array([[0.0]]))
 
     class FakeFactory:
-        def create_processor(self, cfg_path, mode):
+        def create_processor(self, cfg_path, mode, average_file_path=None):
             captured["cfg_path"] = cfg_path
             captured["mode"] = mode
+            captured["average_file_path"] = average_file_path
             return FakeProcessor()
 
     class FakeRegistry:
@@ -449,6 +450,8 @@ def test_structure_loading_service_uses_injected_registry(monkeypatch, tmp_path)
     assert captured["file_type"] == "f1d"
     assert captured["cfg_path"].endswith("sample_1d.f1d")
     assert captured["mode"] == "calculate"
+    # no filename_av configured -> no average file forwarded
+    assert captured["average_file_path"] is None
     assert captured["processed"] is True
     np.testing.assert_allclose(structure.coeff, np.array([2.0]))
 

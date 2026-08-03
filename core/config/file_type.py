@@ -18,5 +18,7 @@ def determine_configuration_file_type(file_path: str) -> str:
             return 'f2d'
     elif ext == '.f1d':
             return 'f1d'
+    elif ext in ('.data', '.lmp', '.lammps'):
+        return 'lammps'
     else:
         raise ValueError(f"Unsupported file extension: {ext}")
