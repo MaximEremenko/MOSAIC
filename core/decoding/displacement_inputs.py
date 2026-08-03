@@ -7,10 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from core.decoding.features import (
-    build_feature_vector_from_patch,
-    resolve_q_window_size,
-)
+from core.decoding.features import build_feature_vector_from_patch
 from core.decoding.grid import (
     apply_rq_pipeline_local,
     center_patch_subvoxel,
@@ -609,11 +606,17 @@ def prepare_displacement_decoder_inputs(
     guard_frac = float(processor.parameters.get("edge_guard_frac", 0.10))
     q_window_kind = str(processor.parameters.get("q_window_kind", "cheb")).lower()
     q_window_at_db = float(processor.parameters.get("q_window_at_db", 100.0))
-    # For a one-cell (amorphous) box the PSF grid length comes from the hkl
-    # extent, not the supercell — see resolve_q_window_size.
-    size_aver = resolve_q_window_size(
-        processor.parameters["supercell"], hkl_max_xyz
-    )
+    # The q-window/PSF grid is dimensioned in units of the SUPERCELL
+    # reciprocal sampling (its real-space step is cell/supercell, its extent
+    # one cell). For the amorphous one-cell box (supercell=(1,1,1)) that
+    # geometry does not map onto the patch grid at all — a transplanted
+    # box-hkl window (2H+1 samples) has step L/(2H+1) and extent L, both
+    # unrelated to the patch, and measured on the imposed-field E2E it
+    # ATTENUATES the features ~300x and degrades decode R^2 from 0.99 to
+    # 0.83. The degenerate 1-point PSF (an identity) is the correct
+    # operator for the one-cell box; the correction is a no-op by design,
+    # not by accident.
+    size_aver = np.asarray(processor.parameters["supercell"], dtype=int)
 
     original_coords = processor.original_coords
     average_coords = processor.average_coords

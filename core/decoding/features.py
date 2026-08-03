@@ -76,21 +76,6 @@ def window_spectrum_vectors_unshifted(size_aver, kind="cheb", at_db=100.0):
     return wd
 
 
-def resolve_q_window_size(supercell, hkl_max_xyz) -> np.ndarray:
-    """Per-axis length of the q-window/PSF grid.
-
-    For a crystal this is the supercell repeat count: the reciprocal
-    samples between unit-cell Bragg nodes. For a one-cell box (the
-    amorphous encoding, supercell=(1,1,1)) the samples are the integer box
-    hkl in [-H, H] — 2H+1 per axis. Without this, chebwin(1)=[1] and a
-    single-sample kband collapse the PSF to one point, silently disabling
-    the band-limit correction the feature builder assumes."""
-    size_aver = np.asarray(supercell, dtype=int)
-    if np.all(size_aver == 1):
-        return 2 * np.ceil(np.asarray(hkl_max_xyz, dtype=float)).astype(int) + 1
-    return size_aver
-
-
 def qspace_psf_in_r(
     size_aver,
     hkl_max_xyz,
