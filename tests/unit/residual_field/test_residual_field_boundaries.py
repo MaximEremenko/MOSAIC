@@ -4205,7 +4205,11 @@ def test_lattice_ram_admission_availability_gate(monkeypatch):
     from core.residual_field import tasks as tasks_mod
 
     monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
-    monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", raising=False)
+    # The cache-budget default scales with PHYSICAL host RAM (0.35x/workers),
+    # so on small CI runners it would veto the 10 GiB grid at the cache
+    # criterion before the availability gate under test is ever consulted.
+    # Disable that (separately tested) criterion to keep this test hermetic.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", "0")
     monkeypatch.delenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION", raising=False)
     # Pin single-worker so the per-process fraction math is what is tested
     # (the fraction divides by expected worker count host-wide).
@@ -4311,6 +4315,8 @@ def test_lattice_ram_admission_divides_by_worker_count(monkeypatch):
     from core.residual_field import tasks as tasks_mod
 
     monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET", str(64 << 30))
+    # Physical-RAM-derived cache default would veto 10 GiB on small CI hosts.
+    monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_CACHE_MAX_BYTES", "0")
     monkeypatch.setenv("MOSAIC_RESIDUAL_LATTICE_RAM_FRACTION", "0.5")
     monkeypatch.setattr(tasks_mod, "_mem_available_bytes", lambda: 40 << 30)
     monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "1")
