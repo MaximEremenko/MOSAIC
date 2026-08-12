@@ -37,6 +37,7 @@ from core.runtime import (
 from core.residual_field.backend import (
     finalize_process_local_residual_chunk,
     flush_process_local_residual_reducer_target,
+    get_process_local_residual_field_backend,
     inspect_process_local_residual_reducer_target,
     ResidualFieldReducerBackend,
     ResidualFieldLocalAccumulatorPartial,
@@ -1776,7 +1777,15 @@ def run_residual_field_stage(
                         manifests_by_chunk=manifests_by_chunk,
                     )
         if owner_local_reducer:
-            local_flush = getattr(task_reducer_backend, "flush_local_reducer_target", None)
+            # Tasks fold into the process-local singleton backend (worker
+            # parity), so flush/inspect must resolve the same instance: the
+            # template backend has no live accumulators and no async snapshot
+            # writer to drain, and inspecting it races the writer thread's
+            # pending commit.
+            local_backend = get_process_local_residual_field_backend(
+                task_reducer_backend
+            )
+            local_flush = getattr(local_backend, "flush_local_reducer_target", None)
             for target_key in _unique_reducer_target_keys(work_units):
                 representative = next(
                     work_unit
@@ -1798,7 +1807,7 @@ def run_residual_field_stage(
                 )
             inspected_target_states = _validate_local_durable_coverage_or_raise(
                 work_units=planned_work_units,
-                reducer_backend=task_reducer_backend,
+                reducer_backend=local_backend,
                 output_dir=artifacts.output_dir,
             )
             _log_owner_local_finalize_metrics(
