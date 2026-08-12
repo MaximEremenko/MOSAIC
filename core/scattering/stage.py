@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
+from core.contracts import ScatteringHandoff
 from core.scattering.coefficients import CoefficientCenteringService
 from core.scattering.context import build_scattering_execution_context
 from core.scattering.payloads import (
@@ -15,11 +16,13 @@ from core.qspace.intervals.interval_reconstruction import (
     IntervalReconstructionService,
 )
 from core.models import StructureData, WorkflowParameters
+from core.scattering.calculator import compute_amplitudes_delta
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 def _compute_amplitudes(**kwargs):
-    from core.scattering.calculator import compute_amplitudes_delta
-
     return compute_amplitudes_delta(**kwargs)
 
 
@@ -46,9 +49,9 @@ class ScatteringStage:
         self,
         workflow_parameters: WorkflowParameters,
         structure: StructureData,
-        artifacts,
+        artifacts: RunArtifacts,
         client,
-    ) -> dict[str, Any]:
+    ) -> ScatteringHandoff:
         context = build_scattering_execution_context(
             workflow_parameters=workflow_parameters,
             structure=structure,
@@ -59,13 +62,13 @@ class ScatteringStage:
             interval_reconstruction_service=self.interval_reconstruction_service,
         )
         if not context.unsaved_interval_chunks:
-            return {}
+            return ScatteringHandoff(is_empty=True)
         base_params = build_base_amplitude_parameters(context)
         amplitude_parameters = build_amplitude_adapter_payload(context, base_params)
         scattering_calculator_impl = self.scattering_weight_registry.create_calculator(
             context.scattering_weight_selection
         )
-        self.compute_amplitudes(
+        stage_result = self.compute_amplitudes(
             parameters=amplitude_parameters,
             FormFactorFactoryProducer=scattering_calculator_impl,
             MaskStrategy=context.mask_strategy,
@@ -75,4 +78,6 @@ class ScatteringStage:
             point_data_processor=context.artifacts.point_data_processor,
             client=client,
         )
-        return base_params
+        if isinstance(stage_result, dict):
+            base_params.update(stage_result)
+        return ScatteringHandoff.from_mapping(base_params)

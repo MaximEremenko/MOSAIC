@@ -4,7 +4,6 @@ import numpy as np
 
 from core.scattering.half_space import (
     HALF_SPACE_ROLE_FULL,
-    HALF_SPACE_ROLE_LEGACY,
     HALF_SPACE_ROLE_POSITIVE_HALF,
     HALF_SPACE_ROLE_ZERO_PLANE,
     apply_half_space_conjugate_reconstruction,
@@ -119,9 +118,16 @@ def apply_scattering_partial_result(
     delta = partial_result.amplitudes_delta
     average_delta = partial_result.amplitudes_average
     if mirror_conjugate_symmetry:
+        # The conjugate reconstruction doubles the AMPLITUDE (delta + conj(delta)) for a
+        # positive-half interval. It must NOT also double reciprocal_point_count:
+        # partial_result.reciprocal_point_count is already the multiplicity-applied
+        # (accepted x multiplicity) count from the q-normalization contract, so the
+        # half-space weight is baked in, so apply the count exactly ONCE (a ``* 2``
+        # here would double-count), matching the merge_scattering_partial_results
+        # path (plain addition of reciprocal_point_count).
         delta = delta + np.conj(delta)
         average_delta = average_delta + np.conj(average_delta)
-        reciprocal_count = current_reciprocal_point_count + (partial_result.reciprocal_point_count * 2)
+        reciprocal_count = current_reciprocal_point_count + partial_result.reciprocal_point_count
     else:
         reciprocal_count = current_reciprocal_point_count + partial_result.reciprocal_point_count
 
@@ -140,7 +146,6 @@ def apply_scattering_partial_result(
 
 __all__ = [
     "HALF_SPACE_ROLE_FULL",
-    "HALF_SPACE_ROLE_LEGACY",
     "HALF_SPACE_ROLE_POSITIVE_HALF",
     "HALF_SPACE_ROLE_ZERO_PLANE",
     "ScatteringPartialResult",

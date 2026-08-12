@@ -5,18 +5,14 @@ Created on Wed Nov 20 13:43:52 2024
 @author: Maksim Eremenko
 """
 
-import numpy as np
-import h5py
-import os
-import logging
-
+import ast
 import numpy as np
 import h5py
 import os
 import logging
 
 # Make sure to import the dimension-aware ReciprocalSpaceIntervalGenerator:
-from core.qspace.intervals import (
+from core.qspace.intervals.interval_generator import (
     ReciprocalSpaceIntervalGenerator,
 )
 from core.runtime.log_utils import short_path
@@ -138,7 +134,7 @@ class ReciprocalSpaceIntervalManager:
                 self.reciprocal_space_intervals = []
                 for idx in sorted(reciprocal_space_intervals_grp.attrs.keys(), key=int):
                     interval_str = reciprocal_space_intervals_grp.attrs[idx]
-                    interval = eval(interval_str)
+                    interval = self._parse_interval_str(interval_str)
                     self.reciprocal_space_intervals.append(interval)
             self.logger.info("reciprocal_space intervals loaded from %s", short_path(self.hdf5_file_path))
             return True
@@ -186,6 +182,65 @@ class ReciprocalSpaceIntervalManager:
             str: String representation of the interval.
         """
         return str(interval)
+
+    @staticmethod
+    def _parse_interval_str(interval_str):
+        """
+        Safely parse a stored interval string back into an interval dictionary.
+
+        The string is produced by ``_interval_to_str`` (i.e. ``str(interval)``)
+        where ``interval`` is a mapping of range name -> (start, end) floats.
+        Parsing uses ``ast.literal_eval``, which parses only Python literal
+        structures (dicts, tuples, numbers, strings) and rejects any expression
+        that would call functions, reference names, or run code -- unlike
+        ``eval``, which would execute arbitrary code embedded in an HDF5 attribute.
+
+        Args:
+            interval_str: String representation of an interval dictionary
+                (``bytes`` are also accepted, as h5py may return bytes).
+
+        Returns:
+            dict: The parsed interval mapping with numeric (start, end) tuples.
+
+        Raises:
+            ValueError: If the string is not a well-formed interval literal.
+        """
+        if isinstance(interval_str, bytes):
+            interval_str = interval_str.decode("utf-8")
+        if not isinstance(interval_str, str):
+            interval_str = str(interval_str)
+
+        try:
+            parsed = ast.literal_eval(interval_str)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError) as exc:
+            raise ValueError(
+                f"Invalid interval representation: {interval_str!r}"
+            ) from exc
+
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"Interval representation must be a dict, got {type(parsed).__name__}: "
+                f"{interval_str!r}"
+            )
+
+        interval = {}
+        for key, value in parsed.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    f"Interval keys must be strings, got {type(key).__name__}: {key!r}"
+                )
+            if not isinstance(value, (tuple, list)) or len(value) != 2:
+                raise ValueError(
+                    f"Interval range '{key}' must be a (start, end) pair, got {value!r}"
+                )
+            start, end = value
+            if isinstance(start, bool) or isinstance(end, bool) or \
+                    not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+                raise ValueError(
+                    f"Interval range '{key}' must contain numbers, got {value!r}"
+                )
+            interval[key] = (float(start), float(end))
+        return interval
 
     def _convert_intervals_to_python_floats(self, intervals):
         """

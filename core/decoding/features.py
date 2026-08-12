@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from scipy.fft import fft, fftshift
 from scipy.signal.windows import chebwin
@@ -82,6 +84,26 @@ def qspace_psf_in_r(
     window_kind="cheb",
     window_at_db=100.0,
 ):
+    """Memoized entry point: normalize inputs to hashable tuples and delegate."""
+    size_aver_tuple = tuple(int(v) for v in np.asarray(size_aver, dtype=int).ravel())
+    hkl_tuple = tuple(float(v) for v in hkl_max_xyz)
+    return _qspace_psf_in_r_cached(
+        size_aver_tuple,
+        hkl_tuple,
+        float(guard_frac),
+        str(window_kind),
+        float(window_at_db),
+    )
+
+
+@lru_cache(maxsize=8)
+def _qspace_psf_in_r_cached(
+    size_aver,
+    hkl_max_xyz,
+    guard_frac,
+    window_kind,
+    window_at_db,
+):
     size_aver = np.asarray(size_aver, dtype=int)
     dim = len(size_aver)
 
@@ -124,6 +146,8 @@ def qspace_psf_in_r(
         psf *= 0.0
         center = tuple(n // 2 for n in psf.shape)
         psf[center] = 1.0
+    # Cached value is shared across callers; guard against in-place mutation.
+    psf.setflags(write=False)
     return psf
 
 

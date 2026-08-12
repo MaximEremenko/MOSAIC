@@ -10,10 +10,12 @@ masks, applies an inverse Fourier transform to recover atom-centered real-space
 fields, and decodes those fields into site-resolved outputs associated with the
 chosen diffuse features.
 
-The scientific method is described in the accompanying manuscript:
+The scientific method is described in the accompanying paper:
 
-> **A Filter-Based Approach Linking Diffuse Scattering Features to
-> Site-Resolved Real-Space Fields**
+> Maksim Eremenko, Victor Krayzman, Matthew G. Tucker, Igor Levin,
+> **Connecting Diffuse Scattering to Atomic-Site-Resolved Occupancy and
+> Displacement Fields through Fourier Filtering**,
+> arXiv:2607.10440 (2026). <https://arxiv.org/pdf/2607.10440>
 
 ## Method Overview
 
@@ -59,6 +61,8 @@ research-scale use.
 
 ## Installation
 
+### CPU (default)
+
 Conda is the recommended path:
 
 ```bash
@@ -73,12 +77,59 @@ Minimal editable install in an existing Python environment:
 pip install -e .
 ```
 
-Practical requirements:
+Cluster scheduler support is exposed through the `hpc` extra:
+
+```bash
+pip install -e '.[hpc]'
+```
+
+### CUDA / GPU
+
+Two supported paths:
+
+**1. Conda env file (CUDA 12.4 wheel stack, recommended).**
+
+```bash
+conda env create -f core/environment_cuda.yml
+conda activate mosaic
+pip install -e .
+```
+
+This installs `cuda-toolkit=12.4.0`, `cupy-cuda12x`,
+`cufinufft==2.5.1`, and `dask-cuda>=26.4`.
+
+**2. `setup_mosaic.sh` (same CUDA 12.4 stack, scripted).**
+
+The script creates or updates the `mosaic` conda environment, installs MOSAIC
+editable, installs the same CUDA wheel stack, and adds a conda activation hook
+so cuFINUFFT can find the CUDA 12 runtime libraries inside the environment:
+
+```bash
+./setup_mosaic.sh
+conda activate mosaic
+```
+
+Pip-only CUDA install is also supported once compatible CUDA 12 runtime
+libraries and a compatible NVIDIA driver are already available on the system:
+
+```bash
+pip install -e '.[cuda12]'
+```
+
+The tested CUDA stack is CUDA 12.4 + `cupy-cuda12x` + `cufinufft==2.5.1`.
+The `cufinufft` wheel links against CUDA 12 libraries, so a CUDA-13-only
+runtime is not a supported wheel-based setup.
+
+The public pip extras are `hpc`, `test`, and `cuda12`. CUDA 11 is not exposed
+as a supported pip extra.
+
+### Practical requirements
 
 - Python 3.11+
 - Linux or WSL
 - CPU-only execution works out of the box
-- GPU acceleration and Dask-based parallel execution are optional
+- GPU acceleration and Dask-based parallel execution are optional; GPU mode
+  requires CuPy, cuFINUFFT, and `dask-cuda`
 
 ## Quick Start
 
@@ -97,6 +148,15 @@ mosaic examples/config_1D/displacement/run_parameters.json
 Expected output location:
 
 - `examples/config_1D/displacement/output_displacement/processed_point_data/`
+
+Durable run state is stored under
+`examples/config_1D/displacement/output_displacement/processed_point_data/.mosaic/runs/`.
+Files directly under `processed_point_data/` remain a compatibility projection
+for existing analysis scripts and are written by the explicit publish step:
+
+```bash
+mosaic publish --output-dir <processed_point_data> --run-digest <run_digest>
+```
 
 Bounded smoke helper:
 
@@ -178,10 +238,12 @@ If you use MOSAIC in your work, please cite:
 
 ```bibtex
 @article{mosaic_paper,
-  author  = {Eremenko, Maksim},
-  title   = {A Filter-Based Approach Linking Diffuse Scattering Features
-             to Site-Resolved Real-Space Fields},
-  year    = {2026}
+  author  = {Eremenko, Maksim and Krayzman, Victor and Tucker, Matthew G. and Levin, Igor},
+  title   = {Connecting Diffuse Scattering to Atomic-Site-Resolved Occupancy
+             and Displacement Fields through Fourier Filtering},
+  journal = {arXiv preprint arXiv:2607.10440},
+  year    = {2026},
+  url     = {https://arxiv.org/pdf/2607.10440}
 }
 ```
 

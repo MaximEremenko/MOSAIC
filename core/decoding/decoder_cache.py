@@ -3,11 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
 from core.runtime.log_utils import short_path
+from core.storage.atomic import atomic_write_json
+from core.storage.attempt_store import relative_to_output, stage_commit_path
+from core.storage.digests import digest_dict
+from core.storage.manifest import read_manifest
+from core.storage.public_manifest import read_public_manifest
+from core.residual_field.commit import (
+    RESIDUAL_FIELD_STAGE,
+    ResidualChunkCommitManifest,
+    ResidualCommitCandidateManifest,
+    ResidualStageCommitManifest,
+    validate_residual_commit_candidate,
+)
 
 
 def _to_plain(value):
@@ -22,20 +35,243 @@ def _to_plain(value):
     return value
 
 
-def build_decoder_cache_path(parameters: dict, output_dir: str) -> str:
+def build_decoder_cache_path(
+    parameters: dict,
+    output_dir: str,
+    *,
+    source_identity: dict | None = None,
+) -> str:
     intervals = parameters.get("reciprocal_space_intervals_all", [])
+    rspace_info = parameters.get("rspace_info", {}) or {}
+    points = parameters.get("points", rspace_info.get("points", []))
     key_obj = {
         "supercell": _to_plain(np.asarray(parameters["supercell"], int)),
         "intervals": _to_plain(intervals),
+        "points": _to_plain(points),
         "q_window_kind": parameters.get("q_window_kind", "cheb"),
         "q_window_at_db": float(parameters.get("q_window_at_db", 100.0)),
         "edge_guard_frac": float(parameters.get("edge_guard_frac", 0.10)),
         "ls_weight_gamma": float(parameters.get("ls_weight_gamma", 0.35)),
         "dog_lambda_reg": float(parameters.get("dog_lambda_reg", 1e-3)),
     }
+    if source_identity is not None:
+        key_obj["source_identity"] = _to_plain(source_identity)
     key_json = json.dumps(key_obj, sort_keys=True)
-    digest = hashlib.sha1(key_json.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(key_json.encode("utf-8")).hexdigest()[:16]
     return os.path.join(output_dir, f"decoder_M_{digest}.npz")
+
+
+def build_decoder_cache_identity(
+    *,
+    residual_source_identity: dict,
+    coordinate_digest: str,
+    average_coordinate_digest: str | None = None,
+    vector_digest: str,
+    refnumber_digest: str | None,
+    feature_mode: str,
+    target_parameters: dict,
+    decoder_architecture_digest: str,
+    code_version: str,
+    schema_version: int = 1,
+) -> dict:
+    payload = {
+        "schema": "mosaic.decoder.cache_identity",
+        "schema_version": int(schema_version),
+        "residual_source_identity": _to_plain(residual_source_identity),
+        "coordinate_digest": str(coordinate_digest),
+        "average_coordinate_digest": (
+            None if average_coordinate_digest is None else str(average_coordinate_digest)
+        ),
+        "vector_digest": str(vector_digest),
+        "refnumber_digest": None if refnumber_digest is None else str(refnumber_digest),
+        "feature_mode": str(feature_mode),
+        "target_parameters": _to_plain(target_parameters),
+        "decoder_architecture_digest": str(decoder_architecture_digest),
+        "code_version": str(code_version),
+    }
+    payload["decoder_cache_digest"] = digest_dict(
+        payload,
+        domain="mosaic.decoder.cache_identity.v1",
+    )
+    return payload
+
+
+def resolve_current_residual_source_identity(
+    *,
+    output_dir: str | Path,
+    run_digest: str,
+) -> dict:
+    output_root = Path(output_dir)
+    stale_prefix = "residual" "_chunk_"
+    loose_residual_files = sorted(output_root.glob(stale_prefix + "*"))
+    if loose_residual_files:
+        raise RuntimeError(
+            "Loose residual chunk files are not valid current decoder source evidence. "
+            "Use residual_field/stage_commit.json for private current runs."
+        )
+    path = stage_commit_path(output_root, run_digest, RESIDUAL_FIELD_STAGE)
+    if not path.exists():
+        raise RuntimeError(
+            "Current decoder source requires residual_field/stage_commit.json for "
+            f"run {run_digest!r}."
+        )
+    stage_commit = read_manifest(
+        path,
+        codec=ResidualStageCommitManifest,
+        output_dir=output_root,
+    )
+    payload_hashes = []
+    upstream_identities = []
+    for chunk_commit_rel in stage_commit.chunk_commit_paths:
+        chunk_commit = read_manifest(
+            output_root / chunk_commit_rel,
+            codec=ResidualChunkCommitManifest,
+            output_dir=output_root,
+        )
+        candidate = read_manifest(
+            output_root / chunk_commit.candidate_manifest_path,
+            codec=ResidualCommitCandidateManifest,
+            output_dir=output_root,
+        )
+        validate_residual_commit_candidate(candidate, output_dir=output_root)
+        payload_hashes.append(
+            {
+                "chunk_id": int(chunk_commit.chunk_id),
+                "candidate_id": chunk_commit.selected_candidate_id,
+                "payload_sha256": chunk_commit.payload_sha256,
+                "file_sha256": chunk_commit.file_sha256,
+                "payload_nbytes": int(chunk_commit.payload_nbytes),
+                "candidate_payload_path": chunk_commit.candidate_payload_path,
+            }
+        )
+        if candidate.source_identity is not None:
+            upstream_identities.append(candidate.source_identity)
+    source_identity = {
+        "schema": "mosaic.decoder.current_residual_source",
+        "schema_version": 1,
+        "run_digest": str(run_digest),
+        "stage_commit_path": relative_to_output(path, output_dir=output_root),
+        "residual_stage_digest": stage_commit.stage_digest,
+        "residual_stage_plan_digest": stage_commit.stage_plan_digest,
+        "residual_payload_hashes": payload_hashes,
+        "upstream_scattering_identity": upstream_identities,
+    }
+    source_identity["source_identity_digest"] = digest_dict(
+        source_identity,
+        domain="mosaic.decoder.current_residual_source.v1",
+    )
+    return source_identity
+
+
+def resolve_local_residual_source_identity(*, output_dir: str | Path) -> dict | None:
+    """Source identity for the local (loose-file) residual layout.
+
+    The local_restartable reducer materialises the residual as loose
+    ``residual_chunk_*`` artifacts and writes no run-scoped
+    ``residual_field/stage_commit.json``, so the manifest-based resolver cannot
+    describe it -- ``decoder.source='current'`` would always fail for local
+    runs. Build the identity from the loose artifacts instead: content hashes
+    of the small per-chunk metadata files plus (size, mtime) of the large
+    amplitude payloads, so any residual recompute changes the identity and
+    invalidates the trained decoder cache (the staleness semantics the
+    manifest path provides). Returns ``None`` when no loose residual chunks
+    exist."""
+    from core.storage.fingerprint import file_sha256
+
+    output_root = Path(output_dir)
+    amplitude_files = sorted(output_root.glob("residual_chunk_*_amplitudes.hdf5"))
+    if not amplitude_files:
+        return None
+    payload_hashes = []
+    digest_entries = []
+    for artifact in sorted(output_root.glob("residual_chunk_*")):
+        if not artifact.is_file():
+            continue
+        stat = artifact.stat()
+        entry = {
+            "name": artifact.name,
+            "nbytes": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+        # Digest material: content hash when we have one; (size, mtime) only
+        # for the large amplitude payloads where hashing is too expensive.
+        # Folding mtime into the digest of sha256-verified files would turn a
+        # timestamp-only change (cp without -p, rsync without -t, archive
+        # restore) into hours of spurious unmasked-pipeline recompute.
+        digest_entry = {"name": entry["name"], "nbytes": entry["nbytes"]}
+        if stat.st_size <= (8 << 20):
+            sha = file_sha256(artifact)
+            entry["file_sha256"] = sha
+            digest_entry["file_sha256"] = sha
+        else:
+            digest_entry["mtime_ns"] = entry["mtime_ns"]
+        payload_hashes.append(entry)
+        digest_entries.append(digest_entry)
+    digest_material = {
+        "schema": "mosaic.decoder.local_residual_source",
+        "schema_version": 2,
+        "run_digest": digest_dict(
+            {"payload_hashes": digest_entries},
+            domain="mosaic.decoder.local_residual_source.v1",
+        ),
+    }
+    source_identity = dict(digest_material)
+    source_identity["residual_payload_hashes"] = payload_hashes
+    source_identity["source_identity_digest"] = digest_dict(
+        digest_material,
+        domain="mosaic.decoder.local_residual_source.v1",
+    )
+    return source_identity
+
+
+def _require_residual_public_source_fields(source_identity: dict) -> None:
+    if not isinstance(source_identity.get("residual_stage_digest"), str):
+        raise RuntimeError("public_manifest.json is missing residual_stage_digest source identity.")
+    if not isinstance(source_identity.get("residual_payload_hashes"), list):
+        raise RuntimeError("public_manifest.json is missing residual payload hash identity.")
+    if not isinstance(source_identity.get("upstream_scattering_identity"), list):
+        raise RuntimeError("public_manifest.json is missing upstream scattering identity.")
+
+
+def resolve_public_residual_source_identity(
+    *,
+    output_dir: str | Path,
+    public_manifest_path: str | Path,
+) -> dict:
+    output_root = Path(output_dir)
+    public_manifest = read_public_manifest(
+        public_manifest_path,
+        output_dir=output_root,
+    )
+    if public_manifest.source_stage != RESIDUAL_FIELD_STAGE:
+        raise RuntimeError(
+            "processing.decoder.source='current' public manifest must describe "
+            "a residual_field source."
+        )
+    public_source_identity = dict(public_manifest.source_identity)
+    _require_residual_public_source_fields(public_source_identity)
+    manifest_path = Path(public_manifest_path)
+    if not manifest_path.is_absolute():
+        manifest_path = output_root / manifest_path
+    source_identity = {
+        "schema": "mosaic.decoder.public_residual_source",
+        "schema_version": 1,
+        "run_digest": public_manifest.run_digest,
+        "public_manifest_path": relative_to_output(manifest_path, output_dir=output_root),
+        "public_manifest_digest": public_manifest.public_manifest_digest,
+        "residual_stage_digest": public_source_identity["residual_stage_digest"],
+        "residual_stage_plan_digest": public_source_identity.get("residual_stage_plan_digest"),
+        "residual_payload_hashes": list(public_source_identity["residual_payload_hashes"]),
+        "upstream_scattering_identity": list(
+            public_source_identity["upstream_scattering_identity"]
+        ),
+        "public_source_identity": public_source_identity,
+    }
+    source_identity["source_identity_digest"] = digest_dict(
+        source_identity,
+        domain="mosaic.decoder.public_residual_source.v1",
+    )
+    return source_identity
 
 
 def build_decoder_provenance_path(output_dir: str) -> str:
@@ -70,22 +306,87 @@ def load_decoder_cache(cache_path: str, logger):
 
 
 def save_decoder_cache(cache_path: str, decoder_M, feature_dim: int, logger) -> None:
+    path = Path(cache_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
     try:
-        np.savez(
-            cache_path,
-            M=decoder_M,
-            feature_dim=np.array(feature_dim, dtype=np.int64),
-        )
-        logger.info("Decoder M saved to '%s'.", short_path(cache_path))
+        with temp_path.open("wb") as handle:
+            np.savez(
+                handle,
+                M=decoder_M,
+                feature_dim=np.array(feature_dim, dtype=np.int64),
+            )
+        os.replace(temp_path, path)
+        logger.info("Decoder M saved to '%s'.", short_path(path))
     except Exception as exc:
-        logger.warning("Failed to save decoder M to '%s': %s", short_path(cache_path), exc)
+        temp_path.unlink(missing_ok=True)
+        logger.warning("Failed to save decoder M to '%s': %s", short_path(path), exc)
+        raise
+
+
+def decoder_cache_source_identity_path(cache_path: str) -> Path:
+    return Path(str(cache_path) + ".source_identity.json")
+
+
+def save_decoder_cache_source_identity(
+    cache_path: str,
+    source_identity: dict,
+    logger,
+) -> None:
+    """Record the residual-source identity a decoder cache was trained from.
+
+    The compute-mode decoder cache filename encodes only the configuration
+    hash, so a cache can silently outlive the residual artifacts it was
+    trained on. The sidecar written here lets the reuse path verify the
+    residual content is unchanged before trusting the cache."""
+    path = decoder_cache_source_identity_path(cache_path)
+    try:
+        # The consolidated writer (temp -> fsync -> rename -> fsync parent).
+        # This used to hand-roll the same protocol MINUS both fsyncs, so the
+        # sidecar that decides whether a trained decoder may be reused could
+        # survive a crash as an empty or partial file.
+        atomic_write_json(path, source_identity, indent=2)
+    except Exception as exc:
+        logger.warning(
+            "Failed to save decoder cache source identity to '%s': %s",
+            short_path(path),
+            exc,
+        )
+
+
+def load_decoder_cache_source_identity(cache_path: str) -> dict | None:
+    path = decoder_cache_source_identity_path(cache_path)
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def save_decoder_provenance(output_dir: str, provenance: dict, logger) -> None:
     path = Path(build_decoder_provenance_path(output_dir))
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(provenance, indent=2, sort_keys=True), encoding="utf-8")
+        cache_path = provenance.get("decoder_cache_path")
+        if isinstance(cache_path, str) and cache_path and not cache_path.startswith("<"):
+            resolved_cache = Path(cache_path)
+            if not resolved_cache.is_absolute():
+                resolved_cache = Path(output_dir) / resolved_cache
+            if resolved_cache.exists():
+                decoder, feature_dim = load_decoder_cache(str(resolved_cache), logger)
+                if decoder is None or feature_dim is None:
+                    raise RuntimeError(
+                        f"Decoder provenance references an unreadable cache: {resolved_cache}"
+                    )
+        atomic_write_json(path, provenance, indent=2)
         logger.info("Decoder source provenance saved to '%s'.", short_path(path))
     except Exception as exc:
         logger.warning("Failed to save decoder provenance to '%s': %s", short_path(path), exc)
+        raise

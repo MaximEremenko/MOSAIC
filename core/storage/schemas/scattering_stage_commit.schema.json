@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.scattering.stage_commit"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "stage": {"const": "scattering"},
+    "chunk_ids": {"type": "array", "items": {"type": "integer"}},
+    "chunk_commit_paths": {"type": "array", "items": {"type": "string"}},
+    "stage_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "stage_plan_digest": {
+      "anyOf": [
+        {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        {"type": "null"}
+      ]
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "stage",
+    "chunk_ids",
+    "chunk_commit_paths",
+    "stage_digest",
+    "stage_plan_digest"
+  ],
+  "type": "object"
+}

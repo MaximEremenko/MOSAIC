@@ -44,6 +44,7 @@ def test_database_manager_uses_split_repositories(tmp_path):
             )
         ]
         assert manager.get_unsaved_interval_chunks() == [(1, 7)]
+        assert manager.get_interval_chunks() == [(1, 7)]
     finally:
         manager.close()
 

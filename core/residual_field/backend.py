@@ -2,43 +2,34 @@ from __future__ import annotations
 
 import logging
 import os
-import re
-from dataclasses import dataclass
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from core.residual_field.accumulation import (
-    build_existing_materialized_residual_field_state,
-)
 from core.residual_field.artifacts import (
     _ResidualFieldChunkStatusUpdater,
     _build_residual_field_reducer_progress_manifest,
-    _write_residual_field_chunk_state,
-    assess_residual_field_manifest,
+    _write_residual_field_chunk_payload_components,
     build_residual_field_chunk_manifest,
     build_residual_field_output_artifact_refs,
     delete_reclaimable_residual_field_shards,
-    discover_stale_residual_field_generation_manifests,
     discover_residual_field_reducer_progress_manifest,
     discover_residual_field_shard_manifests,
-    load_residual_field_generation_metadata,
-    load_residual_field_generation_payload,
-    parse_residual_field_generation_ref,
-    persist_residual_field_generation_checkpoint,
     ResidualFieldArtifactStore,
     persist_residual_field_shard_checkpoint,
     reconcile_residual_field_reducer_progress,
-    reduce_residual_field_shards_for_chunk,
-    summarize_residual_field_generation_metrics,
     write_residual_field_reducer_progress_manifest,
+    _normalize_residual_shard_cleanup_policy,
 )
 from core.residual_field.local_accumulator import (
     LiveLocalAccumulator,
     ResidualFieldLocalAccumulatorPartial,
+    SnapshotCloneUnsupported,
     build_local_accumulator_snapshot_path,
     load_local_accumulator_snapshot,
+    load_local_accumulator_snapshot_metadata,
     make_local_accumulator_snapshot_key,
     parse_local_accumulator_snapshot_key,
     write_local_accumulator_snapshot,
@@ -51,7 +42,43 @@ from core.residual_field.contracts import (
 )
 from core.contracts import CompletionStatus
 from core.runtime import chunk_mutex
-from core.runtime import is_sync_client
+
+# Re-exports from extracted sibling modules — keep all existing imports working.
+from core.residual_field.reducer_helpers import (  # noqa: F401
+    _allocate_finalize_output,
+    _finalize_scratch_dir,
+    _manifest_final_artifacts_present,
+    _mark_residual_intervals_saved,
+    _normalize_reducer_backend_kind,
+    checkpoint_cadence as _checkpoint_cadence_policy,
+    live_trim_cadence as _live_trim_cadence_policy,
+    DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES,
+    is_same_node_local_client,
+)
+from core.residual_field.snapshot_writer import (  # noqa: F401
+    _LocalSnapshotWriter,
+    _PendingLocalSnapshot,
+)
+# Re-exported for callers that import the assembly helpers from here.
+from core.residual_field.assembly import (  # noqa: F401
+    assemble_interval_partitioned_chunk_payload,
+    assemble_local_snapshot_chunk_payload,
+    validate_interval_partitioned_snapshot_family,
+    validate_local_partition_snapshot_family,
+    _require_expected_interval_coverage,
+    _require_expected_partition_family,
+)
+from core.residual_field.reducer_policy import (  # noqa: F401
+    LOCAL_RESTARTABLE_LAYOUT,
+    ResidualFieldCheckpointPolicy,
+    ResidualFieldReducerBackend,
+    ResidualFieldReducerBackendKind,
+    ResidualFieldReducerBackendLayout,
+    ResidualFieldReducerRuntimeState,
+    ResidualShardCheckpointPolicy,
+    ScatteringIntervalArtifactPolicy,
+    ScratchRolePolicy,
+)
 
 if TYPE_CHECKING:
     from core.models import WorkflowParameters
@@ -59,319 +86,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES = 256 * 1024 * 1024
-_GENERATION_KEY_RE = re.compile(r":generation-partition-(?P<partition_token>[^:]+):seq-(?P<generation_seq>\d+)$")
+
 _PROCESS_LOCAL_REDUCER_BACKENDS: dict[
     tuple[str, str | None, int],
     "ManifestDrivenResidualFieldReducerBackend",
 ] = {}
 
 
-ResidualFieldReducerBackendKind = Literal[
-    "local_restartable",
-    "durable_shared_restartable",
-]
-ScatteringIntervalArtifactPolicy = Literal[
-    "required_transport",
-    "optional_output",
-]
-ResidualShardCheckpointPolicy = Literal[
-    "required_local_restart_state",
-    "required_durable_checkpoint",
-]
-ScratchRolePolicy = Literal[
-    "committed_local_restart_state_and_temporary_staging",
-    "temporary_staging_only",
-]
-
-
-@dataclass(frozen=True)
-class ResidualFieldCheckpointPolicy:
-    interval_artifacts: ScatteringIntervalArtifactPolicy
-    shard_checkpoints: ResidualShardCheckpointPolicy
-    reducer_progress_manifest: Literal["required_durable"]
-    final_chunk_artifacts: Literal["required_durable"]
-    worker_local_scratch_role: ScratchRolePolicy
-
-
-@dataclass(frozen=True)
-class ResidualFieldReducerBackendLayout:
-    """
-    Explicit state-placement description for the current restartable reducer path.
-
-    Wave 1 keeps the manifest-driven reducer model unchanged and only makes
-    backend/storage semantics explicit. Uncommitted work may still be recomputed;
-    only committed shard/progress/final artifacts are restart state.
-    """
-
-    kind: ResidualFieldReducerBackendKind
-    reducer_ownership: str
-    reducer_backing_store: str
-    durability_policy: str
-    checkpoint_policy: ResidualFieldCheckpointPolicy
-    ram_state: tuple[str, ...]
-    local_scratch_state: tuple[str, ...]
-    durable_state: tuple[str, ...]
-    scattering_interval_transport: str
-    scattering_interval_outputs_supported: bool
-    direct_interval_handoff_supported: bool
-    persist_interval_artifacts_by_default: bool
-    committed_shard_storage: str
-    shard_compression: str
-    uncommitted_restart_rule: str
-
-
-@dataclass(frozen=True)
-class ResidualFieldReducerRuntimeState:
-    kind: ResidualFieldReducerBackendKind
-    reducer_ownership: str
-    reducer_backing_store: str
-    durability_policy: str
-    checkpoint_policy: ResidualFieldCheckpointPolicy
-    ram_state: tuple[str, ...]
-    local_scratch_root: str | None
-    local_scratch_state: tuple[str, ...]
-    durable_root: str
-    durable_state: tuple[str, ...]
-    scattering_interval_transport: str
-    scattering_interval_outputs_supported: bool
-    direct_interval_handoff_supported: bool
-    persist_interval_artifacts_by_default: bool
-    committed_shard_root: str
-    committed_shard_storage: str
-    shard_compression: str
-    durable_truth_unit: str
-    live_state_storage_role: str
-    durable_checkpoint_storage_role: str
-    final_artifact_storage_role: str
-    uncommitted_restart_rule: str
-
-
-class ResidualFieldReducerBackend(Protocol):
-    layout: ResidualFieldReducerBackendLayout
-
-    def uses_local_chunk_accumulator(self) -> bool:
-        ...
-
-    def build_local_partial(
-        self,
-        work_unit: ResidualFieldWorkUnit,
-        *,
-        grid_shape_nd: np.ndarray,
-        total_reciprocal_points: int,
-        contribution_reciprocal_points: int,
-        amplitudes_delta: np.ndarray,
-        amplitudes_average: np.ndarray,
-        point_ids: np.ndarray,
-    ) -> ResidualFieldLocalAccumulatorPartial:
-        ...
-
-    def describe_runtime_state(
-        self,
-        *,
-        output_dir: str,
-        scratch_root: str | None,
-    ) -> ResidualFieldReducerRuntimeState:
-        ...
-
-    def persist_shard_checkpoint(
-        self,
-        work_unit: ResidualFieldWorkUnit,
-        *,
-        grid_shape_nd,
-        total_reciprocal_points: int,
-        contribution_reciprocal_points: int,
-        amplitudes_delta,
-        amplitudes_average,
-        point_ids=None,
-        output_dir: str,
-        scratch_root: str | None = None,
-        quiet_logs: bool = False,
-    ) -> ResidualFieldShardManifest:
-        ...
-
-    def discover_shard_manifests(
-        self,
-        *,
-        output_dir: str,
-        chunk_id: int,
-        parameter_digest: str,
-        scratch_root: str | None = None,
-    ) -> list[ResidualFieldShardManifest]:
-        ...
-
-    def load_progress_manifest(
-        self,
-        *,
-        output_dir: str,
-        chunk_id: int,
-        parameter_digest: str,
-    ) -> ResidualFieldReducerProgressManifest | None:
-        ...
-
-    def write_progress_manifest(
-        self,
-        manifest: ResidualFieldReducerProgressManifest,
-    ) -> ResidualFieldReducerProgressManifest:
-        ...
-
-    def reconcile_progress(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        db_path: str,
-        manifests: list[ResidualFieldShardManifest] | None = None,
-        scratch_root: str | None = None,
-    ) -> ResidualFieldReducerProgressManifest | None:
-        ...
-
-    def finalize_chunk(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        db_path: str,
-        manifests: list[ResidualFieldShardManifest] | None = None,
-        cleanup_policy: str | bool | None = None,
-        scratch_root: str | None = None,
-        quiet_logs: bool = False,
-    ) -> ResidualFieldArtifactManifest | None:
-        ...
-
-    def cleanup_reclaimable_shards(
-        self,
-        *,
-        output_dir: str,
-        chunk_id: int,
-        parameter_digest: str,
-        db_path: str,
-        manifests: list[ResidualFieldShardManifest] | None = None,
-        scratch_root: str | None = None,
-    ) -> tuple[str, ...]:
-        ...
-
-    def accept_partial(
-        self,
-        partial: ResidualFieldLocalAccumulatorPartial,
-        *,
-        output_dir: str,
-        scratch_root: str,
-        db_path: str,
-        total_expected_partials: int,
-        cleanup_policy: str = "off",
-    ) -> None:
-        ...
-
-    def accept_local_contribution(
-        self,
-        work_unit: ResidualFieldWorkUnit,
-        *,
-        grid_shape_nd: np.ndarray,
-        total_reciprocal_points: int,
-        contribution_reciprocal_points: int,
-        amplitudes_delta: np.ndarray,
-        amplitudes_average: np.ndarray,
-        point_ids: np.ndarray,
-        output_dir: str,
-        scratch_root: str,
-        db_path: str,
-        total_expected_partials: int,
-        cleanup_policy: str = "off",
-    ) -> None:
-        ...
-
-    def inspect_local_reducer_target(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        partition_id: int | None = None,
-    ) -> dict[str, object] | None:
-        ...
-
-    def flush_local_reducer_target(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        partition_id: int | None,
-        output_dir: str,
-        db_path: str,
-        cleanup_policy: str = "off",
-    ) -> bool:
-        ...
-
-
-LOCAL_RESTARTABLE_LAYOUT = ResidualFieldReducerBackendLayout(
-    kind="local_restartable",
-    reducer_ownership="single-writer chunk-owned reducer",
-    reducer_backing_store="reducer-owned local accumulator with periodic durable snapshots",
-    durability_policy=(
-        "restart from committed local accumulator snapshots, reducer progress, and final artifacts; "
-        "uncommitted local task work may be recomputed"
-    ),
-    checkpoint_policy=ResidualFieldCheckpointPolicy(
-        interval_artifacts="optional_output",
-        shard_checkpoints="required_local_restart_state",
-        reducer_progress_manifest="required_durable",
-        final_chunk_artifacts="required_durable",
-        worker_local_scratch_role="committed_local_restart_state_and_temporary_staging",
-    ),
-    ram_state=(
-        "task-local inverse outputs before shard commit",
-        "reducer-local merged chunk state while reconciling committed shards",
-    ),
-    local_scratch_state=(
-        "live local accumulator files when file-backed",
-        "temporary local transport and staging state before the next snapshot",
-    ),
-    durable_state=(
-        "durable local accumulator snapshots",
-        "reducer progress manifest",
-        "final residual-field chunk artifact family",
-    ),
-    scattering_interval_transport="direct in-process interval payload handoff preferred; saved interval outputs optional",
-    scattering_interval_outputs_supported=True,
-    direct_interval_handoff_supported=True,
-    persist_interval_artifacts_by_default=False,
-    committed_shard_storage="local scratch",
-    shard_compression="np.savez",
-    uncommitted_restart_rule=(
-        "if a task crashes before local shard commit or before reducer commit, recompute the "
-        "forward/inverse work for that interval batch; artifact existence alone never implies completion"
-    ),
-)
-
-SHARED_DURABLE_LAYOUT = ResidualFieldReducerBackendLayout(
-    kind="durable_shared_restartable",
-    reducer_ownership="single-writer chunk-owned reducer",
-    reducer_backing_store="owner-local accumulator with immutable shared-storage generations",
-    durability_policy=(
-        "restart from committed accumulator generations, reducer progress, and final artifacts "
-        "visible to workers/jobs; uncommitted task-local work may be recomputed"
-    ),
-    checkpoint_policy=ResidualFieldCheckpointPolicy(
-        interval_artifacts="required_transport",
-        shard_checkpoints="required_durable_checkpoint",
-        reducer_progress_manifest="required_durable",
-        final_chunk_artifacts="required_durable",
-        worker_local_scratch_role="temporary_staging_only",
-    ),
-    ram_state=LOCAL_RESTARTABLE_LAYOUT.ram_state,
-    local_scratch_state=LOCAL_RESTARTABLE_LAYOUT.local_scratch_state,
-    durable_state=LOCAL_RESTARTABLE_LAYOUT.durable_state,
-    scattering_interval_transport="durable interval artifacts required execution transport",
-    scattering_interval_outputs_supported=True,
-    direct_interval_handoff_supported=False,
-    persist_interval_artifacts_by_default=True,
-    committed_shard_storage="durable shared storage",
-    shard_compression="np.savez_compressed",
-    uncommitted_restart_rule=LOCAL_RESTARTABLE_LAYOUT.uncommitted_restart_rule,
-)
 
 
 class ManifestDrivenResidualFieldReducerBackend:
@@ -400,15 +121,152 @@ class ManifestDrivenResidualFieldReducerBackend:
         self._local_accumulators: dict[
             tuple[int, str, int | None], LiveLocalAccumulator
         ] = {}
+        self._local_accumulator_locks: dict[
+            tuple[int, str, int | None], threading.RLock
+        ] = {}
+        self._local_accumulator_locks_guard = threading.Lock()
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        # Live accumulators, locks and the snapshot writer are process-local
+        # runtime state. Dask serializes this backend into task graphs, so
+        # only configuration can cross the scheduler boundary.
+        state["_local_accumulators"] = {}
+        state["_local_accumulator_locks"] = {}
+        state.pop("_local_accumulator_locks_guard", None)
+        state.pop("_snapshot_writer_obj", None)
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._local_accumulators = {}
+        self._local_accumulator_locks = {}
+        self._local_accumulator_locks_guard = threading.Lock()
+        self._snapshot_writer_obj = None
+
+    def _snapshot_writer(self) -> _LocalSnapshotWriter:
+        writer = getattr(self, "_snapshot_writer_obj", None)
+        if writer is None:
+            with self._local_accumulator_locks_guard:
+                writer = getattr(self, "_snapshot_writer_obj", None)
+                if writer is None:
+                    writer = _LocalSnapshotWriter()
+                    self._snapshot_writer_obj = writer
+        return writer
+
+    def _async_snapshot_writes_enabled(self) -> bool:
+        """Async durable snapshot writes (default on for local_restartable).
+
+        MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES=0 restores the fully
+        synchronous write-under-fold-lock behavior for A/B verification."""
+        if self.layout.kind != "local_restartable":
+            return False
+        return os.getenv("MOSAIC_RESIDUAL_ASYNC_SNAPSHOT_WRITES", "1").strip() != "0"
+
+    def _repair_progress_final_artifacts(
+        self,
+        *,
+        chunk_id: int,
+        parameter_digest: str,
+        output_dir: str,
+        db_path: str,
+        cleanup_policy: str | bool | None,
+        scratch_root: str | None = None,
+        mark_intervals_saved: bool = True,
+    ) -> ResidualFieldArtifactManifest | None:
+        progress = self.load_progress_manifest(
+            output_dir=output_dir,
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+        )
+        if progress is None:
+            return None
+        if progress.pending_shard_keys or progress.pending_interval_ids:
+            return None
+        incorporated_interval_ids = tuple(
+            sorted(int(value) for value in progress.incorporated_interval_ids)
+        )
+        if not incorporated_interval_ids:
+            return None
+
+        representative_interval_id = max(incorporated_interval_ids)
+        manifest = build_residual_field_chunk_manifest(
+            ResidualFieldWorkUnit.interval_chunk(
+                interval_id=representative_interval_id,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+                output_dir=output_dir,
+            ),
+            output_dir=output_dir,
+            completion_status=CompletionStatus.COMMITTED,
+        )
+        if not _manifest_final_artifacts_present(manifest):
+            return None
+        applied_interval_ids = ResidualFieldArtifactStore(output_dir).load_applied_interval_ids(
+            chunk_id
+        )
+        if not set(incorporated_interval_ids).issubset(applied_interval_ids):
+            return None
+
+        resolved_cleanup_policy = _normalize_residual_shard_cleanup_policy(
+            cleanup_policy
+            if cleanup_policy is not None
+            else progress.cleanup_policy
+        )
+        reclaimable_shard_keys = (
+            progress.reclaimable_shard_keys
+            if progress.reclaimable_shard_keys
+            else progress.incorporated_shard_keys
+        )
+        needs_progress_rewrite = (
+            progress.completion_status is not CompletionStatus.COMMITTED
+            or progress.cleanup_policy != resolved_cleanup_policy
+            or (
+                resolved_cleanup_policy == "delete_reclaimable"
+                and bool(progress.incorporated_shard_keys)
+                and not progress.reclaimable_shard_keys
+            )
+        )
+        if needs_progress_rewrite:
+            committed_progress = _build_residual_field_reducer_progress_manifest(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+                completion_status=CompletionStatus.COMMITTED,
+                durable_truth_unit=progress.durable_truth_unit,
+                incorporated_shard_keys=progress.incorporated_shard_keys,
+                incorporated_interval_ids=incorporated_interval_ids,
+                reclaimable_shard_keys=reclaimable_shard_keys,
+                final_artifacts=manifest.artifacts,
+                pending_shard_keys=(),
+                pending_interval_ids=(),
+                cleanup_policy=resolved_cleanup_policy,
+            )
+            self.write_progress_manifest(committed_progress)
+
+        if mark_intervals_saved:
+            _mark_residual_intervals_saved(
+                db_path=db_path,
+                chunk_id=chunk_id,
+                interval_ids=incorporated_interval_ids,
+            )
+        if resolved_cleanup_policy == "delete_reclaimable":
+            self.cleanup_reclaimable_shards(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+                db_path=db_path,
+                scratch_root=scratch_root,
+            )
+        return manifest
 
     def uses_local_chunk_accumulator(self) -> bool:
         return self.layout.kind == "local_restartable"
 
-    def uses_shared_durable_generations(self) -> bool:
-        return self.layout.kind == "durable_shared_restartable"
-
     def uses_owner_local_accumulator(self) -> bool:
-        return self.uses_local_chunk_accumulator() or self.uses_shared_durable_generations()
+        # local_restartable is the only layout since durable_shared_restartable
+        # was retired; every backend keeps an owner-local accumulator.
+        return self.uses_local_chunk_accumulator()
 
     def build_local_partial(
         self,
@@ -460,16 +318,8 @@ class ManifestDrivenResidualFieldReducerBackend:
             committed_shard_storage=self.layout.committed_shard_storage,
             shard_compression=self.layout.shard_compression,
             durable_truth_unit="committed_local_snapshot_generation",
-            live_state_storage_role=(
-                "owner-local-live-accumulator"
-                if self.uses_local_chunk_accumulator()
-                else "owner-local-live-accumulator-with-shared-durable-generations"
-            ),
-            durable_checkpoint_storage_role=(
-                "durable-local-snapshot-generation"
-                if self.uses_local_chunk_accumulator()
-                else "durable-shared-generation"
-            ),
+            live_state_storage_role="owner-local-live-accumulator",
+            durable_checkpoint_storage_role="durable-local-snapshot-generation",
             final_artifact_storage_role="durable-final-chunk-artifact",
             uncommitted_restart_rule=self.layout.uncommitted_restart_rule,
         )
@@ -482,8 +332,6 @@ class ManifestDrivenResidualFieldReducerBackend:
     ) -> str:
         if self.shard_storage_root_override is not None:
             return self.shard_storage_root_override
-        if self.layout.kind == "durable_shared_restartable":
-            return str(output_dir)
         root = scratch_root or str(Path(output_dir) / ".local_restartable")
         return str(Path(root).expanduser())
 
@@ -496,12 +344,6 @@ class ManifestDrivenResidualFieldReducerBackend:
     def interval_artifacts_required_for_transport(self) -> bool:
         return self.layout.checkpoint_policy.interval_artifacts == "required_transport"
 
-    def shard_checkpoints_require_durable_storage(self) -> bool:
-        return (
-            self.layout.checkpoint_policy.shard_checkpoints
-            == "required_durable_checkpoint"
-        )
-
     def _local_accumulator_key(
         self,
         *,
@@ -513,6 +355,30 @@ class ManifestDrivenResidualFieldReducerBackend:
             int(partition_id) if partition_id is not None else None
         )
 
+    def _release_local_accumulator(
+        self,
+        key: tuple[int, str, int | None],
+    ) -> bool:
+        accumulator = self._local_accumulators.pop(key, None)
+        if accumulator is None:
+            return False
+        try:
+            accumulator.cleanup_live_files()
+        except Exception:
+            pass
+        return True
+
+    def _local_accumulator_lock(
+        self,
+        key: tuple[int, str, int | None],
+    ) -> threading.RLock:
+        with self._local_accumulator_locks_guard:
+            lock = self._local_accumulator_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._local_accumulator_locks[key] = lock
+            return lock
+
     def _load_latest_local_snapshot(
         self,
         *,
@@ -520,37 +386,8 @@ class ManifestDrivenResidualFieldReducerBackend:
         parameter_digest: str,
         output_dir: str,
         partition_id: int | None,
+        include_payload: bool = True,
     ) -> tuple[int, dict[str, object]] | None:
-        if self.uses_shared_durable_generations():
-            generation_manifests = [
-                manifest
-                for manifest in self.discover_shard_manifests(
-                    output_dir=output_dir,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                )
-                if parse_residual_field_generation_ref(manifest) is not None
-            ]
-            if partition_id is not None:
-                generation_manifests = [
-                    manifest
-                    for manifest in generation_manifests
-                    if parse_residual_field_generation_ref(manifest)[0] == int(partition_id)
-                ]
-            elif generation_manifests:
-                generation_manifests = [
-                    manifest
-                    for manifest in generation_manifests
-                    if parse_residual_field_generation_ref(manifest)[0] is None
-                ]
-            if not generation_manifests:
-                return None
-            manifest = max(
-                generation_manifests,
-                key=lambda item: parse_residual_field_generation_ref(item)[1],
-            )
-            payload = load_residual_field_generation_payload(manifest)
-            return int(payload["generation_seq"]), payload
         progress = self.load_progress_manifest(
             output_dir=output_dir,
             chunk_id=chunk_id,
@@ -577,7 +414,12 @@ class ManifestDrivenResidualFieldReducerBackend:
                     snapshot_seq = max(snapshot_seq, int(parsed_seq))
         if snapshot_seq <= 0:
             return None
-        snapshot = load_local_accumulator_snapshot(
+        snapshot_loader = (
+            load_local_accumulator_snapshot
+            if include_payload
+            else load_local_accumulator_snapshot_metadata
+        )
+        snapshot = snapshot_loader(
             output_dir,
             chunk_id=chunk_id,
             parameter_digest=parameter_digest,
@@ -635,6 +477,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             parameter_digest=parameter_digest,
             output_dir=output_dir,
             partition_id=partition_id,
+            include_payload=True,
         )
         if snapshot_state is None:
             return None
@@ -719,6 +562,7 @@ class ManifestDrivenResidualFieldReducerBackend:
                     current_start, current_stop,
                     len(accumulator.current_interval_ids),
                 )
+                accumulator.cleanup_live_files()
                 accumulator = None
         if accumulator is None:
             accumulator = LiveLocalAccumulator.from_arrays(
@@ -745,6 +589,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             parameter_digest=work_unit.parameter_digest,
             output_dir=output_dir,
             partition_id=work_unit.partition_id,
+            include_payload=False,
         )
         if snapshot_state is None:
             return False
@@ -774,73 +619,164 @@ class ManifestDrivenResidualFieldReducerBackend:
             return False
         return set(expected_interval_ids).issubset(durable_intervals)
 
-    def _checkpoint_cadence(self, total_expected_partials: int) -> int:
-        if self.uses_shared_durable_generations():
-            override = os.getenv("MOSAIC_DISTRIBUTED_CHECKPOINT_CADENCE")
-            if override is not None and str(override).strip():
-                return max(int(override), 1)
-        return max(int(total_expected_partials) // 4, 1)
-
-    def _parse_generation_shard_key(
-        self,
-        shard_key: str,
-    ) -> tuple[int | None, int] | None:
-        match = _GENERATION_KEY_RE.search(str(shard_key))
-        if match is None:
-            return None
-        partition_token = match.group("partition_token")
-        partition_id = None if partition_token == "owner" else int(partition_token)
-        return partition_id, int(match.group("generation_seq"))
-
-    def _generation_metrics_for_target(
+    def invalidate_incompatible_local_checkpoints(
         self,
         *,
         chunk_id: int,
         parameter_digest: str,
         output_dir: str,
-        partition_id: int | None,
-        scratch_root: str | None = None,
-    ) -> dict[str, object]:
-        manifests = [
-            manifest
-            for manifest in discover_residual_field_shard_manifests(
+        expected_targets: dict[int | None, dict[str, object]],
+    ) -> int:
+        """Drop local checkpoint snapshots that do not fit the current plan.
+
+        After a crash + resume across a code or configuration change, the
+        partition layout or the interval grouping of a chunk can differ from
+        what wrote the on-disk snapshots. Snapshots for partition ids absent
+        from the current plan, whose atom ranges moved, or whose durable
+        interval set is not a union of the current plan's interval batches
+        (the durable-skip filter and the accumulator both reason in whole
+        batches) would otherwise corrupt the resume: stale layouts get
+        concatenated at finalize, and regrouped batches either double-count
+        or strand durable intervals no work unit re-covers. Called once per
+        (chunk, digest) at plan time with ``expected_targets`` mapping each
+        planned partition id to ``{"point_start", "point_stop",
+        "interval_batches"}``. Returns the number of snapshots invalidated.
+        """
+        if not self.uses_local_chunk_accumulator():
+            return 0
+        with chunk_mutex(chunk_id, lock_root=output_dir):
+            progress = self.load_progress_manifest(
                 output_dir=output_dir,
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
-                shard_storage_root=self.resolve_shard_storage_root(
-                    output_dir=output_dir,
-                    scratch_root=scratch_root,
+            )
+            if progress is None or progress.completion_status is CompletionStatus.COMMITTED:
+                return 0
+            retained_keys: list[str] = []
+            retained_interval_ids: set[int] = set()
+            dropped: list[tuple[int | None, int]] = []
+            for key in progress.incorporated_shard_keys:
+                parsed = parse_local_accumulator_snapshot_key(key)
+                if parsed is None:
+                    retained_keys.append(key)
+                    continue
+                parsed_chunk_id, parsed_digest, partition_id, snapshot_seq = parsed
+                if parsed_chunk_id != int(chunk_id) or parsed_digest != str(parameter_digest):
+                    retained_keys.append(key)
+                    continue
+                stale = partition_id not in expected_targets
+                metadata = None
+                if not stale:
+                    metadata = load_local_accumulator_snapshot_metadata(
+                        output_dir,
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        partition_id=partition_id,
+                        snapshot_seq=snapshot_seq,
+                    )
+                    if metadata is None:
+                        stale = True
+                    else:
+                        expected = expected_targets[partition_id]
+                        snap_start = metadata.get("point_start")
+                        snap_stop = metadata.get("point_stop")
+                        expected_start = expected.get("point_start")
+                        expected_stop = expected.get("point_stop")
+                        expected_axis = expected.get("partition_axis")
+                        if (
+                            expected_axis is not None
+                            and str(metadata.get("accumulator_axis", "points"))
+                            != str(expected_axis)
+                        ):
+                            # A points-axis snapshot in an intervals-axis plan
+                            # (or vice versa) describes a different chunk
+                            # decomposition; reconciling it would either
+                            # double-count or truncate at merge.
+                            stale = True
+                        elif (snap_start is not None or snap_stop is not None) and (
+                            snap_start != expected_start or snap_stop != expected_stop
+                        ):
+                            stale = True
+                        elif expected.get("interval_batches") is not None:
+                            durable = set(
+                                int(v) for v in metadata["incorporated_interval_ids"]
+                            )
+                            covered: set[int] = set()
+                            for batch in expected["interval_batches"]:
+                                if set(batch) <= durable:
+                                    covered.update(int(v) for v in batch)
+                            if covered != durable:
+                                stale = True
+                if stale:
+                    dropped.append((partition_id, int(snapshot_seq)))
+                    continue
+                retained_keys.append(key)
+                retained_interval_ids.update(
+                    int(v) for v in metadata["incorporated_interval_ids"]
+                )
+            if not dropped:
+                return 0
+            for partition_id, snapshot_seq in dropped:
+                build_local_accumulator_snapshot_path(
+                    output_dir,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                    partition_id=partition_id,
+                    snapshot_seq=snapshot_seq,
+                ).unlink(missing_ok=True)
+                self._release_local_accumulator(
+                    self._local_accumulator_key(
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        partition_id=partition_id,
+                    )
+                )
+            progress_manifest = _build_residual_field_reducer_progress_manifest(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+                completion_status=CompletionStatus.MATERIALIZED,
+                durable_truth_unit=progress.durable_truth_unit,
+                incorporated_shard_keys=tuple(sorted(retained_keys)),
+                incorporated_interval_ids=tuple(sorted(retained_interval_ids)),
+                reclaimable_shard_keys=(),
+                final_artifacts=build_residual_field_output_artifact_refs(
+                    output_dir,
+                    chunk_id,
                 ),
-                include_stale_generations=True,
+                pending_shard_keys=(),
+                pending_interval_ids=(),
+                cleanup_policy=progress.cleanup_policy,
             )
-            if (
-                parse_residual_field_generation_ref(manifest) is not None
-                and parse_residual_field_generation_ref(manifest)[0]
-                == (int(partition_id) if partition_id is not None else None)
-            )
-        ]
-        summary = summarize_residual_field_generation_metrics(manifests)
-        latest_manifest = None
-        if manifests:
-            latest_manifest = max(
-                manifests,
-                key=lambda item: parse_residual_field_generation_ref(item)[1],
-            )
-        latest_metadata = (
-            load_residual_field_generation_metadata(latest_manifest)
-            if latest_manifest is not None
-            else {}
+            self.write_progress_manifest(progress_manifest)
+        logger.warning(
+            "Residual-field checkpoint invalidation | chunk=%d | dropped %d snapshot(s) "
+            "from a previous partition layout (partitions %s); the affected "
+            "partitions will be recomputed by the current plan.",
+            int(chunk_id),
+            len(dropped),
+            sorted(
+                "owner" if partition_id is None else str(partition_id)
+                for partition_id, _seq in dropped
+            ),
         )
-        return {
-            **summary,
-            "latest_generation_seq": int(latest_metadata.get("generation_seq") or 0),
-            "latest_checkpoint_bytes_written": int(
-                latest_metadata.get("checkpoint_bytes_written", 0)
-            ),
-            "latest_checkpoint_wall_seconds": float(
-                latest_metadata.get("checkpoint_wall_seconds", 0.0)
-            ),
-        }
+        return len(dropped)
+
+    def _checkpoint_cadence(
+        self,
+        total_expected_partials: int,
+        *,
+        partition_axis: str | None = None,
+    ) -> int:
+        # Cadence is pure POLICY (see reducer_helpers); the method stays as a thin
+        # delegator so call sites are unchanged.
+        return _checkpoint_cadence_policy(
+            total_expected_partials,
+            partition_axis=partition_axis,
+        )
+
+    def _live_trim_cadence(self, checkpoint_cadence: int) -> int:
+        return _live_trim_cadence_policy(checkpoint_cadence)
 
     def _snapshot_local_accumulator(
         self,
@@ -850,86 +786,109 @@ class ManifestDrivenResidualFieldReducerBackend:
         db_path: str,
         cleanup_policy: str,
     ) -> None:
+        """Synchronous capture + commit (caller holds the per-target lock)."""
+        pending = self._capture_local_snapshot(
+            accumulator,
+            output_dir=output_dir,
+            db_path=db_path,
+            cleanup_policy=cleanup_policy,
+            capture_mode="view",
+        )
+        self._commit_local_snapshot(pending)
+
+    def _capture_local_snapshot(
+        self,
+        accumulator: LiveLocalAccumulator,
+        *,
+        output_dir: str,
+        db_path: str,
+        cleanup_policy: str,
+        capture_mode: str,
+    ) -> _PendingLocalSnapshot:
+        """Runs UNDER the per-target lock. capture_mode='copy' materializes
+        private array copies (RAM targets) and 'clone' reflink-clones the
+        memmap backing files (file targets) so the commit may run on the
+        writer thread while folds continue; 'view' keeps live views for the
+        synchronous path (no extra memory). 'clone' raises
+        SnapshotCloneUnsupported on filesystems without reflink."""
         snapshot_seq = accumulator.next_snapshot_seq()
-        snapshot_payload = accumulator.snapshot_payload()
-        if self.uses_shared_durable_generations():
-            generation_manifest = persist_residual_field_generation_checkpoint(
-                chunk_id=accumulator.chunk_id,
-                parameter_digest=accumulator.parameter_digest,
-                partition_id=accumulator.partition_id,
-                generation_seq=snapshot_seq,
-                incorporated_interval_ids=tuple(
-                    int(v) for v in snapshot_payload["incorporated_interval_ids"]
-                ),
-                grid_shape_nd=np.asarray(snapshot_payload["grid_shape_nd"], dtype=np.int64),
-                reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-                total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
-                amplitudes_delta=np.asarray(snapshot_payload["amplitudes_delta"], dtype=np.complex128),
-                amplitudes_average=np.asarray(snapshot_payload["amplitudes_average"], dtype=np.complex128),
-                point_ids=np.asarray(snapshot_payload["point_ids"], dtype=np.int64),
-                output_dir=output_dir,
-                scratch_root=None,
-                shard_storage_root=self.resolve_shard_storage_root(
-                    output_dir=output_dir,
-                    scratch_root=None,
-                ),
-                compress=True,
-            )
-            generation_metrics = load_residual_field_generation_metadata(
-                generation_manifest
-            )
-            checkpoint_cadence_batches = max(
-                1,
-                int(accumulator.checkpoint_cadence_batches or 1),
-            )
-            accumulator.record_checkpoint_metrics(
-                bytes_written=int(
-                    generation_metrics.get("checkpoint_bytes_written", 0)
-                ),
-                wall_seconds=float(
-                    generation_metrics.get("checkpoint_wall_seconds", 0.0)
-                ),
-                checkpoint_cadence_batches=checkpoint_cadence_batches,
-            )
-            logger.info(
-                "Residual-field durable checkpoint | chunk=%d | partition=%s | seq=%d | cadence_batches=%d | max_recompute_batches=%d | bytes=%d | wall=%.3fs",
-                int(accumulator.chunk_id),
-                "owner"
-                if accumulator.partition_id is None
-                else int(accumulator.partition_id),
-                int(snapshot_seq),
-                checkpoint_cadence_batches,
-                checkpoint_cadence_batches,
-                int(generation_metrics.get("checkpoint_bytes_written", 0)),
-                float(generation_metrics.get("checkpoint_wall_seconds", 0.0)),
-            )
-            new_snapshot_key = generation_manifest.artifact_key
+        if capture_mode == "copy":
+            payload = accumulator.capture_snapshot_payload()
+        elif capture_mode == "clone":
+            payload = accumulator.capture_snapshot_payload_file_clone()
         else:
-            local_snapshot_path = write_local_accumulator_snapshot(
-                output_dir,
+            payload = accumulator.snapshot_payload()
+        accumulator.mark_snapshot_captured()
+        return _PendingLocalSnapshot(
+            key=self._local_accumulator_key(
                 chunk_id=accumulator.chunk_id,
                 parameter_digest=accumulator.parameter_digest,
                 partition_id=accumulator.partition_id,
-                snapshot_seq=snapshot_seq,
-                point_ids=snapshot_payload["point_ids"],
-                grid_shape_nd=snapshot_payload["grid_shape_nd"],
-                amplitudes_delta=snapshot_payload["amplitudes_delta"],
-                amplitudes_average=snapshot_payload["amplitudes_average"],
-                reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-                total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
-                incorporated_interval_ids=snapshot_payload["incorporated_interval_ids"],
-                storage_mode=str(snapshot_payload["storage_mode"]),
-                checkpoint_write_count=int(accumulator.checkpoint_write_count) + 1,
-                checkpoint_bytes_written_total=int(
-                    accumulator.checkpoint_bytes_written_total
-                ),
-                checkpoint_wall_seconds_total=float(
-                    accumulator.checkpoint_wall_seconds_total
-                ),
-                checkpoint_cadence_batches=int(accumulator.checkpoint_cadence_batches),
-                point_start=accumulator.point_start,
-                point_stop=accumulator.point_stop,
-            )
+            ),
+            accumulator=accumulator,
+            snapshot_seq=int(snapshot_seq),
+            payload=payload,
+            captured_interval_ids=tuple(
+                int(v) for v in payload["incorporated_interval_ids"]
+            ),
+            output_dir=str(output_dir),
+            db_path=str(db_path),
+            cleanup_policy=str(cleanup_policy),
+        )
+
+    def _commit_and_release_clones(self, pending: _PendingLocalSnapshot) -> None:
+        """Writer-thread commit for clone/copy captures: after the durable
+        commit (or its failure), unlink the reflink clone files a file-mode
+        capture left in the live dir."""
+        try:
+            self._commit_local_snapshot(pending)
+        finally:
+            for clone_path in pending.payload.get("_clone_paths", ()):
+                try:
+                    Path(clone_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _commit_local_snapshot(self, pending: _PendingLocalSnapshot) -> None:
+        """The durable commit sequence, byte-identical to the historical
+        inline path: write -> atomic rename -> chunk-mutex manifest union ->
+        mark committed -> SQLite -> unlink previous seq. Runs either inline
+        (sync path, caller holds the per-target lock; re-acquisition is
+        reentrant) or on the writer thread (acquires the per-target lock
+        only for the brief accumulator-mutating sections)."""
+        accumulator = pending.accumulator
+        snapshot_seq = pending.snapshot_seq
+        snapshot_payload = pending.payload
+        output_dir = pending.output_dir
+        db_path = pending.db_path
+        cleanup_policy = pending.cleanup_policy
+        local_snapshot_path = write_local_accumulator_snapshot(
+            output_dir,
+            chunk_id=accumulator.chunk_id,
+            parameter_digest=accumulator.parameter_digest,
+            partition_id=accumulator.partition_id,
+            snapshot_seq=snapshot_seq,
+            point_ids=snapshot_payload["point_ids"],
+            grid_shape_nd=snapshot_payload["grid_shape_nd"],
+            amplitudes_delta=snapshot_payload["amplitudes_delta"],
+            amplitudes_average=snapshot_payload["amplitudes_average"],
+            reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
+            total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
+            incorporated_interval_ids=snapshot_payload["incorporated_interval_ids"],
+            storage_mode=str(snapshot_payload["storage_mode"]),
+            checkpoint_write_count=int(accumulator.checkpoint_write_count) + 1,
+            checkpoint_bytes_written_total=int(
+                accumulator.checkpoint_bytes_written_total
+            ),
+            checkpoint_wall_seconds_total=float(
+                accumulator.checkpoint_wall_seconds_total
+            ),
+            checkpoint_cadence_batches=int(accumulator.checkpoint_cadence_batches),
+            point_start=accumulator.point_start,
+            point_stop=accumulator.point_stop,
+            accumulator_axis=getattr(accumulator, "accumulator_axis", "points"),
+        )
+        with self._local_accumulator_lock(pending.key):
             accumulator.record_checkpoint_metrics(
                 bytes_written=int(local_snapshot_path.stat().st_size),
                 wall_seconds=0.0,
@@ -938,57 +897,65 @@ class ManifestDrivenResidualFieldReducerBackend:
                     int(accumulator.checkpoint_cadence_batches or 1),
                 ),
             )
-            new_snapshot_key = make_local_accumulator_snapshot_key(
-                chunk_id=accumulator.chunk_id,
-                parameter_digest=accumulator.parameter_digest,
-                partition_id=accumulator.partition_id,
-                snapshot_seq=snapshot_seq,
-            )
-        with chunk_mutex(accumulator.chunk_id):
+        new_snapshot_key = make_local_accumulator_snapshot_key(
+            chunk_id=accumulator.chunk_id,
+            parameter_digest=accumulator.parameter_digest,
+            partition_id=accumulator.partition_id,
+            snapshot_seq=snapshot_seq,
+        )
+        with chunk_mutex(accumulator.chunk_id, lock_root=output_dir):
             existing_progress = self.load_progress_manifest(
                 output_dir=output_dir,
                 chunk_id=accumulator.chunk_id,
                 parameter_digest=accumulator.parameter_digest,
             )
             retained_snapshot_keys: list[str] = []
+            replaced_snapshot_seqs: list[int] = []
             prior_interval_ids: tuple[int, ...] = ()
             if existing_progress is not None:
                 prior_interval_ids = existing_progress.incorporated_interval_ids
                 for key in existing_progress.incorporated_shard_keys:
-                    if self.uses_shared_durable_generations():
-                        generation_ref = self._parse_generation_shard_key(key)
-                        if (
-                            generation_ref is not None
-                            and generation_ref[0]
-                            == (
-                                int(accumulator.partition_id)
-                                if accumulator.partition_id is not None
-                                else None
+                    parsed = parse_local_accumulator_snapshot_key(key)
+                    if parsed is None:
+                        retained_snapshot_keys.append(key)
+                        continue
+                    (
+                        parsed_chunk_id,
+                        parsed_digest,
+                        parsed_partition_id,
+                        parsed_seq,
+                    ) = parsed
+                    if (
+                        parsed_chunk_id == int(accumulator.chunk_id)
+                        and parsed_digest == str(accumulator.parameter_digest)
+                        and parsed_partition_id
+                        == (
+                            int(accumulator.partition_id)
+                            if accumulator.partition_id is not None
+                            else None
+                        )
+                    ):
+                        # Fencing: a partition's manifest seq only ever
+                        # ADVANCES. A replacement owner sequences from
+                        # epoch * STRIDE, so a scheduler-declared-dead-
+                        # but-alive predecessor that tries to commit
+                        # after the remap lands here — loudly — instead
+                        # of racing the live owner's rename and dropping
+                        # its snapshot key from the family (which
+                        # finalize would only discover at the very end
+                        # of the run).
+                        if int(parsed_seq) >= int(snapshot_seq):
+                            raise RuntimeError(
+                                "Residual-field snapshot commit superseded: "
+                                f"chunk={int(accumulator.chunk_id)} "
+                                f"partition={accumulator.partition_id} already "
+                                f"has durable seq {int(parsed_seq)} >= "
+                                f"{int(snapshot_seq)} — a replacement owner "
+                                "has advanced this target; this process's "
+                                "ownership is stale."
                             )
-                        ):
-                            continue
-                    else:
-                        parsed = parse_local_accumulator_snapshot_key(key)
-                        if parsed is None:
-                            retained_snapshot_keys.append(key)
-                            continue
-                        (
-                            parsed_chunk_id,
-                            parsed_digest,
-                            parsed_partition_id,
-                            _,
-                        ) = parsed
-                        if (
-                            parsed_chunk_id == int(accumulator.chunk_id)
-                            and parsed_digest == str(accumulator.parameter_digest)
-                            and parsed_partition_id
-                            == (
-                                int(accumulator.partition_id)
-                                if accumulator.partition_id is not None
-                                else None
-                            )
-                        ):
-                            continue
+                        replaced_snapshot_seqs.append(int(parsed_seq))
+                        continue
                     retained_snapshot_keys.append(key)
             progress_manifest = _build_residual_field_reducer_progress_manifest(
                 output_dir=output_dir,
@@ -1016,52 +983,29 @@ class ManifestDrivenResidualFieldReducerBackend:
                 cleanup_policy=cleanup_policy,
             )
             self.write_progress_manifest(progress_manifest)
-        newly_durable = accumulator.mark_snapshot_committed(snapshot_seq)
+        with self._local_accumulator_lock(pending.key):
+            newly_durable = accumulator.mark_snapshot_committed(
+                snapshot_seq, pending.captured_interval_ids
+            )
         if accumulator.partition_id is None:
             status_updater = _ResidualFieldChunkStatusUpdater(db_path)
-            for interval_id in newly_durable:
-                status_updater.mark_saved(int(interval_id), int(accumulator.chunk_id))
-        previous_snapshot_seq = snapshot_seq - 1
-        if previous_snapshot_seq > 0 and not self.uses_shared_durable_generations():
-            previous_snapshot_path = build_local_accumulator_snapshot_path(
+            status_updater.mark_saved_many(
+                sorted(int(v) for v in newly_durable), int(accumulator.chunk_id)
+            )
+        # The manifest no longer references the replaced seqs; unlink
+        # their files (covers both the standard previous-seq case and a
+        # predecessor tenure's last snapshot after an epoch jump, which
+        # snapshot_seq - 1 alone would orphan on disk).
+        for stale_seq in set(replaced_snapshot_seqs) | {snapshot_seq - 1}:
+            if stale_seq <= 0 or stale_seq == snapshot_seq:
+                continue
+            build_local_accumulator_snapshot_path(
                 output_dir,
                 chunk_id=accumulator.chunk_id,
                 parameter_digest=accumulator.parameter_digest,
                 partition_id=accumulator.partition_id,
-                snapshot_seq=previous_snapshot_seq,
-            )
-            previous_snapshot_path.unlink(missing_ok=True)
-
-    def _build_local_materialized_state(
-        self,
-        *,
-        chunk_id: int,
-        parameter_digest: str,
-        output_dir: str,
-        snapshot_payload: dict[str, object],
-    ):
-        return build_existing_materialized_residual_field_state(
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            output_artifacts=build_residual_field_output_artifact_refs(output_dir, chunk_id),
-            amplitudes_payload=np.column_stack(
-                (
-                    np.asarray(snapshot_payload["point_ids"], dtype=np.int64).astype(np.complex128),
-                    np.asarray(snapshot_payload["amplitudes_delta"], dtype=np.complex128),
-                )
-            ),
-            amplitudes_average_payload=np.column_stack(
-                (
-                    np.asarray(snapshot_payload["point_ids"], dtype=np.int64).astype(np.complex128),
-                    np.asarray(snapshot_payload["amplitudes_average"], dtype=np.complex128),
-                )
-            ),
-            grid_shape_nd=np.asarray(snapshot_payload["grid_shape_nd"], dtype=np.int64),
-            reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
-            applied_interval_ids=tuple(
-                int(interval_id) for interval_id in snapshot_payload["incorporated_interval_ids"]
-            ),
-        )
+                snapshot_seq=stale_seq,
+            ).unlink(missing_ok=True)
 
     def accept_partial(
         self,
@@ -1103,45 +1047,132 @@ class ManifestDrivenResidualFieldReducerBackend:
         db_path: str,
         total_expected_partials: int,
         cleanup_policy: str = "off",
+        owner_epoch: int = 0,
     ) -> None:
         if not self.uses_owner_local_accumulator():
             raise ValueError(
                 "accept_local_contribution requires an owner-local accumulator backend."
             )
-        accumulator = self._get_or_create_local_accumulator_for_target(
-            work_unit=work_unit,
-            point_ids=point_ids,
-            grid_shape_nd=grid_shape_nd,
-            total_reciprocal_points=total_reciprocal_points,
-            amplitudes_delta=amplitudes_delta,
-            amplitudes_average=amplitudes_average,
-            output_dir=output_dir,
-            scratch_root=scratch_root,
+        key = self._local_accumulator_key(
+            chunk_id=work_unit.chunk_id,
+            parameter_digest=work_unit.parameter_digest,
+            partition_id=work_unit.partition_id,
         )
-        before = tuple(sorted(accumulator.current_interval_ids))
-        accumulator.accept_contribution(
-            work_unit,
-            point_ids=point_ids,
-            grid_shape_nd=grid_shape_nd,
-            total_reciprocal_points=total_reciprocal_points,
-            contribution_reciprocal_points=contribution_reciprocal_points,
-            amplitudes_delta=amplitudes_delta,
-            amplitudes_average=amplitudes_average,
-        )
-        after = tuple(sorted(accumulator.current_interval_ids))
-        if before == after:
-            return
-        snapshot_every = self._checkpoint_cadence(total_expected_partials)
-        accumulator.checkpoint_cadence_batches = int(snapshot_every)
-        if accumulator.accepted_since_snapshot >= snapshot_every:
-            self.flush_local_reducer_target(
-                chunk_id=work_unit.chunk_id,
-                parameter_digest=work_unit.parameter_digest,
-                partition_id=work_unit.partition_id,
+        with self._local_accumulator_lock(key):
+            accumulator = self._get_or_create_local_accumulator_for_target(
+                work_unit=work_unit,
+                point_ids=point_ids,
+                grid_shape_nd=grid_shape_nd,
+                total_reciprocal_points=total_reciprocal_points,
+                amplitudes_delta=amplitudes_delta,
+                amplitudes_average=amplitudes_average,
                 output_dir=output_dir,
-                db_path=db_path,
-                cleanup_policy=cleanup_policy,
+                scratch_root=scratch_root,
             )
+            if owner_epoch:
+                accumulator.raise_owner_epoch_floor(owner_epoch)
+            before = tuple(sorted(accumulator.current_interval_ids))
+            accumulator.accept_contribution(
+                work_unit,
+                point_ids=point_ids,
+                grid_shape_nd=grid_shape_nd,
+                total_reciprocal_points=total_reciprocal_points,
+                contribution_reciprocal_points=contribution_reciprocal_points,
+                amplitudes_delta=amplitudes_delta,
+                amplitudes_average=amplitudes_average,
+            )
+            after = tuple(sorted(accumulator.current_interval_ids))
+            if before == after:
+                return
+            snapshot_every = self._checkpoint_cadence(
+                total_expected_partials,
+                partition_axis=getattr(work_unit, "partition_axis", None),
+            )
+            accumulator.checkpoint_cadence_batches = int(snapshot_every)
+            async_writes = self._async_snapshot_writes_enabled()
+            if async_writes:
+                # A failed async commit surfaces on the fold path, exactly
+                # where the synchronous write would have raised.
+                writer_error = self._snapshot_writer().pop_error(key)
+                if writer_error is not None:
+                    raise writer_error
+            flushed = False
+            captured = False
+            if accumulator.accepted_since_snapshot >= snapshot_every:
+                # RAM targets capture by private copy (memcpy << savez).
+                # File targets capture by reflink-cloning their memmap
+                # backing files — O(1) copy-on-write on XFS/btrfs/NFS4.2 —
+                # so the multi-second savez of a GB-scale accumulator no
+                # longer blocks folds (hkl40-scale targets are ALWAYS
+                # file-mode; the old RAM-only gate meant the writer could
+                # never fire on the workload that motivated it). Where the
+                # scratch FS cannot reflink (ext4), file targets fall back
+                # to the synchronous flush.
+                if async_writes:
+                    if not self._snapshot_writer().in_flight(key):
+                        pending = None
+                        if getattr(accumulator, "storage_mode", "ram") != "file":
+                            pending = self._capture_local_snapshot(
+                                accumulator,
+                                output_dir=output_dir,
+                                db_path=db_path,
+                                cleanup_policy=cleanup_policy,
+                                capture_mode="copy",
+                            )
+                        elif getattr(self, "_file_clone_captures_usable", True):
+                            try:
+                                pending = self._capture_local_snapshot(
+                                    accumulator,
+                                    output_dir=output_dir,
+                                    db_path=db_path,
+                                    cleanup_policy=cleanup_policy,
+                                    capture_mode="clone",
+                                )
+                            except SnapshotCloneUnsupported as exc:
+                                self._file_clone_captures_usable = False
+                                logger.info(
+                                    "Residual-field async snapshots: %s; "
+                                    "file-mode targets use the synchronous "
+                                    "flush.",
+                                    exc,
+                                )
+                        if pending is not None:
+                            self._snapshot_writer().submit(
+                                key,
+                                lambda pending=pending: self._commit_and_release_clones(
+                                    pending
+                                ),
+                            )
+                            accumulator.trim_live_memory()
+                            captured = True
+                        else:
+                            flushed = self.flush_local_reducer_target(
+                                chunk_id=work_unit.chunk_id,
+                                parameter_digest=work_unit.parameter_digest,
+                                partition_id=work_unit.partition_id,
+                                output_dir=output_dir,
+                                db_path=db_path,
+                                cleanup_policy=cleanup_policy,
+                            )
+                    # else: a write is already in flight — keep folding;
+                    # the cadence counter re-arms after that commit.
+                else:
+                    flushed = self.flush_local_reducer_target(
+                        chunk_id=work_unit.chunk_id,
+                        parameter_digest=work_unit.parameter_digest,
+                        partition_id=work_unit.partition_id,
+                        output_dir=output_dir,
+                        db_path=db_path,
+                        cleanup_policy=cleanup_policy,
+                    )
+            trim_every = self._live_trim_cadence(snapshot_every)
+            if (
+                not flushed
+                and not captured
+                and accumulator.accepted_since_snapshot > 0
+                and accumulator.accepted_since_snapshot % trim_every == 0
+            ):
+                accumulator.trim_live_memory()
 
     def inspect_local_reducer_target(
         self,
@@ -1150,6 +1181,7 @@ class ManifestDrivenResidualFieldReducerBackend:
         parameter_digest: str,
         output_dir: str,
         partition_id: int | None = None,
+        include_payload: bool = False,
     ) -> dict[str, object] | None:
         if not self.uses_owner_local_accumulator():
             raise ValueError(
@@ -1166,6 +1198,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             parameter_digest=parameter_digest,
             output_dir=output_dir,
             partition_id=partition_id,
+            include_payload=include_payload,
         )
         if accumulator is None and snapshot_state is None:
             return None
@@ -1175,77 +1208,29 @@ class ManifestDrivenResidualFieldReducerBackend:
         snapshot_manifest_path = None
         if snapshot_state is not None:
             snapshot_seq, snapshot_payload = snapshot_state
-            if self.uses_shared_durable_generations():
-                generation_manifests = [
-                    manifest
-                    for manifest in self.discover_shard_manifests(
-                        output_dir=output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                    )
-                    if (
-                        parse_residual_field_generation_ref(manifest) is not None
-                        and parse_residual_field_generation_ref(manifest)[0]
-                        == (
-                            int(partition_id)
-                            if partition_id is not None
-                            else None
-                        )
-                    )
-                ]
-                if generation_manifests:
-                    latest_manifest = max(
-                        generation_manifests,
-                        key=lambda item: parse_residual_field_generation_ref(item)[1],
-                    )
-                    snapshot_path = next(
-                        (
-                            artifact.path
-                            for artifact in latest_manifest.artifacts
-                            if artifact.kind == "residual-shard-data"
-                        ),
-                        None,
-                    )
-                    snapshot_manifest_path = next(
-                        (
-                            artifact.path
-                            for artifact in latest_manifest.artifacts
-                            if artifact.kind == "residual-shard-manifest"
-                        ),
-                        None,
-                    )
-            else:
-                snapshot_path = str(
-                    build_local_accumulator_snapshot_path(
-                        output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        partition_id=partition_id,
-                        snapshot_seq=snapshot_seq,
-                    )
+            snapshot_path = str(
+                build_local_accumulator_snapshot_path(
+                    output_dir,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                    partition_id=partition_id,
+                    snapshot_seq=snapshot_seq,
                 )
-        if self.uses_shared_durable_generations():
-            checkpoint_metrics = self._generation_metrics_for_target(
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-                partition_id=partition_id,
             )
-        else:
-            snapshot_bytes = 0
-            if snapshot_path is not None:
-                try:
-                    snapshot_bytes = int(Path(snapshot_path).stat().st_size)
-                except OSError:
-                    pass
-            checkpoint_metrics = {
-                "total_checkpoint_bytes_written": snapshot_bytes,
-                "total_checkpoint_writes": int(snapshot_seq),
-                "total_checkpoint_wall_seconds": 0.0,
-                "latest_generation_seq": int(snapshot_seq),
-                "latest_checkpoint_bytes_written": snapshot_bytes,
-                "latest_checkpoint_wall_seconds": 0.0,
-            }
+        snapshot_bytes = 0
+        if snapshot_path is not None:
+            try:
+                snapshot_bytes = int(Path(snapshot_path).stat().st_size)
+            except OSError:
+                pass
+        checkpoint_metrics = {
+            "total_checkpoint_bytes_written": snapshot_bytes,
+            "total_checkpoint_writes": int(snapshot_seq),
+            "total_checkpoint_wall_seconds": 0.0,
+            "latest_generation_seq": int(snapshot_seq),
+            "latest_checkpoint_bytes_written": snapshot_bytes,
+            "latest_checkpoint_wall_seconds": 0.0,
+        }
         return {
             "chunk_id": int(chunk_id),
             "parameter_digest": str(parameter_digest),
@@ -1275,7 +1260,7 @@ class ManifestDrivenResidualFieldReducerBackend:
             "durable_snapshot_seq": int(snapshot_seq),
             "durable_snapshot_path": snapshot_path,
             "durable_snapshot_manifest_path": snapshot_manifest_path,
-            "durable_snapshot_payload": snapshot_payload,
+            "durable_snapshot_payload": snapshot_payload if include_payload else None,
             "checkpoint_metrics": checkpoint_metrics,
             **checkpoint_metrics,
         }
@@ -1299,18 +1284,42 @@ class ManifestDrivenResidualFieldReducerBackend:
             parameter_digest=parameter_digest,
             partition_id=partition_id,
         )
-        accumulator = self._local_accumulators.get(key)
-        if accumulator is None:
-            return False
-        if accumulator.current_interval_ids == accumulator.durable_interval_ids:
-            return False
-        self._snapshot_local_accumulator(
-            accumulator,
-            output_dir=output_dir,
-            db_path=db_path,
-            cleanup_policy=cleanup_policy,
+        # Drain BEFORE taking the per-target lock (the async commit acquires
+        # that lock and chunk_mutex — draining under it would deadlock), then
+        # RE-CHECK in-flight under the lock: a fold can submit a fresh async
+        # capture in the drain->lock gap, and a concurrent sync capture would
+        # then claim the SAME snapshot_seq (durable_snapshot_seq only bumps
+        # at commit) — two seq-N renames racing while the manifest union
+        # records the superset. Submissions only happen under the per-target
+        # lock, so once the check passes while we hold it, no new write can
+        # start beneath us.
+        drained = False
+        writer = (
+            self._snapshot_writer()
+            if self._async_snapshot_writes_enabled()
+            else None
         )
-        return True
+        lock = self._local_accumulator_lock(key)
+        while True:
+            if writer is not None:
+                drained = writer.drain(key) or drained
+            with lock:
+                if writer is not None and writer.in_flight(key):
+                    continue
+                accumulator = self._local_accumulators.get(key)
+                if accumulator is None:
+                    return drained
+                if accumulator.current_interval_ids == accumulator.durable_interval_ids:
+                    accumulator.trim_live_memory()
+                    return drained
+                self._snapshot_local_accumulator(
+                    accumulator,
+                    output_dir=output_dir,
+                    db_path=db_path,
+                    cleanup_policy=cleanup_policy,
+                )
+                accumulator.trim_live_memory()
+                return True
 
     def persist_shard_checkpoint(
         self,
@@ -1340,7 +1349,9 @@ class ManifestDrivenResidualFieldReducerBackend:
                 output_dir=output_dir,
                 scratch_root=scratch_root,
             ),
-            compress=self.layout.kind != "local_restartable",
+            # Current checkpoint payloads are uniformly uncompressed; old-codebase
+            # checkpoint formats are not a supported compatibility input.
+            compress=False,
             quiet_logs=quiet_logs,
         )
 
@@ -1414,206 +1425,55 @@ class ManifestDrivenResidualFieldReducerBackend:
         cleanup_policy: str | bool | None = None,
         scratch_root: str | None = None,
         quiet_logs: bool = False,
+        opportunistic: bool = False,
+        expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
+        expected_interval_ids: tuple[int, ...] | None = None,
+        mark_intervals_saved: bool = True,
     ) -> ResidualFieldArtifactManifest | None:
-        if self.uses_shared_durable_generations():
-            matching_keys = [
-                key
-                for key in list(self._local_accumulators)
-                if key[0] == int(chunk_id) and key[1] == str(parameter_digest)
-            ]
-            for key in matching_keys:
-                accumulator = self._local_accumulators.get(key)
-                if accumulator is None:
-                    continue
-                if accumulator.current_interval_ids != accumulator.durable_interval_ids:
-                    self._snapshot_local_accumulator(
-                        accumulator,
-                        output_dir=output_dir,
-                        db_path=db_path,
-                        cleanup_policy=str(cleanup_policy or "off"),
-                    )
-            generation_manifests = [
-                manifest
-                for manifest in self.discover_shard_manifests(
-                    output_dir=output_dir,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    scratch_root=scratch_root,
-                )
-                if parse_residual_field_generation_ref(manifest) is not None
-            ]
-            if not generation_manifests:
-                return None
-            first_snapshot = load_residual_field_generation_payload(generation_manifests[0])
-            partitioned = first_snapshot.get("partition_id") is not None
-            if partitioned:
-                point_ids_blocks: list[np.ndarray] = []
-                delta_blocks: list[np.ndarray] = []
-                average_blocks: list[np.ndarray] = []
-                grid_shape_blocks: list[np.ndarray] = []
-                applied_set: set[int] = set()
-                total_reciprocal_points = int(first_snapshot["total_reciprocal_points"])
-                reciprocal_point_count = 0
-                del first_snapshot
-                sorted_manifests = sorted(
-                    generation_manifests,
-                    key=lambda m: (
-                        -1
-                        if parse_residual_field_generation_ref(m) is None
-                        else parse_residual_field_generation_ref(m)[0] or -1
-                    ),
-                )
-                for manifest in sorted_manifests:
-                    snapshot = load_residual_field_generation_payload(manifest)
-                    point_ids_blocks.append(
-                        np.asarray(snapshot["point_ids"], dtype=np.int64)
-                    )
-                    delta_blocks.append(
-                        np.asarray(snapshot["amplitudes_delta"], dtype=np.complex128).reshape(-1)
-                    )
-                    average_blocks.append(
-                        np.asarray(snapshot["amplitudes_average"], dtype=np.complex128).reshape(-1)
-                    )
-                    grid_shape_blocks.append(
-                        np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
-                    )
-                    reciprocal_point_count += int(snapshot["reciprocal_point_count"])
-                    applied_set.update(
-                        int(interval_id)
-                        for interval_id in snapshot["incorporated_interval_ids"]
-                    )
-                    del snapshot
-                snapshot_payload = {
-                    "point_ids": (
-                        np.concatenate(point_ids_blocks)
-                        if point_ids_blocks
-                        else np.array([], dtype=np.int64)
-                    ),
-                    "grid_shape_nd": (
-                        np.vstack(grid_shape_blocks)
-                        if grid_shape_blocks
-                        else np.array([], dtype=np.int64)
-                    ),
-                    "amplitudes_delta": (
-                        np.concatenate(delta_blocks)
-                        if delta_blocks
-                        else np.array([], dtype=np.complex128)
-                    ),
-                    "amplitudes_average": (
-                        np.concatenate(average_blocks)
-                        if average_blocks
-                        else np.array([], dtype=np.complex128)
-                    ),
-                    "reciprocal_point_count": int(reciprocal_point_count),
-                    "total_reciprocal_points": int(total_reciprocal_points),
-                    "incorporated_interval_ids": tuple(sorted(applied_set)),
-                }
-                del point_ids_blocks, delta_blocks, average_blocks, grid_shape_blocks
-            else:
-                snapshot_payload = first_snapshot
-                applied_set = set(
-                    int(interval_id)
-                    for interval_id in snapshot_payload["incorporated_interval_ids"]
-                )
-            with chunk_mutex(chunk_id):
-                store = ResidualFieldArtifactStore(output_dir)
-                _write_residual_field_chunk_state(
-                    store=store,
-                    chunk_id=chunk_id,
-                    merged_state=self._build_local_materialized_state(
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        output_dir=output_dir,
-                        snapshot_payload=snapshot_payload,
-                    ),
-                    total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
-                    applied_set=applied_set,
-                )
-            representative_interval_id = max(
-                int(v) for v in snapshot_payload["incorporated_interval_ids"]
-            )
-            work_unit = ResidualFieldWorkUnit.interval_chunk(
-                interval_id=representative_interval_id,
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-            )
-            manifest = build_residual_field_chunk_manifest(
-                work_unit,
-                output_dir=output_dir,
-                completion_status=CompletionStatus.COMMITTED,
-            )
-            manifest_assessment = assess_residual_field_manifest(
-                manifest,
-                db_path=db_path,
-            )
-            progress_manifest = _build_residual_field_reducer_progress_manifest(
-                output_dir=output_dir,
-                chunk_id=chunk_id,
-                parameter_digest=parameter_digest,
-                completion_status=(
-                    CompletionStatus.COMMITTED
-                    if manifest_assessment.is_complete
-                    else CompletionStatus.MATERIALIZED
-                ),
-                durable_truth_unit="committed_local_snapshot_generation",
-                incorporated_shard_keys=tuple(
-                    sorted(manifest_item.artifact_key for manifest_item in generation_manifests)
-                ),
-                incorporated_interval_ids=tuple(
-                    sorted(int(v) for v in snapshot_payload["incorporated_interval_ids"])
-                ),
-                reclaimable_shard_keys=tuple(
-                    sorted(manifest_item.artifact_key for manifest_item in generation_manifests)
-                )
-                if manifest_assessment.is_complete
-                else (),
-                final_artifacts=manifest.artifacts,
-                pending_shard_keys=(),
-                pending_interval_ids=(),
-                cleanup_policy=str(cleanup_policy or "off"),
-            )
-            self.write_progress_manifest(progress_manifest)
-            status_updater = _ResidualFieldChunkStatusUpdater(db_path)
-            for interval_id in sorted(
-                int(v) for v in snapshot_payload["incorporated_interval_ids"]
-            ):
-                status_updater.mark_saved(int(interval_id), int(chunk_id))
-            if manifest_assessment.is_complete:
-                deleted = self.cleanup_reclaimable_shards(
-                    output_dir=output_dir,
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    db_path=db_path,
-                    scratch_root=scratch_root,
-                )
-                metrics = summarize_residual_field_generation_metrics(
-                    discover_residual_field_shard_manifests(
-                        output_dir=output_dir,
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        shard_storage_root=self.resolve_shard_storage_root(
-                            output_dir=output_dir,
-                            scratch_root=scratch_root,
-                        ),
-                        include_stale_generations=True,
-                    )
-                )
-                log_fn = logger.debug if quiet_logs else logger.info
-                log_fn(
-                    "finalize-generations | chunk %d | targets=%d | checkpoint_writes=%d | checkpoint_bytes=%d | checkpoint_wall=%.3fs | deleted=%d",
-                    chunk_id,
-                    len(generation_manifests),
-                    metrics["total_checkpoint_writes"],
-                    metrics["total_checkpoint_bytes_written"],
-                    metrics["total_checkpoint_wall_seconds"],
-                    len(deleted),
-                )
-            for key in matching_keys:
-                accumulator = self._local_accumulators.pop(key, None)
-                if accumulator is not None:
-                    accumulator.cleanup_live_files()
-            return manifest
+        """Fold committed local snapshots into the final chunk artifact.
+
+        ``mark_intervals_saved=False`` defers SQLite interval marking to the
+        driver (single writer) when finalizes run concurrently on many
+        workers; SQLite is a rebuildable cache, so ordering only shifts the
+        crash-repair window (manifests remain the authority).
+
+        ``opportunistic=True`` marks a caller (startup recovery) that runs
+        BEFORE planning and therefore cannot know the expected partition
+        family: partitioned families are deferred (return ``None``) instead of
+        published or failed, because partition snapshots flush on independent
+        cadences and routinely disagree mid-run. ``expected_partitions`` is
+        the plan's ``(partition_id, point_start, point_stop)`` family for this
+        chunk; when provided, the snapshot family must match it exactly.
+        ``expected_interval_ids`` is the plan's full interval set for this
+        chunk; interval-partitioned (subchunk) families must union to it
+        exactly before their snapshots are summed."""
+        # In-flight async snapshot commits for this chunk must land before
+        # finalize reads durable state (drain outside all locks). Loop:
+        # a straggler fold can submit a new capture during the drain, and a
+        # commit landing AFTER finalize published would rewrite the progress
+        # manifest and re-reference snapshots finalize unlinked.
+        if self._async_snapshot_writes_enabled():
+            writer = self._snapshot_writer()
+
+            def _matches(key) -> bool:
+                return key[0] == int(chunk_id) and key[1] == str(parameter_digest)
+
+            for _ in range(1000):
+                writer.drain_matching(_matches)
+                if not writer.has_matching(_matches):
+                    break
+        repaired_manifest = self._repair_progress_final_artifacts(
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+            db_path=db_path,
+            cleanup_policy=cleanup_policy,
+            scratch_root=scratch_root,
+            mark_intervals_saved=mark_intervals_saved,
+        )
+        if repaired_manifest is not None:
+            return repaired_manifest
+
         if self.uses_local_chunk_accumulator():
             if scratch_root is None:
                 raise ValueError("Local accumulator finalization requires scratch_root.")
@@ -1623,106 +1483,154 @@ class ManifestDrivenResidualFieldReducerBackend:
                 if key[0] == int(chunk_id) and key[1] == str(parameter_digest)
             ]
             for key in matching_keys:
-                accumulator = self._local_accumulators.get(key)
-                if accumulator is None:
-                    continue
-                if accumulator.current_interval_ids != accumulator.durable_interval_ids:
-                    self._snapshot_local_accumulator(
-                        accumulator,
-                        output_dir=output_dir,
-                        db_path=db_path,
-                        cleanup_policy=str(cleanup_policy or "off"),
-                    )
+                # Same locking contract as the flush path: capture over live
+                # array views may not interleave with a concurrent fold. The
+                # dead-owner rescue can leave a zombie fold running on a
+                # scheduler-evicted-but-alive worker, and an unlocked savez
+                # interleaving with its accept_contribution yields internally
+                # inconsistent amplitudes under a VALID interval set — the one
+                # corruption shape family validation cannot detect.
+                with self._local_accumulator_lock(key):
+                    accumulator = self._local_accumulators.get(key)
+                    if accumulator is None:
+                        continue
+                    if accumulator.current_interval_ids != accumulator.durable_interval_ids:
+                        self._snapshot_local_accumulator(
+                            accumulator,
+                            output_dir=output_dir,
+                            db_path=db_path,
+                            cleanup_policy=str(cleanup_policy or "off"),
+                        )
             snapshot_refs = self._latest_local_snapshot_refs(
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
                 output_dir=output_dir,
             )
             if not snapshot_refs:
-                accumulator = self._restore_local_accumulator(
-                    chunk_id=chunk_id,
-                    parameter_digest=parameter_digest,
-                    output_dir=output_dir,
-                    scratch_root=scratch_root,
-                    partition_id=None,
-                )
-                if accumulator is None:
-                    return None
-                snapshot_refs = [(None, int(accumulator.durable_snapshot_seq))]
-            snapshots: list[dict[str, object]] = []
+                # No committed snapshot keys in the progress manifest. The
+                # old owner-restore fallback read the SAME manifest and so
+                # could never produce a snapshot either — removed as
+                # unreachable.
+                return None
+            snapshot_metadata: list[tuple[int | None, int, dict[str, object]]] = []
             for partition_id, snapshot_seq in snapshot_refs:
-                snapshot = load_local_accumulator_snapshot(
+                metadata = load_local_accumulator_snapshot_metadata(
                     output_dir,
                     chunk_id=chunk_id,
                     parameter_digest=parameter_digest,
                     partition_id=partition_id,
                     snapshot_seq=snapshot_seq,
                 )
-                if snapshot is not None:
-                    snapshots.append(snapshot)
-            if not snapshots:
+                if metadata is not None:
+                    snapshot_metadata.append((partition_id, int(snapshot_seq), metadata))
+            if not snapshot_metadata:
                 return None
             partitioned = any(
-                snapshot.get("partition_id") not in (None, -1)
-                for snapshot in snapshots
+                metadata.get("partition_id") not in (None, -1)
+                for _, _, metadata in snapshot_metadata
             )
+            family_axes = {
+                str(metadata.get("accumulator_axis", "points"))
+                for _, _, metadata in snapshot_metadata
+            }
+            if len(family_axes) > 1:
+                raise RuntimeError(
+                    "Residual-field local finalization found checkpoints from "
+                    f"BOTH partition axes for chunk={int(chunk_id)} "
+                    f"({sorted(family_axes)}). A points-axis and an "
+                    "intervals-axis (subchunk) layout are irreconcilable; "
+                    "delete 'residual_checkpoints/' under the output "
+                    "directory and re-run to recompute this chunk."
+                )
+            family_axis = family_axes.pop() if family_axes else "points"
+            if opportunistic and (partitioned or expected_interval_ids is None):
+                # Startup recovery runs BEFORE planning. Partition snapshots
+                # flush on independent cadences, so a mid-run crash routinely
+                # leaves them with different interval subsets and possibly a
+                # missing tail partition -- and a NON-partitioned owner-level
+                # snapshot just as routinely covers a strict subset of the
+                # chunk's intervals (cadence flushes). Publishing either as
+                # COMMITTED would credit the partial set and silently drop
+                # the pre-crash amplitudes when the completion run overwrites
+                # the chunk. Coverage is only provable against the plan;
+                # defer to the stage.
+                log_fn = logger.debug if quiet_logs else logger.info
+                log_fn(
+                    "Residual-field startup recovery deferring chunk %d to "
+                    "the residual stage (family/coverage completeness is "
+                    "only provable against the plan).",
+                    int(chunk_id),
+                )
+                return None
+            if partitioned and expected_partitions is not None:
+                _require_expected_partition_family(
+                    snapshot_metadata,
+                    expected_partitions=expected_partitions,
+                    chunk_id=chunk_id,
+                )
             if partitioned:
-                point_offset = 0
-                point_ids_blocks: list[np.ndarray] = []
-                delta_blocks: list[np.ndarray] = []
-                average_blocks: list[np.ndarray] = []
-                grid_shape_blocks: list[np.ndarray] = []
-                applied_set: set[int] = set()
-                total_reciprocal_points = int(snapshots[0]["total_reciprocal_points"])
-                reciprocal_point_count = 0
-                for snapshot in snapshots:
-                    delta_block = np.asarray(
-                        snapshot["amplitudes_delta"], dtype=np.complex128
-                    ).reshape(-1)
-                    average_block = np.asarray(
-                        snapshot["amplitudes_average"], dtype=np.complex128
-                    ).reshape(-1)
-                    block_size = int(delta_block.shape[0])
-                    point_ids_blocks.append(
-                        np.arange(point_offset, point_offset + block_size, dtype=np.int64)
+                scratch_dir = _finalize_scratch_dir(
+                    scratch_root,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                )
+                if family_axis == "intervals":
+                    snapshot_payload = assemble_interval_partitioned_chunk_payload(
+                        snapshot_metadata=snapshot_metadata,
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        output_dir=output_dir,
+                        scratch_dir=scratch_dir,
+                        expected_interval_ids=expected_interval_ids,
                     )
-                    point_offset += block_size
-                    delta_blocks.append(delta_block)
-                    average_blocks.append(average_block)
-                    grid_shape_blocks.append(
-                        np.asarray(snapshot["grid_shape_nd"], dtype=np.int64)
+                else:
+                    snapshot_payload = assemble_local_snapshot_chunk_payload(
+                        snapshot_metadata=snapshot_metadata,
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        output_dir=output_dir,
+                        scratch_dir=scratch_dir,
                     )
-                    reciprocal_point_count += int(snapshot["reciprocal_point_count"])
-                    applied_set.update(
-                        int(interval_id)
-                        for interval_id in snapshot["incorporated_interval_ids"]
-                    )
-                snapshot_payload = {
-                    "point_ids": np.concatenate(point_ids_blocks) if point_ids_blocks else np.array([], dtype=np.int64),
-                    "grid_shape_nd": np.vstack(grid_shape_blocks) if grid_shape_blocks else np.array([], dtype=np.int64),
-                    "amplitudes_delta": np.concatenate(delta_blocks) if delta_blocks else np.array([], dtype=np.complex128),
-                    "amplitudes_average": np.concatenate(average_blocks) if average_blocks else np.array([], dtype=np.complex128),
-                    "reciprocal_point_count": int(reciprocal_point_count),
-                    "total_reciprocal_points": int(total_reciprocal_points),
-                    "incorporated_interval_ids": tuple(sorted(applied_set)),
-                }
+                if snapshot_payload is None:
+                    return None
+                applied_set = set(
+                    int(x) for x in snapshot_payload["incorporated_interval_ids"]
+                )
             else:
-                snapshot_payload = snapshots[0]
+                partition_id, snapshot_seq, _metadata = snapshot_metadata[0]
+                snapshot_payload = load_local_accumulator_snapshot(
+                    output_dir,
+                    chunk_id=chunk_id,
+                    parameter_digest=parameter_digest,
+                    partition_id=partition_id,
+                    snapshot_seq=snapshot_seq,
+                )
+                if snapshot_payload is None:
+                    return None
                 applied_set = set(
                     int(interval_id)
                     for interval_id in snapshot_payload["incorporated_interval_ids"]
                 )
-            with chunk_mutex(chunk_id):
+                if expected_interval_ids is not None:
+                    expected_set = {int(v) for v in expected_interval_ids}
+                    if applied_set != expected_set:
+                        raise RuntimeError(
+                            "Residual-field local finalization coverage "
+                            f"mismatch for chunk={int(chunk_id)}: "
+                            f"missing={sorted(expected_set - applied_set)} "
+                            f"unexpected={sorted(applied_set - expected_set)}."
+                        )
+            with chunk_mutex(chunk_id, lock_root=output_dir):
                 store = ResidualFieldArtifactStore(output_dir)
-                _write_residual_field_chunk_state(
+                _write_residual_field_chunk_payload_components(
                     store=store,
                     chunk_id=chunk_id,
-                    merged_state=self._build_local_materialized_state(
-                        chunk_id=chunk_id,
-                        parameter_digest=parameter_digest,
-                        output_dir=output_dir,
-                        snapshot_payload=snapshot_payload,
-                    ),
+                    parameter_digest=parameter_digest,
+                    point_ids=snapshot_payload["point_ids"],
+                    grid_shape_nd=snapshot_payload["grid_shape_nd"],
+                    amplitudes_delta=snapshot_payload["amplitudes_delta"],
+                    amplitudes_average=snapshot_payload["amplitudes_average"],
+                    reciprocal_point_count=int(snapshot_payload["reciprocal_point_count"]),
                     total_reciprocal_points=int(snapshot_payload["total_reciprocal_points"]),
                     applied_set=(
                         applied_set
@@ -1747,40 +1655,53 @@ class ManifestDrivenResidualFieldReducerBackend:
                 output_dir=output_dir,
                 completion_status=CompletionStatus.COMMITTED,
             )
-            manifest_assessment = assess_residual_field_manifest(
-                manifest,
-                db_path=db_path,
+            final_artifacts_present = _manifest_final_artifacts_present(manifest)
+            if not final_artifacts_present:
+                raise RuntimeError(
+                    "Residual-field local finalization did not publish all final artifacts "
+                    f"for chunk={int(chunk_id)}."
+                )
+            snapshot_keys = tuple(
+                sorted(
+                    make_local_accumulator_snapshot_key(
+                        chunk_id=chunk_id,
+                        parameter_digest=parameter_digest,
+                        partition_id=partition_id,
+                        snapshot_seq=snapshot_seq,
+                    )
+                    for partition_id, snapshot_seq, _metadata in snapshot_metadata
+                )
             )
             progress_manifest = _build_residual_field_reducer_progress_manifest(
                 output_dir=output_dir,
                 chunk_id=chunk_id,
                 parameter_digest=parameter_digest,
-                completion_status=(
-                    CompletionStatus.COMMITTED
-                    if manifest_assessment.is_complete
-                    else CompletionStatus.MATERIALIZED
-                ),
+                completion_status=CompletionStatus.COMMITTED,
                 durable_truth_unit="committed_local_snapshot_generation",
-                incorporated_shard_keys=(),
+                incorporated_shard_keys=snapshot_keys,
                 incorporated_interval_ids=tuple(
                     sorted(
                         int(v)
                         for v in snapshot_payload["incorporated_interval_ids"]
                     )
                 ),
-                reclaimable_shard_keys=(),
+                reclaimable_shard_keys=snapshot_keys,
                 final_artifacts=manifest.artifacts,
                 pending_shard_keys=(),
                 pending_interval_ids=(),
                 cleanup_policy=str(cleanup_policy or "off"),
             )
             self.write_progress_manifest(progress_manifest)
-            status_updater = _ResidualFieldChunkStatusUpdater(db_path)
-            for interval_id in sorted(
-                int(v) for v in snapshot_payload["incorporated_interval_ids"]
-            ):
-                status_updater.mark_saved(int(interval_id), int(chunk_id))
-            for partition_id, snapshot_seq in snapshot_refs:
+            if mark_intervals_saved:
+                _mark_residual_intervals_saved(
+                    db_path=db_path,
+                    chunk_id=chunk_id,
+                    interval_ids=tuple(
+                        int(v)
+                        for v in snapshot_payload["incorporated_interval_ids"]
+                    ),
+                )
+            for partition_id, snapshot_seq, _metadata in snapshot_metadata:
                 build_local_accumulator_snapshot_path(
                     output_dir,
                     chunk_id=chunk_id,
@@ -1789,23 +1710,9 @@ class ManifestDrivenResidualFieldReducerBackend:
                     snapshot_seq=snapshot_seq,
                 ).unlink(missing_ok=True)
             for key in matching_keys:
-                accumulator = self._local_accumulators.pop(key, None)
-                if accumulator is not None:
-                    accumulator.cleanup_live_files()
+                self._release_local_accumulator(key)
             return manifest
-        return reduce_residual_field_shards_for_chunk(
-            chunk_id=chunk_id,
-            parameter_digest=parameter_digest,
-            output_dir=output_dir,
-            db_path=db_path,
-            manifests=manifests,
-            cleanup_policy=cleanup_policy,
-            shard_storage_root=self.resolve_shard_storage_root(
-                output_dir=output_dir,
-                scratch_root=scratch_root,
-            ),
-            quiet_logs=quiet_logs,
-        )
+        return None
 
     def cleanup_reclaimable_shards(
         self,
@@ -1838,14 +1745,11 @@ def build_residual_field_reducer_backend(
     shard_storage_root_override: str | None = None,
     local_accumulator_max_ram_bytes: int = DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES,
 ) -> ManifestDrivenResidualFieldReducerBackend:
-    normalized = _normalize_reducer_backend_kind(kind)
-    layout = (
-        LOCAL_RESTARTABLE_LAYOUT
-        if normalized == "local_restartable"
-        else SHARED_DURABLE_LAYOUT
-    )
+    # Normalization raises for the retired durable_shared_restartable kind,
+    # so local_restartable is the only layout that can be built.
+    _normalize_reducer_backend_kind(kind)
     return ManifestDrivenResidualFieldReducerBackend(
-        layout,
+        LOCAL_RESTARTABLE_LAYOUT,
         shard_storage_root_override=shard_storage_root_override,
         local_accumulator_max_ram_bytes=local_accumulator_max_ram_bytes,
     )
@@ -1854,6 +1758,11 @@ def build_residual_field_reducer_backend(
 def get_process_local_residual_field_backend(
     template_backend: ManifestDrivenResidualFieldReducerBackend,
 ) -> ManifestDrivenResidualFieldReducerBackend:
+    if not isinstance(template_backend, ManifestDrivenResidualFieldReducerBackend):
+        # Test seams substitute duck-typed fakes; they carry their own local
+        # state, so the process-local singleton indirection must not replace
+        # them with a real backend.
+        return template_backend
     key = (
         str(template_backend.layout.kind),
         template_backend.shard_storage_root_override,
@@ -1872,12 +1781,23 @@ def get_process_local_residual_field_backend(
 
 def clear_process_local_residual_field_backends() -> None:
     for backend in list(_PROCESS_LOCAL_REDUCER_BACKENDS.values()):
-        for accumulator in list(getattr(backend, "_local_accumulators", {}).values()):
+        writer = getattr(backend, "_snapshot_writer_obj", None)
+        if writer is not None:
             try:
-                accumulator.cleanup_live_files()
+                writer.drain_all()
             except Exception:
-                pass
-        getattr(backend, "_local_accumulators", {}).clear()
+                logger.exception("async snapshot writer drain failed at clear")
+        for key in list(getattr(backend, "_local_accumulators", {})):
+            release = getattr(backend, "_release_local_accumulator", None)
+            if callable(release):
+                release(key)
+                continue
+            accumulator = getattr(backend, "_local_accumulators", {}).pop(key, None)
+            if accumulator is not None:
+                try:
+                    accumulator.cleanup_live_files()
+                except Exception:
+                    pass
     _PROCESS_LOCAL_REDUCER_BACKENDS.clear()
 
 
@@ -1891,6 +1811,10 @@ def finalize_process_local_residual_chunk(
     cleanup_policy: str | bool | None = None,
     scratch_root: str | None = None,
     quiet_logs: bool = False,
+    expected_partitions: tuple[tuple[int | None, int | None, int | None], ...] | None = None,
+    expected_interval_ids: tuple[int, ...] | None = None,
+    mark_intervals_saved: bool = True,
+    opportunistic: bool = False,
 ) -> ResidualFieldArtifactManifest | None:
     backend = get_process_local_residual_field_backend(template_backend)
     return backend.finalize_chunk(
@@ -1901,6 +1825,10 @@ def finalize_process_local_residual_chunk(
         cleanup_policy=cleanup_policy,
         scratch_root=scratch_root,
         quiet_logs=quiet_logs,
+        expected_partitions=expected_partitions,
+        expected_interval_ids=expected_interval_ids,
+        mark_intervals_saved=mark_intervals_saved,
+        opportunistic=opportunistic,
     )
 
 
@@ -1932,6 +1860,7 @@ def inspect_process_local_residual_reducer_target(
     parameter_digest: str,
     output_dir: str,
     partition_id: int | None = None,
+    include_payload: bool = False,
 ) -> dict[str, object] | None:
     backend = get_process_local_residual_field_backend(template_backend)
     return backend.inspect_local_reducer_target(
@@ -1939,6 +1868,7 @@ def inspect_process_local_residual_reducer_target(
         parameter_digest=parameter_digest,
         output_dir=output_dir,
         partition_id=partition_id,
+        include_payload=include_payload,
     )
 
 
@@ -1948,23 +1878,25 @@ def resolve_residual_field_reducer_backend(
     client,
 ) -> ManifestDrivenResidualFieldReducerBackend:
     runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    shard_storage_root_override = None
-    local_accumulator_max_ram_bytes = DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES
+    # Precedence rule, uniform for every MOSAIC_* knob: OPERATOR ENV WINS
+    # over JSON config, config over default. This function used to apply
+    # both orderings within twenty lines (config-wins for the shard root,
+    # env-wins for the RAM cap) — pick one and say so.
+    shard_storage_root_override = os.getenv("MOSAIC_RESIDUAL_SHARD_DURABLE_ROOT")
+    local_accumulator_max_ram_bytes = os.getenv("MOSAIC_LOCAL_REDUCER_MAX_RAM_BYTES")
     if hasattr(runtime_info, "get"):
-        shard_storage_root_override = runtime_info.get("residual_shard_durable_root")
-        local_accumulator_max_ram_bytes = int(
-            runtime_info.get(
-                "residual_local_accumulator_max_ram_bytes",
-                local_accumulator_max_ram_bytes,
+        if shard_storage_root_override is None:
+            shard_storage_root_override = runtime_info.get(
+                "residual_shard_durable_root"
             )
-        )
-    if shard_storage_root_override is None:
-        shard_storage_root_override = os.getenv("MOSAIC_RESIDUAL_SHARD_DURABLE_ROOT")
+        if local_accumulator_max_ram_bytes is None:
+            local_accumulator_max_ram_bytes = runtime_info.get(
+                "residual_local_accumulator_max_ram_bytes"
+            )
     local_accumulator_max_ram_bytes = int(
-        os.getenv(
-            "MOSAIC_LOCAL_REDUCER_MAX_RAM_BYTES",
-            str(local_accumulator_max_ram_bytes),
-        )
+        local_accumulator_max_ram_bytes
+        if local_accumulator_max_ram_bytes is not None
+        else DEFAULT_LOCAL_ACCUMULATOR_MAX_RAM_BYTES
     )
     return build_residual_field_reducer_backend(
         resolve_residual_field_reducer_backend_kind(
@@ -1990,39 +1922,14 @@ def resolve_residual_field_reducer_backend_kind(
         override = os.getenv("MOSAIC_RESIDUAL_FIELD_REDUCER_BACKEND")
     if override is not None:
         return _normalize_reducer_backend_kind(str(override))
-    return (
-        "local_restartable"
-        if is_same_node_local_client(client)
-        else "durable_shared_restartable"
-    )
-
-
-def is_same_node_local_client(client) -> bool:
-    if client is None or is_sync_client(client):
-        return True
-    backend = str(os.getenv("DASK_BACKEND", "")).strip().lower()
-    if backend in {"local", "cuda-local", "sync", "synchronous", "single-threaded"}:
-        return True
-    cluster = getattr(client, "cluster", None)
-    cluster_name = type(cluster).__name__.lower() if cluster is not None else ""
-    return "localcluster" in cluster_name
-
-
-def _normalize_reducer_backend_kind(value: str) -> ResidualFieldReducerBackendKind:
-    normalized = str(value).strip().lower().replace("-", "_")
-    if normalized in {"local", "local_restartable", "local_restartable_reducer"}:
-        return "local_restartable"
-    if normalized in {
-        "durable",
-        "durable_shared",
-        "durable_shared_restartable",
-        "durable_restartable",
-    }:
-        return "durable_shared_restartable"
-    raise ValueError(
-        "Residual-field reducer backend must be 'local_restartable' or "
-        "'durable_shared_restartable'."
-    )
+    # local_restartable is the only reducer layout. The tile-owner
+    # architecture made it multi-node-safe (working accumulators on
+    # node-local scratch, durable snapshots + progress manifests on the
+    # shared output dir), and the multi-node NON-streaming case was
+    # validated in the cluster sim on 2026-08-01 at max|diff| 1.7e-12 Å
+    # vs reference — retiring the locality heuristic that routed
+    # non-streaming distributed clients to durable_shared_restartable.
+    return "local_restartable"
 
 
 __all__ = [

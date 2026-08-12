@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import OrderedDict
 import os
 from pathlib import Path
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,13 +16,20 @@ from core.scattering.kernels import (
     reciprocal_space_points_counter,
     to_interval_dict,
 )
+from core.scattering.contracts import build_interval_artifact_ref
 from core.runtime import (
     DEFAULT_TASK_RETRIES,
     is_sync_client,
     logging_redirect_tqdm,
+    nufft_task_resources,
+    path_is_tmpfs,
+    profile_output_filesystem,
     progress_bar,
+    require_gpu_admission,
     register_cleanup_plugin,
+    resolve_nufft_execution_settings,
     resolve_worker_scratch_root,
+    runtime_provenance_for_attempt,
     short_path,
     task_progress_enabled,
     yield_futures_with_results,
@@ -28,11 +37,11 @@ from core.runtime import (
 from core.residual_field.backend import (
     finalize_process_local_residual_chunk,
     flush_process_local_residual_reducer_target,
+    get_process_local_residual_field_backend,
     inspect_process_local_residual_reducer_target,
     ResidualFieldReducerBackend,
     ResidualFieldLocalAccumulatorPartial,
     build_residual_field_reducer_backend,
-    is_same_node_local_client,
     resolve_residual_field_reducer_backend,
 )
 from core.residual_field.contracts import (
@@ -41,6 +50,7 @@ from core.residual_field.contracts import (
     ResidualFieldWorkUnit,
 )
 from core.residual_field.artifacts import (
+    discover_residual_field_reducer_progress_manifest,
     summarize_residual_field_output_artifacts,
     summarize_residual_field_shards,
 )
@@ -48,10 +58,69 @@ from core.residual_field.planning import (
     _RESIDUAL_GRID_VALUE_BYTES_PER_POINT,
     _weighted_partition_split,
     build_adaptive_partition_plan,
+    build_residual_field_parameter_digest,
     build_residual_field_work_units,
     partition_residual_field_work_units,
+    resolve_residual_shard_grid_budget_bytes,
+    resolve_residual_shard_source_budget,
 )
-from core.residual_field.tasks import run_residual_field_interval_chunk_task
+from core.residual_field.tasks import (
+    _residual_lattice_fft_enabled,
+    build_residual_rifft_payload,
+    clear_residual_rifft_payload_cache,
+    run_residual_field_interval_chunk_task,
+)
+from core.storage.digests import digest_dict
+from core.workflow.run_state_cache import (
+    pending_residual_interval_chunks,
+    rebuild_sqlite_cache_from_manifests,
+)
+from core.residual_field.runtime_policy import (
+    DEFAULT_RESIDUAL_PARTITION_TARGET_BYTES,
+    _cleanup_residual_attempts_enabled,
+    _memory_backpressure_poll_seconds,
+    _memory_backpressure_threshold,
+    _owner_local_reducer_enabled,
+    _residual_attempt_cleanup_policy,
+    _residual_nufft_policy,
+    _residual_nufft_prefetch_factor,
+    _residual_nufft_resources,
+    _residual_nufft_settings,
+    _residual_partition_runtime_policy,
+    _residual_rifft_payload_reuse_enabled,
+    _worker_owned_local_reducer_enabled,
+)
+from core.residual_field.progress_logging import (
+    _build_planned_target_metrics,
+    _format_elapsed_eta,
+    _format_progress_bar,
+    _log_async_residual_progress,
+    _log_owner_local_finalize_metrics,
+    _log_partition_effectiveness_report,
+    _planned_partition_imbalance_ratio,
+    _should_log_async_progress,
+    _work_unit_interval_label,
+)
+from core.residual_field.cluster_helpers import (
+    _cap_async_max_inflight,
+    _clear_worker_rifft_payload_caches,
+    _cluster_host_memory_pressure,
+    _current_worker_addresses,
+    _resolve_owner_address,
+    _scheduler_nufft_capacity,
+    _trim_workers_for_memory_pressure,
+)
+from core.residual_field.run_loop import ResidualRunLoop
+from core.residual_field.work_unit_utils import (
+    _hex64_or_digest,
+    _interval_inputs_for_work_unit,
+    _interval_paths_for_work_unit,
+    _reducer_target_key,
+    _sort_work_units_by_target,
+    _unique_reducer_target_keys,
+    _work_unit_expected_interval_ids,
+    _work_unit_sort_key,
+)
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -60,399 +129,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_RESIDUAL_INTERVALS_PER_SHARD = 4
-
-
-def _worker_owned_local_reducer_enabled(workflow_parameters) -> bool:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    override = None
-    if hasattr(runtime_info, "get"):
-        override = runtime_info.get("residual_local_owner_reducer")
-    if override is None:
-        override = os.getenv("MOSAIC_RESIDUAL_LOCAL_OWNER_REDUCER")
-    if override is None:
-        return True
-    if isinstance(override, str):
-        return override.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(override)
-
-
-def _distributed_owner_affinity_enabled(workflow_parameters) -> bool:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-    override = None
-    if hasattr(runtime_info, "get"):
-        override = runtime_info.get("residual_distributed_owner_affinity")
-    if override is None:
-        override = os.getenv("MOSAIC_RESIDUAL_DISTRIBUTED_OWNER_AFFINITY")
-    if override is None:
-        return True
-    if isinstance(override, str):
-        return override.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(override)
-
-
-def _distributed_owner_local_reducer_supported(
-    reducer_backend: ResidualFieldReducerBackend,
-    *,
-    reducer_runtime_state,
-) -> bool:
-    support_override = getattr(
-        reducer_backend,
-        "distributed_owner_local_reducer_supported",
-        None,
-    )
-    if support_override is None:
-        support_override = getattr(
-            reducer_backend,
-            "supports_distributed_owner_local_reducer",
-            None,
-        )
-    if support_override is not None:
-        return bool(support_override)
-    return (
-        callable(getattr(reducer_backend, "accept_local_contribution", None))
-        and callable(getattr(reducer_backend, "inspect_local_reducer_target", None))
-        and callable(getattr(reducer_backend, "flush_local_reducer_target", None))
-        and getattr(reducer_runtime_state, "durable_truth_unit", None)
-        == "committed_local_snapshot_generation"
-        and getattr(reducer_runtime_state, "durable_checkpoint_storage_role", None)
-        in {"durable-local-snapshot-generation", "durable-shared-generation"}
-    )
-
-
-def _owner_local_reducer_enabled(
-    *,
-    reducer_backend: ResidualFieldReducerBackend,
-    worker_owned_local_reducer: bool,
-    distributed_owner_local_reducer: bool,
-) -> bool:
-    return bool(worker_owned_local_reducer or distributed_owner_local_reducer)
-
-
-def _residual_partition_runtime_policy(
-    workflow_parameters,
-    *,
-    default_target_bytes: int,
-    effective_nufft_workers: int,
-) -> dict[str, int | float]:
-    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
-
-    def _get_int(name: str, default: int) -> int:
-        value = None
-        if hasattr(runtime_info, "get"):
-            value = runtime_info.get(name)
-        if value is None:
-            env_name = f"MOSAIC_{name.upper()}"
-            value = os.getenv(env_name)
-        return int(value) if value is not None else int(default)
-
-    def _get_float(name: str, default: float) -> float:
-        value = None
-        if hasattr(runtime_info, "get"):
-            value = runtime_info.get(name)
-        if value is None:
-            env_name = f"MOSAIC_{name.upper()}"
-            value = os.getenv(env_name)
-        return float(value) if value is not None else float(default)
-
-    return {
-        "target_partition_bytes": max(1, _get_int("residual_partition_target_bytes", int(default_target_bytes))),
-        "target_partition_bytes_3d": max(
-            1,
-            _get_int(
-                "residual_partition_target_bytes_3d",
-                max(1, int(default_target_bytes) // 2),
-            ),
-        ),
-        "max_partitions_per_chunk": _get_int(
-            "residual_max_partitions_per_chunk",
-            0,  # 0 = auto: let byte budget drive partition count
-        ),
-        "min_points_per_partition": max(
-            1,
-            _get_int("residual_min_points_per_partition", 1),
-        ),
-        "hysteresis_low_factor": _get_float(
-            "residual_partition_hysteresis_low",
-            0.8,
-        ),
-        "hysteresis_high_factor": _get_float(
-            "residual_partition_hysteresis_high",
-            1.2,
-        ),
-    }
-
-
-def _format_progress_bar(count: int, total: int, *, width: int = 20) -> str:
-    total = max(int(total), 1)
-    count = max(0, min(int(count), total))
-    filled = int(round((count / float(total)) * width))
-    return f"[{'#' * filled}{'.' * (width - filled)}]"
-
-
-def _planned_partition_imbalance_ratio(
-    *,
-    rifft_points_per_atom: tuple[int, ...],
-    target_partitions: int,
-) -> float:
-    weights = np.asarray(rifft_points_per_atom, dtype=np.int64)
-    if weights.size == 0 or target_partitions <= 1:
-        return 1.0
-    selections = _weighted_partition_split(
-        np.arange(weights.shape[0], dtype=np.int64),
-        weights,
-        int(target_partitions),
-    )
-    partition_weights = [
-        int(np.sum(weights[selection], dtype=np.int64))
-        for selection in selections
-        if selection.size > 0
-    ]
-    if not partition_weights:
-        return 1.0
-    min_weight = min(partition_weights)
-    max_weight = max(partition_weights)
-    if min_weight <= 0:
-        return float("inf") if max_weight > 0 else 1.0
-    return float(max_weight) / float(min_weight)
-
-
-def _build_planned_target_metrics(
-    partition_plans: dict[int, object],
-) -> dict[tuple[int, int | None], dict[str, object]]:
-    planned_metrics: dict[tuple[int, int | None], dict[str, object]] = {}
-    for chunk_id, plan in partition_plans.items():
-        weights = np.asarray(
-            getattr(
-                plan,
-                "rifft_points_per_atom",
-                np.ones(int(plan.point_count), dtype=np.int64),
-            ),
-            dtype=np.int64,
-        )
-        target_partitions = int(getattr(plan, "target_partitions", 1))
-        if target_partitions <= 1:
-            planned_metrics[(int(chunk_id), None)] = {
-                "planned_partition_count": 1,
-                "planned_rifft_points": int(np.sum(weights, dtype=np.int64)),
-                "planned_estimated_bytes": int(getattr(plan, "estimated_bytes", 0)),
-                "target_partition_bytes": int(getattr(plan, "target_partition_bytes", 0)),
-                "planned_imbalance_ratio": 1.0,
-            }
-            continue
-        selections = _weighted_partition_split(
-            np.arange(weights.shape[0], dtype=np.int64),
-            weights,
-            target_partitions,
-        )
-        imbalance_ratio = _planned_partition_imbalance_ratio(
-            rifft_points_per_atom=tuple(int(value) for value in weights.tolist()),
-            target_partitions=target_partitions,
-        )
-        for partition_id, selection in enumerate(selections):
-            planned_rifft_points = int(np.sum(weights[selection], dtype=np.int64))
-            planned_estimated_bytes = (
-                planned_rifft_points * int(_RESIDUAL_GRID_VALUE_BYTES_PER_POINT)
-            ) + (int(selection.size) * int(getattr(plan, "dimensionality", 1)) * 8)
-            planned_metrics[(int(chunk_id), int(partition_id))] = {
-                "planned_partition_count": int(target_partitions),
-                "planned_rifft_points": int(planned_rifft_points),
-                "planned_estimated_bytes": int(planned_estimated_bytes),
-                "target_partition_bytes": int(getattr(plan, "target_partition_bytes", 0)),
-                "planned_imbalance_ratio": float(imbalance_ratio),
-            }
-    return planned_metrics
-
-
-def _log_partition_effectiveness_report(
-    *,
-    planned_target_metrics: dict[tuple[int, int | None], dict[str, object]],
-    inspected_target_states: dict[tuple[int, int | None], dict[str, object] | None],
-) -> None:
-    if not planned_target_metrics or not inspected_target_states:
-        return
-    for target_key in sorted(planned_target_metrics):
-        planned = planned_target_metrics.get(target_key) or {}
-        actual = inspected_target_states.get(target_key) or {}
-        checkpoint_metrics = actual.get("checkpoint_metrics") if isinstance(actual, dict) else {}
-        if not isinstance(checkpoint_metrics, dict):
-            checkpoint_metrics = {}
-        actual_checkpoint_bytes = int(
-            checkpoint_metrics.get(
-                "latest_checkpoint_bytes_written",
-                checkpoint_metrics.get("total_checkpoint_bytes_written", 0),
-            )
-        )
-        actual_checkpoint_writes = int(checkpoint_metrics.get("total_checkpoint_writes", 0))
-        actual_checkpoint_wall = float(checkpoint_metrics.get("total_checkpoint_wall_seconds", 0.0))
-        target_partition_bytes = int(planned.get("target_partition_bytes", 0))
-        logger.info(
-            "Residual-field partition report | target=%s | planned_rifft_points=%d | planned_bytes=%d | target_bytes=%d | actual_checkpoint_bytes=%d | actual_checkpoint_writes=%d | actual_checkpoint_wall=%.3fs | imbalance=%.3f | over_budget=%s",
-            target_key,
-            int(planned.get("planned_rifft_points", 0)),
-            int(planned.get("planned_estimated_bytes", 0)),
-            target_partition_bytes,
-            actual_checkpoint_bytes,
-            actual_checkpoint_writes,
-            actual_checkpoint_wall,
-            float(planned.get("planned_imbalance_ratio", 1.0)),
-            str(bool(target_partition_bytes > 0 and actual_checkpoint_bytes > target_partition_bytes)).lower(),
-        )
-
-
-def _work_unit_interval_label(work_unit: ResidualFieldWorkUnit) -> str:
-    interval_ids = work_unit.interval_ids or (
-        (work_unit.interval_id,) if work_unit.interval_id is not None else ()
-    )
-    return ",".join(str(interval_id) for interval_id in interval_ids) if interval_ids else "n/a"
-
-
-def _format_elapsed_eta(elapsed_seconds: float, completed: int, total: int) -> str:
-    """Format elapsed time and estimated remaining time."""
-    def _fmt(seconds: float) -> str:
-        seconds = max(0.0, seconds)
-        if seconds < 60:
-            return f"{seconds:.0f}s"
-        minutes = seconds / 60.0
-        if minutes < 60:
-            return f"{minutes:.1f}m"
-        hours = minutes / 60.0
-        return f"{hours:.1f}h"
-
-    parts = [f"elapsed={_fmt(elapsed_seconds)}"]
-    if completed > 0 and completed < total:
-        rate = completed / max(elapsed_seconds, 0.001)
-        remaining = (total - completed) / rate
-        parts.append(f"eta={_fmt(remaining)}")
-        parts.append(f"rate={rate:.1f}/s")
-    return " | ".join(parts)
-
-
-def _log_async_residual_progress(
-    *,
-    enabled: bool,
-    event: str,
-    work_unit: ResidualFieldWorkUnit,
-    completed: int,
-    total: int,
-    submitted: int,
-    running: int,
-    detail: str | None = None,
-    start_time: float | None = None,
-) -> None:
-    if not enabled:
-        return
-    current = int(submitted if event == "queue" else completed)
-    progress_bar_text = _format_progress_bar(current, total)
-    percent = (100.0 * current / float(max(int(total), 1)))
-    suffix = f" | {detail}" if detail else ""
-    timing = ""
-    if start_time is not None and event == "progress":
-        timing = f" | {_format_elapsed_eta(time.monotonic() - start_time, completed, total)}"
-    logger.info(
-        "Residual-field %s %s %d/%d (%.0f%%) | running=%d | chunk=%d | intervals=%s%s%s",
-        event,
-        progress_bar_text,
-        current,
-        int(total),
-        percent,
-        int(running),
-        int(work_unit.chunk_id),
-        _work_unit_interval_label(work_unit),
-        timing,
-        suffix,
-    )
-
-
-def _should_log_async_progress(
-    *,
-    phase: str,
-    count: int,
-    total: int,
-    force: bool = False,
-) -> bool:
-    if force or total <= 0:
-        return True
-    if count <= 1 or count >= total:
-        return True
-    target_updates = 4 if phase == "queue" else 20
-    stride = max(1, int(math.ceil(total / float(target_updates))))
-    return count % stride == 0
-
-
-def _cap_async_max_inflight(
-    *,
-    client,
-    requested: int,
-) -> int:
-    requested = max(1, int(requested))
-    if client is None or is_sync_client(client):
-        return requested
-    if not is_same_node_local_client(client):
-        return requested
-    try:
-        scheduler_info = client.scheduler_info()
-        workers = scheduler_info.get("workers", {})
-    except Exception:
-        workers = {}
-    if not workers:
-        return min(requested, 1)
-    nufft_slots = sum(
-        int(worker.get("resources", {}).get("nufft", 0))
-        for worker in workers.values()
-    )
-    capacity = max(1, int(nufft_slots) if int(nufft_slots) > 0 else len(workers))
-    capped = min(requested, capacity)
-    if capped < requested:
-        logger.info(
-            "Residual-field local inflight cap | requested=%d | effective=%d | workers=%d | nufft_slots=%d",
-            requested,
-            capped,
-            len(workers),
-            int(nufft_slots),
-        )
-    return capped
-
-
-def _current_worker_addresses(client) -> list[str]:
-    if client is None or is_sync_client(client):
-        return []
-    try:
-        workers = client.scheduler_info().get("workers", {})
-    except Exception:
-        workers = {}
-    return sorted(workers)
-
-
-def _resolve_owner_address(
-    *,
-    target_key: tuple[int, int | None],
-    target_owners: dict[tuple[int, int | None], str],
-    worker_addresses: list[str],
-) -> str | None:
-    current_owner = target_owners.get(target_key)
-    if current_owner in worker_addresses:
-        return current_owner
-    if not worker_addresses:
-        return current_owner
-    live_owner_loads = {address: 0 for address in worker_addresses}
-    for other_target_key, owner_address in target_owners.items():
-        if other_target_key == target_key:
-            continue
-        if owner_address in live_owner_loads:
-            live_owner_loads[owner_address] += 1
-    replacement_owner = min(
-        worker_addresses,
-        key=lambda address: (live_owner_loads[address], address),
-    )
-    target_owners[target_key] = replacement_owner
-    if current_owner is not None and current_owner != replacement_owner:
-        logger.warning(
-            "Residual-field owner remap | target=%s | previous=%s | replacement=%s",
-            target_key,
-            current_owner,
-            replacement_owner,
-        )
-    return replacement_owner
 
 
 def _build_task_reducer_backend(
@@ -475,51 +151,475 @@ def _build_task_reducer_backend(
     )
 
 
-def _interval_paths_for_work_unit(work_unit: ResidualFieldWorkUnit) -> tuple[str, ...]:
-    interval_paths = tuple(
-        artifact.path
-        for artifact in work_unit.source_artifacts
-        if artifact.kind == "interval-precompute" and artifact.path is not None
-    )
-    if not interval_paths:
-        raise ValueError("ResidualFieldWorkUnit is missing source interval artifact paths.")
-    return interval_paths
-
-
-def _interval_inputs_for_work_unit(
-    work_unit: ResidualFieldWorkUnit,
+def _residual_current_identity(
     *,
-    transient_interval_payloads: dict[int, object] | None,
-):
-    interval_ids = tuple(int(interval_id) for interval_id in (work_unit.interval_ids or ()))
-    if work_unit.interval_id is not None and not interval_ids:
-        interval_ids = (int(work_unit.interval_id),)
-    if transient_interval_payloads:
-        payload_source = transient_interval_payloads
-        if all(int(interval_id) in payload_source for interval_id in interval_ids):
-            values = tuple(payload_source[int(interval_id)] for interval_id in interval_ids)
-            return values[0] if len(values) == 1 else values
-    return _interval_paths_for_work_unit(work_unit)
+    workflow_parameters,
+    work_units: list[ResidualFieldWorkUnit],
+    point_counts_by_chunk: dict[int, int],
+    backend_kind: str,
+    max_intervals_per_batch: int,
+) -> dict[str, str | None]:
+    runtime_info = getattr(workflow_parameters, "runtime_info", {}) or {}
+    if not hasattr(runtime_info, "get"):
+        runtime_info = {}
+    run_digest = (
+        runtime_info.get("residual_run_digest")
+        or runtime_info.get("residual_field_run_digest")
+        or runtime_info.get("scattering_run_digest")
+    )
+    if not run_digest:
+        run_digest = digest_dict(
+            {
+                "parameter_digest": work_units[0].parameter_digest if work_units else "",
+                "chunks": sorted(point_counts_by_chunk),
+            },
+            domain="mosaic.residual_field.run_digest.v1",
+        )
+    source_scattering_commit_digest = _hex64_or_digest(
+        runtime_info.get("source_scattering_commit_digest")
+        or runtime_info.get("scattering_stage_digest")
+        or runtime_info.get("scattering_run_digest")
+        or run_digest,
+        domain="mosaic.residual_field.source_scattering_commit.v1",
+    )
+    source_replacement = runtime_info.get("source_replacement_digest")
+    return {
+        "run_digest": str(run_digest),
+        "partition_plan_digest": digest_dict(
+            {
+                "point_counts_by_chunk": point_counts_by_chunk,
+                "work_units": [
+                    {
+                        "chunk_id": int(work_unit.chunk_id),
+                        "interval_ids": list(_work_unit_expected_interval_ids(work_unit)),
+                    }
+                    for work_unit in work_units
+                ],
+            },
+            domain="mosaic.residual_field.partition_plan.v1",
+        ),
+        "source_scattering_commit_digest": source_scattering_commit_digest,
+        "source_replacement_digest": (
+            None
+            if source_replacement in {None, ""}
+            else _hex64_or_digest(
+                source_replacement,
+                domain="mosaic.residual_field.source_replacement.v1",
+            )
+        ),
+        "backend_policy_digest": digest_dict(
+            {
+                "backend_kind": str(backend_kind),
+                "max_intervals_per_batch": int(max_intervals_per_batch),
+                "protocol": "attempt-commit",
+            },
+            domain="mosaic.residual_field.backend_policy.v1",
+        ),
+        "expected_output_digest": digest_dict(
+            {
+                "point_counts_by_chunk": point_counts_by_chunk,
+                "work_units": [
+                    {
+                        "chunk_id": int(work_unit.chunk_id),
+                        "interval_ids": list(_work_unit_expected_interval_ids(work_unit)),
+                        "parameter_digest": work_unit.parameter_digest,
+                    }
+                    for work_unit in work_units
+                ],
+            },
+            domain="mosaic.residual_field.expected_output.v1",
+        ),
+    }
 
 
-def _reducer_target_key(work_unit: ResidualFieldWorkUnit) -> tuple[int, int | None]:
-    return int(work_unit.chunk_id), (
-        int(work_unit.partition_id) if work_unit.partition_id is not None else None
+def _identity_complete_residual_work_units(
+    *,
+    work_units: list[ResidualFieldWorkUnit],
+    point_data_list: list[dict],
+    workflow_parameters,
+    backend_kind: str,
+    max_intervals_per_batch: int,
+    force_partition: bool = True,
+) -> list[ResidualFieldWorkUnit]:
+    point_counts_by_chunk: dict[int, int] = {}
+    for row in point_data_list:
+        chunk_id = int(row["chunk_id"])
+        point_counts_by_chunk[chunk_id] = point_counts_by_chunk.get(chunk_id, 0) + 1
+    identity = _residual_current_identity(
+        workflow_parameters=workflow_parameters,
+        work_units=work_units,
+        point_counts_by_chunk=point_counts_by_chunk,
+        backend_kind=backend_kind,
+        max_intervals_per_batch=max_intervals_per_batch,
+    )
+    completed: list[ResidualFieldWorkUnit] = []
+    for work_unit in work_units:
+        with_identity = replace(work_unit, **identity)
+        if force_partition and with_identity.partition_id is None:
+            point_count = int(point_counts_by_chunk.get(int(with_identity.chunk_id), 0))
+            if point_count <= 0:
+                point_count = 1
+            with_identity = with_identity.with_partition(
+                partition_id=0,
+                point_start=0,
+                point_stop=point_count,
+            )
+        completed.append(with_identity)
+    return completed
+
+
+def _scheduler_kind(client) -> str:
+    if client is None or is_sync_client(client):
+        return "sync"
+    return "dask"
+
+
+def _runtime_provenance_for_residual(
+    *,
+    workflow_parameters,
+    fs_capability_digest: str | None,
+    client,
+) -> dict[str, object]:
+    settings = _residual_nufft_settings(workflow_parameters)
+    provenance = runtime_provenance_for_attempt(
+        fs_capability_digest=fs_capability_digest,
+        scheduler_kind=_scheduler_kind(client),
+        nufft_policy=settings.execution_policy,
+        resource_requirements=_residual_nufft_resources(workflow_parameters),
+        cuda_probe=settings.gpu_only,
+    )
+    provenance["nufft_execution_settings"] = settings.identity_payload()
+    return provenance
+
+
+def _expected_partition_family_for_chunk(
+    planned_work_units: list[ResidualFieldWorkUnit],
+    *,
+    chunk_id: int,
+) -> tuple[tuple[int | None, int | None, int | None], ...]:
+    """The plan's (partition_id, point_start, point_stop) family for a chunk.
+
+    Passed to finalize so the snapshot family is checked against the plan --
+    the only source of truth that can see a missing tail partition.
+    """
+    family: dict[int | None, tuple[int | None, int | None]] = {}
+    for work_unit in planned_work_units:
+        if int(work_unit.chunk_id) != int(chunk_id):
+            continue
+        family[work_unit.partition_id] = (
+            None if work_unit.point_start is None else int(work_unit.point_start),
+            None if work_unit.point_stop is None else int(work_unit.point_stop),
+        )
+    return tuple(
+        (partition_id, start, stop)
+        for partition_id, (start, stop) in sorted(
+            family.items(),
+            key=lambda item: (-1 if item[0] is None else int(item[0])),
+        )
     )
 
 
-def _unique_reducer_target_keys(
+def _streaming_subchunk_slot_count(workflow_parameters, client) -> int:
+    """Number of subchunk slots per chunk in streaming mode.
+
+    The slot count is part of work-unit/checkpoint identity, so it must
+    NOT depend on how many workers happen to be alive: a run started on a
+    1-GPU node has to resume on an 8-GPU node with its checkpoints intact.
+    Fixed default of 8 keeps every realistic worker count folding
+    concurrently; ``runtime_info.residual_streaming_subchunks`` overrides.
+    Sync execution gets one slot (a single accumulator per chunk)."""
+    raw = workflow_parameters.runtime_info.get("residual_streaming_subchunks")
+    if raw is not None:
+        return max(1, int(raw))
+    if client is None or is_sync_client(client):
+        return 1
+    return 8
+
+
+def _streaming_slot_owner_map(
+    target_keys,
+    worker_addresses: list[str],
+) -> dict[tuple[int, int | None], str]:
+    """Owner assignment round-robin over the sorted (chunk, slot) targets.
+
+    Slot-keyed placement (slot % workers) balanced unit COUNTS but not
+    WORK: slots are content-addressed from batch interval ids, and a
+    sparse mask concentrates nearly all real scattering volume in one
+    slot's batches — observed on the hkl40 'rod' case, whose second half
+    ran entirely on ONE GPU while three folded mask-empty no-ops. Spreading
+    each slot's per-chunk accumulators across workers quarters that skew.
+    The old co-location rationale (one worker computes a batch's payloads
+    once for all chunks) is obsolete with the durable stage-1 store: any
+    worker reads the payloads at disk speed, and the lattice entry a batch
+    needs is rebuilt at most once per owning worker, overlapped with other
+    units' transforms. Runtime-only placement — never part of work-unit
+    or checkpoint identity."""
+    # SLOT-major ordering: a slot's per-chunk accumulators take consecutive
+    # ranks, so one heavy slot spreads across workers even in the degenerate
+    # case where targets-per-chunk divides the worker count (chunk-major
+    # ordering collapses back to slot-keyed placement exactly then).
+    ordered = sorted(
+        {
+            (int(key[1]) if key[1] is not None else -1, int(key[0]))
+            for key in target_keys
+        }
+    )
+    rank = {target: index for index, target in enumerate(ordered)}
+    return {
+        target_key: worker_addresses[
+            rank[
+                (
+                    int(target_key[1]) if target_key[1] is not None else -1,
+                    int(target_key[0]),
+                )
+            ]
+            % len(worker_addresses)
+        ]
+        for target_key in target_keys
+    }
+
+
+def _mark_finalized_chunk_intervals_saved(*, db_path, chunk_id, interval_ids):
+    """Driver-side SQLite marking for streaming finalizes (single writer).
+
+    Marks the PLAN's interval set: _validate_local_durable_coverage_or_raise
+    proved the durable union covers the plan, and finalize_chunk's family
+    validation raises unless the snapshot union equals it exactly."""
+    from core.residual_field.reducer_helpers import _mark_residual_intervals_saved
+
+    _mark_residual_intervals_saved(
+        db_path=db_path, chunk_id=int(chunk_id), interval_ids=tuple(interval_ids)
+    )
+
+
+def _streaming_finalize_owner_map(
+    chunk_ids,
+    worker_addresses: list[str],
+) -> dict[int, str]:
+    """Finalize ownership keyed by CHUNK, round-robin across workers.
+
+    Finalize reads the durable slot snapshots from the shared output
+    directory, so unlike fold tasks it has no slot-owner locality tie —
+    but the slot-keyed map sends EVERY chunk's finalize to the same
+    worker (every chunk shares the identical content-addressed slot set),
+    serializing ~34 GB reads + 13.5 GB writes per chunk on one worker
+    while the rest idle. Deterministic and independent of the fold-owner
+    map (which _resolve_owner_address may mutate on remap)."""
+    return {
+        int(chunk_id): worker_addresses[index % len(worker_addresses)]
+        for index, chunk_id in enumerate(sorted(int(c) for c in chunk_ids))
+    }
+
+
+def _prewarm_stage1_store_if_enabled(
+    *,
+    client,
+    streaming_context,
+    streaming_context_future,
+    work_units,
+    worker_addresses,
+    workflow_parameters,
+) -> None:
+    """Fill the durable stage-1 payload store in parallel across ALL workers.
+
+    Without this, each interval's first compute happens inside its owner's
+    first fold of the shard: a serial, mostly-CPU prologue on one worker while
+    every other GPU idles (measured on hkl40: multi-minute all-idle windows,
+    25+ min for one sparse-mask shard). Prewarm batches are NOT slot-pinned,
+    so stage-1 spreads over every GPU up front; the store then makes every
+    later load — including restarts on any cluster size — a memmap read.
+    Best-effort: any failure degrades to the in-fold compute path.
+    ``MOSAIC_STREAMING_STAGE1_PREWARM=0`` disables."""
+    if streaming_context is None or streaming_context_future is None:
+        return
+    if not worker_addresses:
+        return
+    store_dir = getattr(streaming_context, "payload_store_dir", None)
+    if not store_dir:
+        return
+    raw = os.getenv("MOSAIC_STREAMING_STAGE1_PREWARM", "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return
+    try:
+        from core.scattering.streaming import (
+            prewarm_stage1_payload_store,
+            stage1_store_has,
+        )
+
+        interval_ids = sorted(
+            {
+                int(interval_id)
+                for work_unit in work_units
+                for interval_id in _work_unit_expected_interval_ids(work_unit)
+            }
+        )
+        missing = [
+            interval_id
+            for interval_id in interval_ids
+            if not stage1_store_has(store_dir, interval_id)
+        ]
+        if not missing:
+            if interval_ids:
+                logger.info(
+                    "Stage-1 payload store already complete (%d interval(s)).",
+                    len(interval_ids),
+                )
+            return
+        # ~4 batches per worker: enough tasks to balance uneven interval
+        # costs without paying scheduler overhead per interval.
+        batch_count = max(1, min(len(missing), 4 * len(worker_addresses)))
+        batch_size = -(-len(missing) // batch_count)
+        batches = [
+            missing[start : start + batch_size]
+            for start in range(0, len(missing), batch_size)
+        ]
+        settings = _residual_nufft_settings(workflow_parameters)
+        start_time = time.perf_counter()
+        logger.info(
+            "Prewarming stage-1 payload store: %d interval(s) in %d batch(es) "
+            "across %d worker(s) -> %s",
+            len(missing),
+            len(batches),
+            len(worker_addresses),
+            store_dir,
+        )
+        futures = [
+            client.submit(
+                prewarm_stage1_payload_store,
+                batch,
+                streaming_context_future,
+                nufft_eps=settings.eps,
+                nufft_prefer_cpu=settings.prefer_cpu,
+                nufft_gpu_only=settings.gpu_only,
+                resources={"nufft": 1},
+                retries=1,
+                pure=False,
+            )
+            for batch in batches
+        ]
+        computed = sum(int(count or 0) for count in client.gather(futures))
+        logger.info(
+            "Stage-1 payload store prewarmed: %d interval(s) in %.1fs.",
+            computed,
+            time.perf_counter() - start_time,
+        )
+    except Exception:
+        logger.warning(
+            "Stage-1 store prewarm failed; falling back to in-fold compute.",
+            exc_info=True,
+        )
+
+
+def _sort_streaming_work_units_batch_major(
     work_units: list[ResidualFieldWorkUnit],
-) -> list[tuple[int, int | None]]:
-    return list(dict.fromkeys(_reducer_target_key(work_unit) for work_unit in work_units))
+    target_owners: dict[tuple[int, int | None], str] | None = None,
+) -> list[ResidualFieldWorkUnit]:
+    """Batch-major submission order for streaming work units.
+
+    Sorts by (interval batch, chunk) so the SAME batch's units for different
+    chunks are adjacent: the batch's stage-1 payloads are computed once, all
+    chunks fold them, and only then does the next batch start. Combined with
+    the capped per-worker payload memo this is the all-in-RAM constraint —
+    the 1 GiB memo only ever needs the CURRENT batch, never more than one
+    batch's payloads at a time. Chunk-major (plan) order would instead touch
+    every batch once per chunk and thrash the memo.
+
+    Across queues the round-robin is keyed by the RESOLVED OWNER, not the
+    slot: slot-keyed interleave degenerates whenever worker count divides
+    chunk count (hkl40's 4 chunks on 4 GPUs), because (slot*C + c) mod W
+    collapses to chunk-only placement and every slot queue's head is the
+    lowest chunk — the first S in-flight units all land on ONE worker unless
+    prefetch covers ~3S units. Owner-keyed queues make the first W
+    submissions cover W distinct workers at any prefetch, while each owner's
+    OWN queue stays batch-major (the memo/lattice-cache locality is per
+    worker). Falls back to slot keying when no owner map exists (sync
+    clients)."""
+    batch_major = sorted(
+        work_units,
+        key=lambda work_unit: (
+            _work_unit_expected_interval_ids(work_unit),
+            int(work_unit.chunk_id),
+        ),
+    )
+    if target_owners:
+        def _queue_key(work_unit):
+            return target_owners.get(
+                (int(work_unit.chunk_id), work_unit.partition_id),
+                work_unit.partition_id,
+            )
+    else:
+        def _queue_key(work_unit):
+            return work_unit.partition_id
+    slot_queues: "OrderedDict[object, list[ResidualFieldWorkUnit]]" = OrderedDict()
+    for work_unit in batch_major:
+        slot_queues.setdefault(_queue_key(work_unit), []).append(work_unit)
+    if len(slot_queues) <= 1:
+        return batch_major
+    interleaved: list[ResidualFieldWorkUnit] = []
+    queues = [iter(queue) for queue in slot_queues.values()]
+    while queues:
+        remaining = []
+        for queue in queues:
+            unit = next(queue, None)
+            if unit is not None:
+                interleaved.append(unit)
+                remaining.append(queue)
+        queues = remaining
+    return interleaved
 
 
-def _work_unit_expected_interval_ids(work_unit: ResidualFieldWorkUnit) -> tuple[int, ...]:
-    if work_unit.interval_ids:
-        return tuple(int(interval_id) for interval_id in work_unit.interval_ids)
-    if work_unit.interval_id is None:
-        return ()
-    return (int(work_unit.interval_id),)
+def _invalidate_incompatible_local_checkpoints(
+    *,
+    planned_work_units: list[ResidualFieldWorkUnit],
+    reducer_backend: ResidualFieldReducerBackend,
+    output_dir: str,
+) -> None:
+    """Drop on-disk checkpoints whose partition layout no longer matches the plan.
+
+    Without this, snapshots surviving a crash across a code/configuration change
+    (different partition count or atom ranges) stay referenced by the progress
+    manifest and are concatenated at finalize, silently corrupting the chunk.
+    """
+    invalidate = getattr(
+        reducer_backend, "invalidate_incompatible_local_checkpoints", None
+    )
+    if not callable(invalidate):
+        return
+    expected_by_chunk: dict[tuple[int, str], dict[int | None, dict[str, object]]] = {}
+    for work_unit in planned_work_units:
+        key = (int(work_unit.chunk_id), str(work_unit.parameter_digest))
+        target = expected_by_chunk.setdefault(key, {}).setdefault(
+            work_unit.partition_id,
+            {
+                "point_start": (
+                    None if work_unit.point_start is None else int(work_unit.point_start)
+                ),
+                "point_stop": (
+                    None if work_unit.point_stop is None else int(work_unit.point_stop)
+                ),
+                # Snapshots from the OTHER partition axis must be dropped, not
+                # reconciled: a points-axis checkpoint surviving into a
+                # streaming (intervals-axis) plan, or vice versa, describes a
+                # different decomposition of the same chunk.
+                "partition_axis": getattr(work_unit, "partition_axis", "points"),
+                "interval_batches": [],
+            },
+        )
+        target["interval_batches"].append(
+            frozenset(
+                int(interval_id)
+                for interval_id in _work_unit_expected_interval_ids(work_unit)
+            )
+        )
+    for (chunk_id, parameter_digest), expected_targets in expected_by_chunk.items():
+        for target in expected_targets.values():
+            target["interval_batches"] = tuple(target["interval_batches"])
+        invalidate(
+            chunk_id=chunk_id,
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+            expected_targets=expected_targets,
+        )
 
 
 def _reconcile_and_filter_local_durable_work_units(
@@ -609,6 +709,137 @@ def _validate_local_durable_coverage_or_raise(
     return resolved_states
 
 
+def _dead_cluster_horizon_seconds() -> float:
+    try:
+        return max(
+            60.0,
+            float(os.getenv("MOSAIC_RESIDUAL_DEAD_CLUSTER_HORIZON_SECONDS", "900")),
+        )
+    except ValueError:
+        return 900.0
+
+
+def _barrier_future_ok(future) -> bool:
+    status = getattr(future, "status", None)
+    if status is not None and status != "finished":
+        return False
+    try:
+        result = future.result()
+    except Exception:
+        return False
+    return result is not None and result is not False
+
+
+def _drain_owner_pinned_barrier(
+    *,
+    client,
+    futures_by_key: dict,
+    owner_by_key: dict,
+    resubmit,
+    barrier_name: str,
+    timeout_seconds: float = 45.0,
+):
+    """Yield (key, future, ok) for owner-pinned barrier futures, rescuing any
+    whose pinned worker left the cluster.
+
+    A future pinned with workers=[owner], allow_other_workers=False whose only
+    allowed worker died parks in no-worker state as 'pending' FOREVER (nanny
+    restarts come back on NEW addresses), so a bare as_completed here hangs
+    the driver — the same failure the fold drain loop already rescues; the
+    flush/inspect/finalize barriers after it did not. Waits in bounded slices,
+    cancels futures pinned to dead owners, and resubmits via
+    ``resubmit(key, new_owner)`` on a live worker. Raises if the cluster has
+    no live workers for longer than the dead-cluster horizon."""
+    if client is None or is_sync_client(client):
+        reverse = {future: key for key, future in futures_by_key.items()}
+        for future, _ok in yield_futures_with_results(
+            list(futures_by_key.values()), client
+        ):
+            key = reverse.get(future)
+            if key is not None:
+                yield key, future, _barrier_future_ok(future)
+        return
+    from distributed import wait as _distributed_wait
+
+    pending = dict(futures_by_key)
+    owners = dict(owner_by_key)
+    dead_since: float | None = None
+    rescued = 0
+    while pending:
+        live = _current_worker_addresses(client)
+        if not live:
+            now = time.monotonic()
+            if dead_since is None:
+                dead_since = now
+            elif now - dead_since >= _dead_cluster_horizon_seconds():
+                raise RuntimeError(
+                    f"Residual-field {barrier_name} barrier: no live workers "
+                    f"for {_dead_cluster_horizon_seconds():.0f}s with "
+                    f"{len(pending)} owner-pinned task(s) outstanding."
+                )
+            time.sleep(min(5.0, timeout_seconds))
+            continue
+        dead_since = None
+        live_set = set(live)
+        for key, future in list(pending.items()):
+            status = getattr(future, "status", "")
+            if status in ("finished", "error"):
+                continue
+            owner = owners.get(key)
+            if status not in ("cancelled", "lost") and (
+                owner is None or owner in live_set
+            ):
+                continue
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            new_owner = live[rescued % len(live)]
+            rescued += 1
+            logger.warning(
+                "Residual-field %s barrier: owner %s for %s is gone; "
+                "resubmitting on %s",
+                barrier_name,
+                owner,
+                key,
+                new_owner,
+            )
+            pending[key] = resubmit(key, new_owner)
+            owners[key] = new_owner
+        try:
+            _distributed_wait(
+                list(pending.values()),
+                timeout=timeout_seconds,
+                return_when="FIRST_COMPLETED",
+            )
+        except TimeoutError:
+            continue
+        except Exception:
+            # Comm hiccups/test doubles can make wait() raise immediately —
+            # take one completion through the blocking generator instead of
+            # spinning on retry.
+            for future, ok in yield_futures_with_results(
+                list(pending.values()), client
+            ):
+                for key, pending_future in list(pending.items()):
+                    if pending_future is future:
+                        del pending[key]
+                        yield key, future, ok
+                        break
+                break
+            continue
+        for key, future in list(pending.items()):
+            done = getattr(future, "done", None)
+            try:
+                is_done = future.done() if callable(done) else True
+            except Exception:
+                is_done = True
+            if not is_done:
+                continue
+            del pending[key]
+            yield key, future, _barrier_future_ok(future)
+
+
 def _inspect_owner_local_reducer_targets_or_raise(
     *,
     client,
@@ -626,21 +857,11 @@ def _inspect_owner_local_reducer_targets_or_raise(
             "Residual-field owner-local finalize requires per-target inspection support "
             "before publishing chunk artifacts."
         )
-    inspect_futures = []
-    target_keys_by_future = {}
     worker_addresses = _current_worker_addresses(client)
-    for chunk_id, partition_id in target_keys:
-        owner_address = _resolve_owner_address(
-            target_key=(int(chunk_id), partition_id),
-            target_owners=target_owners,
-            worker_addresses=worker_addresses,
-        )
-        if owner_address is None:
-            raise RuntimeError(
-                "Residual-field owner-local finalize requires target ownership for "
-                f"reducer target {(int(chunk_id), partition_id)}."
-            )
-        future = client.submit(
+
+    def _submit_inspect(target_key, owner_address):
+        chunk_id, partition_id = target_key
+        return client.submit(
             inspect_helper,
             template_backend,
             chunk_id=int(chunk_id),
@@ -651,83 +872,38 @@ def _inspect_owner_local_reducer_targets_or_raise(
             workers=[owner_address],
             allow_other_workers=False,
         )
-        inspect_futures.append(future)
-        target_keys_by_future[future] = (int(chunk_id), partition_id)
+
+    futures_by_key = {}
+    owner_by_key = {}
+    for chunk_id, partition_id in target_keys:
+        target_key = (int(chunk_id), partition_id)
+        owner_address = _resolve_owner_address(
+            target_key=target_key,
+            target_owners=target_owners,
+            worker_addresses=worker_addresses,
+        )
+        if owner_address is None:
+            raise RuntimeError(
+                "Residual-field owner-local finalize requires target ownership for "
+                f"reducer target {target_key}."
+            )
+        futures_by_key[target_key] = _submit_inspect(target_key, owner_address)
+        owner_by_key[target_key] = owner_address
     inspected_target_states: dict[tuple[int, int | None], dict[str, object] | None] = {}
-    for future, result in yield_futures_with_results(inspect_futures, client):
-        if future is None:
-            continue
+    # Inspection reads durable state from the shared output dir, so a dead
+    # owner's inspect is safely remapped to any live worker.
+    for target_key, future, ok in _drain_owner_pinned_barrier(
+        client=client,
+        futures_by_key=futures_by_key,
+        owner_by_key=owner_by_key,
+        resubmit=_submit_inspect,
+        barrier_name="inspect",
+    ):
         try:
-            inspected_target_states[target_keys_by_future[future]] = future.result()
+            inspected_target_states[target_key] = future.result()
         except Exception:
-            inspected_target_states[target_keys_by_future[future]] = None
+            inspected_target_states[target_key] = None
     return inspected_target_states
-
-
-def _log_owner_local_finalize_metrics(
-    *,
-    inspected_target_states: dict[tuple[int, int | None], dict[str, object] | None],
-    backend_kind: str,
-) -> None:
-    if not inspected_target_states:
-        return
-    total_bytes = 0
-    total_writes = 0
-    total_wall_seconds = 0.0
-    saw_metrics = False
-    for target_key in sorted(inspected_target_states):
-        target_state = inspected_target_states.get(target_key) or {}
-        checkpoint_metrics = target_state.get("checkpoint_metrics")
-        if not isinstance(checkpoint_metrics, dict):
-            checkpoint_metrics = target_state
-        checkpoint_bytes = target_state.get(
-            "total_checkpoint_bytes_written",
-            checkpoint_metrics.get("total_checkpoint_bytes_written")
-            if checkpoint_metrics is not target_state
-            else target_state.get("checkpoint_bytes_written"),
-        )
-        checkpoint_writes = target_state.get(
-            "total_checkpoint_writes",
-            checkpoint_metrics.get("total_checkpoint_writes")
-            if checkpoint_metrics is not target_state
-            else target_state.get("checkpoint_writes"),
-        )
-        checkpoint_wall_seconds = target_state.get(
-            "total_checkpoint_wall_seconds",
-            checkpoint_metrics.get("total_checkpoint_wall_seconds")
-            if checkpoint_metrics is not target_state
-            else target_state.get("checkpoint_wall_seconds"),
-        )
-        if (
-            checkpoint_bytes is None
-            and checkpoint_writes is None
-            and checkpoint_wall_seconds is None
-        ):
-            continue
-        saw_metrics = True
-        target_bytes = int(checkpoint_bytes or 0)
-        target_writes = int(checkpoint_writes or 0)
-        target_wall_seconds = float(checkpoint_wall_seconds or 0.0)
-        total_bytes += target_bytes
-        total_writes += target_writes
-        total_wall_seconds += target_wall_seconds
-        logger.info(
-            "Residual-field finalize checkpoints | backend=%s | target=%s | writes=%d | bytes=%d | wall=%.3fs",
-            backend_kind,
-            target_key,
-            target_writes,
-            target_bytes,
-            target_wall_seconds,
-        )
-    if saw_metrics:
-        logger.info(
-            "Residual-field finalize checkpoints total | backend=%s | targets=%d | writes=%d | bytes=%d | wall=%.3fs",
-            backend_kind,
-            int(len(inspected_target_states)),
-            total_writes,
-            total_bytes,
-            total_wall_seconds,
-        )
 
 
 def _record_residual_task_result(
@@ -755,6 +931,7 @@ def _flush_local_reducer_targets_or_raise(
     output_dir: str,
     db_path: str,
     target_owners: dict[tuple[int, int | None], str],
+    pre_submitted_futures: dict[tuple[int, int | None], object] | None = None,
 ) -> None:
     if not target_keys:
         return
@@ -772,57 +949,69 @@ def _flush_local_reducer_targets_or_raise(
                 f"for partitioned chunks: {multi_owner_chunks}"
             )
         return
-    flush_futures = []
     worker_addresses = _current_worker_addresses(client)
+
+    def _submit_flush(target_key, owner_address):
+        chunk_id, partition_id = target_key
+        return client.submit(
+            flush_helper,
+            template_backend,
+            chunk_id=int(chunk_id),
+            parameter_digest=parameter_digest,
+            output_dir=output_dir,
+            db_path=db_path,
+            partition_id=partition_id,
+            pure=False,
+            workers=[owner_address],
+            allow_other_workers=False,
+        )
+
+    futures_by_key = {}
+    owner_by_key = {}
     for chunk_id, partition_id in target_keys:
+        target_key = (int(chunk_id), partition_id)
+        pre_submitted = (pre_submitted_futures or {}).get(target_key)
+        if pre_submitted is not None:
+            pre_future, pre_owner = pre_submitted
+            pre_status = getattr(pre_future, "status", "")
+            if pre_status == "finished" or (
+                pre_status not in ("error", "cancelled", "lost")
+                and pre_owner in worker_addresses
+            ):
+                # Early per-target flush already done or in flight on a
+                # LIVE owner — the barrier just waits on it.
+                futures_by_key[target_key] = pre_future
+                owner_by_key[target_key] = pre_owner
+                continue
+            # Owner died (a worker-pinned future for a dead worker parks in
+            # no-worker state as 'pending' FOREVER — reusing it would hang
+            # the barrier). Cancel and resubmit through the owner remap.
+            cancel = getattr(pre_future, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
         owner_address = _resolve_owner_address(
-            target_key=(int(chunk_id), partition_id),
+            target_key=target_key,
             target_owners=target_owners,
             worker_addresses=worker_addresses,
         )
         if owner_address is None:
             continue
-        flush_futures.append(
-            client.submit(
-                flush_helper,
-                template_backend,
-                chunk_id=int(chunk_id),
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-                db_path=db_path,
-                partition_id=partition_id,
-                pure=False,
-                workers=[owner_address],
-                allow_other_workers=False,
-            )
-        )
-    for future, result in yield_futures_with_results(flush_futures, client):
-        if future is None:
-            continue
-
-
-def _cleanup_residual_shards_enabled(workflow_parameters) -> bool:
-    return _residual_shard_cleanup_policy(workflow_parameters) == "delete_reclaimable"
-
-
-def _residual_shard_cleanup_policy(workflow_parameters) -> str:
-    runtime_policy = workflow_parameters.runtime_info.get(
-        "residual_shard_cleanup_policy"
-    )
-    if runtime_policy is not None:
-        value = str(runtime_policy).strip().lower()
-        if value in {"off", "keep"}:
-            return "off"
-        if value in {"delete_reclaimable", "cleanup"}:
-            return "delete_reclaimable"
-    runtime_value = workflow_parameters.runtime_info.get("cleanup_residual_shards")
-    if runtime_value is not None:
-        return "delete_reclaimable" if bool(runtime_value) else "off"
-    return (
-        "delete_reclaimable"
-        if os.getenv("MOSAIC_CLEANUP_RESIDUAL_SHARDS", "0") == "1"
-        else "off"
-    )
+        futures_by_key[target_key] = _submit_flush(target_key, owner_address)
+        owner_by_key[target_key] = owner_address
+    # A dead owner's RAM state is unrecoverable, so a remapped flush is a
+    # no-op on the new worker — the point is converting a silent barrier
+    # hang into the durable-coverage validation's clean fail-stop.
+    for _key, _future, _ok in _drain_owner_pinned_barrier(
+        client=client,
+        futures_by_key=futures_by_key,
+        owner_by_key=owner_by_key,
+        resubmit=_submit_flush,
+        barrier_name="flush",
+    ):
+        pass
 
 
 def _finalize_residual_field_chunks(
@@ -839,38 +1028,9 @@ def _finalize_residual_field_chunks(
 ) -> None:
     for chunk_id in sorted(set(int(chunk_id) for chunk_id in chunk_ids)):
         shard_manifests = manifests_by_chunk.get(int(chunk_id))
-        if not reducer_backend.uses_local_chunk_accumulator():
-            reconciled_progress = reducer_backend.reconcile_progress(
-                chunk_id=int(chunk_id),
-                parameter_digest=parameter_digest,
-                output_dir=output_dir,
-                db_path=db_path,
-                manifests=shard_manifests,
-                scratch_root=scratch_root,
-            )
-            expected_interval_ids = set(
-                int(interval_id)
-                for interval_id in expected_interval_ids_by_chunk.get(int(chunk_id), ())
-            )
-            if reconciled_progress is not None:
-                durable_interval_ids = set(
-                    int(interval_id)
-                    for interval_id in reconciled_progress.incorporated_interval_ids
-                )
-                missing_interval_ids = tuple(sorted(expected_interval_ids - durable_interval_ids))
-                if missing_interval_ids:
-                    raise RuntimeError(
-                        "Residual-field distributed finalize missing durable coverage for "
-                        f"chunk {int(chunk_id)}: {missing_interval_ids}"
-                    )
-                logger.info(
-                    "Residual-field reconcile | chunk=%d | truth=%s | committed_shards=%d | pending_shards=%d | pending_intervals=%d",
-                    int(chunk_id),
-                    reconciled_progress.durable_truth_unit,
-                    int(len(reconciled_progress.incorporated_shard_keys)),
-                    int(len(reconciled_progress.pending_shard_keys)),
-                    int(len(reconciled_progress.pending_interval_ids)),
-                )
+        # Only the sync-client owner-local path reaches here; the old
+        # reconcile pre-check served the non-owner-local shard/attempt
+        # universe, which the two backend-kind guards make unreachable.
         shard_summary = summarize_residual_field_shards(shard_manifests or [])
         finalize_start = time.perf_counter()
         manifest = reducer_backend.finalize_chunk(
@@ -882,6 +1042,7 @@ def _finalize_residual_field_chunks(
             cleanup_policy=cleanup_policy,
             scratch_root=scratch_root,
             quiet_logs=False,
+            expected_interval_ids=expected_interval_ids_by_chunk.get(int(chunk_id)),
         )
         if manifest is not None:
             output_summary = summarize_residual_field_output_artifacts(manifest.artifacts)
@@ -903,6 +1064,154 @@ def _finalize_residual_field_chunks(
             )
 
 
+def _drop_mask_emptied_interval_chunks(
+    interval_chunk_pairs,
+    *,
+    output_dir,
+    transient_interval_payloads,
+    parameter_digest,
+    logger,
+):
+    """Drop (interval, chunk) pairs whose interval produced no scattering output.
+
+    A reciprocal-space mask can eliminate every Q-point in a subvolume (e.g. a
+    half-integer superlattice mask empties the entire l=0 plane).  Such intervals
+    have no precomputed ``interval_<id>.hdf5`` artifact and no transient in-memory
+    payload; their residual-field contribution is exactly zero.  The scattering
+    stage marks them complete, but ``rebuild_sqlite_cache_from_manifests`` resets
+    every interval-chunk to unsaved and only re-marks intervals that have a
+    manifest, so mask-emptied intervals resurface here and would otherwise make
+    the residual stage try to open files that were never written.
+
+    A genuine scattering failure aborts Stage-1 before the residual stage runs,
+    but "no artifact and no payload" alone is NOT enough to conclude the mask
+    emptied the interval: on a restart, an interval whose transient payload was
+    already consumed and folded into a committed durable generation looks
+    identical.  Such pairs must stay in the plan so the finalize/repair path can
+    re-mark them saved and apply the cleanup policy; only intervals that are
+    also absent from the chunk's durable reducer progress are dropped.
+    """
+    payloads = transient_interval_payloads or {}
+    available: dict[int, bool] = {}
+    incorporated_by_chunk: dict[int, frozenset[int]] = {}
+
+    def _has_payload(interval_id: int) -> bool:
+        cached = available.get(interval_id)
+        if cached is not None:
+            return cached
+        present = int(interval_id) in payloads
+        if not present:
+            artifact_path = build_interval_artifact_ref(output_dir, int(interval_id)).path
+            present = artifact_path is not None and os.path.exists(artifact_path)
+        available[interval_id] = present
+        return present
+
+    def _durably_incorporated(interval_id: int, chunk_id: int) -> bool:
+        incorporated = incorporated_by_chunk.get(chunk_id)
+        if incorporated is None:
+            progress = discover_residual_field_reducer_progress_manifest(
+                output_dir=output_dir,
+                chunk_id=chunk_id,
+                parameter_digest=parameter_digest,
+            )
+            incorporated = (
+                frozenset(int(value) for value in progress.incorporated_interval_ids)
+                if progress is not None
+                else frozenset()
+            )
+            incorporated_by_chunk[chunk_id] = incorporated
+        return interval_id in incorporated
+
+    kept = [
+        (interval_id, chunk_id)
+        for interval_id, chunk_id in interval_chunk_pairs
+        if _has_payload(int(interval_id))
+        or _durably_incorporated(int(interval_id), int(chunk_id))
+    ]
+    dropped_intervals = sorted(
+        {int(interval_id) for interval_id, _ in interval_chunk_pairs}
+        - {int(interval_id) for interval_id, _ in kept}
+    )
+    if dropped_intervals:
+        logger.info(
+            "Residual-field: skipping %d mask-emptied interval(s) with no scattering "
+            "output (zero contribution): %s%s",
+            len(dropped_intervals),
+            dropped_intervals[:20],
+            " ..." if len(dropped_intervals) > 20 else "",
+        )
+    return kept
+
+
+def _lattice_grid_capped_intervals_per_shard(
+    intervals,
+    supercell,
+    budget_bytes: int,
+) -> tuple[int, int]:
+    """Grid-size-aware cap on how many intervals fold into one lattice shard.
+
+    The lattice (scatter+type-2) residual path materialises one dense
+    coefficient grid per shard spanning the bounding box of the shard's
+    intervals at a reciprocal pitch of ``1/supercell_axis`` r.l.u. per axis.
+    Model: the dense grid for the FULL interval union spans, per axis,
+    ``(global_qmax - global_qmin) / pitch + 1`` points, and costs
+    ``prod(dims) * 16 bytes * 2`` (two complex128 transforms).  The per-shard
+    bounding box of a contiguous run of reciprocal-space-sorted interval ids
+    scales roughly with its interval fraction, so the shard size is capped at
+    ``max(1, floor(n_intervals * budget_bytes / full_union_grid_bytes))``;
+    the memmap spill remains the safety net for outlier shards.
+
+    This bounds the DEFAULT durable-mode shard fold so hkl40-scale runs no
+    longer build whole-extent (tens-of-GiB) grids by default.  Returns
+    ``(capped_max_intervals_per_shard, full_union_grid_bytes)``; when the
+    full-union grid fits the budget the cap equals ``len(intervals)`` (the
+    existing fold-everything behaviour is kept).
+    """
+    interval_dicts = [to_interval_dict(interval) for interval in intervals]
+    n_intervals = max(1, len(interval_dicts))
+    supercell = np.asarray(supercell, dtype=float)
+    grid_points = 1
+    for axis, cells in zip(("h", "k", "l"), supercell):
+        starts = [d[f"{axis}_start"] for d in interval_dicts if f"{axis}_start" in d]
+        ends = [d[f"{axis}_end"] for d in interval_dicts if f"{axis}_end" in d]
+        if not starts or not ends:
+            continue
+        pitch = 1.0 / float(cells)
+        span = max(ends) - min(starts)
+        grid_points *= max(1, int(math.floor(span / pitch + 0.5)) + 1)
+    full_union_grid_bytes = int(grid_points) * 16 * 2
+    if full_union_grid_bytes <= int(budget_bytes):
+        return n_intervals, full_union_grid_bytes
+    cap = max(1, (n_intervals * int(budget_bytes)) // full_union_grid_bytes)
+    return min(n_intervals, cap), full_union_grid_bytes
+
+
+def _adaptive_residual_intervals_per_shard(
+    *,
+    artifacts,
+    structure,
+    source_budget: int,
+) -> int:
+    intervals = list(artifacts.padded_intervals)
+    n_intervals = max(1, len(intervals))
+    # The residual inverse concatenates the actual q_grid rows as source points.
+    # Those rows are multiplicity-free; half-space conjugate reconstruction is
+    # applied after the inverse.  Using multiplicity-folded dense counts here
+    # overestimates source memory and splits batches unnecessarily.
+    total_source_points = sum(
+        int(
+            reciprocal_space_points_counter(
+                to_interval_dict(interval),
+                structure.supercell,
+                include_multiplicity=False,
+            )
+        )
+        for interval in intervals
+    )
+    avg_source_points = max(1, int(total_source_points) // n_intervals)
+    return max(1, min(n_intervals, int(source_budget) // avg_source_points))
+
+
 def run_residual_field_stage(
     *,
     workflow_parameters,
@@ -911,29 +1220,96 @@ def run_residual_field_stage(
     client: "Client | None",
     max_inflight: int = 5_000,
 ) -> None:
-    explicit_scratch_root = workflow_parameters.runtime_info.get(
-        "residual_shard_scratch_root",
-        os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT"),
-    )
+    # Uniform precedence: operator env wins over config (see
+    # resolve_residual_field_reducer_backend for the rule).
+    explicit_scratch_root = os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT")
+    if explicit_scratch_root is None:
+        explicit_scratch_root = workflow_parameters.runtime_info.get(
+            "residual_shard_scratch_root"
+        )
     preliminary_backend = resolve_residual_field_reducer_backend(
         workflow_parameters=workflow_parameters,
         client=client,
     )
     register_cleanup_plugin(client, is_sync_client=is_sync_client)
-    max_intervals_per_shard = int(
-        workflow_parameters.runtime_info.get(
-            "residual_shard_batch_size",
-            DEFAULT_RESIDUAL_INTERVALS_PER_SHARD,
-        )
+    _env_shard = os.getenv("MOSAIC_RESIDUAL_INTERVALS_PER_SHARD")
+    _configured_shard = workflow_parameters.runtime_info.get("residual_shard_batch_size")
+    if _env_shard is not None:
+        max_intervals_per_shard = max(1, int(_env_shard))
+    elif _configured_shard is not None:
+        max_intervals_per_shard = max(1, int(_configured_shard))
+    else:
+        # Adaptive default: fold as many intervals as possible into ONE shard so the
+        # inverse transform is issued as FEW, LARGE GPU calls (concat source-batching,
+        # high GPU utilisation) instead of one tiny task per interval. Bound the fold by
+        # a source-point budget so wide-hkl 3D keeps the concatenated q-list -- and hence
+        # the type-3 fine grid -- within VRAM. 2D folds all intervals; huge 3D caps.
+        try:
+            if _residual_lattice_fft_enabled():
+                # Lattice (scatter+type-2) path: one shard covering every
+                # interval means ONE scattered coefficient grid, cached and
+                # reused by all (chunk, partition) work units. The type-3
+                # source-point budget is irrelevant -- lattice memory is set by
+                # the grid dims, not the point count. Bound the fold by a
+                # projected-grid-bytes budget so wide-hkl 3D (e.g. hkl40) does
+                # not build a whole-extent dense grid by default.
+                _lattice_intervals = list(artifacts.padded_intervals)
+                max_intervals_per_shard = max(1, len(_lattice_intervals))
+                _grid_budget = resolve_residual_shard_grid_budget_bytes()
+                _grid_cap, _full_grid_bytes = _lattice_grid_capped_intervals_per_shard(
+                    _lattice_intervals,
+                    structure.supercell,
+                    _grid_budget,
+                )
+                if _grid_cap < max_intervals_per_shard:
+                    logger.info(
+                        "Residual-field lattice shard fold capped by projected "
+                        "grid size: %d -> %d intervals/shard (full-union grid "
+                        "~%.2f GiB > budget %.2f GiB)",
+                        max_intervals_per_shard,
+                        _grid_cap,
+                        _full_grid_bytes / float(1024**3),
+                        _grid_budget / float(1024**3),
+                    )
+                    max_intervals_per_shard = _grid_cap
+            else:
+                _budget = resolve_residual_shard_source_budget()
+                max_intervals_per_shard = _adaptive_residual_intervals_per_shard(
+                    artifacts=artifacts,
+                    structure=structure,
+                    source_budget=_budget,
+                )
+        except Exception:
+            logger.debug("Adaptive residual shard sizing failed; using default.", exc_info=True)
+            max_intervals_per_shard = DEFAULT_RESIDUAL_INTERVALS_PER_SHARD
+    logger.info(
+        "Residual-field interval shard size | max_intervals_per_shard=%d "
+        "(env=%s, config=%s)",
+        max_intervals_per_shard,
+        _env_shard,
+        _configured_shard,
     )
+    if explicit_scratch_root is not None:
+        preferred_scratch = explicit_scratch_root
+    elif preliminary_backend.layout.kind == "local_restartable":
+        # Live accumulators are node-local WORKING state; only durable
+        # snapshots belong on the shared output dir. Defaulting scratch to
+        # output_dir streamed every GB-scale live memmap over NFS on
+        # multi-node runs — the multi-node-safety rationale in the backend
+        # selection assumes node-local scratch. Default to the worker
+        # scratch base instead, unless that base is tmpfs (RAM), where the
+        # shared output dir remains the safer default.
+        import tempfile as _tempfile
+
+        preferred_scratch = None
+        if os.getenv("MOSAIC_WORKER_SCRATCH_ROOT") is None and path_is_tmpfs(
+            _tempfile.gettempdir()
+        ):
+            preferred_scratch = str(Path(artifacts.output_dir) / ".local_restartable")
+    else:
+        preferred_scratch = None
     scratch_root = resolve_worker_scratch_root(
-        preferred=(
-            explicit_scratch_root
-            if explicit_scratch_root is not None
-            else str(Path(artifacts.output_dir) / ".local_restartable")
-            if preliminary_backend.layout.kind == "local_restartable"
-            else None
-        ),
+        preferred=preferred_scratch,
         stage="residual_field",
     )
     reducer_backend = preliminary_backend
@@ -941,10 +1317,6 @@ def run_residual_field_stage(
     worker_owned_local_reducer = (
         reducer_backend.layout.kind == "local_restartable"
         and _worker_owned_local_reducer_enabled(workflow_parameters)
-    )
-    distributed_owner_local_reducer = (
-        reducer_backend.layout.kind == "durable_shared_restartable"
-        and _distributed_owner_affinity_enabled(workflow_parameters)
     )
     if reducer_backend.layout.kind == "local_restartable" and not worker_owned_local_reducer:
         raise ValueError(
@@ -991,40 +1363,172 @@ def run_residual_field_stage(
         reducer_runtime_state.checkpoint_policy.final_chunk_artifacts,
         reducer_runtime_state.checkpoint_policy.worker_local_scratch_role,
     )
-    if reducer_backend.layout.kind == "durable_shared_restartable":
-        if not distributed_owner_local_reducer:
-            raise ValueError(
-                "Residual-field distributed durable execution requires owner affinity. "
-                "The shard-per-partial distributed path has been removed."
-            )
-        if not _distributed_owner_local_reducer_supported(
-            reducer_backend,
-            reducer_runtime_state=reducer_runtime_state,
-        ):
-            raise RuntimeError(
-                "Residual-field distributed durable execution requires backend support "
-                "for owner-local accumulation via accept_local_contribution, "
-                "inspect_local_reducer_target, and flush_local_reducer_target."
-            )
     owner_local_reducer = _owner_local_reducer_enabled(
         reducer_backend=reducer_backend,
         worker_owned_local_reducer=worker_owned_local_reducer,
-        distributed_owner_local_reducer=distributed_owner_local_reducer,
     )
-    cleanup_policy = _residual_shard_cleanup_policy(workflow_parameters)
-    work_units = build_residual_field_work_units(
-        artifacts.db_manager.get_unsaved_interval_chunks(),
+    cleanup_policy = _residual_attempt_cleanup_policy(workflow_parameters)
+    streaming_context = (getattr(artifacts, "streaming_state", None) or {}).get(
+        "compute_context"
+    )
+    all_interval_chunk_pairs = list(
+        artifacts.db_manager.get_interval_chunks()
+        if hasattr(artifacts.db_manager, "get_interval_chunks")
+        else artifacts.db_manager.get_unsaved_interval_chunks()
+    )
+    if streaming_context is None:
+        all_interval_chunk_pairs = _drop_mask_emptied_interval_chunks(
+            all_interval_chunk_pairs,
+            output_dir=artifacts.output_dir,
+            transient_interval_payloads=getattr(artifacts, "transient_interval_payloads", {}) or {},
+            parameter_digest=build_residual_field_parameter_digest(workflow_parameters),
+            logger=logger,
+        )
+    # else: streaming mode has no interval artifacts or payload dict to probe;
+    # mask-emptiness is discovered inside the work unit, which folds an exact
+    # zero and still records the interval as incorporated.
+    #
+    # Interval GEOMETRY for shard packing: interval ids run one reciprocal
+    # axis at a time, so a contiguous id run spans nearly the full q-volume
+    # and its dense lattice grid blows past every budget (hkl40: 31 GiB ->
+    # RAM-admission failure -> silent type-3 fallback). Handing the planner
+    # each id's bounds lets it pack shards by spatial bounding box instead.
+    interval_geometry: dict[int, dict] | None = None
+    try:
+        unique_interval_ids = sorted(
+            {int(interval_id) for interval_id, _chunk in all_interval_chunk_pairs}
+        )
+        interval_geometry = {
+            int(record.interval_id): {
+                "h_start": record.h_range[0],
+                "h_end": record.h_range[1],
+                "k_start": record.k_range[0],
+                "k_end": record.k_range[1],
+                "l_start": record.l_range[0],
+                "l_end": record.l_range[1],
+            }
+            for record in artifacts.db_manager.get_intervals_by_ids(
+                unique_interval_ids
+            )
+        }
+    except Exception:
+        logger.debug(
+            "Interval geometry unavailable; shard packing falls back to "
+            "contiguous id slicing.",
+            exc_info=True,
+        )
+        interval_geometry = None
+    _shard_packing_kwargs = {
+        "interval_geometry": interval_geometry,
+        "supercell": getattr(structure, "supercell", None),
+        "grid_budget_bytes": resolve_residual_shard_grid_budget_bytes(),
+    }
+    initial_work_units = build_residual_field_work_units(
+        all_interval_chunk_pairs,
         parameters=workflow_parameters,
         output_dir=artifacts.output_dir,
         max_intervals_per_shard=max_intervals_per_shard,
+        **_shard_packing_kwargs,
+    )
+    initial_chunk_ids = sorted({work_unit.chunk_id for work_unit in initial_work_units})
+    point_data_list: list[dict] = []
+    for chunk_id in initial_chunk_ids:
+        point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
+    initial_identity_units = _identity_complete_residual_work_units(
+        work_units=initial_work_units,
+        point_data_list=point_data_list,
+        workflow_parameters=workflow_parameters,
+        backend_kind=reducer_backend.layout.kind,
+        max_intervals_per_batch=max_intervals_per_shard,
+        force_partition=not owner_local_reducer,
+    )
+    if initial_identity_units:
+        run_digest = str(initial_identity_units[0].run_digest)
+        snapshot = rebuild_sqlite_cache_from_manifests(
+            artifacts.db_manager,
+            output_dir=artifacts.output_dir,
+            run_digest=run_digest,
+            # Credits COMMITTED streaming reducer progress (status-only
+            # results write no payload manifests) so a completed case's
+            # retry skips the residual stage instead of re-deriving it.
+            residual_parameter_digest=str(
+                initial_identity_units[0].parameter_digest
+            ),
+        )
+        pending_pairs = pending_residual_interval_chunks(
+            snapshot,
+            all_interval_chunk_pairs,
+            output_dir=artifacts.output_dir,
+            residual_parameter_digest=str(
+                initial_identity_units[0].parameter_digest
+            ),
+        )
+    else:
+        pending_pairs = []
+
+    work_units = build_residual_field_work_units(
+        pending_pairs,
+        parameters=workflow_parameters,
+        output_dir=artifacts.output_dir,
+        max_intervals_per_shard=max_intervals_per_shard,
+        **_shard_packing_kwargs,
     )
     planned_target_metrics: dict[tuple[int, int | None], dict[str, object]] = {}
     chunk_ids = sorted({work_unit.chunk_id for work_unit in work_units})
-    point_data_list: list[dict] = []
+    point_data_list = []
     for chunk_id in chunk_ids:
         point_data_list.extend(artifacts.db_manager.get_point_data_for_chunk(int(chunk_id)))
 
-    if owner_local_reducer and client is not None and not is_sync_client(client) and work_units:
+    work_units = _identity_complete_residual_work_units(
+        work_units=work_units,
+        point_data_list=point_data_list,
+        workflow_parameters=workflow_parameters,
+        backend_kind=reducer_backend.layout.kind,
+        max_intervals_per_batch=max_intervals_per_shard,
+        force_partition=not owner_local_reducer,
+    )
+
+    if streaming_context is not None and work_units:
+        # Streaming subchunks: partition on the INTERVAL axis instead of the
+        # atom axis. Every batch unit covers its chunk's full point range and
+        # is routed to a content-addressed slot; each slot's accumulator sums
+        # a disjoint interval subset, and finalize merges slots by summation
+        # (validated by the disjoint-union family checks).
+        from core.scattering.streaming import streaming_slot_map
+
+        point_counts_by_chunk: dict[int, int] = {}
+        for point_data in point_data_list:
+            chunk_key = int(point_data["chunk_id"])
+            point_counts_by_chunk[chunk_key] = point_counts_by_chunk.get(chunk_key, 0) + 1
+        n_slots = _streaming_subchunk_slot_count(workflow_parameters, client)
+        slot_by_batch = streaming_slot_map(
+            (
+                _work_unit_expected_interval_ids(work_unit)
+                for work_unit in work_units
+            ),
+            n_slots,
+        )
+        work_units = [
+            work_unit.with_subchunk(
+                subchunk_id=slot_by_batch[
+                    tuple(
+                        int(interval_id)
+                        for interval_id in _work_unit_expected_interval_ids(work_unit)
+                    )
+                ],
+                point_count=point_counts_by_chunk[int(work_unit.chunk_id)],
+            )
+            for work_unit in work_units
+        ]
+        logger.info(
+            "Residual-field streaming mode: %d batch unit(s) across %d "
+            "subchunk slot(s); interval payloads computed in-task, no "
+            "durable interval store.",
+            len(work_units),
+            n_slots,
+        )
+
+    if streaming_context is None and owner_local_reducer and client is not None and not is_sync_client(client) and work_units:
         point_rows_by_chunk = {
             int(chunk_id): [
                 point_data
@@ -1033,9 +1537,22 @@ def run_residual_field_stage(
             ]
             for chunk_id in chunk_ids
         }
-        local_partition_capacity = _cap_async_max_inflight(
-            client=client,
-            requested=max_inflight,
+        # Capacity CONSTANT, not live scheduler capacity: partition point
+        # ranges are written into snapshots and compared on resume, so
+        # deriving this from client.scheduler_info() made durable-mode
+        # checkpoints worker-count DEPENDENT — a 4-GPU run resumed on an
+        # 8-GPU node changed every atom range and discarded every partition
+        # snapshot. Fixed default 8 mirrors the streaming slot count (any
+        # realistic worker count keeps folding concurrently);
+        # runtime_info.residual_partition_capacity overrides, and the knob
+        # is part of the parameter digest.
+        raw_partition_capacity = workflow_parameters.runtime_info.get(
+            "residual_partition_capacity"
+        )
+        local_partition_capacity = (
+            max(1, int(raw_partition_capacity))
+            if raw_partition_capacity is not None
+            else 8
         )
         partition_policy = _residual_partition_runtime_policy(
             workflow_parameters,
@@ -1125,12 +1642,49 @@ def run_residual_field_stage(
             )
 
     planned_work_units = list(work_units)
+    fs_capability_digest: str | None = None
+    runtime_provenance: dict[str, object] | None = None
+    nufft_resources = _residual_nufft_resources(workflow_parameters)
+    nufft_settings = _residual_nufft_settings(workflow_parameters)
+    if planned_work_units:
+        fs_capability = profile_output_filesystem(
+            artifacts.output_dir,
+            run_digest=str(planned_work_units[0].run_digest),
+            client=client,
+        )
+        fs_capability_digest = fs_capability.capability_digest
+        runtime_provenance = _runtime_provenance_for_residual(
+            workflow_parameters=workflow_parameters,
+            fs_capability_digest=fs_capability_digest,
+            client=client,
+        )
+        if client is not None and not is_sync_client(client):
+            require_gpu_admission(
+                client,
+                policy=_residual_nufft_policy(workflow_parameters),
+                required_gpu_tasks=(1 if "gpu" in nufft_resources else 0),
+            )
     if owner_local_reducer:
+        _invalidate_incompatible_local_checkpoints(
+            planned_work_units=planned_work_units,
+            reducer_backend=task_reducer_backend,
+            output_dir=artifacts.output_dir,
+        )
         work_units = _reconcile_and_filter_local_durable_work_units(
             work_units=work_units,
             reducer_backend=task_reducer_backend,
             output_dir=artifacts.output_dir,
         )
+    reuse_rifft_payload = _residual_rifft_payload_reuse_enabled(workflow_parameters)
+    if reuse_rifft_payload:
+        planned_work_units = _sort_work_units_by_target(planned_work_units)
+        # Streaming keeps batch-major submission order (below) instead of the
+        # target-major re-sort; planned_work_units ordering is untouched — it
+        # feeds finalize/invalidation expectations, not submission.
+        if streaming_context is None:
+            work_units = _sort_work_units_by_target(work_units)
+    # Streaming submission order is applied AFTER the owner map is built
+    # (below) so the interleave can round-robin by resolved owner.
 
     total_tasks = len(work_units)
     if total_tasks == 0 and not (owner_local_reducer and planned_work_units):
@@ -1166,29 +1720,50 @@ def run_residual_field_stage(
     }
     transient_interval_payloads = getattr(artifacts, "transient_interval_payloads", {}) or {}
     stage_task_logs = task_progress_enabled(True)
+    if reuse_rifft_payload:
+        logger.info("Residual-field RIFFT payload reuse enabled.")
     if client is None or is_sync_client(client):
         rec = point_list_to_recarray(point_data_list)
+        current_rifft_target: tuple[int, int | None] | None = None
+        current_rifft_payload: tuple[np.ndarray, np.ndarray] | None = None
         with progress_bar(total_tasks, desc="Residual-field", unit="batch", force=True) as pbar:
             for work_unit in work_units:
                 atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
+                if reuse_rifft_payload:
+                    target_key = _reducer_target_key(work_unit)
+                    if target_key != current_rifft_target:
+                        current_rifft_payload = None
+                        current_rifft_payload = build_residual_rifft_payload(
+                            atoms,
+                            work_unit=work_unit,
+                            quiet_logs=False,
+                        )
+                        current_rifft_target = target_key
                 manifest = run_residual_field_interval_chunk_task(
                     work_unit,
-                    _interval_inputs_for_work_unit(
+                    ()
+                    if streaming_context is not None
+                    else _interval_inputs_for_work_unit(
                         work_unit,
                         transient_interval_payloads=transient_interval_payloads,
                     ),
-                    atoms,
+                    None if reuse_rifft_payload else atoms,
                     total_reciprocal_points=total_reciprocal_points,
                     output_dir=artifacts.output_dir,
-                    db_path=artifacts.db_manager.db_path,
+                    db_path=artifacts.db_manager.db_path if owner_local_reducer else None,
                     scratch_root=scratch_root,
                     reducer_backend=task_reducer_backend,
                     total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
                     owner_local_reducer=owner_local_reducer,
                     quiet_logs=False,
+                    streaming_compute_context=streaming_context,
+                    rifft_payload=current_rifft_payload if reuse_rifft_payload else None,
+                    runtime_provenance=runtime_provenance,
+                    nufft_eps=nufft_settings.eps,
+                    nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                    nufft_gpu_only=nufft_settings.gpu_only,
                 )
                 pbar.update(1)
-                pbar.refresh()
                 if manifest is None:
                     logger.error(
                         "GAVE UP after retries | residual batch %s | chunk %d (sync)",
@@ -1202,7 +1777,15 @@ def run_residual_field_stage(
                         manifests_by_chunk=manifests_by_chunk,
                     )
         if owner_local_reducer:
-            local_flush = getattr(task_reducer_backend, "flush_local_reducer_target", None)
+            # Tasks fold into the process-local singleton backend (worker
+            # parity), so flush/inspect must resolve the same instance: the
+            # template backend has no live accumulators and no async snapshot
+            # writer to drain, and inspecting it races the writer thread's
+            # pending commit.
+            local_backend = get_process_local_residual_field_backend(
+                task_reducer_backend
+            )
+            local_flush = getattr(local_backend, "flush_local_reducer_target", None)
             for target_key in _unique_reducer_target_keys(work_units):
                 representative = next(
                     work_unit
@@ -1224,7 +1807,7 @@ def run_residual_field_stage(
                 )
             inspected_target_states = _validate_local_durable_coverage_or_raise(
                 work_units=planned_work_units,
-                reducer_backend=task_reducer_backend,
+                reducer_backend=local_backend,
                 output_dir=artifacts.output_dir,
             )
             _log_owner_local_finalize_metrics(
@@ -1245,8 +1828,20 @@ def run_residual_field_stage(
                     cleanup_policy=cleanup_policy,
                     scratch_root=scratch_root,
                     quiet_logs=False,
+                    expected_partitions=_expected_partition_family_for_chunk(
+                        planned_work_units,
+                        chunk_id=int(chunk_id),
+                    ),
+                    expected_interval_ids=expected_interval_ids_by_chunk.get(
+                        int(chunk_id)
+                    ),
                 )
         else:
+            # Owner-local reduction is force-enabled for both backend kinds
+            # (the two ValueError guards above are the contract), so tasks
+            # return status-only results and there is no attempt/candidate
+            # universe to quiesce — the old require_chunk_quiescence
+            # ceremony here scanned for attempts that can never exist.
             _finalize_residual_field_chunks(
                 chunk_ids=chunk_ids,
                 parameter_digest=work_units[0].parameter_digest,
@@ -1260,56 +1855,92 @@ def run_residual_field_stage(
             )
         if transient_interval_payloads:
             transient_interval_payloads.clear()
+        _clear_worker_rifft_payload_caches(client)
         logger.info("Residual-field finished (sync).")
         return
 
-    fail_streak, fail_threshold = 0, 3
-    gpu_tripped = False
+    residual_prefetch_factor = _residual_nufft_prefetch_factor(workflow_parameters)
     max_inflight = _cap_async_max_inflight(
         client=client,
         requested=max_inflight,
+        prefetch_factor=residual_prefetch_factor,
     )
-
-    def _trip_to_cpu_only() -> None:
-        nonlocal gpu_tripped, max_inflight
-        if gpu_tripped:
-            return
-        if hasattr(client, "run"):
-            try:
-                from core.adapters.cunufft_wrapper import set_cpu_only
-
-                client.run(set_cpu_only, True)
-            except Exception:
-                pass
-        max_inflight = min(max_inflight, 256)
-        gpu_tripped = True
-        logger.warning("Circuit-breaker: switching residual-field to CPU-only & throttling.")
 
     rec = point_list_to_recarray(point_data_list)
     chunk_futures = {
         chunk_id: client.scatter(rec[rec.chunk_id == chunk_id], broadcast=False, hash=False)
         for chunk_id in chunk_ids
     }
+    # Streaming mode: the scattering compute context (structure arrays, mask
+    # strategy, form factors) ships to every worker exactly once.
+    streaming_context_future = (
+        client.scatter(streaming_context, broadcast=True, hash=False)
+        if streaming_context is not None
+        else None
+    )
     worker_addresses = _current_worker_addresses(client)
+    _prewarm_stage1_store_if_enabled(
+        client=client,
+        streaming_context=streaming_context,
+        streaming_context_future=streaming_context_future,
+        work_units=work_units,
+        worker_addresses=worker_addresses,
+        workflow_parameters=workflow_parameters,
+    )
     owner_local_target_units = planned_work_units if owner_local_reducer else work_units
+    # Streaming: ownership keyed by SLOT alone (partition_id is never None for
+    # streaming units) — the same batch content hashes to the same slot for
+    # every chunk, so slot-keyed ownership makes each batch's stage-1 compute
+    # land on one worker and be reused for all chunks (payload memo locality).
+    # Non-streaming keeps the byte-identical round-robin by enumeration index.
     target_owners = (
-        {
-            target_key: worker_addresses[index % len(worker_addresses)]
-            for index, target_key in enumerate(_unique_reducer_target_keys(owner_local_target_units))
-        }
+        (
+            _streaming_slot_owner_map(
+                _unique_reducer_target_keys(owner_local_target_units),
+                worker_addresses,
+            )
+            if streaming_context is not None
+            else {
+                target_key: worker_addresses[index % len(worker_addresses)]
+                for index, target_key in enumerate(_unique_reducer_target_keys(owner_local_target_units))
+            }
+        )
         if owner_local_reducer and worker_addresses
         else {}
     )
+    if streaming_context is not None:
+        # Batch-major ordering means the 1 GiB payload memo only ever needs
+        # the CURRENT batch (the all-in-RAM constraint): every chunk folds a
+        # batch before the next batch's stage-1 payloads are computed.
+        work_units = _sort_streaming_work_units_batch_major(
+            work_units, target_owners=target_owners
+        )
     retries_left = {
         (str(work_unit.artifact_key), int(work_unit.chunk_id)): DEFAULT_TASK_RETRIES
         for work_unit in work_units
     }
-    flying: set = set()
-    future_meta: dict = {}
-    submitted = 0
-    completed = 0
-
-    _residual_start_time = time.monotonic()
+    # Infrastructure failures (worker OOM-kill/restart, cancelled/lost comms)
+    # say nothing about the task and get their OWN budget with exponential
+    # backoff: a nanny-restart window otherwise burned entire retry budgets
+    # in seconds (observed: 15/32 units exhausted inside one 3-minute
+    # restart storm, every retry dying instantly on comm timeouts).
+    try:
+        infra_retry_budget = max(
+            1, int(os.getenv("MOSAIC_RESIDUAL_INFRA_RETRIES", "12"))
+        )
+    except ValueError:
+        infra_retry_budget = 12
+    # A unit that repeatedly KILLS its worker is indistinguishable from
+    # infrastructure by error class (KilledWorker) but is really a poison
+    # task — without its own cap it would enjoy the LARGEST retry budget
+    # while physically destroying workers. Same-key worker kills get a
+    # smaller cap; exceeding it fails the unit (no breaker coupling).
+    try:
+        killed_worker_retry_cap = max(
+            1, int(os.getenv("MOSAIC_RESIDUAL_KILLED_WORKER_RETRIES", "4"))
+        )
+    except ValueError:
+        killed_worker_retry_cap = 4
 
     if stage_task_logs:
         logger.info(
@@ -1321,175 +1952,41 @@ def run_residual_field_stage(
             cleanup_policy,
         )
 
-    def _submit(work_unit: ResidualFieldWorkUnit) -> None:
-        nonlocal submitted
-        submit_kwargs = dict(
-            total_reciprocal_points=total_reciprocal_points,
-            output_dir=artifacts.output_dir,
-            db_path=artifacts.db_manager.db_path,
-            scratch_root=scratch_root,
-            reducer_backend=task_reducer_backend,
-            total_expected_partials=total_partials_by_target[_reducer_target_key(work_unit)],
-            owner_local_reducer=owner_local_reducer,
-            quiet_logs=False,
-            key=f"residual-{work_unit.artifact_key}",
-            pure=False,
-            resources={"nufft": 1},
-            retries=DEFAULT_TASK_RETRIES,
-        )
-        target_key = _reducer_target_key(work_unit)
-        if target_key in target_owners:
-            owner_address = _resolve_owner_address(
-                target_key=target_key,
-                target_owners=target_owners,
-                worker_addresses=_current_worker_addresses(client),
-            )
-            if owner_address is not None:
-                submit_kwargs["workers"] = [owner_address]
-                submit_kwargs["allow_other_workers"] = False
-        future = client.submit(
-            run_residual_field_interval_chunk_task,
-            work_unit,
-            _interval_inputs_for_work_unit(
-                work_unit,
-                transient_interval_payloads=transient_interval_payloads,
-            ),
-            chunk_futures[int(work_unit.chunk_id)],
-            **submit_kwargs,
-        )
-        flying.add(future)
-        future_meta[future] = work_unit
-        submitted += 1
-        if _should_log_async_progress(
-            phase="queue",
-            count=submitted,
-            total=total_tasks,
-        ):
-            _log_async_residual_progress(
-                enabled=stage_task_logs,
-                event="queue",
-                work_unit=work_unit,
-                completed=completed,
-                total=total_tasks,
-                submitted=submitted,
-                running=len(flying),
-            )
-
-    def _incorporate_completed_result(
-        future,
-        completed_work_unit: ResidualFieldWorkUnit | None,
-    ) -> None:
-        if completed_work_unit is None:
-            return
-        payload = future.result()
-        _record_residual_task_result(
-            payload=payload,
-            work_unit=completed_work_unit,
-            manifests_by_chunk=manifests_by_chunk,
-        )
-
-    def _harvest_finished_nonblocking(bump, pbar=None) -> None:
-        nonlocal completed, fail_streak
-        done_now = [future for future in list(flying) if future.done()]
-        for future in done_now:
-            try:
-                ok = future.result() is not None
-            except Exception:
-                ok = False
-            flying.discard(future)
-            work_unit = future_meta.pop(future, None)
-            bump()
-            completed += 1
-            if work_unit is not None and pbar is not None:
-                _update_pbar_postfix(pbar, work_unit, ok=ok)
-                if not ok:
-                    logger.warning(
-                        "Residual-field batch FAILED | chunk=%d | intervals=%s",
-                        work_unit.chunk_id,
-                        _work_unit_interval_label(work_unit),
-                    )
-            if not ok and work_unit is not None:
-                fail_streak += 1
-                if fail_streak >= fail_threshold:
-                    _trip_to_cpu_only()
-                key = (str(work_unit.artifact_key), int(work_unit.chunk_id))
-                if retries_left.get(key, 0) > 0:
-                    retries_left[key] -= 1
-                    _submit(work_unit)
-            else:
-                fail_streak = 0
-                _incorporate_completed_result(future, work_unit)
-
-    def _update_pbar_postfix(pbar, work_unit, ok=True):
-        elapsed = time.monotonic() - _residual_start_time
-        timing = _format_elapsed_eta(elapsed, completed, total_tasks)
-        status = "" if ok else " | FAILED"
-        pbar.set_postfix_str(
-            f"chunk={work_unit.chunk_id} | running={len(flying)} | {timing}{status}"
-        )
-
-    with logging_redirect_tqdm():
-        with progress_bar(total_tasks, desc="Residual-field", unit="batch", force=True) as pbar:
-
-            def bump() -> None:
-                pbar.update(1)
-                pbar.refresh()
-
-            for work_unit in work_units:
-                _submit(work_unit)
-                _harvest_finished_nonblocking(bump, pbar=pbar)
-                while len(flying) >= max_inflight:
-                    for future, result in yield_futures_with_results(list(flying), client):
-                        ok = bool(result)
-                        flying.discard(future)
-                        completed_work_unit = future_meta.pop(future, None)
-                        bump()
-                        completed += 1
-                        if completed_work_unit is not None:
-                            _update_pbar_postfix(pbar, completed_work_unit, ok=ok)
-                            if not ok:
-                                logger.warning(
-                                    "Residual-field batch FAILED | chunk=%d | intervals=%s",
-                                    completed_work_unit.chunk_id,
-                                    _work_unit_interval_label(completed_work_unit),
-                                )
-                        if not ok and completed_work_unit is not None:
-                            fail_streak += 1
-                            if fail_streak >= fail_threshold:
-                                _trip_to_cpu_only()
-                            key = (
-                                str(completed_work_unit.artifact_key),
-                                int(completed_work_unit.chunk_id),
-                            )
-                            if retries_left.get(key, 0) > 0:
-                                retries_left[key] -= 1
-                                _submit(completed_work_unit)
-                        else:
-                            fail_streak = 0
-                            if result:
-                                _incorporate_completed_result(future, completed_work_unit)
-
-            for future, result in yield_futures_with_results(list(flying), client):
-                flying.discard(future)
-                completed_work_unit = future_meta.pop(future, None)
-                bump()
-                completed += 1
-                if completed_work_unit is not None:
-                    _update_pbar_postfix(pbar, completed_work_unit, ok=bool(result))
-                    if not bool(result):
-                        logger.warning(
-                            "Residual-field batch FAILED | chunk=%d | intervals=%s",
-                            completed_work_unit.chunk_id,
-                            _work_unit_interval_label(completed_work_unit),
-                        )
-                if not bool(result) and completed_work_unit is not None:
-                    logger.error(
-                        "GAVE UP after retries | residual batch %s | chunk %d",
-                        ",".join(str(interval_id) for interval_id in completed_work_unit.interval_ids),
-                        completed_work_unit.chunk_id,
-                    )
-                elif completed_work_unit is not None:
-                    _incorporate_completed_result(future, completed_work_unit)
+    # The scheduler loop (submission, completion, retry, rescue) owns its
+    # own state; the stage keeps planning, the barriers and finalize.
+    run_loop = ResidualRunLoop(
+        client=client,
+        artifacts=artifacts,
+        chunk_futures=chunk_futures,
+        chunk_ids=chunk_ids,
+        streaming_context=streaming_context,
+        streaming_context_future=streaming_context_future,
+        task_reducer_backend=task_reducer_backend,
+        planned_work_units=planned_work_units,
+        work_units=work_units,
+        total_tasks=total_tasks,
+        total_reciprocal_points=total_reciprocal_points,
+        total_partials_by_target=total_partials_by_target,
+        scratch_root=scratch_root,
+        owner_local_reducer=owner_local_reducer,
+        worker_addresses=worker_addresses,
+        target_owners=target_owners,
+        nufft_resources=nufft_resources,
+        nufft_settings=nufft_settings,
+        runtime_provenance=runtime_provenance,
+        reuse_rifft_payload=reuse_rifft_payload,
+        transient_interval_payloads=transient_interval_payloads,
+        manifests_by_chunk=manifests_by_chunk,
+        stage_task_logs=stage_task_logs,
+        max_inflight=max_inflight,
+        retries_left=retries_left,
+        infra_retry_budget=infra_retry_budget,
+        killed_worker_retry_cap=killed_worker_retry_cap,
+    )
+    run_loop.run()
+    run_loop.raise_if_batches_failed()
+    submitted = run_loop.submitted
+    early_flush_futures = run_loop.early_flush_futures
 
     if owner_local_reducer and worker_addresses:
         _flush_local_reducer_targets_or_raise(
@@ -1500,6 +1997,7 @@ def run_residual_field_stage(
             output_dir=artifacts.output_dir,
             db_path=artifacts.db_manager.db_path,
             target_owners=target_owners,
+            pre_submitted_futures=early_flush_futures,
         )
         inspected_target_states = _inspect_owner_local_reducer_targets_or_raise(
             client=client,
@@ -1523,10 +2021,51 @@ def run_residual_field_stage(
             planned_target_metrics=planned_target_metrics,
             inspected_target_states=inspected_target_states,
         )
-        finalize_futures = []
+        finalize_futures_by_chunk: dict = {}
+        finalize_owner_by_chunk_key: dict = {}
+        finalize_live_workers = _current_worker_addresses(client)
+        # Chunk-keyed finalize placement for streaming: the slot-keyed fold
+        # map sends every chunk's finalize to ONE worker (all chunks share
+        # the same content-addressed slot set) — 3-5 min serialized on one
+        # worker while the rest idle. Finalize reads durable snapshots from
+        # the shared output dir, so any worker can run any chunk.
+        finalize_owner_by_chunk = (
+            _streaming_finalize_owner_map(chunk_ids, finalize_live_workers)
+            if streaming_context is not None and finalize_live_workers
+            else {}
+        )
+
+        def _submit_finalize(finalize_chunk_id, finalize_worker):
+            return client.submit(
+                finalize_process_local_residual_chunk,
+                task_reducer_backend,
+                chunk_id=int(finalize_chunk_id),
+                parameter_digest=planned_work_units[0].parameter_digest,
+                output_dir=artifacts.output_dir,
+                db_path=artifacts.db_manager.db_path,
+                cleanup_policy=cleanup_policy,
+                scratch_root=scratch_root,
+                quiet_logs=False,
+                expected_partitions=_expected_partition_family_for_chunk(
+                    planned_work_units,
+                    chunk_id=int(finalize_chunk_id),
+                ),
+                expected_interval_ids=expected_interval_ids_by_chunk.get(
+                    int(finalize_chunk_id)
+                ),
+                # Streaming finalizes run on multiple workers concurrently;
+                # SQLite marking moves to the driver (single writer).
+                mark_intervals_saved=streaming_context is None,
+                pure=False,
+                workers=[finalize_worker],
+                allow_other_workers=False,
+            )
+
         for chunk_id in chunk_ids:
             finalizer_owner = None
-            if any(int(work_unit.chunk_id) == int(chunk_id) for work_unit in owner_local_target_units):
+            if streaming_context is not None:
+                finalizer_owner = finalize_owner_by_chunk.get(int(chunk_id))
+            elif any(int(work_unit.chunk_id) == int(chunk_id) for work_unit in owner_local_target_units):
                 representative = next(
                     work_unit
                     for work_unit in owner_local_target_units
@@ -1544,26 +2083,39 @@ def run_residual_field_stage(
                 raise RuntimeError(
                     f"Owner-local residual finalization requires an available worker for chunk {int(chunk_id)}."
                 )
-            finalize_futures.append(
-                client.submit(
-                    finalize_process_local_residual_chunk,
-                    task_reducer_backend,
-                    chunk_id=int(chunk_id),
-                    parameter_digest=planned_work_units[0].parameter_digest,
-                    output_dir=artifacts.output_dir,
-                    db_path=artifacts.db_manager.db_path,
-                    cleanup_policy=cleanup_policy,
-                    scratch_root=scratch_root,
-                    quiet_logs=False,
-                    pure=False,
-                    workers=[finalizer_owner],
-                    allow_other_workers=False,
-                )
+            finalize_futures_by_chunk[int(chunk_id)] = _submit_finalize(
+                int(chunk_id), finalizer_owner
             )
-        for future, result in yield_futures_with_results(finalize_futures, client):
-            if not bool(result):
-                raise RuntimeError("Owner-local residual finalization failed.")
+            finalize_owner_by_chunk_key[int(chunk_id)] = finalizer_owner
+        # Finalize reads durable snapshots from the shared output dir, so a
+        # dead finalizer's chunk is safely remapped to any live worker. This
+        # is the highest-exposure barrier (finalize reads/writes tens of GB
+        # per chunk — the phase most likely to OOM-kill a worker).
+        for finalized_chunk, future, ok in _drain_owner_pinned_barrier(
+            client=client,
+            futures_by_key=finalize_futures_by_chunk,
+            owner_by_key=finalize_owner_by_chunk_key,
+            resubmit=_submit_finalize,
+            barrier_name="finalize",
+        ):
+            if not ok:
+                raise RuntimeError(
+                    "Owner-local residual finalization failed for chunk "
+                    f"{int(finalized_chunk)}."
+                )
+            if streaming_context is not None:
+                _mark_finalized_chunk_intervals_saved(
+                    db_path=artifacts.db_manager.db_path,
+                    chunk_id=finalized_chunk,
+                    interval_ids=expected_interval_ids_by_chunk.get(
+                        finalized_chunk, ()
+                    ),
+                )
     else:
+        # Sync-client path (no worker addresses). Owner-local reduction is
+        # force-enabled for both backend kinds, tasks return status-only
+        # results, and the attempt/candidate universe is never written —
+        # quiescence scanning here was ceremony for a mode that cannot occur.
         _finalize_residual_field_chunks(
             chunk_ids=chunk_ids,
             parameter_digest=planned_work_units[0].parameter_digest,
@@ -1577,6 +2129,7 @@ def run_residual_field_stage(
         )
     if transient_interval_payloads:
         transient_interval_payloads.clear()
+    _clear_worker_rifft_payload_caches(client)
     logger.info("Residual-field finished – %d tasks submitted", submitted)
 
 

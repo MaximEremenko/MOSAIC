@@ -11,7 +11,8 @@ from core.qspace.intervals.manager import (
     ReciprocalSpaceIntervalManager,
 )
 from core.models import PointData, ReciprocalSpaceArtifacts, WorkflowParameters
-from core.storage.database_manager import DatabaseManager
+from core.storage.database_manager import DatabaseManager, ManifestOnlyDatabaseManager
+from core.storage.db_cache import DBCacheConfig, resolve_db_cache_config
 from core.storage.rifft_in_data_saver import RIFFTInDataSaver
 
 
@@ -50,6 +51,7 @@ class _DefaultReciprocalSpaceArtifactBuilder:
         workflow_parameters: WorkflowParameters,
         output_dir: str,
         supercell,
+        db_cache_config: DBCacheConfig | None = None,
     ) -> _ReciprocalSpaceArtifactBundle:
         parameters = workflow_parameters.to_payload()
         dimension = workflow_parameters.struct_info.dimension
@@ -58,10 +60,17 @@ class _DefaultReciprocalSpaceArtifactBuilder:
             data_saver=saver,
             save_rifft_coordinates=workflow_parameters.rspace_info.save_rifft_coordinates,
         )
-        db_manager = self.db_manager_factory(
-            str(Path(output_dir) / "point_reciprocal_space_associations.db"),
-            dimension,
+        db_config = db_cache_config or resolve_db_cache_config(
+            workflow_parameters=workflow_parameters,
+            output_dir=output_dir,
         )
+        if db_config.enabled:
+            db_manager = self.db_manager_factory(
+                str(db_config.db_path or Path(output_dir) / "point_reciprocal_space_associations.db"),
+                dimension,
+            )
+        else:
+            db_manager = ManifestOnlyDatabaseManager(dimension=dimension)
         reciprocal_manager = ReciprocalSpaceIntervalManager(
             str(Path(output_dir) / "point_reciprocal_space_data.hdf5"),
             parameters,
@@ -91,13 +100,16 @@ class ReciprocalSpacePreparationService:
         point_data: PointData,
         supercell,
         output_dir: str,
+        db_cache_config: DBCacheConfig | None = None,
     ) -> ReciprocalSpaceArtifacts:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        artifact_bundle = self.artifact_builder.create(
-            workflow_parameters=workflow_parameters,
-            output_dir=output_dir,
-            supercell=supercell,
-        )
+        create_kwargs = {
+            "workflow_parameters": workflow_parameters,
+            "output_dir": output_dir,
+            "supercell": supercell,
+            "db_cache_config": db_cache_config,
+        }
+        artifact_bundle = self.artifact_builder.create(**create_kwargs)
         artifact_bundle.point_data_processor.process_point_data(point_data)
         artifact_bundle.db_manager.insert_point_data_batch(
             [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from dataclasses import dataclass
 from dataclasses import replace
 from dataclasses import asdict, is_dataclass
@@ -40,6 +41,18 @@ def _parameter_value(parameters: object, key: str, default=None):
     return getattr(parameters, key, default)
 
 
+def _runtime_value(runtime_info: object, key: str, default=None):
+    """Read an operator-supplied runtime key.
+
+    ``WorkflowRuntimeInfo`` keeps these in ``.extra`` and exposes them only
+    through ``.get`` — plain ``getattr`` returns the default for every one
+    of them, which silently drops whatever it was asked for."""
+    getter = getattr(runtime_info, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return default
+
+
 def _stable_point_payload(point: object) -> dict[str, object]:
     return {
         "filename": _parameter_value(point, "filename"),
@@ -66,12 +79,136 @@ def _stable_point_payload(point: object) -> dict[str, object]:
     }
 
 
+RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT = 4 * 1024**3
+RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN = 1024**2
+RESIDUAL_SHARD_SOURCE_BUDGET_DEFAULT = 30_000_000
+
+
+def resolve_residual_shard_grid_budget_bytes() -> int:
+    """Projected-grid-bytes budget for one lattice shard (default 4 GiB).
+
+    Deliberately a fixed constant with NO host-dependent default: it enters
+    checkpoint identity (below), so it must resolve identically on every
+    machine and worker count. Env override:
+    ``MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES`` (clamped to a 1 MiB minimum;
+    invalid values fall back to the default)."""
+    raw = os.getenv("MOSAIC_RESIDUAL_SHARD_GRID_BUDGET_BYTES")
+    if raw is None:
+        return RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return RESIDUAL_SHARD_GRID_BUDGET_BYTES_DEFAULT
+    return max(RESIDUAL_SHARD_GRID_BUDGET_BYTES_MIN, value)
+
+
+def resolve_residual_shard_source_budget() -> int:
+    raw = os.getenv("MOSAIC_RESIDUAL_SHARD_SOURCE_BUDGET")
+    try:
+        return int(raw) if raw is not None else RESIDUAL_SHARD_SOURCE_BUDGET_DEFAULT
+    except ValueError:
+        return RESIDUAL_SHARD_SOURCE_BUDGET_DEFAULT
+
+
+def residual_lattice_fft_enabled() -> bool:
+    """Whether the residual inverse runs as scatter + type-2 on the
+    reciprocal LATTICE instead of type-3 over scattered points. Selects
+    which shard-sizing rule runs, so it is checkpoint identity."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_FFT")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _residual_execution_identity_payload(parameters: object) -> dict:
+    """Identity-bearing EXECUTION knobs, digested alongside the science.
+
+    Each of these changes batch composition or the durable slot layout, so
+    two runs that differ in any of them must land in DISJOINT checkpoint
+    families. Before digest schema 3 they were outside the digest, and
+    invalidate_incompatible_local_checkpoints resolved the mismatch by
+    DELETING the existing family — an sbatch resume that forgot one env var
+    silently recomputed hours of work. The raw config/env values are
+    digested; the adaptive shard fold is a deterministic function of these
+    plus the digested science inputs, so resolved values add nothing."""
+    runtime_info = _parameter_value(parameters, "runtime_info", {}) or {}
+    get = getattr(runtime_info, "get", None)
+
+    def _rt(key):
+        return get(key) if callable(get) else None
+
+    intervals_per_shard = os.getenv("MOSAIC_RESIDUAL_INTERVALS_PER_SHARD")
+    if intervals_per_shard is None:
+        intervals_per_shard = _rt("residual_shard_batch_size")
+    try:
+        intervals_per_shard = (
+            int(intervals_per_shard) if intervals_per_shard is not None else "adaptive"
+        )
+    except (TypeError, ValueError):
+        intervals_per_shard = str(intervals_per_shard)
+    try:
+        partition_capacity = (
+            max(1, int(_rt("residual_partition_capacity")))
+            if _rt("residual_partition_capacity") is not None
+            else 8
+        )
+    except (TypeError, ValueError):
+        partition_capacity = str(_rt("residual_partition_capacity"))
+    return {
+        # The RESOLVED slot count, not the raw override. Unset resolves to 1
+        # for a sync client and 8 for a distributed one, and in the
+        # non-streaming owner-local path a sync client skips the partition
+        # plan entirely -- so digesting the raw None let two runs share a
+        # parameter digest while producing DISJOINT partition_id sets. The
+        # workflow stamps the resolved value before any stage runs; the raw
+        # value is kept as a fallback for callers that never had a client.
+        "streaming_subchunks": _to_jsonable(
+            _runtime_value(runtime_info, "residual_streaming_subchunks_resolved")
+            if _runtime_value(runtime_info, "residual_streaming_subchunks_resolved")
+            is not None
+            else _rt("residual_streaming_subchunks")
+        ),
+        "intervals_per_shard": intervals_per_shard,
+        "partition_capacity": partition_capacity,
+        "shard_grid_budget_bytes": int(resolve_residual_shard_grid_budget_bytes()),
+        "shard_source_budget": int(resolve_residual_shard_source_budget()),
+        "lattice_fft": bool(residual_lattice_fft_enabled()),
+        # The upstream numerical contract. These enter the stage-1 payload
+        # identity and run_digest but used to miss this digest entirely, so a
+        # changed eps or dtype left the reducer-progress manifests addressed
+        # identically and the streaming resume credit -- which tests only
+        # artifact EXISTENCE -- handed the new run the old run's intervals.
+        "scattering_nufft_eps": _runtime_value(
+            runtime_info, "scattering_nufft_eps", _runtime_value(
+                runtime_info, "nufft_eps", 1e-12
+            )
+        ),
+        "scattering_dtype": str(
+            _runtime_value(
+                runtime_info,
+                "scattering_dtype",
+                _runtime_value(runtime_info, "nufft_dtype", "complex128"),
+            )
+        ),
+    }
+
+
 def build_residual_field_parameter_digest(parameters: object) -> str:
     rspace_info = _parameter_value(parameters, "rspace_info", {}) or {}
     struct_info = _parameter_value(parameters, "struct_info", {}) or {}
     peak_info = _parameter_value(parameters, "peak_info", {}) or {}
+    runtime_info = _parameter_value(parameters, "runtime_info", {}) or {}
     payload = {
-        "digest_schema_version": 2,
+        # 4: the structure CONTENT joins the identity. Until then this
+        # keyed on the structure FILENAME, so overwriting a structure file
+        # in place left every reducer-progress manifest addressed
+        # identically and a re-run credited the previous structure's
+        # incorporated intervals (measured: a completed case republished
+        # byte-identical displacements for changed coordinates). These
+        # manifests live outside .mosaic/runs/, so the run digest cannot
+        # scope them -- this digest has to carry the structure itself.
+        "digest_schema_version": 5,
+        "execution_identity": _residual_execution_identity_payload(parameters),
         "postprocessing_mode": (
             _parameter_value(parameters, "postprocessing_mode")
             if _parameter_value(parameters, "postprocessing_mode") is not None
@@ -82,6 +219,13 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
             "dimension": _parameter_value(struct_info, "dimension"),
             "filename": _parameter_value(struct_info, "filename"),
             "filename_av": _parameter_value(struct_info, "filename_av"),
+            # Stamped once at structure load (core/structure/identity.py),
+            # so every call site of this digest -- including the one inside
+            # the scattering stage that labels the manifests the residual
+            # stage later reads -- sees the same value.
+            "content_digest": _runtime_value(
+                runtime_info, "source_structure_digest"
+            ),
             "cells_limits_min": _to_jsonable(
                 _parameter_value(struct_info, "cells_limits_min")
             ),
@@ -122,13 +266,83 @@ def build_residual_field_parameter_digest(parameters: object) -> str:
         },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+
+_SHARD_AXES = ("h", "k", "l")
+
+
+def _spatially_packed_shards(
+    interval_ids: list[int],
+    *,
+    interval_geometry: dict[int, dict],
+    supercell,
+    max_intervals_per_shard: int,
+    grid_budget_bytes: int,
+) -> list[tuple[int, ...]]:
+    """Group intervals into shards whose reciprocal-space BOUNDING BOX stays
+    inside a dense-grid byte budget.
+
+    Interval ids are ordered along one reciprocal axis at a time (k-fastest for
+    3D plans), so a contiguous run of ids is spatially THIN but LONG: at hkl40
+    a 147-id run spans the full 1281x1281x641 extent and its dense lattice
+    grid is 31 GiB — which fails RAM admission and silently demotes the shard
+    to the slow type-3 path. Sorting by spatial position first and then packing
+    greedily against the actual bounding-box grid size keeps every shard's
+    grid within budget by construction, for ANY id ordering the q-space
+    planner produces. Deterministic given (intervals, budget, cap), so shard
+    identity — and with it the checkpoint ledger — is invariant to worker
+    count and cluster size."""
+    import math
+
+    pitch = np.asarray(supercell, dtype=np.float64)
+    pitch = np.where(pitch > 0, 1.0 / pitch, 1.0)
+
+    def _bounds(interval_id: int):
+        info = interval_geometry[int(interval_id)]
+        start = np.array(
+            [float(info.get(f"{axis}_start", 0.0)) for axis in _SHARD_AXES]
+        )
+        end = np.array([float(info.get(f"{axis}_end", 0.0)) for axis in _SHARD_AXES])
+        return start, end
+
+    def _grid_bytes(lo: np.ndarray, hi: np.ndarray) -> int:
+        points = 1
+        for axis in range(len(_SHARD_AXES)):
+            step = pitch[axis] if axis < len(pitch) else 1.0
+            span = float(hi[axis] - lo[axis])
+            points *= max(1, int(math.floor(span / step + 0.5)) + 1)
+        return points * 16 * 2  # complex128 x (delta, average)
+
+    ordered = sorted(interval_ids, key=lambda i: tuple(_bounds(i)[0]))
+    shards: list[tuple[int, ...]] = []
+    current: list[int] = []
+    lo = hi = None
+    for interval_id in ordered:
+        start, end = _bounds(interval_id)
+        new_lo = start if lo is None else np.minimum(lo, start)
+        new_hi = end if hi is None else np.maximum(hi, end)
+        if current and (
+            len(current) >= max_intervals_per_shard
+            or _grid_bytes(new_lo, new_hi) > grid_budget_bytes
+        ):
+            shards.append(tuple(current))
+            current, lo, hi = [interval_id], start, end
+        else:
+            current.append(interval_id)
+            lo, hi = new_lo, new_hi
+    if current:
+        shards.append(tuple(current))
+    return shards
 
 
 def _batch_interval_chunks(
     unsaved_interval_chunks: list[tuple[int, int]],
     *,
     max_intervals_per_shard: int,
+    interval_geometry: dict[int, dict] | None = None,
+    supercell=None,
+    grid_budget_bytes: int | None = None,
 ) -> list[tuple[int, tuple[int, ...]]]:
     if max_intervals_per_shard <= 0:
         raise ValueError("max_intervals_per_shard must be positive.")
@@ -140,6 +354,23 @@ def _batch_interval_chunks(
     batches: list[tuple[int, tuple[int, ...]]] = []
     for chunk_id in sorted(grouped):
         interval_ids = grouped[chunk_id]
+        packable = (
+            interval_geometry is not None
+            and supercell is not None
+            and grid_budget_bytes is not None
+            and int(grid_budget_bytes) > 0
+            and all(int(i) in interval_geometry for i in interval_ids)
+        )
+        if packable:
+            for shard in _spatially_packed_shards(
+                interval_ids,
+                interval_geometry=interval_geometry,
+                supercell=supercell,
+                max_intervals_per_shard=max_intervals_per_shard,
+                grid_budget_bytes=int(grid_budget_bytes),
+            ):
+                batches.append((chunk_id, shard))
+            continue
         for start in range(0, len(interval_ids), max_intervals_per_shard):
             batches.append((chunk_id, tuple(interval_ids[start : start + max_intervals_per_shard])))
     return batches
@@ -151,6 +382,9 @@ def build_residual_field_work_units(
     parameters: object,
     output_dir: str,
     max_intervals_per_shard: int = 1,
+    interval_geometry: dict[int, dict] | None = None,
+    supercell=None,
+    grid_budget_bytes: int | None = None,
 ) -> list[ResidualFieldWorkUnit]:
     digest = build_residual_field_parameter_digest(parameters)
     patch_scope = "chunk"
@@ -159,6 +393,9 @@ def build_residual_field_work_units(
     for chunk_id, interval_ids in _batch_interval_chunks(
         unsaved_interval_chunks,
         max_intervals_per_shard=max_intervals_per_shard,
+        interval_geometry=interval_geometry,
+        supercell=supercell,
+        grid_budget_bytes=grid_budget_bytes,
     ):
         if len(interval_ids) == 1:
             work_units.append(

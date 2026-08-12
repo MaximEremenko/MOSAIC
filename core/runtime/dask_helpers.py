@@ -51,10 +51,25 @@ _BACKENDS = Literal[
 
 logger = logging.getLogger(__name__)
 DEFAULT_TASK_RETRIES = 4
+# Single source of truth for the threads-per-worker default; the CLI entry
+# point (dask_client) and embedded callers must agree on it.
+DEFAULT_DASK_THREADS_PER_WORKER = 16
 
 # --------------------------------------------------------------------------- #
 #  Configuration helpers                                                      #
 # --------------------------------------------------------------------------- #
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean value {value!r}")
 
 def _load_external_config() -> Dict[str, Any]:
     """Return dict parsed from file pointed to by $MOSAIC_DASK_CONFIG.
@@ -89,7 +104,7 @@ def ensure_dask_client(
     max_workers: int = 2,
     *,
     threads_per_worker: int = 2,
-    processes: bool = True,
+    processes: bool | None = None,
     backend: _BACKENDS | None = None,
     gpu: int | None = None,  # GPUs *per job*
     dashboard: bool = True,
@@ -136,6 +151,15 @@ def ensure_dask_client(
         cfg_file.get("threads_per_worker"),
         cast=int,
     )
+    processes = _pick(
+        "processes",
+        processes,
+        os.getenv("DASK_PROCESSES"),
+        cfg_file.get("processes"),
+        cast=_as_bool,
+    )
+    if processes is None:
+        processes = True
     gpu = _pick("gpu", gpu, os.getenv("GPUS_PER_JOB"), cfg_file.get("gpu"), cast=int)
 
     if worker_dashboard is None:
@@ -147,14 +171,16 @@ def ensure_dask_client(
             cast=lambda v: bool(int(v)) if isinstance(v, str) else bool(v),
         )
 
-    backend = (
-        backend
-        or os.getenv("DASK_BACKEND")
-        or cfg_file.get("backend")
-        or _auto_backend()
-        or "local"
-    ).lower()
-    
+    auto_backend = _auto_backend()
+    explicit_backend = backend or os.getenv("DASK_BACKEND") or cfg_file.get("backend")
+    backend = (explicit_backend or auto_backend or "local").lower()
+    if str(explicit_backend or "").lower() == "local" and auto_backend is not None:
+        logger.warning(
+            "HPC environment looks like %s, but Dask backend is explicitly local. "
+            "This disables job-queue worker scheduling for the run.",
+            auto_backend,
+        )
+
     # if backend in {"single-threaded", "sync", "synchronous"}:
     # # Do NOT try to reuse a distributed Client; we want true in-thread execution
     # # so that pdb/cProfile/etc. work normally.
@@ -184,23 +210,59 @@ def ensure_dask_client(
     if worker_dashboard is None:
         worker_dashboard = dashboard
 
+    # Worker-env hygiene: bound glibc arena count so freed blocks actually
+    # return to the OS (classic cause of "unmanaged memory" growth in dask
+    # workers). Only injected when the user has NOT already set the key,
+    # and only for glibc-sensitive knobs that are math-neutral.
+    _mem_env = {"MALLOC_ARENA_MAX": "2"}
+    _worker_env = {k: v for k, v in _mem_env.items() if k not in os.environ}
+
     # ────────── single‑node back‑ends ──────────
+    # LocalCluster / LocalCUDACluster accept ``resources=`` via the
+    # ``**worker_kwargs`` catch-all — forwarded to Worker.__init__. Pass it
+    # through at the top level (wrapping in an explicit ``worker_kwargs``
+    # dict would make Worker receive ``worker_kwargs=...`` as an unknown
+    # kwarg and crash the Nanny).
     if backend == "local":
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
         cluster_kw.pop("job_extra_directives", None)
         cluster_kw.pop("python", None)
         cluster_kw.pop("scheduler_options", None)
-        return Client(
+        user_env = cluster_kw.get("env", {})
+        if bool(processes):
+            if isinstance(user_env, dict):
+                cluster_kw["env"] = {**_worker_env, **user_env}
+        else:
+            # In-process/threaded LocalCluster uses distributed.Worker, whose
+            # constructor does not accept env=. The current process environment
+            # is already the worker environment in this mode.
+            cluster_kw.pop("env", None)
+            # Multiple threaded Worker objects share one Python process, so the
+            # default LocalCluster memory_limit="auto" divides machine RAM by
+            # n_workers but every Worker observes the same process RSS. That is
+            # the root of false "Worker is at 80% memory usage. Pausing worker"
+            # messages for processes=False runs. Disable Dask's per-worker RSS
+            # limiter in this mode unless the caller explicitly configured it.
+            cluster_kw.setdefault(
+                "memory_limit",
+                os.getenv(
+                    "DASK_MEMORY_LIMIT",
+                    cfg_file.get("memory_limit", cfg_file.get("memory", 0)),
+                ),
+            )
+        client = Client(
             LocalCluster(
                 n_workers=max_workers,
                 threads_per_worker=threads_per_worker,
-                processes=processes,
+                processes=bool(processes),
                 dashboard_address=":8787" if dashboard else None,
                # worker_dashboard=worker_dashboard,
                 local_directory=local_directory,
                 **cluster_kw,
             )
         )
+        _register_heap_trim_plugin(client)
+        return client
 
     if backend == "cuda-local":
         from dask_cuda import LocalCUDACluster
@@ -208,7 +270,27 @@ def ensure_dask_client(
         cluster_kw.pop("python", None)
         cluster_kw.pop("scheduler_options", None)
         local_directory = os.getenv("DASK_LOCAL_DIR") or cfg_file.get("local_directory")
-        return Client(
+        # The residual pipeline stages its large arrays through file-backed
+        # memmaps (accumulators, result pairs, target grids). Their resident
+        # pages are RECLAIMABLE cache, but they count into process RSS, so
+        # dask's default per-worker limit (total RAM / n_workers) reads them
+        # as worker memory and the nanny kills healthy workers at 95% --
+        # measured on hkl40: every 4-worker run died this way while >20 GB
+        # stayed reclaimable. Default the limit OFF for cuda-local and let
+        # the kernel arbitrate page cache; DASK_MEMORY_LIMIT overrides for
+        # deployments that want a hard ceiling (e.g. cgroup-less shared
+        # hosts).
+        cluster_kw.setdefault(
+            "memory_limit",
+            os.getenv(
+                "DASK_MEMORY_LIMIT",
+                cfg_file.get("memory_limit", cfg_file.get("memory", 0)),
+            ),
+        )
+        user_env = cluster_kw.get("env", {})
+        if isinstance(user_env, dict):
+            cluster_kw["env"] = {**_worker_env, **user_env}
+        client = Client(
             LocalCUDACluster(
                 n_workers=max_workers,
                 protocol=os.getenv("DASK_COMM_PROTOCOL", "tcp"),
@@ -220,6 +302,8 @@ def ensure_dask_client(
                 **cluster_kw,
             )
         )
+        _register_heap_trim_plugin(client)
+        return client
 
     # ────────── job‑queue family ──────────
     if backend in {"sge", "slurm", "pbs", "lsf", "oar"}:
@@ -266,26 +350,63 @@ def ensure_dask_client(
         if dashboard:
             sched_opts.setdefault("dashboard_address", ":8787")
 
-        # Merge user overrides *after* defaults so user wins
-        merged = {**defaults, **cluster_kw}
-        merged.pop("resources", None)  # hard‑remove if user passed it by habit
+        # Merge user overrides *after* defaults so user wins — but list-valued
+        # directive keys concatenate and scheduler_options dict-merges: a plain
+        # dict override would let the client-layer job_extra_directives list
+        # replace the whole key and silently drop the --gpus directive (and a
+        # partial scheduler_options override would lose the fixed endpoint).
+        # dask-jobqueue constructors do not accept Worker(resources=...) at
+        # the cluster level; that has to be forwarded to the worker command.
+        merged = _merge_jobqueue_kwargs(defaults, cluster_kw)
+        resource_args = _resource_worker_args(merged.pop("resources", None))
+        if resource_args:
+            _append(merged, "worker_extra_args", *resource_args)
+
+        # Batch workers run on remote nodes, so the worker-env hygiene keys
+        # must travel in the job script; jobqueue clusters take them as
+        # "export K=V" prologue lines. User-provided prologue lines win.
+        if _worker_env:
+            prologue: List[str] = list(merged.get("job_script_prologue", []))
+            existing = " ".join(str(line) for line in prologue)
+            for key, value in _worker_env.items():
+                if key not in existing:
+                    prologue.append(f"export {key}={value}")
+            merged["job_script_prologue"] = prologue
 
         cluster = Cluster(**merged)
         cluster.scale(jobs=max_workers)
-        return Client(cluster)
+        client = Client(cluster)
+        _register_heap_trim_plugin(client)
+        return client
 
     # ────────── dask‑mpi ──────────
     if backend == "mpi":
+        # SPMD shape: every rank runs the same driver; initialize() turns
+        # rank 0 into the scheduler and ranks >= 2 into workers (they never
+        # return), rank 1 continues as the client. GPU pinning is per-rank
+        # CUDA_VISIBLE_DEVICES set by the launch wrapper (one rank per GPU),
+        # so plain distributed workers are correct — no dask-cuda needed.
         from dask_mpi import initialize
 
+        worker_options: Dict[str, Any] = {}
+        resources = cluster_kw.pop("resources", None)
+        if isinstance(resources, dict) and resources:
+            worker_options["resources"] = {
+                str(name): float(value) for name, value in resources.items()
+            }
         initialize(
             nthreads=threads_per_worker,
-            memory_limit="0",
-            worker_dashboard=worker_dashboard,
-            local_directory=os.getenv("DASK_LOCAL_DIR", cfg_file.get("local_directory", "/tmp")),
-            python="dask-cuda-worker" if gpu else None,
+            # Same rationale as cuda-local: memmap pages count into RSS and
+            # the nanny would kill healthy workers; kernel arbitrates.
+            memory_limit=os.getenv("DASK_MEMORY_LIMIT", "0"),
+            local_directory=os.getenv(
+                "DASK_LOCAL_DIR", cfg_file.get("local_directory", "/tmp")
+            ),
+            worker_options=worker_options or None,
         )
-        return Client()
+        client = Client()
+        _register_heap_trim_plugin(client)
+        return client
 
     raise ValueError(f"Unknown backend '{backend}'")
 
@@ -300,6 +421,31 @@ def is_sync_client(client) -> bool:
         return ("syncclient" in cls) or (not has_loop)
     except Exception:
         return True
+
+
+def is_same_node_local_client(client) -> bool:
+    """True when driver and workers share one host (sync/local backends), so
+    worker-local scratch is directly readable by the driver."""
+    if client is None or is_sync_client(client):
+        return True
+    backend = str(os.getenv("DASK_BACKEND", "")).strip().lower()
+    if backend in {"local", "cuda-local", "sync", "synchronous", "single-threaded"}:
+        return True
+    cluster = getattr(client, "cluster", None)
+    cluster_name = type(cluster).__name__.lower() if cluster is not None else ""
+    return "localcluster" in cluster_name
+
+
+def current_worker_addresses(client) -> list[str]:
+    """Sorted live worker addresses; a sync/None client must report none
+    (there are no remote workers to address or pin work to)."""
+    if client is None or is_sync_client(client):
+        return []
+    try:
+        workers = client.scheduler_info().get("workers", {})
+    except Exception:
+        workers = {}
+    return sorted(workers)
 
 
 def yield_futures_with_results(futs, client: Client | None):
@@ -393,7 +539,6 @@ class SyncClient:
     def close(self): return None
 
 
-    
     def register_worker_plugin(self, plugin, name=None):
         """Ignore worker plugins in sync mode."""
         import warnings
@@ -403,15 +548,15 @@ class SyncClient:
             RuntimeWarning,
         )
         return None
-   
+
     def run(self, func, *args, **kwargs):
         """Simulate client.run: call the function locally once."""
         return func(*args, **kwargs)
-   
+
     def get_worker(self):
         """No worker concept in sync mode."""
         return None
-    
+
     def submit(self, func, *args, **kwargs):
             # kwargs accepted by distributed.Client.submit but NOT your function
             dist_only = {
@@ -452,9 +597,9 @@ class SyncClient:
         if len(iterables) == 1:
             return [_ImmediateFuture(func(x, **safe_kwargs)) for x in iterables[0]]
         else:
-            return [_ImmediateFuture(func(*xs, **safe_kwargs)) for xs in zip(*iterables)]     
-        
-     
+            return [_ImmediateFuture(func(*xs, **safe_kwargs)) for xs in zip(*iterables)]
+
+
 def _auto_backend() -> Optional[str]:
     env = os.environ
     if "SLURM_JOB_ID" in env:
@@ -507,15 +652,58 @@ def _append(d: Dict[str, Any], key: str, *items: str) -> None:
     d[key] = lst
 
 
-# --------------------------------------------------------------------------- #
-#  Convenience for interactive sessions                                      #
-# --------------------------------------------------------------------------- #
+# Cluster kwargs that hold directive lists: overriding them wholesale would
+# discard defaults such as the slurm --gpus directive.
+_JOBQUEUE_LIST_KEYS = ("job_extra_directives", "worker_extra_args")
 
-def shutdown_dask() -> None:
+
+def _merge_jobqueue_kwargs(
+    defaults: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge user cluster kwargs over jobqueue defaults. Scalar keys: user
+    wins. Directive-list keys: concatenated defaults-first with duplicates
+    dropped. ``scheduler_options``: dict-merged, user keys win but default
+    keys (fixed host/port endpoint) survive a partial override."""
+    merged = {**defaults, **overrides}
+    for key in _JOBQUEUE_LIST_KEYS:
+        if key in defaults and key in overrides:
+            combined: List[str] = list(defaults[key])
+            combined += [it for it in overrides[key] if it not in combined]
+            merged[key] = combined
+    default_sched = defaults.get("scheduler_options")
+    override_sched = overrides.get("scheduler_options")
+    if isinstance(default_sched, dict) and isinstance(override_sched, dict):
+        merged["scheduler_options"] = {**default_sched, **override_sched}
+    return merged
+
+
+def _resource_worker_args(resources: Any) -> tuple[str, ...]:
+    if not isinstance(resources, dict) or not resources:
+        return ()
+    parts: list[str] = []
+    for name, value in sorted(resources.items()):
+        if value is None:
+            continue
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            numeric = value
+        parts.append(f"{name}={numeric}")
+    if not parts:
+        return ()
+    return ("--resources", ",".join(parts))
+
+
+def _register_heap_trim_plugin(client) -> None:
+    """Attach the per-task heap-trim WorkerPlugin. Best-effort; silent on
+    failure. No-op for SyncClient / clients without register_worker_plugin."""
     try:
-        client = get_client()
-        client.close()
-        getattr(client, "cluster", None) and client.cluster.close()
-        logger.info("Dask client closed.")
-    except ValueError:
-        logger.info("No active Dask client.")
+        if client is None or not hasattr(client, "register_worker_plugin"):
+            return
+        if is_sync_client(client):
+            return
+        from core.runtime.worker_hooks import _PerTaskHeapTrim
+
+        client.register_worker_plugin(_PerTaskHeapTrim(), name="mosaic-heap-trim")
+    except Exception:
+        return

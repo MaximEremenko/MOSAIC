@@ -1,0 +1,38 @@
+{
+  "array_sha256": {
+    "complex_values": "5ece7642cbf0952ac82d2789b284bb7cf97cdd1924a2a66d4a87b7ad632ff637",
+    "positive_half_expected": "bb6c5d324450f2117f8181a088eaa2f74a287d1afb7763ae1da52e605c104237",
+    "q_grid_misleading_positive_role": "7ecc5af3f5ac21533722bd1f0e17a8500230b219ca9acf871a179d655de685ce",
+    "q_grid_misleading_zero_role": "eb7feebb89ec0d6ffc55637fae36e50c126f674593393cf92d6e5c9ff0ebbad3",
+    "q_grid_positive_l": "eb7feebb89ec0d6ffc55637fae36e50c126f674593393cf92d6e5c9ff0ebbad3",
+    "q_grid_zero_l": "7ecc5af3f5ac21533722bd1f0e17a8500230b219ca9acf871a179d655de685ce",
+    "zero_plane_expected": "5ece7642cbf0952ac82d2789b284bb7cf97cdd1924a2a66d4a87b7ad632ff637"
+  },
+  "description": "Synthetic compact baseline for half-space RIFFT reconstruction.",
+  "generator": "tests/fixtures/baselines/synthetic_half_space_v1/generate.py",
+  "metrics": {
+    "positive_half_imag_norm": 0.0,
+    "positive_half_imag_over_real": 0.0,
+    "positive_half_real_norm": 6.5
+  },
+  "provenance": {
+    "anchor_commit": "f019f76",
+    "dependency_versions": {
+      "numpy": "2.4.4",
+      "python": "3.11.15"
+    },
+    "generator_command": "python3 tests/fixtures/baselines/synthetic_half_space_v1/generate.py",
+    "input_files": [],
+    "public_representative_fixture": {
+      "reason": "No committed representative public fixture has been selected.",
+      "status": "deferred"
+    },
+    "synthetic_only": true
+  },
+  "schema": "mosaic.synthetic_half_space_baseline",
+  "schema_version": 1,
+  "thresholds": {
+    "positive_half_imag_over_real": 1e-12,
+    "zero_plane_preserves_imag": true
+  }
+}

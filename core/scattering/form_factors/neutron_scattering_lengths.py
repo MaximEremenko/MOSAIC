@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Mon Nov 20 11:55:43 2023
-
-@author: MOSAIC
-"""
+"""Neutron scattering-length lookup tables (RMC element/isotope keys)."""
 
 def rmc_neutron_scl_(ca):
     fca_values = {

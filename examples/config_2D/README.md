@@ -11,7 +11,8 @@ This directory contains the two current 2D example cases:
 - mode: `displacement`
 - backend: `local`
 - checked-in runtime: `max_workers: 6`, `threads_per_worker: 1`, `processes: true`
-- mask: butterfly-wing exclusion around Bragg peaks
+- mask convention: `*_masked` selects reciprocal-space pixels inside the
+  butterfly-wing mask; `*_rest` selects the complement
 - output roots:
   - `displacement/output_displacement`
   - `displacement/output_displacement_decoder_full`
@@ -29,8 +30,8 @@ reciprocal-space selections are additive: `u(mask) + u(rest) = u(all)`.
 
 | Config | Mask | Description |
 |--------|------|-------------|
-| `input_parameters.json` | Feature | Diffuse region excluding butterfly wings |
-| `input_parameters_rest.json` | ~Feature | Butterfly-wing regions near Bragg peaks |
+| `input_parameters.json` | ~Butterfly mask | Diffuse region outside butterfly wings (legacy default) |
+| `input_parameters_rest.json` | Butterfly mask | Butterfly-wing pixels near Bragg peaks (legacy complement) |
 | `input_parameters_all.json` | Full | All reciprocal-space points |
 
 ```bash

@@ -117,10 +117,12 @@ def test_normalize_input_schema_maps_processing_decoder_policy():
         "processing": {
             "mode": "displacement",
             "method": "from_average",
+            "fresh_start": False,
             "points": [],
             "decoder": {
                 "source": "compute",
                 "compute_output_directory": "./decoder_full",
+                "fresh_start": True,
             },
         },
     }
@@ -132,6 +134,8 @@ def test_normalize_input_schema_maps_processing_decoder_policy():
         normalized["rspace_info"]["decoder"]["compute_output_directory"]
         == "./decoder_full"
     )
+    assert normalized["rspace_info"]["fresh_start"] is False
+    assert normalized["rspace_info"]["decoder"]["fresh_start"] is True
 
 
 def test_parameter_loading_service_finds_examples_run_file_from_core_workdir(

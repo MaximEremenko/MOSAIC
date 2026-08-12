@@ -74,6 +74,13 @@ A typical single-GPU launch is:
 CUDA_VISIBLE_DEVICES=0 conda run -n mosaic python -m core.main examples/config_2D/chemical_ordering/run_parameters.json
 ```
 
+GPU execution requires a CUDA-enabled MOSAIC install. See the
+[CUDA / GPU section of the README](../README.md#cuda--gpu) for the supported
+paths (`core/environment_cuda.yml`, the `[cuda12]` pip extra, or
+`setup_mosaic.sh`). The tested wheel stack is CUDA 12.4 + `cupy-cuda12x` +
+`cufinufft==2.5.1` + `dask-cuda>=26.4`; the `cufinufft` wheel needs CUDA 12
+runtime libraries visible at runtime.
+
 Notes:
 
 - `cuda-local` requires `dask-cuda` in the active environment.
@@ -106,5 +113,17 @@ Current example outputs:
 - `examples/config_3D/displacement/output_displacement`
 - `examples/config_3D/chemical_ordering/output_chemical_ordering`
 
-Most generated artifacts live under `processed_point_data/`. Some modes also
-produce `residual_shards/` for intermediate accumulation data.
+The manifest-authoritative run state lives under
+`processed_point_data/.mosaic/runs/<run_digest>/`. Files directly under
+`processed_point_data/` are a compatibility projection for existing analysis
+scripts and are written only by the explicit public finalizer:
+
+```bash
+mosaic publish --output-dir <processed_point_data> --run-digest <run_digest>
+```
+
+Residual-field checkpoint state for current runs lives under
+`residual_checkpoints/` or the private `.mosaic/runs/<run_digest>/` namespace,
+depending on backend and stage. Use `mosaic cleanup --output-dir
+<processed_point_data> --run-digest <run_digest>` as a separate retention step
+after manifest truth is proven.

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import mmap
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +10,67 @@ from pathlib import Path
 import numpy as np
 
 from core.residual_field.contracts import ResidualFieldWorkUnit
+from core.runtime.worker_hooks import worker_local_scratch_dir
+
+logger = logging.getLogger(__name__)
+
+_LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT = 64 * 1024 * 1024
+
+
+def _flush_and_drop_array_pages(array) -> None:
+    try:
+        flush = getattr(array, "flush", None)
+        if callable(flush):
+            flush()
+        mmap_obj = getattr(array, "_mmap", None)
+        if mmap_obj is None:
+            return
+        mmap_flush = getattr(mmap_obj, "flush", None)
+        if callable(mmap_flush):
+            mmap_flush()
+        madvise = getattr(mmap_obj, "madvise", None)
+        if callable(madvise) and hasattr(mmap, "MADV_DONTNEED"):
+            madvise(mmap.MADV_DONTNEED)
+    except Exception:
+        pass
+
+
+def _local_accumulation_block_len() -> int:
+    raw = os.getenv("MOSAIC_LOCAL_ACCUMULATION_BLOCK_BYTES")
+    try:
+        block_bytes = int(raw) if raw is not None else _LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT
+    except ValueError:
+        block_bytes = _LOCAL_ACCUMULATION_BLOCK_BYTES_DEFAULT
+    return max(1, int(block_bytes) // np.dtype(np.complex128).itemsize)
+
+
+
+def _as_point_ids_no_copy(point_ids) -> np.ndarray:
+    """Return the SAME object when it is already a 1-D int64 vector (the
+    per-process _shared_point_ids cache guarantees one object per
+    (start, count)), so identity checks short-circuit instead of paying a
+    211.7M-element GIL-held compare on every fold."""
+    if (
+        isinstance(point_ids, np.ndarray)
+        and point_ids.dtype == np.int64
+        and point_ids.ndim == 1
+    ):
+        return point_ids
+    return np.asarray(point_ids, dtype=np.int64).reshape(-1)
+
+def _chunked_add_complex(target, source) -> None:
+    source_arr = np.asarray(source, dtype=np.complex128).reshape(-1)
+    target_arr = np.asarray(target, dtype=np.complex128).reshape(-1)
+    if target_arr.shape != source_arr.shape:
+        raise ValueError("Local residual accumulation requires matching target/source shapes.")
+    use_blocks = isinstance(target, np.memmap) or isinstance(source_arr, np.memmap)
+    if not use_blocks:
+        target_arr += source_arr
+        return
+    block_len = _local_accumulation_block_len()
+    for start in range(0, int(source_arr.shape[0]), block_len):
+        stop = min(int(source_arr.shape[0]), start + block_len)
+        target_arr[start:stop] += source_arr[start:stop]
 
 
 @dataclass(frozen=True)
@@ -78,9 +142,58 @@ def build_local_accumulator_snapshot_path(
     )
     return (
         Path(output_dir)
-        / "residual_shards"
+        / "residual_checkpoints"
         / f"chunk_{chunk_id}"
         / f"local_accumulator{partition_suffix}_seq_{int(snapshot_seq)}_params_{parameter_digest}.npz"
+    )
+
+
+from core.storage.npz_mmap import mmap_npz_member as _mmap_npz_member
+
+
+def _snapshot_member_array(data, npz_path: Path, member: str, dtype) -> np.ndarray:
+    mapped = _mmap_npz_member(npz_path, member)
+    if mapped is not None and mapped.dtype == np.dtype(dtype):
+        return mapped
+    return np.asarray(data[member], dtype=dtype)
+
+
+class SnapshotCloneUnsupported(RuntimeError):
+    """The scratch filesystem cannot reflink-clone the live memmap files."""
+
+
+_FICLONE = 0x40049409  # <linux/fs.h> FICLONE: same-FS copy-on-write clone
+
+
+def _reflink_clone_file(source: Path, destination: Path) -> None:
+    import fcntl
+
+    try:
+        with open(source, "rb") as src, open(destination, "wb") as dst:
+            fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+    except (OSError, AttributeError) as exc:
+        destination.unlink(missing_ok=True)
+        raise SnapshotCloneUnsupported(
+            f"reflink clone unavailable under {destination.parent}: {exc}"
+        ) from exc
+
+
+def _warn_torn_snapshot(snapshot_path: Path, exc: Exception) -> None:
+    """A TORN snapshot is treated like a missing one.
+
+    On power loss the rename can be durable while the data pages are not
+    (the writer now fsyncs, but pre-fix snapshots and non-journaled FS
+    remain); a fully missing file is handled gracefully everywhere (stale ->
+    recompute), so an unreadable one must be too — previously the BadZipFile
+    propagated and the run hard-failed until the operator deleted
+    residual_checkpoints/ by hand. Mirrors the stage-1 payload store's
+    self-healing reads."""
+    logger.warning(
+        "Residual-field snapshot %s is unreadable (%s: %s); treating it as "
+        "absent and recomputing.",
+        snapshot_path,
+        type(exc).__name__,
+        exc,
     )
 
 
@@ -101,12 +214,30 @@ def load_local_accumulator_snapshot(
     )
     if not snapshot_path.exists():
         return None
-    with np.load(snapshot_path, allow_pickle=False) as data:
-        return {
-            "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
+    try:
+        with np.load(snapshot_path, allow_pickle=False) as data:
+            return _snapshot_payload_dict(
+                data, snapshot_path, partition_id=partition_id, snapshot_seq=snapshot_seq
+            )
+    except Exception as exc:
+        _warn_torn_snapshot(snapshot_path, exc)
+        return None
+
+
+def _snapshot_payload_dict(
+    data, snapshot_path: Path, *, partition_id: int | None, snapshot_seq: int
+) -> dict[str, object]:
+    return {
+            "point_ids": _snapshot_member_array(
+                data, snapshot_path, "point_ids", np.int64
+            ),
             "grid_shape_nd": np.asarray(data["grid_shape_nd"], dtype=np.int64),
-            "amplitudes_delta": np.asarray(data["amplitudes_delta"], dtype=np.complex128),
-            "amplitudes_average": np.asarray(data["amplitudes_average"], dtype=np.complex128),
+            "amplitudes_delta": _snapshot_member_array(
+                data, snapshot_path, "amplitudes_delta", np.complex128
+            ),
+            "amplitudes_average": _snapshot_member_array(
+                data, snapshot_path, "amplitudes_average", np.complex128
+            ),
             "reciprocal_point_count": int(np.asarray(data["reciprocal_point_count"]).ravel()[0]),
             "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
             "incorporated_interval_ids": tuple(
@@ -140,6 +271,87 @@ def load_local_accumulator_snapshot(
                 if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
                 else None
             ),
+            "accumulator_axis": (
+                str(np.asarray(data["accumulator_axis"]).ravel()[0])
+                if "accumulator_axis" in data
+                else "points"
+            ),
+        }
+
+
+def load_local_accumulator_snapshot_metadata(
+    output_dir: str,
+    *,
+    chunk_id: int,
+    parameter_digest: str,
+    partition_id: int | None = None,
+    snapshot_seq: int,
+) -> dict[str, object] | None:
+    snapshot_path = build_local_accumulator_snapshot_path(
+        output_dir,
+        chunk_id=chunk_id,
+        parameter_digest=parameter_digest,
+        partition_id=partition_id,
+        snapshot_seq=snapshot_seq,
+    )
+    if not snapshot_path.exists():
+        return None
+    try:
+        with np.load(snapshot_path, allow_pickle=False) as data:
+            return _snapshot_metadata_dict(
+                data, partition_id=partition_id, snapshot_seq=snapshot_seq
+            )
+    except Exception as exc:
+        _warn_torn_snapshot(snapshot_path, exc)
+        return None
+
+
+def _snapshot_metadata_dict(
+    data, *, partition_id: int | None, snapshot_seq: int
+) -> dict[str, object]:
+    return {
+            "reciprocal_point_count": int(np.asarray(data["reciprocal_point_count"]).ravel()[0]),
+            "total_reciprocal_points": int(np.asarray(data["total_reciprocal_points"]).ravel()[0]),
+            "incorporated_interval_ids": tuple(
+                int(interval_id) for interval_id in np.asarray(data["incorporated_interval_ids"], dtype=np.int64).tolist()
+            ),
+            "partition_id": (
+                int(np.asarray(data["partition_id"]).ravel()[0])
+                if "partition_id" in data
+                else (int(partition_id) if partition_id is not None else None)
+            ),
+            "storage_mode": str(data["storage_mode"].tolist()),
+            "checkpoint_write_count": int(
+                np.asarray(data["checkpoint_write_count"]).ravel()[0]
+            ) if "checkpoint_write_count" in data else int(snapshot_seq),
+            "checkpoint_bytes_written_total": int(
+                np.asarray(data["checkpoint_bytes_written_total"]).ravel()[0]
+            ) if "checkpoint_bytes_written_total" in data else 0,
+            "checkpoint_wall_seconds_total": float(
+                np.asarray(data["checkpoint_wall_seconds_total"]).ravel()[0]
+            ) if "checkpoint_wall_seconds_total" in data else 0.0,
+            "checkpoint_cadence_batches": int(
+                np.asarray(data["checkpoint_cadence_batches"]).ravel()[0]
+            ) if "checkpoint_cadence_batches" in data else 0,
+            "point_start": (
+                int(np.asarray(data["point_start"]).ravel()[0])
+                if "point_start" in data and int(np.asarray(data["point_start"]).ravel()[0]) >= 0
+                else None
+            ),
+            "point_stop": (
+                int(np.asarray(data["point_stop"]).ravel()[0])
+                if "point_stop" in data and int(np.asarray(data["point_stop"]).ravel()[0]) >= 0
+                else None
+            ),
+            # Which axis this accumulator partitions the chunk on. "points":
+            # legacy atom-range partitions, concatenated at finalize.
+            # "intervals": streaming subchunks (full point range, partial
+            # interval set), summed at finalize. Families must never mix.
+            "accumulator_axis": (
+                str(np.asarray(data["accumulator_axis"]).ravel()[0])
+                if "accumulator_axis" in data
+                else "points"
+            ),
         }
 
 
@@ -164,6 +376,7 @@ def write_local_accumulator_snapshot(
     checkpoint_cadence_batches: int = 0,
     point_start: int | None = None,
     point_stop: int | None = None,
+    accumulator_axis: str = "points",
     compress: bool = False,
 ) -> Path:
     snapshot_path = build_local_accumulator_snapshot_path(
@@ -204,8 +417,24 @@ def write_local_accumulator_snapshot(
             checkpoint_cadence_batches=np.array([int(checkpoint_cadence_batches)], dtype=np.int64),
             point_start=np.array([-1 if point_start is None else int(point_start)], dtype=np.int64),
             point_stop=np.array([-1 if point_stop is None else int(point_stop)], dtype=np.int64),
+            accumulator_axis=np.array([str(accumulator_axis)]),
         )
+        # fsync BEFORE rename: the progress manifest referencing this seq is
+        # fully fsync'd (file + parent), so without this the manifest's
+        # parent-dir fsync could durably commit the rename of a snapshot
+        # whose data pages never hit disk — a torn file a crash-resume then
+        # trips over.
+        handle.flush()
+        os.fsync(handle.fileno())
     Path(handle.name).replace(snapshot_path)
+    try:
+        dir_fd = os.open(snapshot_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
     return snapshot_path
 
 
@@ -282,13 +511,15 @@ class LiveLocalAccumulator:
         live_dir: Path | None = None,
         point_start: int | None = None,
         point_stop: int | None = None,
+        accumulator_axis: str = "points",
     ) -> None:
         self.chunk_id = int(chunk_id)
         self.parameter_digest = str(parameter_digest)
         self.partition_id = int(partition_id) if partition_id is not None else None
-        self.point_ids = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        self.point_ids = _as_point_ids_no_copy(point_ids)
         self.point_start = int(point_start) if point_start is not None else None
         self.point_stop = int(point_stop) if point_stop is not None else None
+        self.accumulator_axis = str(accumulator_axis)
         self.grid_shape_nd = np.asarray(grid_shape_nd, dtype=np.int64)
         self.total_reciprocal_points = int(total_reciprocal_points)
         self.reciprocal_point_count = int(reciprocal_point_count)
@@ -337,7 +568,7 @@ class LiveLocalAccumulator:
         scratch_root: str,
         max_ram_bytes: int,
     ) -> "LiveLocalAccumulator":
-        point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        point_ids_arr = _as_point_ids_no_copy(point_ids)
         grid_shape_nd_arr = np.asarray(grid_shape_nd, dtype=np.int64)
         amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
         amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
@@ -364,9 +595,8 @@ class LiveLocalAccumulator:
             template_delta=amplitudes_delta_arr,
             template_average=amplitudes_average_arr,
             storage_mode=storage_mode,
+            copy_templates=False,
         )
-        amplitudes_delta[:] = 0
-        amplitudes_average[:] = 0
         return cls(
             chunk_id=work_unit.chunk_id,
             parameter_digest=work_unit.parameter_digest,
@@ -388,6 +618,7 @@ class LiveLocalAccumulator:
             live_dir=live_dir,
             point_start=getattr(work_unit, "point_start", None),
             point_stop=getattr(work_unit, "point_stop", None),
+            accumulator_axis=getattr(work_unit, "partition_axis", "points"),
         )
 
     @classmethod
@@ -442,6 +673,7 @@ class LiveLocalAccumulator:
             live_dir=live_dir,
             point_start=int(snapshot["point_start"]) if snapshot.get("point_start") is not None else None,
             point_stop=int(snapshot["point_stop"]) if snapshot.get("point_stop") is not None else None,
+            accumulator_axis=str(snapshot.get("accumulator_axis", "points")),
         )
 
     def should_skip_partial(self, partial: ResidualFieldLocalAccumulatorPartial) -> bool:
@@ -489,8 +721,29 @@ class LiveLocalAccumulator:
         )
         if self.should_skip_interval_ids(interval_ids):
             return
-        self.amplitudes_delta += np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
-        self.amplitudes_average += np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
+        stale_overlap = set(int(v) for v in interval_ids) & self.current_interval_ids
+        if stale_overlap:
+            # A contribution that partially overlaps the accumulated interval
+            # set means the interval grouping changed between the run that
+            # wrote the restored checkpoint and this one. Within one plan,
+            # batches are disjoint, and plan-time checkpoint invalidation
+            # discards checkpoints whose durable set is not a union of the
+            # current plan's batches -- so this state is unreachable in the
+            # orchestrated flow. Adding would double-count the overlap and
+            # resetting could destroy intervals that filtered-out work units
+            # will never re-cover, so fail loudly instead.
+            raise ValueError(
+                "Residual-field local accumulator cannot reconcile a "
+                f"contribution for chunk={self.chunk_id} partition="
+                f"{'owner' if self.partition_id is None else self.partition_id}: "
+                f"{len(stale_overlap)} of its intervals are already accumulated "
+                f"while {len(set(interval_ids) - self.current_interval_ids)} are "
+                "not (interval grouping changed across runs). Delete "
+                "'residual_checkpoints/' under the output directory and re-run "
+                "to recompute this chunk."
+            )
+        _chunked_add_complex(self.amplitudes_delta, amplitudes_delta)
+        _chunked_add_complex(self.amplitudes_average, amplitudes_average)
         self.reciprocal_point_count += int(contribution_reciprocal_points)
         self.current_interval_ids.update(interval_ids)
         self.accepted_since_snapshot += 1
@@ -515,7 +768,7 @@ class LiveLocalAccumulator:
         amplitudes_delta: np.ndarray,
         amplitudes_average: np.ndarray,
     ) -> None:
-        point_ids_arr = np.asarray(point_ids, dtype=np.int64).reshape(-1)
+        point_ids_arr = _as_point_ids_no_copy(point_ids)
         grid_shape_nd_arr = np.asarray(grid_shape_nd, dtype=np.int64)
         amplitudes_delta_arr = np.asarray(amplitudes_delta, dtype=np.complex128).reshape(-1)
         amplitudes_average_arr = np.asarray(amplitudes_average, dtype=np.complex128).reshape(-1)
@@ -529,8 +782,21 @@ class LiveLocalAccumulator:
             raise ValueError("Local accumulator partial parameter digest mismatch.")
         if work_unit.partition_id != self.partition_id:
             raise ValueError("Local accumulator partial partition_id mismatch.")
-        if not np.array_equal(self.point_ids, point_ids_arr):
-            raise ValueError("Local accumulator partial point_ids mismatch.")
+        if getattr(work_unit, "partition_axis", "points") != self.accumulator_axis:
+            raise ValueError(
+                "Local accumulator partial partition_axis mismatch: accumulator "
+                f"is {self.accumulator_axis!r}, contribution is "
+                f"{getattr(work_unit, 'partition_axis', 'points')!r}. A points-axis "
+                "and an intervals-axis (subchunk) layout are irreconcilable; "
+                "delete 'residual_checkpoints/' under the output directory."
+            )
+        if self.point_ids is not point_ids_arr:
+            if not np.array_equal(self.point_ids, point_ids_arr):
+                raise ValueError("Local accumulator partial point_ids mismatch.")
+            # Equality proven (e.g. snapshot-restored accumulator vs the
+            # shared cache object): rebind so every later fold takes the
+            # O(1) identity path.
+            self.point_ids = point_ids_arr
         if not np.array_equal(self.grid_shape_nd, grid_shape_nd_arr):
             raise ValueError("Local accumulator partial grid_shape_nd mismatch.")
         if int(total_reciprocal_points) != self.total_reciprocal_points:
@@ -538,10 +804,10 @@ class LiveLocalAccumulator:
 
     def snapshot_payload(self) -> dict[str, object]:
         return {
-            "point_ids": self.point_ids.copy(),
-            "grid_shape_nd": self.grid_shape_nd.copy(),
-            "amplitudes_delta": np.asarray(self.amplitudes_delta, dtype=np.complex128).copy(),
-            "amplitudes_average": np.asarray(self.amplitudes_average, dtype=np.complex128).copy(),
+            "point_ids": self.point_ids,
+            "grid_shape_nd": self.grid_shape_nd,
+            "amplitudes_delta": np.asarray(self.amplitudes_delta, dtype=np.complex128),
+            "amplitudes_average": np.asarray(self.amplitudes_average, dtype=np.complex128),
             "reciprocal_point_count": int(self.reciprocal_point_count),
             "total_reciprocal_points": int(self.total_reciprocal_points),
             "incorporated_interval_ids": tuple(sorted(self.current_interval_ids)),
@@ -555,17 +821,111 @@ class LiveLocalAccumulator:
             "point_stop": self.point_stop,
         }
 
+    def capture_snapshot_payload(self) -> dict[str, object]:
+        """snapshot_payload with PRIVATE copies of the mutable arrays.
+
+        snapshot_payload() returns live views, so the durable write must
+        stay serialized against folds. This copy (sub-second memcpy vs a
+        4.5-7 s savez) lets the write proceed on a writer thread while
+        folds continue. point_ids/grid_shape_nd stay by-reference: they
+        are never mutated after construction (equality-validated on every
+        fold above)."""
+        payload = self.snapshot_payload()
+        payload["amplitudes_delta"] = np.array(
+            self.amplitudes_delta, dtype=np.complex128, copy=True
+        )
+        payload["amplitudes_average"] = np.array(
+            self.amplitudes_average, dtype=np.complex128, copy=True
+        )
+        return payload
+
+    def capture_snapshot_payload_file_clone(self) -> dict[str, object]:
+        """File-mode async capture: reflink-clone (copy-on-write) the live
+        memmap backing files so the writer thread savez's a FROZEN view
+        while folds continue.
+
+        A RAM-style copy of a GB-scale file target would cost as much as
+        the write it hides and allocate the very RSS file mode exists to
+        avoid; a reflink clone is O(1) under the per-target lock on
+        XFS/btrfs/NFS4.2. Raises SnapshotCloneUnsupported where the scratch
+        filesystem cannot reflink (ext4) — the caller falls back to the
+        synchronous flush. The clone files are unlinked after the commit."""
+        if self.storage_mode != "file" or self.live_dir is None:
+            raise SnapshotCloneUnsupported("no file-mode live dir to clone")
+        payload = self.snapshot_payload()
+        capture_tag = f"capture_seq_{self.next_snapshot_seq()}"
+        clone_paths: list[Path] = []
+        try:
+            for member, array in (
+                ("amplitudes_delta", self.amplitudes_delta),
+                ("amplitudes_average", self.amplitudes_average),
+            ):
+                flush = getattr(array, "flush", None)
+                if callable(flush):
+                    flush()
+                source = self.live_dir / f"{member}.npy"
+                clone = self.live_dir / f"{member}.{capture_tag}.clone.npy"
+                _reflink_clone_file(source, clone)
+                clone_paths.append(clone)
+                payload[member] = np.load(clone, mmap_mode="r")
+        except SnapshotCloneUnsupported:
+            for clone_path in clone_paths:
+                clone_path.unlink(missing_ok=True)
+            raise
+        payload["_clone_paths"] = tuple(clone_paths)
+        return payload
+
+    # Seq-space stride between owner tenures: a replacement owner's first
+    # snapshot seq jumps to epoch * STRIDE, so a zombie predecessor would
+    # need a million snapshots during the overlap window to catch up.
+    OWNER_EPOCH_SEQ_STRIDE = 1_000_000
+
+    def raise_owner_epoch_floor(self, owner_epoch: int) -> None:
+        """Fence stale owners by SEQ ORDERING, not a key-schema change.
+
+        The driver bumps a target's owner epoch on every ownership remap
+        (dead-owner rescue, retry on a vanished worker). Sequencing each
+        tenure from epoch * STRIDE makes the replacement's seqs strictly
+        greater than anything a scheduler-declared-dead-but-alive
+        predecessor can still write, and the commit path's manifest union
+        refuses to move a partition's seq backwards — the zombie's next
+        commit becomes a loud superseded-owner error instead of a
+        same-seq rename race with the live owner. Epoch 0 (no remap ever)
+        keeps historical seq numbering and filenames byte-identical."""
+        floor = int(owner_epoch) * self.OWNER_EPOCH_SEQ_STRIDE
+        if self.durable_snapshot_seq < floor:
+            self.durable_snapshot_seq = floor
+
+    def mark_snapshot_captured(self) -> None:
+        """Reset the cadence counter at CAPTURE time so an in-flight
+        async write does not retrigger a capture every subsequent fold."""
+        self.accepted_since_snapshot = 0
+
     def durable_progress_interval_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self.durable_interval_ids))
 
     def next_snapshot_seq(self) -> int:
         return int(self.durable_snapshot_seq) + 1
 
-    def mark_snapshot_committed(self, snapshot_seq: int) -> tuple[int, ...]:
-        newly_durable = tuple(sorted(self.current_interval_ids - self.durable_interval_ids))
-        self.durable_interval_ids = set(self.current_interval_ids)
+    def mark_snapshot_committed(
+        self, snapshot_seq: int, captured_interval_ids=None
+    ) -> tuple[int, ...]:
+        if captured_interval_ids is None:
+            newly_durable = tuple(
+                sorted(self.current_interval_ids - self.durable_interval_ids)
+            )
+            self.durable_interval_ids = set(self.current_interval_ids)
+            self.accepted_since_snapshot = 0
+        else:
+            # Async commit: only what the CAPTURE contained is durable.
+            # Folds accepted during the in-flight write are in no snapshot
+            # file yet — marking them durable would make a crash-resume
+            # silently skip recomputing them (data loss). Union, never
+            # assignment; cadence counter belongs to capture time.
+            captured = {int(v) for v in captured_interval_ids}
+            newly_durable = tuple(sorted(captured - self.durable_interval_ids))
+            self.durable_interval_ids |= captured
         self.durable_snapshot_seq = int(snapshot_seq)
-        self.accepted_since_snapshot = 0
         return newly_durable
 
     def record_checkpoint_metrics(
@@ -580,14 +940,37 @@ class LiveLocalAccumulator:
         self.checkpoint_wall_seconds_total += float(wall_seconds)
         self.checkpoint_cadence_batches = int(checkpoint_cadence_batches)
 
-    def cleanup_live_files(self) -> None:
-        if self.live_dir is None:
+    def trim_live_memory(self) -> None:
+        if self.storage_mode != "file":
             return
-        for path in self.live_dir.glob("*.npy"):
+        _flush_and_drop_array_pages(self.amplitudes_delta)
+        _flush_and_drop_array_pages(self.amplitudes_average)
+
+    def cleanup_live_files(self) -> None:
+        for array_name in ("amplitudes_delta", "amplitudes_average"):
+            array = getattr(self, array_name, None)
+            _flush_and_drop_array_pages(array)
+            mmap_obj = getattr(array, "_mmap", None)
+            close = getattr(mmap_obj, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            setattr(self, array_name, None)
+
+        self.point_ids = np.array([], dtype=np.int64)
+        self.grid_shape_nd = np.array([], dtype=np.int64)
+
+        live_dir = self.live_dir
+        self.live_dir = None
+        if live_dir is None:
+            return
+        for path in live_dir.glob("*.npy"):
             path.unlink(missing_ok=True)
-        if self.live_dir.exists() and not any(self.live_dir.iterdir()):
-            self.live_dir.rmdir()
-        parent = self.live_dir.parent
+        if live_dir.exists() and not any(live_dir.iterdir()):
+            live_dir.rmdir()
+        parent = live_dir.parent
         if parent.exists() and not any(parent.iterdir()):
             parent.rmdir()
 
@@ -601,14 +984,21 @@ def _allocate_live_arrays(
     template_delta: np.ndarray,
     template_average: np.ndarray,
     storage_mode: str,
+    copy_templates: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, Path | None]:
     delta = np.asarray(template_delta, dtype=np.complex128).reshape(-1)
     average = np.asarray(template_average, dtype=np.complex128).reshape(-1)
     if storage_mode == "ram":
-        return delta.copy(), average.copy(), None
+        if copy_templates:
+            return delta.copy(), average.copy(), None
+        return np.zeros_like(delta), np.zeros_like(average), None
 
+    # Namespaced HERE, on the worker that will own these files — the driver
+    # cannot know the token, and these are opened mode="w+" (truncate), so a
+    # shared path means a remapped owner destroys the previous owner's live
+    # accumulator mid-fold.
     live_dir = (
-        Path(scratch_root).expanduser()
+        worker_local_scratch_dir(scratch_root)
         / "residual_accumulators"
         / f"chunk_{chunk_id}"
         / (
@@ -632,8 +1022,12 @@ def _allocate_live_arrays(
         dtype=np.complex128,
         shape=average.shape,
     )
-    delta_mm[:] = delta
-    average_mm[:] = average
+    if copy_templates:
+        delta_mm[:] = delta
+        average_mm[:] = average
+    else:
+        delta_mm[:] = 0
+        average_mm[:] = 0
     return delta_mm, average_mm, live_dir
 
 
@@ -643,5 +1037,6 @@ __all__ = [
     "build_local_accumulator_snapshot_path",
     "estimate_local_accumulator_bytes",
     "load_local_accumulator_snapshot",
+    "load_local_accumulator_snapshot_metadata",
     "write_local_accumulator_snapshot",
 ]

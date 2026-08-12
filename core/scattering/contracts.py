@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
@@ -14,6 +15,14 @@ from core.contracts import (
     RetryIdempotencySemantics,
 )
 
+
+# Whether scattering interval artifacts are required transport toward the
+# residual stage or merely optional saved output. Producer-side policy, so it
+# lives with the scattering contracts; the residual reducer layouts consume it.
+ScatteringIntervalArtifactPolicy = Literal[
+    "required_transport",
+    "optional_output",
+]
 
 SCATTERING_CONTRACT_SCHEMA_VERSION = 1
 SCATTERING_INTERVAL_ARTIFACT_SCHEMA = ArtifactSchemaSpec(
@@ -73,6 +82,24 @@ def make_scattering_artifact_key(
     return ":".join(parts)
 
 
+# Precompute-mode interval artifacts. The directory is keyed by interval id
+# alone — it carries no run identity — so a reader that did not write the
+# file must validate the payload's own identity stamp before reusing it.
+INTERVAL_ARTIFACT_DIRNAME = "precomputed_intervals"
+
+
+def interval_artifact_filename(interval_id: int) -> str:
+    return f"interval_{int(interval_id)}.hdf5"
+
+
+def interval_artifact_dir(output_dir: str | Path) -> Path:
+    return Path(output_dir) / INTERVAL_ARTIFACT_DIRNAME
+
+
+def interval_artifact_path(output_dir: str | Path, interval_id: int) -> Path:
+    return interval_artifact_dir(output_dir) / interval_artifact_filename(interval_id)
+
+
 def build_interval_artifact_ref(output_dir: str, interval_id: int) -> ArtifactRef:
     return ArtifactRef(
         stage="scattering",
@@ -81,7 +108,7 @@ def build_interval_artifact_ref(output_dir: str, interval_id: int) -> ArtifactRe
             "interval-precompute",
             interval_id=interval_id,
         ),
-        path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+        path=str(interval_artifact_path(output_dir, interval_id)),
         schema_version=SCATTERING_CONTRACT_SCHEMA_VERSION,
     )
 
@@ -167,6 +194,13 @@ class ScatteringWorkUnit:
     chunk_artifact_prefix: str | None
     artifact_key: str
     retry: RetryIdempotencySemantics
+    stage: str = "scattering"
+    scientific_digest: str | None = None
+    execution_digest: str | None = None
+    run_digest: str | None = None
+    qspace_plan_digest: str | None = None
+    backend_policy_digest: str | None = None
+    source_structure_digest: str | None = None
     schema_version: int = SCATTERING_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -176,6 +210,12 @@ class ScatteringWorkUnit:
         interval_id: int,
         dimension: int,
         output_dir: str,
+        scientific_digest: str | None = None,
+        execution_digest: str | None = None,
+        run_digest: str | None = None,
+        qspace_plan_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        source_structure_digest: str | None = None,
     ) -> "ScatteringWorkUnit":
         return cls(
             interval_id=interval_id,
@@ -197,6 +237,12 @@ class ScatteringWorkUnit:
                     "exists and SQLite marks the interval as precomputed"
                 ),
             ),
+            scientific_digest=scientific_digest,
+            execution_digest=execution_digest,
+            run_digest=run_digest,
+            qspace_plan_digest=qspace_plan_digest,
+            backend_policy_digest=backend_policy_digest,
+            source_structure_digest=source_structure_digest,
         )
 
     @classmethod
@@ -207,6 +253,12 @@ class ScatteringWorkUnit:
         chunk_id: int,
         dimension: int,
         output_dir: str,
+        scientific_digest: str | None = None,
+        execution_digest: str | None = None,
+        run_digest: str | None = None,
+        qspace_plan_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        source_structure_digest: str | None = None,
     ) -> "ScatteringWorkUnit":
         return cls(
             interval_id=interval_id,
@@ -230,6 +282,12 @@ class ScatteringWorkUnit:
                     "the interval id"
                 ),
             ),
+            scientific_digest=scientific_digest,
+            execution_digest=execution_digest,
+            run_digest=run_digest,
+            qspace_plan_digest=qspace_plan_digest,
+            backend_policy_digest=backend_policy_digest,
+            source_structure_digest=source_structure_digest,
         )
 
     @property
@@ -320,6 +378,8 @@ def validate_scattering_partial_result(result: ScatteringPartialResult) -> None:
 
 
 def validate_scattering_work_unit(work_unit: ScatteringWorkUnit) -> None:
+    if work_unit.stage != "scattering":
+        raise ValueError("Scattering work units must have stage='scattering'.")
     if work_unit.interval_id < 0:
         raise ValueError("interval_id must be non-negative.")
     if work_unit.chunk_id is not None and work_unit.chunk_id < 0:
@@ -339,7 +399,22 @@ def validate_scattering_work_unit(work_unit: ScatteringWorkUnit) -> None:
                 "Chunk-scoped scattering work units must include interval and chunk artifact identities."
             )
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
-        raise ValueError("Scattering Phase 6 assumes NO_OP replay semantics.")
+        raise ValueError("Scattering work units require NO_OP replay semantics.")
+    identity_fields = (
+        work_unit.scientific_digest,
+        work_unit.execution_digest,
+        work_unit.run_digest,
+        work_unit.qspace_plan_digest,
+        work_unit.backend_policy_digest,
+        work_unit.source_structure_digest,
+    )
+    if any(value is not None for value in identity_fields) and not all(
+        isinstance(value, str) and value for value in identity_fields
+    ):
+        raise ValueError(
+            "Scattering work-unit identity must include scientific, execution, "
+            "run, qspace-plan, backend-policy, and source-structure digests together."
+        )
 
 
 def scattering_partial_result_identity(
@@ -468,6 +543,7 @@ def validate_scattering_artifact_manifest(manifest: ScatteringArtifactManifest) 
 
 
 __all__ = [
+    "INTERVAL_ARTIFACT_DIRNAME",
     "SCATTERING_CONTRACT_SCHEMA_VERSION",
     "SCATTERING_CHUNK_ARTIFACT_SCHEMA",
     "SCATTERING_INTERVAL_ARTIFACT_SCHEMA",
@@ -477,6 +553,9 @@ __all__ = [
     "ScatteringWorkUnit",
     "build_chunk_artifact_refs",
     "build_interval_artifact_ref",
+    "interval_artifact_dir",
+    "interval_artifact_filename",
+    "interval_artifact_path",
     "make_scattering_artifact_key",
     "make_scattering_retry_key",
     "merge_scattering_partial_results",

@@ -1,0 +1,116 @@
+name: mosaic-cluster-sim
+
+# Three heterogeneous "compute nodes" + one NFS "storage node", RAM at
+# 1 GB per core, all traffic latency/rate-shaped. This is the smallest
+# honest model of the target: a laptop-class node (node1), a mid node
+# with 2 GPUs (node2), and a fat CPU node (node3), sharing one NFS
+# filesystem for configs, checkpoints, results, and the stage-1 payload
+# store, with node-local scratch for everything transient.
+#
+#   node1: 1 GPU,  6 cores,  6 GB   (cpuset 0-5,   GPU 0)
+#   node2: 2 GPUs, 16 cores, 16 GB  (cpuset 8-23,  GPUs 1,2)
+#   node3: 1 GPU,  24 cores, 24 GB  (cpuset 24-47, GPU 3)
+#
+# CPU limits are cpusets (how SLURM grants cores), so nproc /
+# sched_getaffinity see the allocation; memory limits are cgroup limits
+# (how SLURM's cgroup plugin enforces --mem) — /proc/meminfo still shows
+# the host, which is exactly the trap core.runtime.cpu_resources exists
+# to handle.
+
+x-node-common: &node-common
+  build:
+    context: .
+    dockerfile: Dockerfile.node
+  cap_add: [SYS_ADMIN, NET_ADMIN]   # SYS_ADMIN: NFS mount; NET_ADMIN: tc netem
+  security_opt: ["apparmor:unconfined"]
+  shm_size: 1g
+  ulimits:
+    memlock: -1
+    nofile: 65536
+  environment: &node-env
+    MOSAIC_ROOT: ${REPO}
+    SIM_NET_DELAY: ${SIM_NET_DELAY:-250us}
+    SIM_NET_RATE: ${SIM_NET_RATE:-10gbit}
+  depends_on:
+    nfs-server:
+      condition: service_healthy
+  networks: [cluster]
+  healthcheck:
+    test: ["CMD", "mountpoint", "-q", "/mnt/shared"]
+    interval: 3s
+    timeout: 3s
+    retries: 40
+
+services:
+  nfs-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.nfs
+    hostname: nfs-server
+    privileged: true                 # kernel nfsd in the container netns
+    environment:
+      SIM_NET_DELAY: ${SIM_NET_DELAY:-250us}
+      SIM_NET_RATE: ${SIM_NET_RATE:-10gbit}
+    volumes:
+      - ${SIM_ROOT}/shared:/export
+    networks: [cluster]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/export/.nfs-ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 45
+
+  node1:
+    <<: *node-common
+    hostname: node1
+    cpuset: "0-5"
+    mem_limit: 6g
+    memswap_limit: 6g
+    volumes:
+      - ${REPO}:${REPO}:ro
+      - ${SIM_ROOT}/scratch/node1:/scratch
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+  node2:
+    <<: *node-common
+    hostname: node2
+    cpuset: "8-23"
+    mem_limit: 16g
+    memswap_limit: 16g
+    volumes:
+      - ${REPO}:${REPO}:ro
+      - ${SIM_ROOT}/scratch/node2:/scratch
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1", "2"]
+              capabilities: [gpu]
+
+  node3:
+    <<: *node-common
+    hostname: node3
+    cpuset: "24-47"
+    mem_limit: 24g
+    memswap_limit: 24g
+    volumes:
+      - ${REPO}:${REPO}:ro
+      - ${SIM_ROOT}/scratch/node3:/scratch
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+
+networks:
+  cluster:
+    driver: bridge

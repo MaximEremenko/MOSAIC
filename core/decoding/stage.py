@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from core.decoding.context import build_decoding_context
 from core.decoding.payloads import build_decoding_payload
-from core.decoding.processor import PointDataPostprocessingProcessor
+from core.decoding.decode_chunk import PointDataPostprocessingProcessor
 from core.models import StructureData, WorkflowParameters
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 def build_default_decoding_processor(db_manager, point_data_processor, parameters):
@@ -23,7 +28,7 @@ class DecodingStage:
         self,
         workflow_parameters: WorkflowParameters,
         structure: StructureData,
-        artifacts,
+        artifacts: RunArtifacts,
         client,
     ) -> None:
         context = build_decoding_context(
@@ -51,9 +56,20 @@ class DecodingStage:
                 artifacts=artifacts,
                 client=client,
             )
-        for chunk_id in sorted(context.artifacts.db_manager.get_pending_chunk_ids()):
-            processor.process_chunk(
-                int(chunk_id),
-                context.artifacts.saver,
-                output_dir=context.artifacts.output_dir,
-            )
+        try:
+            for chunk_id in sorted(context.artifacts.db_manager.get_pending_chunk_ids()):
+                processor.process_chunk(
+                    int(chunk_id),
+                    context.artifacts.saver,
+                    output_dir=context.artifacts.output_dir,
+                )
+        finally:
+            # Release un-popped prepared inputs and remove any spill files
+            # from the run output directory.
+            cache = getattr(processor, "prepared_inputs_cache", None)
+            if cache is not None:
+                try:
+                    cache.clear()
+                except Exception:
+                    pass
+                processor.prepared_inputs_cache = None

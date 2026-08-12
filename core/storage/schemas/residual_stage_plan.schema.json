@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.residual_field.stage_plan"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "stage": {"const": "residual_field"},
+    "expected_by_chunk": {
+      "type": "array",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "chunk_id": {"type": "integer"},
+          "partition_ids": {"type": "array", "items": {"type": "integer"}}
+        },
+        "required": ["chunk_id", "partition_ids"],
+        "type": "object"
+      }
+    },
+    "stage_plan_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "stage",
+    "expected_by_chunk",
+    "stage_plan_digest"
+  ],
+  "type": "object"
+}

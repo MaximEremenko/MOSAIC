@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from core.contracts import ScatteringHandoff
 from core.scattering.context import build_scattering_execution_context
 from core.scattering.stage import ScatteringStage
 from core.scattering.coefficients import CoefficientCenteringService
@@ -303,7 +304,8 @@ def test_scattering_stage_uses_injected_compute_callable(tmp_path):
             artifacts=artifacts,
             client=None,
         )
-        assert result["postprocessing_mode"] == "displacement"
+        assert isinstance(result, ScatteringHandoff)
+        assert result.residual_parameter_digest is not None
         assert captured["db_manager"] is artifacts.db_manager
         assert captured["point_data_processor"] is artifacts.point_data_processor
     finally:
@@ -476,7 +478,7 @@ def test_reciprocal_space_service_uses_injected_artifact_builder(tmp_path):
             calls.append(("process_intervals", None))
 
     class FakeArtifactBuilder:
-        def create(self, *, workflow_parameters, output_dir, supercell):
+        def create(self, *, workflow_parameters, output_dir, supercell, db_cache_config=None):
             calls.append(("build_artifacts", output_dir, tuple(supercell.tolist())))
             return SimpleNamespace(
                 parameters=workflow_parameters.to_payload(),
@@ -535,7 +537,11 @@ def test_workflow_service_uses_injected_services_and_closes_artifacts(tmp_path):
     class FakeStructureService:
         def load(self, workflow_parameters, working_path):
             calls.append(("load_structure", working_path))
-            return SimpleNamespace(supercell=np.array([4]))
+            # A real StructureData, not a namespace carrying only what this
+            # test happens to read: the workflow digests the structure's
+            # identity members, and a stub missing them used to digest them
+            # all as None.
+            return _build_structure()
 
     class FakePointSelectionService:
         def select(self, request):
@@ -553,7 +559,7 @@ def test_workflow_service_uses_injected_services_and_closes_artifacts(tmp_path):
     artifacts = FakeArtifacts()
 
     class FakeReciprocalService:
-        def prepare(self, workflow_parameters, point_data, supercell, output_dir):
+        def prepare(self, workflow_parameters, point_data, supercell, output_dir, db_cache_config=None):
             calls.append(("prepare_reciprocal", output_dir))
             return artifacts
 
@@ -563,6 +569,9 @@ def test_workflow_service_uses_injected_services_and_closes_artifacts(tmp_path):
             return {"stage": "scattering"}
 
     class FakeResidualFieldService:
+        def recover_pending(self, **kwargs):
+            return []
+
         def execute(self, **kwargs):
             calls.append(
                 (
@@ -613,7 +622,7 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
 
     class FakeStructureService:
         def load(self, workflow_parameters, working_path):
-            return SimpleNamespace(supercell=np.array([4]))
+            return _build_structure()
 
     class FakePointSelectionService:
         def select(self, request):
@@ -626,7 +635,7 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
             pass
 
     class FakeReciprocalService:
-        def prepare(self, workflow_parameters, point_data, supercell, output_dir):
+        def prepare(self, workflow_parameters, point_data, supercell, output_dir, db_cache_config=None):
             return FakeArtifacts()
 
     workflow_service = WorkflowService(
@@ -634,7 +643,10 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
         point_selection_service=FakePointSelectionService(),
         reciprocal_space_service=FakeReciprocalService(),
         scattering_stage=SimpleNamespace(execute=lambda **kwargs: {}),
-        residual_field_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        residual_field_stage=SimpleNamespace(
+            execute=lambda **kwargs: {},
+            recover_pending=lambda **kwargs: [],
+        ),
         decoding_stage=SimpleNamespace(execute=lambda **kwargs: None),
     )
     workflow_parameters = _build_workflow_parameters()
@@ -651,15 +663,17 @@ def test_workflow_service_clears_processed_output_on_fresh_start(tmp_path):
     assert stale_file.exists() is False
 
 
-def test_workflow_service_recovers_local_residual_state_before_scattering(
-    tmp_path,
-    monkeypatch,
-):
-    recovered = []
+def test_workflow_service_recovers_local_residual_state_before_scattering(tmp_path):
+    # Residual restart recovery is owned by the residual_field stage
+    # (ResidualFieldStage.recover_pending); the orchestrator only calls it, and
+    # must call it BEFORE scattering. The recovery internals (backend layout,
+    # scratch roots, parameter digests, finalize_chunk) are covered by
+    # tests/unit/residual_field/test_residual_stage_recover_pending.py.
+    order = []
 
     class FakeStructureService:
         def load(self, workflow_parameters, working_path):
-            return SimpleNamespace(supercell=np.array([4]))
+            return _build_structure()
 
     class FakePointSelectionService:
         def select(self, request):
@@ -668,10 +682,6 @@ def test_workflow_service_recovers_local_residual_state_before_scattering(
     class FakeArtifacts:
         def __init__(self):
             self.output_dir = str(tmp_path / "processed_point_data")
-            self.db_manager = SimpleNamespace(
-                db_path=str(tmp_path / "state.db"),
-                get_pending_chunk_ids=lambda: [3],
-            )
             self.closed = False
 
         def close(self):
@@ -680,42 +690,33 @@ def test_workflow_service_recovers_local_residual_state_before_scattering(
     artifacts = FakeArtifacts()
 
     class FakeReciprocalService:
-        def prepare(self, workflow_parameters, point_data, supercell, output_dir):
+        def prepare(self, workflow_parameters, point_data, supercell, output_dir, db_cache_config=None):
             return artifacts
+
+    class FakeResidualFieldStage:
+        def recover_pending(self, **kwargs):
+            order.append("recover")
+            return [3]
+
+        def execute(self, **kwargs):
+            order.append("residual_execute")
+            return {}
+
+    class FakeScatteringStage:
+        def execute(self, **kwargs):
+            order.append("scatter")
+            return {}
 
     workflow_service = WorkflowService(
         structure_loading_service=FakeStructureService(),
         point_selection_service=FakePointSelectionService(),
         reciprocal_space_service=FakeReciprocalService(),
-        scattering_stage=SimpleNamespace(execute=lambda **kwargs: {}),
-        residual_field_stage=SimpleNamespace(execute=lambda **kwargs: {}),
+        scattering_stage=FakeScatteringStage(),
+        residual_field_stage=FakeResidualFieldStage(),
         decoding_stage=SimpleNamespace(execute=lambda **kwargs: None),
     )
     workflow_parameters = _build_workflow_parameters()
     workflow_parameters.struct_info.working_directory = str(tmp_path / "workdir")
-
-    class FakeBackend:
-        layout = SimpleNamespace(kind="local_restartable")
-
-        def load_progress_manifest(self, **kwargs):
-            return {"chunk_id": kwargs["chunk_id"]}
-
-        def finalize_chunk(self, **kwargs):
-            recovered.append(kwargs["chunk_id"])
-            return {"chunk_id": kwargs["chunk_id"]}
-
-    monkeypatch.setattr(
-        "core.workflow.service.resolve_residual_field_reducer_backend",
-        lambda **kwargs: FakeBackend(),
-    )
-    monkeypatch.setattr(
-        "core.workflow.service.resolve_worker_scratch_root",
-        lambda preferred, stage: str(tmp_path / ".local_restartable"),
-    )
-    monkeypatch.setattr(
-        "core.workflow.service.build_residual_field_parameter_digest",
-        lambda workflow_parameters: "stable-digest",
-    )
 
     workflow_service.run(
         run_settings=SimpleNamespace(working_path=tmp_path),
@@ -723,7 +724,8 @@ def test_workflow_service_recovers_local_residual_state_before_scattering(
         client=None,
     )
 
-    assert recovered == [3]
+    # recovery runs before scattering, which runs before residual execute.
+    assert order == ["recover", "scatter", "residual_execute"]
     assert artifacts.closed is True
 
 

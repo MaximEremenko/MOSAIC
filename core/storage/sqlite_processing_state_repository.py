@@ -30,6 +30,7 @@ class SQLiteProcessingStateRepository:
                 )
         except sqlite3.Error as exc:
             self.logger.error("insert_interval_chunk_status_batch failed: %s", exc)
+            raise
 
     def associate_point_reciprocal_space_batch(
         self, associations: list[tuple[int, int]]
@@ -60,6 +61,7 @@ class SQLiteProcessingStateRepository:
             self.update_interval_chunk_status(reciprocal_space_id, chunk_id, saved)
         except sqlite3.Error as exc:
             self.logger.error("update_saved_status_for_chunk_or_point failed: %s", exc)
+            raise
 
     def get_unsaved_associations(self) -> list[tuple[int, int]]:
         try:
@@ -105,6 +107,37 @@ class SQLiteProcessingStateRepository:
                 )
         except sqlite3.Error as exc:
             self.logger.error("update_interval_chunk_status failed: %s", exc)
+            raise
+
+    def update_interval_chunk_status_batch(
+        self, status_rows: "list[tuple[int, int, int | bool]]"
+    ) -> None:
+        """Same upsert as update_interval_chunk_status, one transaction.
+
+        The hot finalize path marks ~2,300 interval rows per chunk; one
+        row per fsync-commit cost ~46 s per hkl40 run on NVMe (worse on
+        slower fsync). executemany in a single transaction leaves
+        bit-identical table content."""
+        if not status_rows:
+            return
+        try:
+            with self.connection:
+                self.connection.executemany(
+                    """
+                    INSERT INTO Interval_Chunk_Status
+                    (reciprocal_space_id, chunk_id, saved)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(reciprocal_space_id, chunk_id)
+                    DO UPDATE SET saved = excluded.saved
+                    """,
+                    [
+                        (int(interval_id), int(chunk_id), int(saved))
+                        for interval_id, chunk_id, saved in status_rows
+                    ],
+                )
+        except sqlite3.Error as exc:
+            self.logger.error("update_interval_chunk_status_batch failed: %s", exc)
+            raise
 
     def get_unsaved_interval_chunks(self) -> list[tuple[int, int]]:
         try:
@@ -118,4 +151,18 @@ class SQLiteProcessingStateRepository:
             return cursor.fetchall()
         except sqlite3.Error as exc:
             self.logger.error("get_unsaved_interval_chunks failed: %s", exc)
-            return []
+            raise
+
+    def get_interval_chunks(self) -> list[tuple[int, int]]:
+        try:
+            cursor = self.connection.execute(
+                """
+                SELECT reciprocal_space_id, chunk_id
+                FROM Interval_Chunk_Status
+                ORDER BY reciprocal_space_id, chunk_id
+                """
+            )
+            return cursor.fetchall()
+        except sqlite3.Error as exc:
+            self.logger.error("get_interval_chunks failed: %s", exc)
+            raise

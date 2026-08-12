@@ -1,0 +1,45 @@
+{
+  "array_sha256": {
+    "grid_shape_nd": "d86e8112f3c4c4442126f8e9f44f16867da487f29052bf91b810457db34209a4",
+    "inverse_outputs": "34586915b44eec635c0bda31eef3e37b37f58d063dd4f3f94977a7ebe571fa4a",
+    "point_ids_expected": "9d34149fbd1fe777eb238799054c8cbfbce372255f219f8740838def9bfd02db",
+    "positive_half_average_expected": "37b62567cbd613762469e0ceeb6172c22258fe54d81bcb8aa01410f2f3f94f6f",
+    "positive_half_delta_expected": "a42de10224db52f39da7a1530491bfd69956f1c45e161d35083dbf95a6394c50",
+    "q_amp_average": "3239b05c38b825ebb79f103172438292a22a0951351a6b81be1df5d44776cc65",
+    "q_amp_delta": "d48b908d1d6ca42c0a573fd78626b6508904e1a44aab41682a843912901ead1f",
+    "q_grid_positive_l": "5fff6936ad5efa5dbc9392650a698b7759fb4bc55e0a7608bd1892f1ace9cccc",
+    "q_grid_zero_l": "9d908ecfb6b256def8b49a7c504e6c889c4b0e41fe6ce3e01863dd7b61a20aa0",
+    "rifft_grid": "e88b6b995f8e2eca57929c527ad6ece4aab9187ce073465d2bb197b6730d3d9f",
+    "zero_plane_average_expected": "11146c3f811ac7294c15c3ba6e492e25f5ecba05cd064b942b9ddaf0c5099b01",
+    "zero_plane_delta_expected": "dfc9ca4a2b2e3e68895a9109a2fc25275ddc74a4970e2116faabbb7d6a5745ba"
+  },
+  "description": "Synthetic compact baseline for residual-field half-space reconstruction.",
+  "generator": "tests/fixtures/baselines/residual_full_synthetic_v1/generate.py",
+  "metrics": {
+    "positive_half_average_imag_over_real": 0.0,
+    "positive_half_delta_imag_over_real": 0.0,
+    "zero_plane_average_imag_norm": 5.0,
+    "zero_plane_delta_imag_norm": 2.23606797749979
+  },
+  "provenance": {
+    "anchor_commit": "f019f76",
+    "dependency_versions": {
+      "numpy": "2.4.4",
+      "python": "3.11.15"
+    },
+    "generator_command": "python3 tests/fixtures/baselines/residual_full_synthetic_v1/generate.py",
+    "input_files": [],
+    "public_representative_fixture": {
+      "reason": "No committed representative public fixture has been selected.",
+      "status": "deferred"
+    },
+    "synthetic_only": true
+  },
+  "schema": "mosaic.residual_full_synthetic_baseline",
+  "schema_version": 1,
+  "thresholds": {
+    "positive_half_average_imag_over_real": 1e-12,
+    "positive_half_delta_imag_over_real": 1e-12,
+    "zero_plane_preserves_imag": true
+  }
+}

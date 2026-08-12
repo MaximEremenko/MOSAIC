@@ -136,4 +136,4 @@ class SQLitePointRepository:
             return [id_map.get(central_id, -1) for central_id in central_ids]
         except sqlite3.Error as exc:
             self.logger.error("insert_point_data_batch failed: %s", exc)
-            return []
+            raise

@@ -1,8 +1,8 @@
 """
 Refactored amplitude-delta calculator facade.
 
-The public API remains ``compute_amplitudes_delta()``, while Phase 3 scattering
-execution now lives behind the explicit ``planning / execution / tasks /
+The public API remains ``compute_amplitudes_delta()``, while scattering
+execution lives behind the explicit ``planning / execution / tasks /
 accumulation / artifacts / kernels`` boundaries.
 """
 
@@ -12,10 +12,11 @@ from typing import TYPE_CHECKING, Any, Dict
 
 from core.scattering.execution import run_scattering_stage
 from core.patch_centers.point_data import PointDataProcessor
-from core.storage.database_manager import DatabaseManager
 
 if TYPE_CHECKING:
     from dask.distributed import Client
+
+    from core.storage.database_manager import DatabaseManager
 
 
 execute_scattering_stage = run_scattering_stage

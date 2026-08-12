@@ -91,7 +91,10 @@ def test_resolve_budget_policy_preserves_explicit_override():
     assert value == pytest.approx(0.42)
 
 
-def test_adaptive_default_reserve_is_relatively_more_permissive_on_large_vram():
+def test_adaptive_default_reserve_is_relatively_more_permissive_on_large_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_headroom_bytes", lambda: 0)
     small_reserve, small_frac, small_source = cunufft_wrapper._resolve_budget_policy(
         mem_frac=None,
         free_bytes=1 << 30,
@@ -109,7 +112,10 @@ def test_adaptive_default_reserve_is_relatively_more_permissive_on_large_vram():
     assert large_reserve >= 2 << 30
 
 
-def test_adaptive_default_remains_bounded_on_small_vram():
+def test_adaptive_default_remains_bounded_on_small_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_headroom_bytes", lambda: 0)
     reserve, value, source = cunufft_wrapper._resolve_budget_policy(
         mem_frac=None,
         free_bytes=1 << 30,
@@ -265,69 +271,6 @@ def test_execute_inverse_cunufft_batch_stacks_cpu_results(monkeypatch: pytest.Mo
     assert result.shape == (2, 2)
     np.testing.assert_allclose(result[0], np.array([3.0 + 0.0j, 3.0 + 1.0j]))
     np.testing.assert_allclose(result[1], np.array([7.0 + 0.0j, 7.0 + 1.0j]))
-
-
-def test_execute_inverse_cunufft_batch_device_materializes_once(monkeypatch: pytest.MonkeyPatch):
-    fake_cp = SimpleNamespace(
-        cuda=SimpleNamespace(
-            memory=SimpleNamespace(
-                OutOfMemoryError=RuntimeError,
-            ),
-            runtime=SimpleNamespace(CUDARuntimeError=RuntimeError),
-            driver=SimpleNamespace(CUDADriverError=RuntimeError),
-        ),
-        asnumpy=lambda x: np.asarray(x),
-    )
-    asnumpy_calls = {"count": 0}
-    fake_cp.asnumpy = lambda x: asnumpy_calls.__setitem__("count", asnumpy_calls["count"] + 1) or np.asarray(x)
-
-    monkeypatch.setattr(cunufft_wrapper, "cp", fake_cp)
-    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", True)
-    monkeypatch.setattr(cunufft_wrapper, "_ensure_gpu_kernels", lambda: None)
-    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 10**9)
-    monkeypatch.setattr(cunufft_wrapper, "_as_device", lambda arr, allow_fail=False: np.asarray(arr))
-    monkeypatch.setattr(cunufft_wrapper, "_contig", lambda x: x)
-    monkeypatch.setattr(
-        cunufft_wrapper,
-        "_execute_inverse_batch_gpu",
-        lambda **kwargs: np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
-    )
-
-    result = cunufft_wrapper._execute_inverse_cunufft_batch_device(
-        q_coords=np.array([[0.0]], dtype=np.float64),
-        weights=np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
-        real_coords=np.array([[0.0]], dtype=np.float64),
-        eps=1e-12,
-    )
-
-    np.testing.assert_allclose(result, np.array([[1.0 + 0.0j], [2.0 + 0.0j]]))
-    assert asnumpy_calls["count"] == 1
-
-
-def test_execute_inverse_cunufft_batch_device_falls_back_safely(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", True)
-    monkeypatch.setattr(cunufft_wrapper, "_ensure_gpu_kernels", lambda: None)
-    monkeypatch.setattr(
-        cunufft_wrapper,
-        "_as_device",
-        lambda arr, allow_fail=False: None if allow_fail else np.asarray(arr),
-    )
-    monkeypatch.setattr(
-        cunufft_wrapper,
-        "_cpu_fallback",
-        lambda real_coords, weights, q_coords, eps, inverse: np.array(
-            [weights.sum() + 0.0j],
-            dtype=np.complex128,
-        ),
-    )
-
-    result = cunufft_wrapper._execute_inverse_cunufft_batch_device(
-        q_coords=np.array([[0.0]], dtype=np.float64),
-        weights=np.array([[1.0 + 0.0j], [2.0 + 0.0j]], dtype=np.complex128),
-        real_coords=np.array([[0.0]], dtype=np.float64),
-    )
-
-    np.testing.assert_allclose(result, np.array([[1.0 + 0.0j], [2.0 + 0.0j]]))
 
 
 def test_execute_inverse_cunufft_super_batch_preserves_shape(monkeypatch: pytest.MonkeyPatch):
@@ -603,6 +546,36 @@ def test_execute_inverse_cunufft_prefer_cpu_uses_cpu_fallback(monkeypatch: pytes
     np.testing.assert_allclose(result, np.array([9.0 + 0.0j]))
 
 
+def test_execute_cunufft_gpu_only_rejects_cpu_fallback_when_gpu_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(cunufft_wrapper, "_CPU_ONLY", False)
+    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", False)
+
+    with pytest.raises(RuntimeError, match="GPU execution forced"):
+        cunufft_wrapper.execute_cunufft(
+            np.array([[0.0]], dtype=np.float64),
+            np.array([1.0 + 0.0j]),
+            np.array([[1.0]], dtype=np.float64),
+            gpu_only=True,
+        )
+
+
+def test_execute_inverse_cunufft_gpu_only_rejects_cpu_only_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(cunufft_wrapper, "_CPU_ONLY", True)
+    monkeypatch.setattr(cunufft_wrapper, "_GPU_AVAILABLE", True)
+
+    with pytest.raises(RuntimeError, match="GPU execution forced"):
+        cunufft_wrapper.execute_inverse_cunufft_batch(
+            q_coords=np.array([[1.0]], dtype=np.float64),
+            weights=np.array([[1.0 + 0.0j]], dtype=np.complex128),
+            real_coords=np.array([[0.0]], dtype=np.float64),
+            gpu_only=True,
+        )
+
+
 def test_batched_type3_calls_cleanup_before_cpu_fallback(monkeypatch: pytest.MonkeyPatch):
     fake_cp = SimpleNamespace(
         cuda=SimpleNamespace(
@@ -681,6 +654,21 @@ def test_batched_type3_does_not_flush_on_every_successful_chunk(monkeypatch: pyt
 
     np.testing.assert_allclose(result, np.array([13.0 + 0.0j, 13.0 + 0.0j]))
     assert cleanup_calls["count"] == 1
+
+
+def test_subprob_order_is_deterministic_and_history_independent():
+    # The OOM back-off ladder must always be the same fixed sequence,
+    # regardless of (dim, n_trans) or prior calls. No last-known-good is
+    # cached across calls, so identical inputs follow an identical subprob
+    # path independent of process history.
+    default = cunufft_wrapper._DEFAULT_SUBPROBS
+    assert cunufft_wrapper._subprob_order(3, 4) == default
+    assert cunufft_wrapper._subprob_order(1, 1) == default
+    # Re-querying after other (dim, n_trans) calls does not reorder anything.
+    assert cunufft_wrapper._subprob_order(3, 4) == default
+    # No cross-call cache state exists to leak history between runs.
+    assert not hasattr(cunufft_wrapper, "_SUCCESSFUL_SUBPROB")
+    assert not hasattr(cunufft_wrapper, "_record_successful_subprob")
 
 
 def test_build_gpu_launch_kwargs_uses_defaults(monkeypatch: pytest.MonkeyPatch):
@@ -905,3 +893,354 @@ def test_inverse_batch_matches_cpu_reference_with_current_gpu_spreadinterponly()
         gpu_only=True,
     )
     np.testing.assert_allclose(result, expected, rtol=1e-9, atol=1e-9)
+
+
+def test_fine_grid_bytes_type3_shrinks_when_sources_are_split():
+    # Fine grid scales with the *spread* (max-min) of source and target coords,
+    # so splitting the q-sources by position must reduce the estimate -- that is
+    # what lets the tiler bound each GPU sub-transform.
+    rng = np.random.RandomState(0)
+    real = rng.uniform(0.0, 27.0, size=(4096, 3))
+    recip = rng.uniform(-33.0, 33.0, size=(8192, 3))
+    full = cunufft_wrapper.fine_grid_bytes_type3(real, recip)
+    ax = int(np.argmax(recip.max(0) - recip.min(0)))
+    half = recip[recip[:, ax] < np.median(recip[:, ax])]
+    assert cunufft_wrapper.fine_grid_bytes_type3(real, half) < full
+    # A single q-point has zero recip spread -> negligible grid.
+    assert cunufft_wrapper.fine_grid_bytes_type3(real, recip[:1]) < full // 10
+
+
+def test_type3_inverse_tiled_recombines_exactly():
+    # The tiler must reproduce the un-tiled type-3 inverse regardless of how many
+    # source/target splits it takes. Use an exact DFT leaf (no GPU) so the test
+    # is deterministic and isolates the split/sum/place bookkeeping.
+    rng = np.random.RandomState(1)
+    dim = 2
+    q = rng.uniform(-20.0, 20.0, size=(200, dim))
+    real = rng.uniform(0.0, 15.0, size=(150, dim))
+    n_trans = 3
+    weights = (rng.standard_normal((n_trans, len(q)))
+               + 1j * rng.standard_normal((n_trans, len(q)))).astype(np.complex128)
+
+    def _exact_leaf(q_sub, w_sub, real_sub):
+        # out[t,k] = sum_j w[t,j] exp(-i real_k . q_j)   (isign = -1)
+        phase = np.exp(-1j * (real_sub @ q_sub.T))       # (Ntgt, Nsrc)
+        return w_sub @ phase.T                            # (n_trans, Ntgt)
+
+    reference = _exact_leaf(q, weights, real)
+    # Force many tiles by using a tiny budget.
+    tiled = cunufft_wrapper._type3_inverse_gpu_tiled(
+        real_coords=real,
+        q_coords=q,
+        weights_arr=weights,
+        eps=1e-12,
+        leaf=_exact_leaf,
+        budget_bytes=1,           # forces recursive splitting to the base case
+    )
+    assert tiled.shape == reference.shape
+    np.testing.assert_allclose(tiled, reference, rtol=1e-10, atol=1e-9)
+
+
+def test_current_tile_budget_scales_with_inflight(monkeypatch):
+    # Budget per tile is an equal live share of the pool: whole pool alone,
+    # halves the moment a second transform is in flight, etc.
+    monkeypatch.setattr(cunufft_wrapper, "_pool_reservable_bytes", lambda: 24 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_inflight", 0, raising=False)
+    cunufft_wrapper._transform_enter()
+    try:
+        alone = cunufft_wrapper._current_tile_budget()
+        cunufft_wrapper._transform_enter()
+        try:
+            shared = cunufft_wrapper._current_tile_budget()
+        finally:
+            cunufft_wrapper._transform_exit()
+    finally:
+        cunufft_wrapper._transform_exit()
+    assert alone == 24 << 30
+    assert shared == 12 << 30
+
+
+def test_reserve_tile_never_exceeds_pool_and_releases(monkeypatch):
+    monkeypatch.setattr(cunufft_wrapper, "_pool_reservable_bytes", lambda: 10 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0, raising=False)
+    cunufft_wrapper._reserve_tile(6 << 30)
+    assert cunufft_wrapper._gpu_reserved == 6 << 30
+    cunufft_wrapper._release_tile(6 << 30)
+    assert cunufft_wrapper._gpu_reserved == 0
+
+
+def test_concurrent_tiled_transforms_are_exact_and_deadlock_free(monkeypatch):
+    # Two threads drive the tiler through the shared reservation pool at once,
+    # each forced to split heavily (tiny pool). Results must stay exact and the
+    # run must finish (no deadlock).
+    import threading
+
+    monkeypatch.setattr(cunufft_wrapper, "_pool_reservable_bytes", lambda: 4 << 20)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_inflight", 0, raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0, raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_MIN_TILE_BUDGET_BYTES", 1)
+
+    rng = np.random.RandomState(2)
+    dim = 2
+    q = rng.uniform(-15.0, 15.0, size=(160, dim))
+    real = rng.uniform(0.0, 12.0, size=(120, dim))
+    weights = (rng.standard_normal((2, len(q)))
+               + 1j * rng.standard_normal((2, len(q)))).astype(np.complex128)
+
+    def _exact_leaf(q_sub, w_sub, real_sub):
+        tile = int(cunufft_wrapper.fine_grid_bytes_type3(real_sub, q_sub)
+                   * cunufft_wrapper._TYPE3_RESIDENCY_FACTOR)
+        cunufft_wrapper._reserve_tile(tile)
+        try:
+            return w_sub @ np.exp(-1j * (real_sub @ q_sub.T)).T
+        finally:
+            cunufft_wrapper._release_tile(tile)
+
+    reference = weights @ np.exp(-1j * (real @ q.T)).T
+    results: dict[int, np.ndarray] = {}
+
+    def _run(idx):
+        cunufft_wrapper._transform_enter()
+        try:
+            results[idx] = cunufft_wrapper._type3_inverse_gpu_tiled(
+                real_coords=real, q_coords=q, weights_arr=weights, eps=1e-12,
+                leaf=_exact_leaf, budget_bytes=cunufft_wrapper._current_tile_budget,
+            )
+        finally:
+            cunufft_wrapper._transform_exit()
+
+    threads = [threading.Thread(target=_run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "tiled transform deadlocked"
+    for idx in range(2):
+        np.testing.assert_allclose(results[idx], reference, rtol=1e-10, atol=1e-9)
+    assert cunufft_wrapper._gpu_reserved == 0
+
+
+def test_headroom_default_keeps_ceiling_margin_on_big_cards(monkeypatch):
+    monkeypatch.delenv("MOSAIC_GPU_HEADROOM_GIB", raising=False)
+    total = 32 << 30
+    expected = int((1.0 - cunufft_wrapper._GPU_TOTAL_OCCUPANCY_CEILING) * float(total))
+    assert cunufft_wrapper._headroom_bytes_for_total(total) == expected
+
+
+def test_headroom_default_floors_on_small_cards(monkeypatch):
+    monkeypatch.delenv("MOSAIC_GPU_HEADROOM_GIB", raising=False)
+    assert (
+        cunufft_wrapper._headroom_bytes_for_total(8 << 30)
+        == cunufft_wrapper._MIN_GPU_HEADROOM_BYTES
+    )
+
+
+def test_headroom_env_override_wins_and_invalid_falls_back(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    assert cunufft_wrapper._headroom_bytes_for_total(32 << 30) == 6 << 30
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "not-a-number")
+    total = 32 << 30
+    expected = int((1.0 - cunufft_wrapper._GPU_TOTAL_OCCUPANCY_CEILING) * float(total))
+    assert cunufft_wrapper._headroom_bytes_for_total(total) == expected
+
+
+def test_headroom_is_zero_without_a_gpu(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    assert cunufft_wrapper._headroom_bytes_for_total(0) == 0
+
+
+def test_pool_reservable_respects_absolute_headroom(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    monkeypatch.delenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 10 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 32 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0)
+    monkeypatch.setattr(cunufft_wrapper, "_uncommitted_budget_growth_bytes", lambda: 0)
+    # live = 10 GiB; fraction bound = 8.5 GiB; headroom bound = 10 - 6 = 4 GiB
+    assert cunufft_wrapper._pool_reservable_bytes() == 4 << 30
+
+
+def test_pool_reservable_precommits_capped_consumers(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    monkeypatch.delenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 30 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 32 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0)
+    monkeypatch.setattr(
+        cunufft_wrapper, "_uncommitted_budget_growth_bytes", lambda: 10 << 30
+    )
+    # live 30 - headroom 6 - future pool/cache growth 10 = 14 GiB: growth the
+    # capped consumers are still owed cannot be promised to fine grids, so the
+    # free floor survives the pool/cache filling AFTER a reservation is granted
+    assert cunufft_wrapper._pool_reservable_bytes() == 14 << 30
+
+
+def test_uncommitted_growth_counts_pool_and_type1_cache(monkeypatch):
+    class _FakePool:
+        def get_limit(self):
+            return 8 << 30
+
+        def total_bytes(self):
+            return 3 << 30
+
+    fake_cp = SimpleNamespace(get_default_memory_pool=lambda: _FakePool())
+    monkeypatch.setattr(cunufft_wrapper, "cp", fake_cp)
+    monkeypatch.setattr(cunufft_wrapper, "_type1_plan_cache_max_bytes", lambda: 4 << 30)
+    monkeypatch.setattr(
+        cunufft_wrapper, "_type1_cache_total_bytes_locked", lambda: 1 << 30
+    )
+    # pool still owed 8-3=5 GiB, type-1 cache still owed 4-1=3 GiB
+    assert cunufft_wrapper._uncommitted_budget_growth_bytes() == (5 << 30) + (3 << 30)
+
+
+def test_tile_budget_total_is_independent_of_inflight_count(monkeypatch):
+    monkeypatch.setenv("MOSAIC_GPU_HEADROOM_GIB", "6")
+    monkeypatch.delenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_free_mem_bytes", lambda: 16 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 32 << 30)
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_reserved", 0)
+    monkeypatch.setattr(cunufft_wrapper, "_uncommitted_budget_growth_bytes", lambda: 0)
+    pool = cunufft_wrapper._pool_reservable_bytes()
+    assert pool == 10 << 30  # live 16 GiB minus 6 GiB headroom (< 0.85 * live)
+    budgets = {}
+    for inflight in (1, 2, 4):
+        monkeypatch.setattr(cunufft_wrapper, "_gpu_inflight", inflight)
+        budgets[inflight] = cunufft_wrapper._current_tile_budget()
+    # a lone transform gets the whole pool; N transforms split the SAME pool
+    assert budgets[1] == pool
+    assert budgets[2] * 2 == pool
+    assert budgets[4] * 4 == pool
+
+
+def test_type1_cache_max_bytes_scales_with_total(monkeypatch):
+    monkeypatch.delenv("MOSAIC_SCATTERING_TYPE1_CACHE_MAX_BYTES", raising=False)
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 8 << 30)
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 1 << 30
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 64 << 30)
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 4 << 30
+    monkeypatch.setattr(cunufft_wrapper, "_total_mem_bytes", lambda: 0)
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 4 << 30
+    monkeypatch.setenv("MOSAIC_SCATTERING_TYPE1_CACHE_MAX_BYTES", "123")
+    assert cunufft_wrapper._type1_plan_cache_max_bytes() == 123
+
+
+def test_adaptive_reserve_enforces_absolute_headroom(monkeypatch):
+    monkeypatch.setattr(cunufft_wrapper, "_gpu_headroom_bytes", lambda: 6 << 30)
+    reserve, frac, source = cunufft_wrapper._resolve_budget_policy(
+        mem_frac=None,
+        free_bytes=16 << 30,
+        resident_bytes=128 << 20,
+    )
+    assert source == "adaptive-reserve-default"
+    assert reserve >= 6 << 30
+    # usable = 16 - 6 = 10 GiB -> frac ~ 0.625 of free
+    assert frac == pytest.approx(10 / 16, abs=0.01)
+    # make-progress escape: free below headroom still leaves a usable sliver
+    reserve_small, frac_small, _ = cunufft_wrapper._resolve_budget_policy(
+        mem_frac=None,
+        free_bytes=2 << 30,
+        resident_bytes=128 << 20,
+    )
+    assert reserve_small <= int(0.85 * (2 << 30))
+    assert frac_small >= 0.05
+
+
+_WORKER_COUNT_VARS = (
+    "MOSAIC_DASK_WORKER_COUNT",
+    "OMPI_COMM_WORLD_LOCAL_SIZE",
+    "SLURM_NTASKS_PER_NODE",
+    "DASK_MAX_WORKERS",
+)
+
+
+def _clear_worker_count_env(monkeypatch):
+    for var in _WORKER_COUNT_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_expected_worker_count_prefers_explicit_override(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "3")
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "2")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "8")
+    assert cunufft_wrapper._expected_worker_count() == 3
+
+
+def test_expected_worker_count_uses_local_ranks_over_cluster_wide(monkeypatch):
+    # Divisor must be per-HOST processes: two co-scheduled MPI ranks, not the
+    # cluster-wide DASK_MAX_WORKERS (which over-divides on this node).
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "2")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "8")
+    assert cunufft_wrapper._expected_worker_count() == 2
+
+
+def test_expected_worker_count_parses_slurm_ntasks_per_node(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("SLURM_NTASKS_PER_NODE", "2(x3)")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "8")
+    assert cunufft_wrapper._expected_worker_count() == 2
+
+
+def test_expected_worker_count_slurm_garbage_falls_through(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("SLURM_NTASKS_PER_NODE", "auto")
+    monkeypatch.setenv("DASK_MAX_WORKERS", "6")
+    assert cunufft_wrapper._expected_worker_count() == 6
+
+
+def test_expected_worker_count_falls_back_to_dask_max_workers(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("DASK_MAX_WORKERS", "6")
+    assert cunufft_wrapper._expected_worker_count() == 6
+
+
+def test_pool_cap_divisor_threads_mode_never_divides(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+    monkeypatch.setenv("DASK_PROCESSES", "0")
+    assert cunufft_wrapper._pool_cap_divisor() == 1
+
+
+def test_pool_cap_divisor_one_process_per_gpu_backends_never_divide(monkeypatch):
+    # dask-cuda spawns one worker process per GPU and the MPI launcher pins
+    # per-rank CUDA_VISIBLE_DEVICES: no two pools share a device, so the
+    # budget must NOT be split even in processes mode.
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    monkeypatch.setenv("DASK_PROCESSES", "1")
+    for backend in ("cuda-local", "mpi"):
+        monkeypatch.setenv("DASK_BACKEND", backend)
+        assert cunufft_wrapper._pool_cap_divisor() == 1
+
+
+def test_pool_cap_divisor_process_workers_share_device(monkeypatch):
+    _clear_worker_count_env(monkeypatch)
+    monkeypatch.setenv("MOSAIC_DASK_WORKER_COUNT", "4")
+    monkeypatch.setenv("DASK_PROCESSES", "1")
+    monkeypatch.delenv("DASK_BACKEND", raising=False)
+    assert cunufft_wrapper._pool_cap_divisor() == 4
+
+
+def test_headroom_floor_scales_down_on_small_cards(monkeypatch):
+    monkeypatch.delenv("MOSAIC_GPU_HEADROOM_GIB", raising=False)
+    # >= 8 GiB cards keep the historical values byte-for-byte
+    assert cunufft_wrapper._headroom_bytes_for_total(24 << 30) == int(
+        0.15 * float(24 << 30)
+    )
+    assert cunufft_wrapper._headroom_bytes_for_total(8 << 30) == 2 << 30
+    # 4 GiB card: floor is total/4 = 1 GiB, not half the card
+    assert cunufft_wrapper._headroom_bytes_for_total(4 << 30) == 1 << 30
+
+
+def test_min_tile_budget_scales_down_on_small_cards():
+    assert cunufft_wrapper._min_tile_budget_bytes(24 << 30) == 1 << 30
+    assert cunufft_wrapper._min_tile_budget_bytes(8 << 30) == 1 << 30
+    assert cunufft_wrapper._min_tile_budget_bytes(4 << 30) == 512 << 20
+    # never below 256 MiB, and no-GPU probes keep the legacy constant
+    assert cunufft_wrapper._min_tile_budget_bytes(1 << 30) == 256 << 20
+    assert (
+        cunufft_wrapper._min_tile_budget_bytes(0)
+        == cunufft_wrapper._MIN_TILE_BUDGET_BYTES
+    )

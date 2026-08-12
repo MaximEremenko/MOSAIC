@@ -24,6 +24,18 @@ def resolve_scattering_weight_settings(
     )
 
 
+def _resolve_max_workers_setting(raw) -> "int | str":
+    """Portable worker count: an integer is explicit; absent or "auto" defers
+    to the runtime, which sizes one worker per visible GPU on cuda-local
+    (node-size independent — correct on a 1-GPU laptop and an 8-GPU node)."""
+    if raw is None:
+        return "auto"
+    text = str(raw).strip().lower()
+    if text in {"auto", ""}:
+        return "auto"
+    return int(raw)
+
+
 def resolve_runtime_settings(parameters: dict) -> RuntimeSettings:
     runtime = first_present(parameters, ("runtime", "runtime_info", "runtimeInfo")) or {}
     dask = first_present(runtime, ("dask", "dask_info", "daskInfo")) or {}
@@ -33,7 +45,9 @@ def resolve_runtime_settings(parameters: dict) -> RuntimeSettings:
             default=False,
         ),
         backend=str(first_present(dask, ("backend", "dask_backend")) or "local"),
-        max_workers=int(first_present(dask, ("max_workers", "dask_max_workers")) or 2),
+        max_workers=_resolve_max_workers_setting(
+            first_present(dask, ("max_workers", "dask_max_workers"))
+        ),
         threads_per_worker=int(
             first_present(dask, ("threads_per_worker", "dask_threads_per_worker")) or 16
         ),

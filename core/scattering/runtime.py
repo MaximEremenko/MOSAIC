@@ -1,18 +1,12 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Any, Dict
 
 from core.runtime import (
-    DEFAULT_TASK_RETRIES,
-    TIMER,
-    chunk_mutex,
-    is_sync_client as _is_sync_client,
-    progress_bar as _tqdm,
     quiet_loggers,
-    timed as _timed,
-    yield_futures_with_results as _yield_futures_with_results,
+    resolve_nufft_execution_settings,
 )
-from core.runtime.worker_hooks import CuPyCleanup
 
 
 @contextmanager
@@ -21,14 +15,51 @@ def _quiet_db_info():
         yield
 
 
+def _require_scheduler_resource_capacity(client, resource_name: str) -> None:
+    try:
+        workers = client.scheduler_info().get("workers", {})
+    except Exception:
+        return
+    if not workers:
+        return
+    total = 0.0
+    for worker in workers.values():
+        resources = worker.get("resources", {}) or {}
+        try:
+            total += float(resources.get(resource_name, 0.0))
+        except (TypeError, ValueError):
+            pass
+    if total <= 0:
+        raise RuntimeError(
+            f"Dask scheduler reports zero total {resource_name!r} resource capacity; "
+            "MOSAIC NUFFT tasks would stay queued or overbook. Configure worker "
+            f"resources with {resource_name}=N."
+        )
+
+
+def _runtime_info(parameters: Dict[str, Any]) -> dict[str, Any]:
+    runtime_info = parameters.get("runtime_info") or {}
+    return runtime_info if isinstance(runtime_info, dict) else {}
+
+
+def _nufft_execution_settings(parameters: Dict[str, Any]):
+    runtime_info = _runtime_info(parameters)
+    requested = runtime_info.get("scattering_nufft_policy")
+    if requested is None:
+        requested = runtime_info.get("nufft_execution_policy")
+    if requested is None:
+        requested = runtime_info.get("nufft_policy")
+    eps = runtime_info.get("scattering_nufft_eps", runtime_info.get("nufft_eps", 1e-12))
+    dtype = runtime_info.get("scattering_dtype", runtime_info.get("nufft_dtype", "complex128"))
+    return resolve_nufft_execution_settings(requested, eps=eps, dtype=dtype)
+
+
+# Nine further names were re-exported here for the stage2_replacement
+# module deleted in 085fb82. Nothing has imported them through this module
+# since; every consumer takes them from core.runtime directly.
 __all__ = [
-    "CuPyCleanup",
-    "DEFAULT_TASK_RETRIES",
-    "TIMER",
-    "_is_sync_client",
+    "_nufft_execution_settings",
     "_quiet_db_info",
-    "_timed",
-    "_tqdm",
-    "_yield_futures_with_results",
-    "chunk_mutex",
+    "_require_scheduler_resource_capacity",
+    "_runtime_info",
 ]

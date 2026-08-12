@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.residual_field.no_output"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "stage": {"const": "residual_field"},
+    "source_scattering_commit_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reason": {"type": "string"},
+    "no_output_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "stage",
+    "source_scattering_commit_digest",
+    "reason",
+    "no_output_digest"
+  ],
+  "type": "object"
+}

@@ -1,91 +1,30 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from core.residual_field.backend import resolve_residual_field_reducer_backend
-from core.residual_field.planning import build_residual_field_parameter_digest
 from core.scattering.stage import ScatteringStage
 from core.patch_centers.service import PointSelectionService
 from core.decoding.stage import DecodingStage
 from core.qspace.service import ReciprocalSpacePreparationService
+from core.residual_field.execution import _streaming_subchunk_slot_count
 from core.residual_field.stage import ResidualFieldStage
+from core.structure.identity import (
+    enforce_output_dir_structure,
+    structure_content_digest_from_structure,
+)
 from core.structure.service import StructureLoadingService
 from core.models import RunSettings, WorkflowParameters
 from core.patch_centers.contracts import PointSelectionRequest
-from core.runtime import resolve_worker_scratch_root, short_path
+from core.storage.db_cache import resolve_db_cache_config
+
+if TYPE_CHECKING:
+    from core.workflow.context import RunArtifacts
 
 
 logger = logging.getLogger(__name__)
-
-
-def recover_local_residual_state_before_scattering(
-    *,
-    workflow_parameters: WorkflowParameters,
-    artifacts,
-    client,
-) -> list[int]:
-    db_manager = getattr(artifacts, "db_manager", None)
-    get_pending_chunk_ids = getattr(db_manager, "get_pending_chunk_ids", None)
-    if not callable(get_pending_chunk_ids):
-        return []
-
-    backend = resolve_residual_field_reducer_backend(
-        workflow_parameters=workflow_parameters,
-        client=client,
-    )
-    if getattr(getattr(backend, "layout", None), "kind", None) != "local_restartable":
-        return []
-
-    load_progress_manifest = getattr(backend, "load_progress_manifest", None)
-    finalize_chunk = getattr(backend, "finalize_chunk", None)
-    if not callable(load_progress_manifest) or not callable(finalize_chunk):
-        return []
-
-    explicit_scratch_root = workflow_parameters.runtime_info.get(
-        "residual_shard_scratch_root",
-        os.getenv("MOSAIC_RESIDUAL_SHARD_SCRATCH_ROOT"),
-    )
-    scratch_root = resolve_worker_scratch_root(
-        preferred=(
-            explicit_scratch_root
-            if explicit_scratch_root is not None
-            else str(Path(artifacts.output_dir) / ".local_restartable")
-        ),
-        stage="residual_field",
-    )
-    parameter_digest = build_residual_field_parameter_digest(workflow_parameters)
-    recovered_chunks: list[int] = []
-    for chunk_id in sorted(int(value) for value in get_pending_chunk_ids()):
-        progress = load_progress_manifest(
-            output_dir=artifacts.output_dir,
-            chunk_id=int(chunk_id),
-            parameter_digest=parameter_digest,
-        )
-        if progress is None:
-            continue
-        manifest = finalize_chunk(
-            chunk_id=int(chunk_id),
-            parameter_digest=parameter_digest,
-            output_dir=artifacts.output_dir,
-            db_path=db_manager.db_path,
-            cleanup_policy="off",
-            scratch_root=scratch_root,
-            quiet_logs=True,
-        )
-        if manifest is not None:
-            recovered_chunks.append(int(chunk_id))
-
-    if recovered_chunks:
-        logger.info(
-            "Recovered residual-field local restart state before scattering | chunks=%s | digest=%s | scratch=%s",
-            recovered_chunks,
-            parameter_digest,
-            short_path(scratch_root),
-        )
-    return recovered_chunks
 
 
 class WorkflowService:
@@ -111,17 +50,56 @@ class WorkflowService:
         run_settings: RunSettings,
         workflow_parameters: WorkflowParameters,
         client,
+        *,
+        db_path: str | None = None,
+        no_db_cache: bool = False,
     ) -> None:
-        artifacts = None
+        artifacts: RunArtifacts | None = None
         structure = self.structure_loading_service.load(
             workflow_parameters,
             str(run_settings.working_path),
         )
+        # One structure identity per run, computed before any stage and
+        # published to all of them. Every downstream identity that
+        # addresses reusable work folds it in; without it a re-run of the
+        # same output directory with different coordinates resolves to the
+        # same run tree and republishes the previous structure's results.
+        workflow_parameters.runtime_info.extra["source_structure_digest"] = (
+            structure_content_digest_from_structure(structure)
+        )
+        # The RESOLVED subchunk slot count, stamped before any stage so both
+        # the scattering-stage and residual-stage callers of
+        # build_residual_field_parameter_digest see the same value. Digesting
+        # the raw override let a sync run and a distributed run share one
+        # parameter digest while producing disjoint partition_id sets.
+        workflow_parameters.runtime_info.extra[
+            "residual_streaming_subchunks_resolved"
+        ] = _streaming_subchunk_slot_count(workflow_parameters, client)
         output_dir = (
             Path(workflow_parameters.struct_info.working_directory)
             / "processed_point_data"
         )
         self._prepare_output_dir(output_dir, workflow_parameters)
+        # After _prepare_output_dir, so fresh_start (which removes the
+        # directory) stays the supported way to retarget one at a new
+        # structure, and before any stage computes anything.
+        enforce_output_dir_structure(
+            output_dir,
+            workflow_parameters.runtime_info.extra["source_structure_digest"],
+        )
+        runtime_info = workflow_parameters.runtime_info.to_mapping()
+        db_cache_config = resolve_db_cache_config(
+            run_settings=run_settings,
+            workflow_parameters=workflow_parameters,
+            run_digest=(
+                runtime_info.get("scattering_run_digest")
+                or runtime_info.get("residual_run_digest")
+                or runtime_info.get("residual_field_run_digest")
+            ),
+            output_dir=output_dir,
+            db_path=db_path,
+            no_db_cache=no_db_cache,
+        )
         point_data = self.point_selection_service.select(
             PointSelectionRequest(
                 method=workflow_parameters.rspace_info.method,
@@ -135,9 +113,10 @@ class WorkflowService:
             point_data=point_data,
             supercell=structure.supercell,
             output_dir=str(output_dir),
+            db_cache_config=db_cache_config,
         )
         try:
-            recover_local_residual_state_before_scattering(
+            self.residual_field_stage.recover_pending(
                 workflow_parameters=workflow_parameters,
                 artifacts=artifacts,
                 client=client,

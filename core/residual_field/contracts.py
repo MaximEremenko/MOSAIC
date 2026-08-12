@@ -117,7 +117,7 @@ def build_residual_field_source_artifacts(
                 stage="scattering",
                 kind="interval-precompute",
                 key=f"scattering:interval-precompute:interval-{interval_id}",
-                path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+                path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.hdf5"),
                 schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
             )
         )
@@ -158,7 +158,7 @@ def build_residual_field_interval_source_artifacts(
             stage="scattering",
             kind="interval-precompute",
             key=f"scattering:interval-precompute:interval-{interval_id}",
-            path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.npz"),
+            path=str(Path(output_dir) / "precomputed_intervals" / f"interval_{interval_id}.hdf5"),
             schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
         ),
     )
@@ -167,14 +167,8 @@ def build_residual_field_interval_source_artifacts(
 def build_residual_field_output_artifacts(
     output_dir: str,
     chunk_id: int,
-    *,
-    legacy_layout: bool = False,
 ) -> tuple[ArtifactRef, ...]:
-    chunk_prefix = Path(output_dir) / (
-        f"point_data_chunk_{chunk_id}"
-        if legacy_layout
-        else f"residual_chunk_{chunk_id}"
-    )
+    chunk_prefix = Path(output_dir) / f"residual_chunk_{chunk_id}"
     return (
         ArtifactRef(
             stage="residual_field",
@@ -230,18 +224,6 @@ def build_residual_field_output_artifacts(
         ),
     )
 
-
-def build_legacy_residual_field_output_artifacts(
-    output_dir: str,
-    chunk_id: int,
-) -> tuple[ArtifactRef, ...]:
-    return build_residual_field_output_artifacts(
-        output_dir,
-        chunk_id,
-        legacy_layout=True,
-    )
-
-
 def build_residual_field_shard_artifacts(
     output_dir: str,
     *,
@@ -251,7 +233,7 @@ def build_residual_field_shard_artifacts(
     shard_storage_root: str | None = None,
 ) -> tuple[ArtifactRef, ...]:
     shard_root = Path(shard_storage_root or output_dir)
-    shard_dir = shard_root / "residual_shards" / f"chunk_{chunk_id}"
+    shard_dir = shard_root / "residual_checkpoints" / f"chunk_{chunk_id}"
     batch_token = make_residual_field_batch_token(interval_ids)
     base_name = f"batch_{batch_token}_params_{parameter_digest}"
     return (
@@ -264,7 +246,7 @@ def build_residual_field_shard_artifacts(
                 parameter_digest=parameter_digest,
             )
             + f":batch-{batch_token}",
-            path=str(shard_dir / f"{base_name}.npz"),
+            path=str(shard_dir / f"{base_name}.hdf5"),
             schema_version=RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION,
         ),
         ArtifactRef(
@@ -300,6 +282,18 @@ class ResidualFieldWorkUnit:
     partition_id: int | None = None
     point_start: int | None = None
     point_stop: int | None = None
+    # Which axis partition_id splits the chunk on. "points": legacy atom-range
+    # partitions (disjoint point ranges, every partition folds every interval;
+    # finalize concatenates). "intervals": streaming subchunks (every subchunk
+    # covers the FULL point range but folds a disjoint interval subset;
+    # finalize sums). The two axes must never mix within one chunk family.
+    partition_axis: str = "points"
+    run_digest: str | None = None
+    partition_plan_digest: str | None = None
+    source_scattering_commit_digest: str | None = None
+    source_replacement_digest: str | None = None
+    backend_policy_digest: str | None = None
+    expected_output_digest: str | None = None
     schema_version: int = RESIDUAL_FIELD_CONTRACT_SCHEMA_VERSION
 
     @classmethod
@@ -311,6 +305,12 @@ class ResidualFieldWorkUnit:
         output_dir: str,
         patch_scope: str | None = None,
         window_spec: str | None = None,
+        run_digest: str | None = None,
+        partition_plan_digest: str | None = None,
+        source_scattering_commit_digest: str | None = None,
+        source_replacement_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        expected_output_digest: str | None = None,
     ) -> "ResidualFieldWorkUnit":
         return cls(
             chunk_id=chunk_id,
@@ -320,6 +320,12 @@ class ResidualFieldWorkUnit:
             source_artifacts=build_residual_field_source_artifacts(output_dir, chunk_id),
             patch_scope=patch_scope,
             window_spec=window_spec,
+            run_digest=run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=source_replacement_digest,
+            backend_policy_digest=backend_policy_digest,
+            expected_output_digest=expected_output_digest,
             artifact_key=make_residual_field_artifact_key(
                 "chunk-scope",
                 chunk_id=chunk_id,
@@ -347,6 +353,12 @@ class ResidualFieldWorkUnit:
         output_dir: str,
         patch_scope: str | None = None,
         window_spec: str | None = None,
+        run_digest: str | None = None,
+        partition_plan_digest: str | None = None,
+        source_scattering_commit_digest: str | None = None,
+        source_replacement_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        expected_output_digest: str | None = None,
     ) -> "ResidualFieldWorkUnit":
         return cls(
             chunk_id=chunk_id,
@@ -359,6 +371,12 @@ class ResidualFieldWorkUnit:
             ),
             patch_scope=patch_scope,
             window_spec=window_spec,
+            run_digest=run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=source_replacement_digest,
+            backend_policy_digest=backend_policy_digest,
+            expected_output_digest=expected_output_digest,
             artifact_key=make_residual_field_artifact_key(
                 "interval-chunk",
                 chunk_id=chunk_id,
@@ -390,6 +408,12 @@ class ResidualFieldWorkUnit:
         output_dir: str,
         patch_scope: str | None = None,
         window_spec: str | None = None,
+        run_digest: str | None = None,
+        partition_plan_digest: str | None = None,
+        source_scattering_commit_digest: str | None = None,
+        source_replacement_digest: str | None = None,
+        backend_policy_digest: str | None = None,
+        expected_output_digest: str | None = None,
     ) -> "ResidualFieldWorkUnit":
         normalized = tuple(sorted(int(interval_id) for interval_id in interval_ids))
         if not normalized:
@@ -410,6 +434,12 @@ class ResidualFieldWorkUnit:
             ),
             patch_scope=patch_scope,
             window_spec=window_spec,
+            run_digest=run_digest,
+            partition_plan_digest=partition_plan_digest,
+            source_scattering_commit_digest=source_scattering_commit_digest,
+            source_replacement_digest=source_replacement_digest,
+            backend_policy_digest=backend_policy_digest,
+            expected_output_digest=expected_output_digest,
             artifact_key=make_residual_field_artifact_key(
                 "interval-batch",
                 chunk_id=chunk_id,
@@ -459,6 +489,37 @@ class ResidualFieldWorkUnit:
             point_stop=int(point_stop),
         )
 
+    def with_subchunk(
+        self,
+        *,
+        subchunk_id: int,
+        point_count: int,
+    ) -> "ResidualFieldWorkUnit":
+        """Assign this batch unit to a streaming subchunk slot.
+
+        A subchunk is the interval-axis transpose of a partition: it covers
+        the chunk's full point range ``[0, point_count)`` and accumulates only
+        the interval batches routed to its slot. The slot id reuses the
+        ``partition_id`` field (and therefore the existing snapshot naming,
+        ownership affinity, and progress-manifest machinery) with
+        ``partition_axis='intervals'`` marking the changed merge semantics."""
+        token = f"subchunk-{int(subchunk_id)}:points-0-{int(point_count)}"
+        return replace(
+            self,
+            artifact_key=f"{self.artifact_key}:{token}",
+            retry=RetryIdempotencySemantics(
+                failure_unit=self.retry.failure_unit,
+                retry_unit=self.retry.retry_unit,
+                idempotency_key=f"{self.retry.idempotency_key}:{token}",
+                replay_disposition=self.retry.replay_disposition,
+                crash_recovery_rule=self.retry.crash_recovery_rule,
+            ),
+            partition_id=int(subchunk_id),
+            point_start=0,
+            point_stop=int(point_count),
+            partition_axis="intervals",
+        )
+
 
 @dataclass(frozen=True)
 class ResidualFieldAccumulatorStatus:
@@ -500,7 +561,7 @@ class ResidualFieldPartialResult:
     """
     Artifact-oriented residual-field seam result.
 
-    This stays metadata-first in Phase 1B so later extraction can choose the final
+    This stays metadata-first so later extraction can choose the final
     ndarray/reducer shape without changing the seam identity.
     """
 
@@ -511,7 +572,12 @@ class ResidualFieldPartialResult:
     source_artifacts: tuple[ArtifactRef, ...]
     output_artifacts: tuple[ArtifactRef, ...] = ()
     grid_shape: tuple[int, ...] | None = None
-    point_ids: tuple[int, ...] = ()
+    # int64 ndarray after __post_init__ (accepts tuples for convenience).
+    # A 211.7M-point chunk as Python tuples cost ~45 s + GC churn per
+    # materialization, twice per chunk; the ndarray passes through
+    # zero-copy. Instances are never compared or hashed (frozen-dataclass
+    # eq over an ndarray field would raise) — verified across the repo.
+    point_ids: "np.ndarray | tuple[int, ...]" = ()
     residual_values: np.ndarray | None = None
     residual_average_values: np.ndarray | None = None
     reciprocal_point_count: int | None = None
@@ -530,7 +596,7 @@ class ResidualFieldPartialResult:
         object.__setattr__(
             self,
             "point_ids",
-            tuple(int(point_id) for point_id in self.point_ids),
+            np.asarray(self.point_ids, dtype=np.int64).reshape(-1),
         )
         if self.residual_values is not None:
             object.__setattr__(self, "residual_values", np.asarray(self.residual_values).reshape(-1))
@@ -567,7 +633,7 @@ RESIDUAL_FIELD_PARTIAL_RESULT_MERGE_INVARIANTS = MergeInvariantSpec(
     ),
     deterministic_serialization_boundary=(
         "the residual-field seam is serialized through artifact manifests and current HDF5 "
-        "chunk artifacts; in-memory arrays are Phase 4 accumulation helpers only"
+        "chunk artifacts; in-memory arrays are accumulation helpers only"
     ),
     duplicate_handling=(
         "duplicate contributing interval ids and duplicate output artifact keys are forbidden "
@@ -603,23 +669,6 @@ def residual_field_partial_result_identity(
     )
 
 
-def _merge_artifact_refs(
-    left: tuple[ArtifactRef, ...],
-    right: tuple[ArtifactRef, ...],
-    *,
-    allow_duplicates: bool,
-) -> tuple[ArtifactRef, ...]:
-    merged: dict[str, ArtifactRef] = {artifact.key: artifact for artifact in left}
-    for artifact in right:
-        existing = merged.get(artifact.key)
-        if existing is not None:
-            if existing != artifact and not allow_duplicates:
-                raise ValueError(f"Conflicting artifact ref for key {artifact.key!r}.")
-            continue
-        merged[artifact.key] = artifact
-    return tuple(merged[key] for key in sorted(merged))
-
-
 def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
     if work_unit.chunk_id < 0:
         raise ValueError("chunk_id must be non-negative.")
@@ -638,7 +687,28 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
     if len(set(source_keys)) != len(source_keys):
         raise ValueError("Residual-field work units must not contain duplicate source artifact keys.")
     if work_unit.retry.replay_disposition is not RetryDisposition.NO_OP:
-        raise ValueError("Residual-field Phase 6 assumes NO_OP replay semantics.")
+        raise ValueError("Residual-field work units require NO_OP replay semantics.")
+    identity_values = (
+        work_unit.run_digest,
+        work_unit.partition_plan_digest,
+        work_unit.source_scattering_commit_digest,
+        work_unit.source_replacement_digest,
+        work_unit.backend_policy_digest,
+        work_unit.expected_output_digest,
+    )
+    if any(value is not None for value in identity_values):
+        required_current_identity = (
+            work_unit.run_digest,
+            work_unit.partition_plan_digest,
+            work_unit.source_scattering_commit_digest,
+            work_unit.backend_policy_digest,
+            work_unit.expected_output_digest,
+        )
+        if not all(isinstance(value, str) and value for value in required_current_identity):
+            raise ValueError(
+                "Current-run residual-field work units must include run, partition-plan, "
+                "source scattering commit, backend-policy, and expected-output identity."
+            )
     if work_unit.partition_id is None:
         if work_unit.point_start is not None or work_unit.point_stop is not None:
             raise ValueError(
@@ -653,6 +723,29 @@ def validate_residual_field_work_unit(work_unit: ResidualFieldWorkUnit) -> None:
             raise ValueError("partition_id must be non-negative.")
         if int(work_unit.point_start) < 0 or int(work_unit.point_stop) <= int(work_unit.point_start):
             raise ValueError("Partition point range must satisfy 0 <= point_start < point_stop.")
+    if work_unit.partition_axis not in ("points", "intervals"):
+        raise ValueError(
+            "partition_axis must be 'points' or 'intervals'; got "
+            f"{work_unit.partition_axis!r}."
+        )
+    if work_unit.partition_axis == "intervals":
+        if work_unit.partition_id is None:
+            raise ValueError(
+                "Interval-axis (subchunk) residual-field work units require a "
+                "partition_id slot."
+            )
+        if int(work_unit.point_start or 0) != 0:
+            raise ValueError(
+                "Interval-axis (subchunk) residual-field work units must cover "
+                "the chunk's full point range (point_start == 0)."
+            )
+
+
+def point_ids_equal(left, right) -> bool:
+    """Identity short-circuit first: builders share the payload's array
+    object, so the common case is O(1) instead of a 211.7M-element
+    compare."""
+    return left is right or np.array_equal(left, right)
 
 
 def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -> None:
@@ -663,11 +756,12 @@ def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -
         raise ValueError("output_artifacts must not contain duplicate artifact keys.")
     if result.reciprocal_point_count is not None and result.reciprocal_point_count < 0:
         raise ValueError("reciprocal_point_count must be non-negative.")
+    point_id_count = int(np.asarray(result.point_ids).size)
     if result.residual_values is not None:
-        if result.point_ids and len(result.point_ids) != result.residual_values.shape[0]:
+        if point_id_count and point_id_count != result.residual_values.shape[0]:
             raise ValueError("residual_values must align with point_ids.")
     if result.residual_average_values is not None:
-        if result.point_ids and len(result.point_ids) != result.residual_average_values.shape[0]:
+        if point_id_count and point_id_count != result.residual_average_values.shape[0]:
             raise ValueError("residual_average_values must align with point_ids.")
     if (
         result.residual_values is not None
@@ -675,96 +769,6 @@ def validate_residual_field_partial_result(result: ResidualFieldPartialResult) -
         and result.residual_values.shape != result.residual_average_values.shape
     ):
         raise ValueError("residual_values and residual_average_values must have matching shape.")
-
-
-def merge_residual_field_partial_results(
-    left: ResidualFieldPartialResult,
-    right: ResidualFieldPartialResult,
-) -> ResidualFieldPartialResult:
-    validate_residual_field_partial_result(left)
-    validate_residual_field_partial_result(right)
-    if left.chunk_id != right.chunk_id:
-        raise ValueError("Cannot merge residual-field partials for different chunks.")
-    if left.parameter_digest != right.parameter_digest:
-        raise ValueError("Cannot merge residual-field partials with different parameter_digest.")
-    if left.output_kind != right.output_kind:
-        raise ValueError("Cannot merge residual-field partials with different output_kind.")
-    if left.schema_version != right.schema_version:
-        raise ValueError("Cannot merge residual-field partials with different schema versions.")
-    if left.grid_shape is not None and right.grid_shape is not None and left.grid_shape != right.grid_shape:
-        raise ValueError("Cannot merge residual-field partials with different grid_shape.")
-    if (
-        left.residual_values is not None
-        and right.residual_values is not None
-        and left.residual_values.shape != right.residual_values.shape
-    ):
-        raise ValueError("Cannot merge residual-field partials with different residual_values shape.")
-    if (
-        left.residual_average_values is not None
-        and right.residual_average_values is not None
-        and left.residual_average_values.shape != right.residual_average_values.shape
-    ):
-        raise ValueError(
-            "Cannot merge residual-field partials with different residual_average_values shape."
-        )
-    if (
-        left.residual_values is not None
-        and right.residual_values is not None
-        and left.point_ids != right.point_ids
-    ):
-        raise ValueError(
-            "Cannot merge materialized residual-field partials with different point_ids."
-        )
-    overlap = set(left.contributing_interval_ids) & set(right.contributing_interval_ids)
-    if overlap:
-        raise ValueError(
-            "Cannot merge residual-field partials with duplicate interval ids: "
-            f"{sorted(overlap)}"
-        )
-    merged_point_ids = (
-        left.point_ids
-        if left.residual_values is not None and right.residual_values is not None
-        else tuple(sorted(set(left.point_ids) | set(right.point_ids)))
-    )
-    return ResidualFieldPartialResult(
-        chunk_id=left.chunk_id,
-        contributing_interval_ids=tuple(
-            sorted(left.contributing_interval_ids + right.contributing_interval_ids)
-        ),
-        parameter_digest=left.parameter_digest,
-        output_kind=left.output_kind,
-        source_artifacts=_merge_artifact_refs(
-            left.source_artifacts,
-            right.source_artifacts,
-            allow_duplicates=True,
-        ),
-        output_artifacts=_merge_artifact_refs(
-            left.output_artifacts,
-            right.output_artifacts,
-            allow_duplicates=False,
-        ),
-        grid_shape=left.grid_shape if left.grid_shape is not None else right.grid_shape,
-        point_ids=merged_point_ids,
-        residual_values=(
-            left.residual_values + right.residual_values
-            if left.residual_values is not None and right.residual_values is not None
-            else left.residual_values
-            if left.residual_values is not None
-            else right.residual_values
-        ),
-        residual_average_values=(
-            left.residual_average_values + right.residual_average_values
-            if left.residual_average_values is not None
-            and right.residual_average_values is not None
-            else left.residual_average_values
-            if left.residual_average_values is not None
-            else right.residual_average_values
-        ),
-        reciprocal_point_count=(
-            (left.reciprocal_point_count or 0) + (right.reciprocal_point_count or 0)
-        ),
-        schema_version=left.schema_version,
-    )
 
 
 @dataclass(frozen=True)
@@ -964,7 +968,6 @@ __all__ = [
     "ResidualFieldReducerProgressManifest",
     "ResidualFieldShardManifest",
     "ResidualFieldWorkUnit",
-    "build_legacy_residual_field_output_artifacts",
     "build_residual_field_interval_source_artifacts",
     "build_residual_field_output_artifacts",
     "build_residual_field_shard_artifacts",
@@ -973,7 +976,6 @@ __all__ = [
     "make_residual_field_artifact_key",
     "make_residual_field_reducer_key",
     "make_residual_field_retry_key",
-    "merge_residual_field_partial_results",
     "residual_field_partial_result_identity",
     "validate_residual_field_artifact_manifest",
     "validate_residual_field_partial_result",

@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+
+# NFS "storage node": kernel NFSv4 server in the container's own network
+# namespace (needs privileged + nfsd module on the host), exporting the
+# shared filesystem the compute nodes mount. Runs behind the same netem
+# latency shaping as the nodes, so every store read/checkpoint write pays
+# a realistic interconnect round-trip.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        nfs-kernel-server iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY nfs-entrypoint.sh /usr/local/bin/nfs-entrypoint.sh
+RUN chmod +x /usr/local/bin/nfs-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/nfs-entrypoint.sh"]

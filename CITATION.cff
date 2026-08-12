@@ -36,9 +36,19 @@ keywords:
 preferred-citation:
   type: article
   title: >-
-    A Filter-Based Approach Linking Diffuse Scattering Features to
-    Site-Resolved Real-Space Fields
+    Connecting Diffuse Scattering to Atomic-Site-Resolved Occupancy and
+    Displacement Fields through Fourier Filtering
   authors:
     - family-names: "Eremenko"
       given-names: "Maksim"
+    - family-names: "Krayzman"
+      given-names: "Victor"
+    - family-names: "Tucker"
+      given-names: "Matthew G."
+    - family-names: "Levin"
+      given-names: "Igor"
+  journal: "arXiv preprint arXiv:2607.10440"
   year: 2026
+  date-published: "2026-07-11"
+  doi: "10.48550/arXiv.2607.10440"
+  url: "https://arxiv.org/pdf/2607.10440"

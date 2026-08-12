@@ -8,45 +8,60 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable
 import numpy as np
 
 from core.residual_field.backend import (
-    ScatteringIntervalArtifactPolicy,
     build_residual_field_reducer_backend,
-    is_same_node_local_client,
     resolve_residual_field_reducer_backend_kind,
 )
 from core.scattering.artifacts import (
-    is_interval_artifact_committed,
+    discard_stale_interval_artifact,
+    interval_artifact_reusable,
     mark_empty_interval_precomputed,
     persist_precomputed_interval_artifact,
 )
-from core.scattering.contracts import ScatteringWorkUnit
+from core.scattering.contracts import (
+    ScatteringIntervalArtifactPolicy,
+    ScatteringWorkUnit,
+    interval_artifact_dir,
+)
 from core.scattering.kernels import (
     IntervalTask,
-    point_list_to_recarray,
     reciprocal_space_points_counter,
     to_interval_dict,
 )
 from core.scattering.planning import (
-    build_scattering_interval_chunk_work_units,
+    ScatteringWorkIdentity,
+    build_scattering_execution_plan,
     build_scattering_interval_lookup,
-    build_scattering_precompute_work_units,
-    chunk_ids_for_work_units,
-    interval_paths_for_work_units,
+    prepare_scattering_run_identity,
 )
 from core.runtime import (
-    DEFAULT_TASK_RETRIES,
+    is_same_node_local_client,
     is_sync_client,
     logging_redirect_tqdm,
+    nufft_task_resources,
+    profile_output_filesystem,
     progress_bar,
     quiet_loggers,
+    require_gpu_admission,
     register_cleanup_plugin,
     yield_futures_with_results,
 )
+from core.scattering.runtime import (
+    _nufft_execution_settings,
+    _require_scheduler_resource_capacity,
+    _runtime_info,
+)
 from core.scattering.tasks import (
     compute_scattering_interval_payload,
-    run_scattering_interval_chunk_task,
     run_scattering_interval_task,
 )
 from core.storage.database_manager import DatabaseManager
+from core.storage.digests import digest_dict
+from core.workflow.run_state_cache import rebuild_sqlite_cache_from_manifests
+from core.scattering.streaming import (
+    StreamingComputeContext,
+    resolve_stage1_payload_store_dir,
+    stage2_streaming_enabled,
+)
 
 if TYPE_CHECKING:
     from dask.distributed import Client
@@ -55,17 +70,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _LOCAL_DIRECT_HANDOFF_MAX_INTERVALS_DEFAULT = 64
 _LOCAL_DIRECT_HANDOFF_MAX_BYTES_DEFAULT = 256 << 20
-
-
-def _chunk_task_key(work_unit: ScatteringWorkUnit) -> str:
-    if work_unit.chunk_id is None:
-        raise ValueError("Chunk task key requires a chunk-scoped work unit.")
-    return f"proc-{work_unit.interval_id}-{work_unit.chunk_id}"
-
-
-def _runtime_info(parameters: Dict[str, Any]) -> dict[str, Any]:
-    runtime_info = parameters.get("runtime_info") or {}
-    return runtime_info if isinstance(runtime_info, dict) else {}
 
 
 def _save_interval_outputs_requested(
@@ -96,7 +100,6 @@ def _resolve_scattering_interval_artifact_policy(
     )
     backend = build_residual_field_reducer_backend(backend_kind)
     default_policy = backend.layout.checkpoint_policy.interval_artifacts
-
     raw_policy = runtime_info.get("scattering_interval_artifact_policy")
     if raw_policy is None:
         raw_policy = runtime_info.get("interval_artifact_policy")
@@ -132,6 +135,93 @@ def _normalize_scattering_interval_artifact_policy(
     raise ValueError(
         "Scattering interval artifact policy must be 'required_transport' or "
         "'optional_output'."
+    )
+
+
+def _scheduler_kind(client) -> str:
+    if client is None or is_sync_client(client):
+        return "sync"
+    return "dask"
+
+
+def _clear_worker_type1_plan_caches(client) -> None:
+    """Release the per-process type-1 forward plan caches after Stage-1.
+
+    The plans' fine-grid scratch is raw cudaMalloc outside the CuPy pool, so
+    leaving them alive would pin VRAM through the residual-field stage."""
+    from core.adapters.cunufft_wrapper import clear_lattice_type1_plan_cache
+
+    try:
+        clear_lattice_type1_plan_cache()
+    except Exception:
+        pass
+    if client is None or is_sync_client(client):
+        return
+    run = getattr(client, "run", None)
+    if not callable(run):
+        return
+    try:
+        run(clear_lattice_type1_plan_cache)
+    except Exception:
+        pass
+
+
+def _nufft_execution_policy(parameters: Dict[str, Any]) -> str:
+    return _nufft_execution_settings(parameters).execution_policy
+
+
+def _nufft_resources_for_parameters(parameters: Dict[str, Any]) -> dict[str, int]:
+    return nufft_task_resources(_nufft_execution_policy(parameters))
+
+
+def _source_scattering_commit_digest(
+    work_identity: ScatteringWorkIdentity,
+) -> str:
+    # Digest of the full scattering work identity, handed to the residual
+    # stage as source_scattering_commit_digest. The domain string predates
+    # the stage-2 mode consolidation and is kept for value stability.
+    return digest_dict(
+        work_identity.to_work_unit_kwargs(),
+        domain="mosaic.stage2_replacement.source_scattering_identity.v1",
+    )
+
+
+def _current_scattering_identity(
+    *,
+    parameters: Dict[str, Any],
+    output_dir: str,
+    B_: np.ndarray,
+    mask_params: Dict[str, Any],
+    MaskStrategy,
+    client,
+) -> ScatteringWorkIdentity:
+    runtime_info = _runtime_info(parameters)
+    nufft_settings = _nufft_execution_settings(parameters)
+    interval_artifact_policy = _resolve_scattering_interval_artifact_policy(
+        parameters=parameters,
+        client=client,
+    )
+    return prepare_scattering_run_identity(
+        parameters=parameters,
+        output_dir=output_dir,
+        B_=B_,
+        mask_params=mask_params,
+        MaskStrategy=MaskStrategy,
+        backend=nufft_settings.backend,
+        eps=nufft_settings.eps,
+        dtype=nufft_settings.dtype,
+        pre_sum_mode=str(runtime_info.get("scattering_pre_sum_mode", "off")),
+        reducer_strategy=(
+            "stage2-streaming"
+            if stage2_streaming_enabled(parameters)
+            else "attempt-commit"
+        ),
+        scheduler_kind=_scheduler_kind(client),
+        interval_artifact_policy=str(interval_artifact_policy),
+        deterministic_mode=nufft_settings.deterministic_mode,
+        thread_count=nufft_settings.thread_count,
+        requested_nufft_policy=nufft_settings.requested_policy,
+        execution_nufft_policy=nufft_settings.execution_policy,
     )
 
 
@@ -215,6 +305,95 @@ def _local_direct_handoff_limits(parameters: Dict[str, Any]) -> tuple[int, int]:
     return max_intervals, max_bytes
 
 
+def _import_stage1_store_payloads(
+    work_units: list[ScatteringWorkUnit],
+    *,
+    store_dir: str | None,
+    payload_identity: str | None,
+    db,
+) -> tuple[list[ScatteringWorkUnit], list[Path]]:
+    """Adopt payloads a STREAMING run of the same physics already computed.
+
+    Both modes now persist the identical payload object in the identical
+    format; only the directory layout differs. So a mode switch that would
+    otherwise repeat every stage-1 transform can instead copy — the store
+    entry becomes this run's interval artifact, and the interval is
+    committed exactly as if precompute had produced it.
+
+    Only identity-matching entries are adopted. Returns the work units
+    still needing compute, plus the artifact paths adopted."""
+    if not store_dir or not payload_identity or not work_units:
+        return work_units, []
+    from core.scattering.streaming import (
+        _STORE_MISS,
+        read_stored_interval_payload,
+    )
+
+    db_path = _sqlite_cache_path(db)
+    remaining: list[ScatteringWorkUnit] = []
+    adopted: list[Path] = []
+    for work_unit in work_units:
+        stored = _STORE_MISS
+        try:
+            stored = read_stored_interval_payload(
+                store_dir,
+                int(work_unit.interval_id),
+                expect_identity=payload_identity,
+            )
+        except Exception:
+            logger.warning(
+                "Stage-1 store adoption failed for interval %d; recomputing.",
+                int(work_unit.interval_id),
+                exc_info=True,
+            )
+        if stored is _STORE_MISS:
+            remaining.append(work_unit)
+            continue
+        try:
+            if stored is None:
+                # The store records mask-emptiness durably; precompute mode
+                # expresses the same answer as "no artifact, marked done" --
+                # which requires clearing any artifact a previous mask left.
+                discard_stale_interval_artifact(work_unit)
+                mark_empty_interval_precomputed(
+                    work_unit.interval_id, db_path=db_path
+                )
+                continue
+            manifest = persist_precomputed_interval_artifact(
+                work_unit,
+                stored,
+                db_path=db_path,
+                payload_identity=payload_identity,
+            )
+        except Exception:
+            logger.warning(
+                "Could not adopt stage-1 store entry for interval %d; recomputing.",
+                int(work_unit.interval_id),
+                exc_info=True,
+            )
+            remaining.append(work_unit)
+            continue
+        if manifest is not None and manifest.artifacts:
+            artifact_path = manifest.artifacts[0].path
+            if artifact_path is not None:
+                adopted.append(Path(artifact_path))
+    if adopted or len(remaining) != len(work_units):
+        logger.info(
+            "Adopted %d stage-1 payload(s) from the streaming store; %d "
+            "interval(s) still need computing.",
+            len(work_units) - len(remaining),
+            len(remaining),
+        )
+    return remaining, adopted
+
+
+def _sqlite_cache_path(db) -> str | None:
+    # Both DatabaseManagerProtocol implementations expose these directly.
+    if not db.cache_enabled:
+        return None
+    return db.db_path
+
+
 def _local_direct_handoff_is_safe(
     *,
     pending: list[ScatteringWorkUnit],
@@ -266,38 +445,55 @@ def run_interval_precompute(
     db: DatabaseManager,
     client: "Client | None",
     transient_interval_payloads: dict[int, IntervalTask] | None = None,
+    payload_identity: str | None = None,
+    stage1_store_dir: str | None = None,
 ) -> list[Path]:
     payload_cache = transient_interval_payloads if transient_interval_payloads is not None else {}
+    nufft_settings = _nufft_execution_settings(parameters)
     local_fast_handoff = _local_fast_handoff_enabled(parameters=parameters, client=client)
     interval_artifact_policy = _resolve_scattering_interval_artifact_policy(
         parameters=parameters,
         client=client,
     )
     persist_interval_artifacts = interval_artifact_policy == "required_transport"
+    # Validated ONCE per interval: proving reusability opens the artifact,
+    # and both the pending and the cached list ask the same question.
+    reusable = {
+        int(work_unit.interval_id): (
+            persist_interval_artifacts
+            and interval_artifact_reusable(
+                work_unit, payload_identity=payload_identity
+            )
+        )
+        for work_unit in work_units
+    }
     pending = [
         work_unit
         for work_unit in work_units
-        if (
-            int(work_unit.interval_id) not in payload_cache
-            and not (
-                persist_interval_artifacts
-                and is_interval_artifact_committed(work_unit, db_path=db.db_path)
-            )
-        )
+        if int(work_unit.interval_id) not in payload_cache
+        and not reusable[int(work_unit.interval_id)]
     ]
     cached = [
         Path(work_unit.interval_artifact.path)
         for work_unit in work_units
         if work_unit.interval_artifact is not None
         and work_unit.interval_artifact.path is not None
-        and persist_interval_artifacts
-        and is_interval_artifact_committed(work_unit, db_path=db.db_path)
+        and reusable[int(work_unit.interval_id)]
     ]
     cached_payloads = [
         int(work_unit.interval_id)
         for work_unit in work_units
         if int(work_unit.interval_id) in payload_cache
     ]
+    # A streaming run of the same physics may already hold these payloads.
+    if persist_interval_artifacts:
+        pending, adopted = _import_stage1_store_payloads(
+            pending,
+            store_dir=stage1_store_dir,
+            payload_identity=payload_identity,
+            db=db,
+        )
+        cached.extend(adopted)
     if local_fast_handoff and not _local_direct_handoff_is_safe(
         pending=pending,
         interval_lookup=interval_lookup,
@@ -323,6 +519,7 @@ def run_interval_precompute(
     written_files: list[Path] = []
     produced_payloads = 0
     if local_fast_handoff and (client is not None) and (not is_sync_client(client)):
+        _require_scheduler_resource_capacity(client, "nufft")
         shared_inputs = _scatter_shared_precompute_inputs(
             client,
             B_=B_,
@@ -334,7 +531,8 @@ def run_interval_precompute(
         )
         futures = [
             client.submit(
-                compute_scattering_interval_payload,
+                run_scattering_interval_task,
+                work_unit,
                 interval_lookup[work_unit.interval_id],
                 B_=shared_inputs["B_"],
                 mask_params=mask_params,
@@ -348,8 +546,13 @@ def run_interval_precompute(
                 coeff_val=shared_inputs["coeff_val"],
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
+                output_dir=output_dir,
+                db_path=None,
+                nufft_eps=nufft_settings.eps,
+                nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                nufft_gpu_only=nufft_settings.gpu_only,
                 pure=False,
-                resources={"nufft": 1},
+                resources=_nufft_resources_for_parameters(parameters),
             )
             for work_unit in pending
         ]
@@ -360,8 +563,11 @@ def run_interval_precompute(
                     work_unit = future_meta[future]
                     try:
                         interval_task = future.result()
-                    except Exception:
-                        interval_task = None
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Scattering interval precompute failed before empty-mask "
+                            f"classification: interval={int(work_unit.interval_id)}"
+                        ) from exc
                     if interval_task is not None:
                         _store_transient_interval_payload(
                             payload_cache,
@@ -374,15 +580,17 @@ def run_interval_precompute(
                             manifest = persist_precomputed_interval_artifact(
                                 work_unit,
                                 interval_task,
-                                db_path=db.db_path,
+                                db_path=_sqlite_cache_path(db),
+                                payload_identity=payload_identity,
                             )
                             if manifest is not None and manifest.artifacts:
                                 artifact_path = manifest.artifacts[0].path
                                 if artifact_path is not None:
                                     written_files.append(Path(artifact_path))
                     else:
+                        discard_stale_interval_artifact(work_unit)
                         mark_empty_interval_precomputed(
-                            work_unit.interval_id, db_path=db.db_path,
+                            work_unit.interval_id, db_path=_sqlite_cache_path(db),
                         )
                     pbar.update(1)
                     pbar.refresh()
@@ -414,6 +622,9 @@ def run_interval_precompute(
                     coeff_val=parameters.get("coeff"),
                     unique_elements=list(unique_elements),
                     ff_factory=ff_factory,
+                    nufft_eps=nufft_settings.eps,
+                    nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                    nufft_gpu_only=nufft_settings.gpu_only,
                 )
                 if interval_task is not None:
                     _store_transient_interval_payload(
@@ -427,15 +638,17 @@ def run_interval_precompute(
                         manifest = persist_precomputed_interval_artifact(
                             work_unit,
                             interval_task,
-                            db_path=db.db_path,
+                            db_path=_sqlite_cache_path(db),
+                            payload_identity=payload_identity,
                         )
                         if manifest is not None and manifest.artifacts:
                             artifact_path = manifest.artifacts[0].path
                             if artifact_path is not None:
                                 written_files.append(Path(artifact_path))
                 else:
+                    discard_stale_interval_artifact(work_unit)
                     mark_empty_interval_precomputed(
-                        work_unit.interval_id, db_path=db.db_path,
+                        work_unit.interval_id, db_path=_sqlite_cache_path(db),
                     )
                 pbar.update(1)
                 pbar.refresh()
@@ -452,6 +665,7 @@ def run_interval_precompute(
         return cached + written_files
 
     if (client is not None) and (not is_sync_client(client)):
+        _require_scheduler_resource_capacity(client, "nufft")
         shared_inputs = _scatter_shared_precompute_inputs(
             client,
             B_=B_,
@@ -479,19 +693,27 @@ def run_interval_precompute(
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
                 output_dir=output_dir,
-                db_path=db.db_path,
+                db_path=None,
+                nufft_eps=nufft_settings.eps,
+                nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                nufft_gpu_only=nufft_settings.gpu_only,
+                payload_identity=payload_identity,
                 pure=False,
-                resources={"nufft": 1},
+                resources=_nufft_resources_for_parameters(parameters),
             )
             for work_unit in pending
         ]
+        future_meta = {future: work_unit for future, work_unit in zip(futures, pending)}
         with logging_redirect_tqdm():
             with progress_bar(len(futures), desc="Precompute intervals", unit="intervals") as pbar:
                 for future, _ in yield_futures_with_results(futures, client):
                     try:
                         manifest = future.result()
-                    except Exception:
-                        manifest = None
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Scattering durable interval precompute failed: "
+                            f"interval={int(getattr(future_meta.get(future), 'interval_id', -1))}"
+                        ) from exc
                     if manifest is not None and manifest.artifacts:
                         artifact_path = manifest.artifacts[0].path
                         if artifact_path is not None:
@@ -527,7 +749,11 @@ def run_interval_precompute(
                 unique_elements=list(unique_elements),
                 ff_factory=ff_factory,
                 output_dir=output_dir,
-                db_path=db.db_path,
+                db_path=_sqlite_cache_path(db),
+                nufft_eps=nufft_settings.eps,
+                nufft_prefer_cpu=nufft_settings.prefer_cpu,
+                nufft_gpu_only=nufft_settings.gpu_only,
+                payload_identity=payload_identity,
             )
             if manifest is not None and manifest.artifacts:
                 artifact_path = manifest.artifacts[0].path
@@ -548,171 +774,6 @@ def run_interval_precompute(
     return cached + written_files
 
 
-def run_interval_chunk_execution(
-    work_units: list[ScatteringWorkUnit],
-    *,
-    total_reciprocal_points: int,
-    point_data_list: list[dict],
-    db_manager: DatabaseManager,
-    client: "Client | None",
-    output_dir: str,
-    max_inflight: int = 5_000,
-) -> None:
-    total_tasks = len(work_units)
-    if total_tasks == 0:
-        logger.info("Stage-2 skipped – no unsaved (interval, chunk) pairs.")
-        return
-
-    interval_paths = interval_paths_for_work_units(work_units)
-    if client is None:
-        rec = point_list_to_recarray(point_data_list)
-        with progress_bar(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
-            for work_unit in work_units:
-                atoms = rec[rec.chunk_id == int(work_unit.chunk_id)]
-                manifest = run_scattering_interval_chunk_task(
-                    work_unit,
-                    interval_paths[work_unit.interval_id],
-                    atoms,
-                    total_reciprocal_points=total_reciprocal_points,
-                    output_dir=output_dir,
-                    db_path=db_manager.db_path,
-                    quiet_logs=False,
-                )
-                pbar.update(1)
-                pbar.refresh()
-                if manifest is None:
-                    logger.error(
-                        "GAVE UP after retries | iv %d | chunk %d (sync)",
-                        work_unit.interval_id,
-                        work_unit.chunk_id,
-                    )
-        logger.info("Stage-2 finished (sync).")
-        return
-
-    fail_streak, fail_threshold = 0, 3
-    gpu_tripped = False
-
-    def _trip_to_cpu_only() -> None:
-        nonlocal gpu_tripped, max_inflight
-        if gpu_tripped:
-            return
-        if hasattr(client, "run"):
-            try:
-                from core.adapters.cunufft_wrapper import set_cpu_only
-
-                client.run(set_cpu_only, True)
-            except Exception:
-                pass
-        max_inflight = min(max_inflight, 256)
-        gpu_tripped = True
-        logger.warning("Circuit-breaker: switching Stage-2 to CPU-only & throttling.")
-
-    rec = point_list_to_recarray(point_data_list)
-    chunk_futures = {
-        chunk_id: client.scatter(rec[rec.chunk_id == chunk_id], broadcast=False, hash=False)
-        for chunk_id in chunk_ids_for_work_units(work_units)
-    }
-    interval_path_futures = {
-        interval_id: client.scatter(path, broadcast=False)
-        for interval_id, path in interval_paths.items()
-    }
-
-    retries_left = {
-        (work_unit.interval_id, int(work_unit.chunk_id)): DEFAULT_TASK_RETRIES
-        for work_unit in work_units
-        if work_unit.chunk_id is not None
-    }
-    flying: set = set()
-    future_meta: dict = {}
-    submitted = 0
-
-    def _submit(work_unit: ScatteringWorkUnit) -> None:
-        nonlocal submitted
-        future = client.submit(
-            run_scattering_interval_chunk_task,
-            work_unit,
-            interval_path_futures[work_unit.interval_id],
-            chunk_futures[int(work_unit.chunk_id)],
-            total_reciprocal_points=total_reciprocal_points,
-            output_dir=output_dir,
-            db_path=db_manager.db_path,
-            quiet_logs=True,
-            key=_chunk_task_key(work_unit),
-            pure=False,
-            resources={"nufft": 1},
-            retries=DEFAULT_TASK_RETRIES,
-        )
-        flying.add(future)
-        future_meta[future] = work_unit
-        submitted += 1
-
-    def _harvest_finished_nonblocking(bump) -> None:
-        nonlocal fail_streak
-        done_now = [future for future in list(flying) if future.done()]
-        for future in done_now:
-            try:
-                ok = future.result() is not None
-            except Exception:
-                ok = False
-
-            flying.discard(future)
-            work_unit = future_meta.pop(future, None)
-            bump()
-
-            if not ok and work_unit is not None:
-                fail_streak += 1
-                if fail_streak >= fail_threshold:
-                    _trip_to_cpu_only()
-                key = (work_unit.interval_id, int(work_unit.chunk_id))
-                if retries_left.get(key, 0) > 0:
-                    retries_left[key] -= 1
-                    _submit(work_unit)
-            else:
-                fail_streak = 0
-
-    with logging_redirect_tqdm():
-        with progress_bar(total_tasks, desc="Stage 2 (chunks × intervals)", unit="pairs") as pbar:
-
-            def bump() -> None:
-                pbar.update(1)
-                pbar.refresh()
-
-            for work_unit in work_units:
-                _submit(work_unit)
-                _harvest_finished_nonblocking(bump)
-                while len(flying) >= max_inflight:
-                    for future, result in yield_futures_with_results(list(flying), client):
-                        ok = bool(result)
-                        flying.discard(future)
-                        completed_work_unit = future_meta.pop(future, None)
-                        bump()
-                        if not ok and completed_work_unit is not None:
-                            fail_streak += 1
-                            if fail_streak >= fail_threshold:
-                                _trip_to_cpu_only()
-                            key = (
-                                completed_work_unit.interval_id,
-                                int(completed_work_unit.chunk_id),
-                            )
-                            if retries_left.get(key, 0) > 0:
-                                retries_left[key] -= 1
-                                _submit(completed_work_unit)
-                        else:
-                            fail_streak = 0
-
-            for future, result in yield_futures_with_results(list(flying), client):
-                completed_work_unit = future_meta.pop(future, None)
-                bump()
-                if not bool(result) and completed_work_unit is not None:
-                    logger.error(
-                        "GAVE UP after retries | iv %d | chunk %d",
-                        completed_work_unit.interval_id,
-                        completed_work_unit.chunk_id,
-                    )
-
-    logger.info("Stage-2 finished – %d tasks submitted", submitted)
-
-
 def run_scattering_stage(
     parameters: Dict[str, Any],
     FormFactorFactoryProducer,
@@ -722,10 +783,9 @@ def run_scattering_stage(
     output_dir: str,
     point_data_processor,
     client: "Client | None",
-) -> None:
+) -> dict[str, object]:
     register_cleanup_plugin(client, is_sync_client=is_sync_client)
 
-    reciprocal_space_intervals_all = parameters["reciprocal_space_intervals_all"]
     reciprocal_space_intervals = parameters["reciprocal_space_intervals"]
     original_coords = parameters["original_coords"]
     cells_origin = parameters["cells_origin"]
@@ -733,42 +793,157 @@ def run_scattering_stage(
     vectors = parameters["vectors"]
     supercell = parameters["supercell"]
     charge = parameters.get("charge", 0.0)
-    dimension = int(len(supercell))
 
     B_ = np.linalg.inv(vectors / supercell)
     unique_elements = np.unique(elements_arr)
-
-    precompute_work_units = build_scattering_precompute_work_units(
-        reciprocal_space_intervals,
-        dimension=dimension,
+    work_identity = _current_scattering_identity(
+        parameters=parameters,
         output_dir=output_dir,
+        B_=B_,
+        mask_params=MaskStrategyParameters,
+        MaskStrategy=MaskStrategy,
+        client=client,
     )
+    profile_output_filesystem(
+        output_dir,
+        run_digest=work_identity.run_digest,
+        client=client,
+    )
+    nufft_resources = _nufft_resources_for_parameters(parameters)
+    if client is not None and not is_sync_client(client):
+        require_gpu_admission(
+            client,
+            policy=_nufft_execution_policy(parameters),
+            required_gpu_tasks=(1 if "gpu" in nufft_resources else 0),
+        )
+    execution_plan = build_scattering_execution_plan(
+        parameters=parameters,
+        db_manager=db_manager,
+        output_dir=output_dir,
+        work_identity=work_identity,
+    )
+    rebuild_sqlite_cache_from_manifests(
+        db_manager,
+        output_dir=output_dir,
+        run_digest=work_identity.run_digest,
+    )
+    # What a durable stage-1 payload must match to be reused — by either
+    # mode, from either directory. Derived once, with the run identity.
+    payload_identity = work_identity.interval_payload_identity or None
     interval_lookup = build_scattering_interval_lookup(reciprocal_space_intervals)
-    with quiet_loggers("core.storage.database_manager", "DatabaseManager"):
-        run_interval_precompute(
-            precompute_work_units,
-            interval_lookup=interval_lookup,
+    if stage2_streaming_enabled(parameters):
+        # Streaming (fused stage-1) mode: compute NO interval payloads and
+        # write NO durable interval store here. Publish the compute context;
+        # the residual stage's work units run the stage-1 kernels themselves,
+        # fold into worker-local subchunk accumulators, and discard the
+        # amplitudes. Set runtime_info.save_scattering_interval_artifacts to
+        # additionally persist inspection copies (not implemented in
+        # streaming mode yet -- artifacts would not be consumed).
+        streaming_sink = parameters.get("streaming_state")
+        if not isinstance(streaming_sink, dict):
+            raise RuntimeError(
+                "Streaming stage-2 mode requires the workflow artifacts "
+                "streaming_state sink in the scattering parameters."
+            )
+        streaming_nufft = _nufft_execution_settings(parameters)
+        # Durable stage-1 payload store: computed payloads persist under the
+        # output dir, scoped by the scattering identity, so stage-1 runs once
+        # per interval across shards, owners, restarts, and cluster sizes.
+        # MOSAIC_STREAMING_PAYLOAD_STORE=0 disables; a path value relocates it
+        # (e.g. onto a parallel filesystem for multi-node runs).
+        payload_store_dir = (
+            resolve_stage1_payload_store_dir(output_dir, payload_identity)
+            if payload_identity
+            else None
+        )
+        if payload_store_dir is not None:
+            Path(payload_store_dir).mkdir(parents=True, exist_ok=True)
+
+        streaming_sink["compute_context"] = StreamingComputeContext(
+            cache_token=str(work_identity.run_digest),
+            interval_lookup=dict(interval_lookup),
             B_=B_,
-            parameters=parameters,
-            unique_elements=unique_elements,
             mask_params=MaskStrategyParameters,
             MaskStrategy=MaskStrategy,
             supercell=supercell,
-            output_dir=output_dir,
             original_coords=original_coords,
             cells_origin=cells_origin,
             elements_arr=elements_arr,
             charge=charge,
+            use_coeff=("coeff" in parameters),
+            coeff_val=parameters.get("coeff"),
+            unique_elements=tuple(str(element) for element in unique_elements),
             ff_factory=FormFactorFactoryProducer,
-            db=db_manager,
-            client=client,
-            transient_interval_payloads=parameters.get("transient_interval_payloads"),
+            nufft_eps=float(streaming_nufft.eps),
+            nufft_prefer_cpu=bool(streaming_nufft.prefer_cpu),
+            nufft_gpu_only=bool(streaming_nufft.gpu_only),
+            payload_store_dir=payload_store_dir,
+            precomputed_artifact_dir=str(interval_artifact_dir(output_dir)),
+            payload_identity=payload_identity,
+        )
+        logger.info(
+            "Scattering stage-1/stage-2 skipped (streaming mode): %d interval(s) "
+            "computed inside residual work units; durable stage-1 payload "
+            "store: %s; precompute artifacts reusable from %s.",
+            len(interval_lookup),
+            payload_store_dir or "disabled",
+            interval_artifact_dir(output_dir),
+        )
+        return {
+            "scattering_run_digest": work_identity.run_digest,
+            "source_scattering_commit_digest": _source_scattering_commit_digest(
+                work_identity
+            ),
+        }
+    with quiet_loggers("core.storage.database_manager", "DatabaseManager"):
+        try:
+            run_interval_precompute(
+                list(execution_plan.interval_work_units),
+                interval_lookup=interval_lookup,
+                B_=B_,
+                parameters=parameters,
+                unique_elements=unique_elements,
+                mask_params=MaskStrategyParameters,
+                MaskStrategy=MaskStrategy,
+                supercell=supercell,
+                output_dir=output_dir,
+                original_coords=original_coords,
+                cells_origin=cells_origin,
+                elements_arr=elements_arr,
+                charge=charge,
+                ff_factory=FormFactorFactoryProducer,
+                db=db_manager,
+                client=client,
+                transient_interval_payloads=parameters.get("transient_interval_payloads"),
+                payload_identity=payload_identity,
+                # A streaming run of the same physics leaves its payloads
+                # here; adopting them beats recomputing stage-1.
+                stage1_store_dir=(
+                    resolve_stage1_payload_store_dir(output_dir, payload_identity)
+                    if payload_identity
+                    else None
+                ),
+            )
+        finally:
+            # The type-1 plans only fill during interval precompute; release
+            # their raw-cudaMalloc scratch BEFORE the stage-2 / residual
+            # inverse transforms run (and on failure paths), or it pins VRAM
+            # their budget models assume is free.
+            _clear_worker_type1_plan_caches(client)
+        logger.info(
+            "Scattering Stage-2 deferred: residual-field stage will consume "
+            "precomputed interval artifacts."
         )
     logger.info("Completed scattering interval precompute stage")
+    return {
+        "scattering_run_digest": work_identity.run_digest,
+        "source_scattering_commit_digest": _source_scattering_commit_digest(
+            work_identity
+        ),
+    }
 
 
 __all__ = [
-    "run_interval_chunk_execution",
     "run_interval_precompute",
     "run_scattering_stage",
 ]

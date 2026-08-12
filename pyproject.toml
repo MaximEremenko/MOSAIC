@@ -35,7 +35,26 @@ dependencies = [
   "requests",
   "scipy",
   "sympy",
+  "threadpoolctl",
   "tqdm",
+]
+
+[project.optional-dependencies]
+hpc = [
+  "dask-jobqueue",
+  "dask-mpi",
+]
+test = [
+  "build",
+  "pytest",
+  "pytest-timeout",
+  "twine",
+]
+cuda12 = [
+  "cuda-bindings==12.*",
+  "cupy-cuda12x",
+  "cufinufft==2.5.1",
+  "dask-cuda>=26.4",
 ]
 
 [project.urls]
@@ -47,6 +66,9 @@ mosaic = "core.entrypoints.main:cli"
 
 [tool.setuptools.packages.find]
 include = ["core*"]
+
+[tool.setuptools.package-data]
+"core.storage" = ["schemas/*.json"]
 
 [tool.setuptools.dynamic]
 version = {attr = "core.__version__"}

@@ -13,15 +13,469 @@ rev 2025-08-08-mem
 from __future__ import annotations
 from typing import Callable, Optional
 import copy
+import hashlib
 import logging
 import os
+import re
+import threading
 import time
 import warnings
 import numpy as np
 
+from core.adapters._direct_dft import direct_dft_type3
+from core.runtime.env import env_bool, env_int
+
 
 logger = logging.getLogger(__name__)
 _LAST_NUFFT_TELEMETRY = None
+
+
+###############################################################################
+#  Bounded cuFINUFFT Plan cache                                               #
+#                                                                             #
+#  Cache key is the exact set of Plan() + setpts arguments, so a cache hit    #
+#  replays the bit-identical call. Per-plan lock serializes concurrent        #
+#  setpts/execute calls on the same plan (cuFINUFFT Plans are not             #
+#  thread-safe). On CuPy OOM the cache is flushed once and the builder       #
+#  re-runs.                                                                   #
+###############################################################################
+def _coord_sig(arr) -> bytes:
+    if arr is None:
+        return b"\x00" * 8
+    # Accept CuPy arrays (disallow implicit asarray) and NumPy arrays alike.
+    get = getattr(arr, "get", None)
+    if callable(get):
+        try:
+            host = np.ascontiguousarray(get())
+        except Exception:
+            host = np.ascontiguousarray(np.asarray(arr))
+    else:
+        host = np.ascontiguousarray(np.asarray(arr))
+    return hashlib.sha256(host.view(np.uint8).tobytes()).digest()[:8]
+
+
+def _coords_sig(cols) -> bytes:
+    if cols is None:
+        return b"\x00" * 8
+    return b"".join(_coord_sig(c) for c in cols)
+
+
+_PLAN_CACHE_MAX = int(os.getenv("MOSAIC_NUFFT_PLAN_CACHE_MAX", "0"))
+_PLAN_CACHE: "dict[tuple, tuple]" = {}
+_PLAN_CACHE_ORDER: list = []
+_PLAN_CACHE_LOCK = threading.Lock()
+
+# Concurrency-aware GPU admission. Worker threads sharing one process (the
+# default Dask ``processes=False`` layout) all target the same card, so the VRAM
+# is *partitioned* by the number of GPU worker threads rather than serialized:
+#   * 1 thread  -> it is admitted alone and budgeted the whole card (full VRAM).
+#   * N threads -> up to N run concurrently, each budgeted ~1/N of the card, so
+#     their fine grids sum to <= the card and none races another into OOM.
+# The per-transform budget (VRAM/N) feeds the fine-grid tiler, which splits each
+# transform to fit its share and keeps everything on the GPU. Separate worker
+# *processes* (each its own CUDA context) coordinate through this only within a
+# process; across processes the per-share budget still bounds each one.
+_GPU_ADMIT_COND = threading.Condition()
+_gpu_inflight = 0                 # GPU transforms currently in flight (live share count)
+_gpu_reserved = 0                 # VRAM bytes currently reserved by in-flight tiles
+
+
+def _free_cupy_pool_blocks() -> None:
+    """Best-effort: return CuPy pool blocks to the device. Used after a
+    plan cache flush so VRAM held by destroyed plans is actually reclaimable
+    by subsequent allocations."""
+    try:
+        import cupy as cp_mod  # type: ignore
+        cp_mod.get_default_memory_pool().free_all_blocks()
+        try:
+            cp_mod.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_CUPY_POOL_CAPPED = False
+# Default per-worker target = 60% of total VRAM divided by expected worker
+# count. Each Dask worker process has its OWN CuPy pool, so a 65% per-worker
+# cap on N workers asks for N*0.65 of VRAM total, which OOMs. We split the
+# 60% global budget across workers and account for ~30% headroom held by
+# cuFINUFFT plan scratch (which bypasses the pool via raw cudaMalloc).
+_DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT = 0.60
+_DEFAULT_NON_POOL_HEADROOM_PCT = 0.30
+
+# Absolute VRAM headroom: bytes that must stay FREE on the card at all times.
+# Every budget in this module (reservation pool, CuPy pool cap, lattice plan
+# budgets) keys off this ONE number, and the reservation pool is *split* among
+# in-flight transforms, so the guaranteed-free floor neither shrinks nor
+# multiplies with the number of worker threads sharing the GPU.
+_GPU_TOTAL_OCCUPANCY_CEILING = 0.85
+_MIN_GPU_HEADROOM_BYTES = 2 << 30
+
+
+def _headroom_bytes_for_total(total_vram: int) -> int:
+    """Absolute VRAM to keep free for a card of ``total_vram`` bytes.
+
+    ``MOSAIC_GPU_HEADROOM_GIB`` (float GiB) overrides; the default is the
+    larger of ``(1 - occupancy ceiling) * total`` and ``min(2 GiB, total/4)``,
+    so cards >= 8 GiB keep the historical margins byte-for-byte while a flat
+    2 GiB floor never claims half of a small card (on a 4 GiB part it left
+    the OOM back-off ladder as the normal path)."""
+    if total_vram <= 0:
+        return 0
+    raw = os.getenv("MOSAIC_GPU_HEADROOM_GIB")
+    if raw:
+        try:
+            return max(0, int(float(raw) * (1 << 30)))
+        except ValueError:
+            logger.warning("Ignoring invalid MOSAIC_GPU_HEADROOM_GIB=%r", raw)
+    derived = (1.0 - _GPU_TOTAL_OCCUPANCY_CEILING) * float(total_vram)
+    floor = min(_MIN_GPU_HEADROOM_BYTES, total_vram // 4)
+    return int(max(derived, floor))
+
+
+def expected_worker_count() -> int:
+    """MOSAIC worker processes on THIS host. The budgets divided by this
+    count (MemAvailable, per-worker pool caps) are per-host resources, so a
+    cluster-wide count over-divides on a node hosting fewer workers, and a
+    per-rank device probe under-divides on co-scheduled MPI ranks: each rank
+    sees 1 GPU through its CUDA_VISIBLE_DEVICES pin and would admit the full
+    host budget."""
+    raw = os.getenv("MOSAIC_DASK_WORKER_COUNT")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    # Launcher-provided LOCAL counts: ranks/tasks on this node, not the job
+    # total. SLURM_NTASKS_PER_NODE uses formats like "2(x3)" on heterogeneous
+    # allocations; the leading integer is this node's count.
+    for var in ("OMPI_COMM_WORLD_LOCAL_SIZE", "SLURM_NTASKS_PER_NODE"):
+        raw = os.getenv(var)
+        if raw:
+            match = re.match(r"\s*(\d+)", raw)
+            if match:
+                return max(1, int(match.group(1)))
+    raw = os.getenv("DASK_MAX_WORKERS")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass  # "auto" falls through to the device probe
+    try:
+        import cupy as cp_mod  # type: ignore
+
+        count = int(cp_mod.cuda.runtime.getDeviceCount())
+        if count > 0:
+            return count  # cuda-local: one worker per visible GPU
+    except Exception:
+        pass
+    return 4  # matches the project default
+
+
+# Back-compat alias for the pre-promotion private name.
+_expected_worker_count = expected_worker_count
+
+
+def _pool_cap_divisor() -> int:
+    """How many worker PROCESSES' CuPy pools share THIS device.
+
+    Splitting the global pool budget is only correct when several processes
+    each own a pool on the same card. Threads-mode Dask (DASK_PROCESSES=0,
+    the project default) runs every worker in one process sharing ONE pool
+    -- dividing shrank the shared pool N-fold (32 GiB card: 2.4 GiB pool,
+    slab and tile sizing strangled, hkl40 batches ~10x slower). The
+    one-process-per-device backends never co-locate pools either: dask-cuda
+    ("cuda-local") hardcodes one worker process per GPU, and the MPI
+    launcher pins per-rank CUDA_VISIBLE_DEVICES."""
+    if os.getenv("DASK_PROCESSES", "0") != "1":
+        return 1
+    if os.getenv("DASK_BACKEND") in ("cuda-local", "mpi"):
+        return 1
+    return _expected_worker_count()
+
+
+def _apply_cupy_pool_cap() -> None:
+    """Bound CuPy's default memory pool **per worker process** so the
+    cumulative pool footprint across workers stays inside the GPU.
+
+    Resolution order (first match wins):
+        1. ``MOSAIC_CUPY_POOL_LIMIT_BYTES``   — absolute per-worker cap
+        2. ``MOSAIC_CUPY_POOL_LIMIT_GIB``     — per-worker cap in GiB
+        3. ``MOSAIC_CUPY_POOL_LIMIT_PCT``     — per-worker fraction of total
+        4. Auto: ``(global_budget - non_pool_headroom) / N_workers``
+           where global_budget = 0.60 of total VRAM and non_pool_headroom =
+           0.30 of total VRAM (reserved for cuFINUFFT plan internals which
+           bypass the CuPy pool).
+
+    On a 32 GiB GPU with 4 workers, the auto cap is
+        (0.60 - 0.30) * 32 / 4 = 2.4 GiB per worker pool → ~10 GiB pool
+    aggregate + ~10 GiB plan scratch + ~12 GiB free = 60-70% steady-state.
+
+    Idempotent; safe when CuPy is absent.
+    """
+    global _CUPY_POOL_CAPPED
+    if _CUPY_POOL_CAPPED:
+        return
+
+    limit_bytes: int | None = None
+    raw_bytes = os.getenv("MOSAIC_CUPY_POOL_LIMIT_BYTES")
+    raw_gib = os.getenv("MOSAIC_CUPY_POOL_LIMIT_GIB")
+    raw_pct = os.getenv("MOSAIC_CUPY_POOL_LIMIT_PCT")
+
+    if raw_bytes:
+        try:
+            limit_bytes = max(0, int(raw_bytes))
+        except ValueError:
+            limit_bytes = None
+
+    if limit_bytes is None and raw_gib:
+        try:
+            limit_bytes = max(0, int(float(raw_gib) * (1 << 30)))
+        except ValueError:
+            limit_bytes = None
+
+    try:
+        import cupy as cp_mod  # type: ignore
+        try:
+            _free, total_vram = cp_mod.cuda.runtime.memGetInfo()
+        except Exception:
+            total_vram = 0
+    except Exception:
+        return  # CuPy unavailable; nothing to cap
+
+    if total_vram <= 0:
+        return
+
+    if limit_bytes is None:
+        if raw_pct:
+            try:
+                pct = float(raw_pct)
+            except ValueError:
+                pct = _DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT
+            pct = min(max(pct, 0.0), 0.95)
+            limit_bytes = int(pct * total_vram)
+        else:
+            # Divide only among pools that actually co-reside on this device
+            # (see _pool_cap_divisor for why threads mode and the
+            # one-process-per-GPU backends must not divide).
+            n_workers = _pool_cap_divisor()
+            usable_pct = max(
+                0.05,
+                _DEFAULT_CUPY_POOL_GLOBAL_BUDGET_PCT - _DEFAULT_NON_POOL_HEADROOM_PCT,
+            )
+            limit_bytes = int(usable_pct * total_vram / max(1, n_workers))
+            # The pool cap alone must not plan past the absolute headroom
+            # (matters on small cards where 30% of total can exceed
+            # total - headroom); explicit env overrides above stay authoritative.
+            limit_bytes = min(
+                limit_bytes,
+                max(
+                    int(total_vram - _headroom_bytes_for_total(total_vram)),
+                    int(0.05 * total_vram),
+                ),
+            )
+
+    if limit_bytes is None or limit_bytes <= 0:
+        return
+
+    try:
+        cp_mod.get_default_memory_pool().set_limit(size=int(limit_bytes))
+        _CUPY_POOL_CAPPED = True
+        logger.info(
+            "CuPy pool capped at %.2f GiB (total_vram=%.2f GiB).",
+            limit_bytes / (1 << 30),
+            total_vram / (1 << 30),
+        )
+    except Exception as exc:
+        logger.debug("Could not set CuPy pool limit: %s", exc)
+    _apply_pinned_pool_policy(cp_mod)
+
+
+def _apply_pinned_pool_policy(cp_mod) -> None:
+    """Bound page-locked host memory on RAM-tight hosts.
+
+    Every ``cp.asarray(host_array)`` stages through CuPy's pinned pool,
+    which bins blocks by size and NEVER returns them to the OS (measured:
+    cudaHostAlloc pages land in shmem-rss; ~10 GB/worker at hkl40 —
+    the direct cause of kernel OOM kills on a 61 GB / 4-worker box).
+    CuPy has no set_limit for the pinned pool, so the cap is allocator
+    choice: MOSAIC_CUPY_PINNED_POOL_MODE = 'pool' (cached, default on
+    big-RAM hosts) | 'none' (direct cudaHostAlloc/FreeHost, zero cache).
+    Auto picks 'none' when total_ram / expected_workers < 24 GiB."""
+    mode = os.getenv("MOSAIC_CUPY_PINNED_POOL_MODE", "").strip().lower()
+    if mode not in ("pool", "none"):
+        from core.runtime.cpu_resources import total_memory_bytes
+
+        ram = total_memory_bytes()
+        workers = max(1, _expected_worker_count())
+        mode = "none" if ram and ram / workers < (24 << 30) else "pool"
+    if mode == "none":
+        try:
+            cp_mod.cuda.set_pinned_memory_allocator(None)
+            logger.info(
+                "CuPy pinned-memory pool DISABLED (RAM-tight host): "
+                "staging buffers use direct cudaHostAlloc/FreeHost."
+            )
+        except Exception as exc:
+            logger.debug("Could not disable pinned pool: %s", exc)
+
+
+def _flush_pinned_pool() -> None:
+    """Return the pinned pool's free blocks to the OS (no-op when the
+    pinned allocator is disabled). Free pinned blocks are pure cache; a
+    cudaFreeHost per block per tile is unmeasurable next to a transform."""
+    cp_mod = cp
+    if cp_mod is None:
+        return
+    try:
+        cp_mod.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+
+# Deliberately do not touch CuPy/CUDA at import time.  Dask-CUDA imports the
+# workflow in its launcher before assigning each worker's visible device; an
+# import-time context would therefore be inherited on GPU 0 by every worker.
+# The cap is applied lazily by ``_ensure_gpu_backend`` after worker assignment.
+# Fixed, deterministic OOM back-off ladder for ``gpu_maxsubprobsize``.
+# Selection is intentionally history-independent: every call starts at the
+# same largest subproblem size and, on out-of-memory, backs off through this
+# exact sequence.  We deliberately do NOT cache a last-known-good size across
+# calls — caching made the subprob path depend on prior-call history (process
+# state), so identical inputs could follow different ladders in different
+# processes.  With a fixed ladder, identical inputs always follow an identical
+# subprob path regardless of process history.  OOM recovery is unchanged: the
+# back-off ladder (and the one cache-flush retry per subprob) is preserved.
+_DEFAULT_SUBPROBS: tuple = (32, 16, 8, 4, 2, 1)
+
+
+def _subprob_order(dim: int, n_trans: int) -> tuple:
+    """Return the deterministic OOM back-off ladder.
+
+    History-independent by design: always the same fixed sequence, so the
+    subprob path a given input follows does not depend on what earlier calls
+    in this process happened to succeed at.  ``dim``/``n_trans`` are accepted
+    for call-site stability but do not influence the order.
+    """
+    return _DEFAULT_SUBPROBS
+
+
+def _destroy_plan_quietly(plan) -> None:
+    """Release a cuFINUFFT plan without invoking ``__del__`` directly.
+
+    cuFINUFFT exposes the C destroy callback and handle on the Python Plan.
+    Calling ``plan.__del__()`` manually is unsafe because the Python wrapper
+    remains live and may be finalized again later. Destroy the handle and
+    poison the wrapper state instead, matching the library finalizer's
+    idempotency contract.
+    """
+    if plan is None:
+        return
+    destroy_plan = getattr(plan, "_destroy_plan", None)
+    handle = getattr(plan, "_plan", None)
+    if not callable(destroy_plan) or handle is None:
+        return
+    destroyed = False
+    try:
+        status = destroy_plan(handle)
+        if status:
+            logger.debug("cuFINUFFT plan destroy returned status %s", status)
+        else:
+            destroyed = True
+    except Exception as exc:
+        logger.debug("cuFINUFFT plan destroy swallowed error: %s", exc)
+    if destroyed:
+        try:
+            plan._plan = None
+        except Exception:
+            pass
+        try:
+            plan._references = []
+        except Exception:
+            pass
+
+
+def _clear_plan_cache() -> None:
+    """Drop all cached plans and return CuPy pool blocks to the device.
+    Called on CuPy OOM or external pool flush."""
+    with _PLAN_CACHE_LOCK:
+        victims = list(_PLAN_CACHE.values())
+        _PLAN_CACHE.clear()
+        _PLAN_CACHE_ORDER.clear()
+    for plan, per_plan_lock in victims:
+        with per_plan_lock:
+            _destroy_plan_quietly(plan)
+    _free_cupy_pool_blocks()
+
+
+def _evict_one_locked() -> None:
+    if not _PLAN_CACHE_ORDER:
+        return
+    oldest = _PLAN_CACHE_ORDER.pop(0)
+    victim = _PLAN_CACHE.pop(oldest, None)
+    if victim is not None:
+        plan, per_plan_lock = victim
+        with per_plan_lock:
+            _destroy_plan_quietly(plan)
+        # Return CuPy pool blocks held by the destroyed plan so the next
+        # allocation can actually use the freed VRAM.
+        _free_cupy_pool_blocks()
+
+
+def _plan_cache_get_or_build(key: tuple, builder):
+    """Return ``(plan, per_plan_lock, cached)``.
+
+    When ``_PLAN_CACHE_MAX <= 0`` the cache is disabled — a fresh Plan is
+    built and the caller is responsible for destroying it once done. This
+    is the default and the safe choice on a single GPU shared by multiple
+    Dask worker processes: cuFINUFFT plan scratch is allocated via raw
+    ``cudaMalloc`` and **bypasses the CuPy pool**, so leaving plans alive
+    pins VRAM that no pool cap can reclaim.
+    """
+    if _PLAN_CACHE_MAX <= 0:
+        plan = builder()
+        return (plan, threading.Lock(), False)
+
+    with _PLAN_CACHE_LOCK:
+        entry = _PLAN_CACHE.get(key)
+        if entry is not None:
+            try:
+                _PLAN_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            _PLAN_CACHE_ORDER.append(key)
+            plan, per_plan_lock = entry
+            return (plan, per_plan_lock, True)
+
+    plan = builder()
+    per_plan_lock = threading.Lock()
+
+    with _PLAN_CACHE_LOCK:
+        existing = _PLAN_CACHE.get(key)
+        if existing is not None:
+            _destroy_plan_quietly(plan)
+            try:
+                _PLAN_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            _PLAN_CACHE_ORDER.append(key)
+            existing_plan, existing_lock = existing
+            return (existing_plan, existing_lock, True)
+        while len(_PLAN_CACHE_ORDER) >= max(1, _PLAN_CACHE_MAX):
+            _evict_one_locked()
+        _PLAN_CACHE[key] = (plan, per_plan_lock)
+        _PLAN_CACHE_ORDER.append(key)
+        return (plan, per_plan_lock, True)
+
+
+def _plan_cache_stats() -> dict:
+    with _PLAN_CACHE_LOCK:
+        return {
+            "size": len(_PLAN_CACHE_ORDER),
+            "max": _PLAN_CACHE_MAX,
+            "keys": list(_PLAN_CACHE_ORDER),
+        }
 
 ###############################################################################
 #  Global CPU-only switch                                                     #
@@ -31,13 +485,20 @@ _CPU_ONLY = os.getenv("MOSAIC_NUFFT_CPU_ONLY", "0") == "1"
 def set_cpu_only(flag: bool = True) -> None:
     """
     Force wrapper into CPU-only mode (or re-enable GPU when False).
-    Call once, before the first execute_* function.
+
+    Safe to call at ANY time, including from an error handler while sibling
+    threads are mid-transform: the module-global ``cp`` reference is left
+    intact so in-flight GPU code (device arrays, ``except cp.cuda...``
+    clauses) keeps working; only the mode flags flip, and every NEW transform
+    checks them. Nulling ``cp`` here is what used to crash concurrent threads
+    with ``'NoneType' object has no attribute 'cuda'`` and demote whole
+    workers to CPU on a single transient GPU error.
     """
-    global _CPU_ONLY, _GPU_AVAILABLE, cp
+    global _CPU_ONLY, _GPU_AVAILABLE, _GPU_PROBED
     _CPU_ONLY = bool(flag)
     if _CPU_ONLY:
         _GPU_AVAILABLE = False
-        cp = None                     # type: ignore
+        _GPU_PROBED = True
         return
     _probe_gpu_backend()
 
@@ -47,13 +508,16 @@ def set_cpu_only(flag: bool = True) -> None:
 ###############################################################################
 cp = None                             # type: ignore
 _GPU_AVAILABLE = False
+_GPU_PROBED = False
+_GPU_PROBE_LOCK = threading.Lock()
 
 
 def _probe_gpu_backend() -> None:
-    global cp, _GPU_AVAILABLE
+    global cp, _GPU_AVAILABLE, _GPU_PROBED
     if _CPU_ONLY:
         cp = None                     # type: ignore
         _GPU_AVAILABLE = False
+        _GPU_PROBED = True
         return
     try:
         import cupy as _cp            # noqa: E402
@@ -66,9 +530,25 @@ def _probe_gpu_backend() -> None:
     except ImportError:
         cp = None                     # type: ignore
         _GPU_AVAILABLE = False
+    _GPU_PROBED = True
 
 
-_probe_gpu_backend()
+def _ensure_gpu_backend() -> None:
+    """Initialize CUDA only when GPU work begins inside the assigned worker."""
+    if _CPU_ONLY:
+        return
+    # Tests and embedders may inject an already-live backend directly.
+    if not _GPU_PROBED and not _GPU_AVAILABLE:
+        with _GPU_PROBE_LOCK:
+            if not _GPU_PROBED and not _GPU_AVAILABLE:
+                _probe_gpu_backend()
+            if _GPU_PROBED and _GPU_AVAILABLE:
+                _apply_cupy_pool_cap()
+        return
+    if _GPU_PROBED and _GPU_AVAILABLE and not _CUPY_POOL_CAPPED:
+        with _GPU_PROBE_LOCK:
+            if not _CUPY_POOL_CAPPED:
+                _apply_cupy_pool_cap()
 
 # Lazily imported CPU backend (avoid importing finufft on GPU-only nodes)
 _FINUFFT3: dict[int, Callable] | None = None
@@ -90,6 +570,179 @@ def _free_mem_bytes() -> int:
     with cp.cuda.Device(0):
         free, _ = cp.cuda.runtime.memGetInfo()
     return int(free)
+
+
+def _total_mem_bytes() -> int:
+    """Total VRAM in bytes (0 if GPU unavailable)."""
+    if not _GPU_AVAILABLE:
+        return 0
+    with cp.cuda.Device(0):
+        _, total = cp.cuda.runtime.memGetInfo()
+    return int(total)
+
+
+def _gpu_headroom_bytes() -> int:
+    """Absolute VRAM kept free on this card (0 when no GPU is present or the
+    device cannot be queried). See ``_headroom_bytes_for_total`` /
+    ``MOSAIC_GPU_HEADROOM_GIB``."""
+    try:
+        total = _total_mem_bytes()
+    except Exception:
+        return 0
+    return _headroom_bytes_for_total(total)
+
+
+def _uncommitted_budget_growth_bytes() -> int:
+    """VRAM that capped consumers (CuPy pool, type-1 plan cache) are still
+    ENTITLED to take but have not allocated yet.
+
+    Live free VRAM cannot see this future growth, so the reservation pool must
+    treat it as already spent. Sizing reservations against free alone let the
+    pool and cache fill AFTER fine-grid reservations were granted against the
+    older, larger free reading -- measured free pinned at ~0.1 GiB on the
+    32 GiB card during the hkl32 streaming run despite a 6 GiB headroom."""
+    growth = 0
+    try:
+        pool = cp.get_default_memory_pool()
+        limit = int(pool.get_limit() or 0)
+        if limit > 0:
+            growth += max(0, limit - int(pool.total_bytes()))
+    except Exception:
+        pass
+    try:
+        with _TYPE1_PLAN_CACHE_LOCK:
+            cache_bytes = _type1_cache_total_bytes_locked()
+        growth += max(0, _type1_plan_cache_max_bytes() - cache_bytes)
+    except Exception:
+        pass
+    return growth
+
+
+def _pool_reservable_bytes() -> int:
+    """VRAM the tiler may hand out across all concurrent transforms *right now*.
+
+    Based on live free VRAM plus what our own in-flight tiles already hold, so
+    the pool reflects the real card minus anything external (another process, a
+    notebook) is using -- we only ever promise VRAM we can actually provide.
+
+    Additionally bounded so an absolute headroom (``_gpu_headroom_bytes``)
+    always stays free: sizing purely from a fraction of free VRAM
+    asymptotically fills the card (measured 98% on hkl40 -- CuPy pool at
+    its cap + fine grids sized from the remaining free), and running at the
+    rim turns every allocation into a potential churn/failure. The headroom is
+    subtracted from the SHARED pool, not per transform, so the guaranteed-free
+    floor is the same whether 1 or N worker threads are in flight. Future
+    growth still owed to the CuPy pool cap and the type-1 plan cache is
+    subtracted as well (``_uncommitted_budget_growth_bytes``), so the floor
+    survives those consumers filling up after a reservation was granted."""
+    free = _free_mem_bytes()
+    live = free + _gpu_reserved
+    total = _total_mem_bytes()
+    if live <= 0:
+        live = total
+    committed = _gpu_headroom_bytes() + _uncommitted_budget_growth_bytes()
+    ceiling_room = max(0, int(live - committed))
+    return min(int(live * _gpu_vram_headroom_frac()), ceiling_room)
+
+
+_LOW_FREE_LOG_LOCK = threading.Lock()
+_LOW_FREE_LAST_LOG = 0.0
+
+
+def _warn_if_below_headroom(context: str) -> None:
+    """Watchdog: rate-limited WARNING whenever live free VRAM sits below the
+    configured headroom, with the full budget breakdown. Names the allocation
+    site that materialized a floor breach -- the breakdown separates ledger
+    reservations, CuPy pool, and type-1 cache so unaccounted raw cudaMalloc
+    shows up as the difference."""
+    global _LOW_FREE_LAST_LOG
+    if not _GPU_AVAILABLE:
+        return
+    try:
+        free = _free_mem_bytes()
+        headroom = _gpu_headroom_bytes()
+        if headroom <= 0 or free >= headroom:
+            return
+        now = time.monotonic()
+        with _LOW_FREE_LOG_LOCK:
+            if now - _LOW_FREE_LAST_LOG < 5.0:
+                return
+            _LOW_FREE_LAST_LOG = now
+        pool_used = pool_total = -1
+        try:
+            pool = cp.get_default_memory_pool()
+            pool_used = int(pool.used_bytes())
+            pool_total = int(pool.total_bytes())
+        except Exception:
+            pass
+        try:
+            with _TYPE1_PLAN_CACHE_LOCK:
+                cache_bytes = _type1_cache_total_bytes_locked()
+        except Exception:
+            cache_bytes = -1
+        logger.warning(
+            "GPU free below headroom after %s | free=%.2f GiB headroom=%.2f GiB "
+            "ledger_reserved=%.2f GiB pool_used=%.2f GiB pool_total=%.2f GiB "
+            "type1_cache_est=%.2f GiB inflight=%d",
+            context,
+            free / 2**30,
+            headroom / 2**30,
+            _gpu_reserved / 2**30,
+            pool_used / 2**30,
+            pool_total / 2**30,
+            cache_bytes / 2**30,
+            _gpu_inflight,
+        )
+    except Exception:
+        pass
+
+
+def _transform_enter() -> None:
+    """Register a GPU transform as in-flight (raises the live sharing count)."""
+    global _gpu_inflight
+    with _GPU_ADMIT_COND:
+        _gpu_inflight += 1
+        _GPU_ADMIT_COND.notify_all()
+
+
+def _transform_exit() -> None:
+    global _gpu_inflight
+    with _GPU_ADMIT_COND:
+        _gpu_inflight = max(0, _gpu_inflight - 1)
+        _GPU_ADMIT_COND.notify_all()
+
+
+def _current_tile_budget() -> int:
+    """VRAM a single tile may claim *right now*: an equal share of the reservable
+    pool among the transforms currently in flight. Re-read per tile, so it tracks
+    workers arriving/leaving dynamically -- a lone worker gets the whole pool; the
+    moment a sibling starts, both converge to half on their next tile."""
+    with _GPU_ADMIT_COND:
+        active = max(1, _gpu_inflight)
+        pool = _pool_reservable_bytes()
+    return max(pool // active, _min_tile_budget_bytes(_total_mem_bytes()))
+
+
+def _reserve_tile(nbytes: int) -> None:
+    """Reserve ``nbytes`` of VRAM from the shared pool, blocking until it fits.
+
+    Guarantees the sum of live tile reservations never exceeds the pool, so
+    concurrent transforms cannot race each other into an out-of-memory. A tile is
+    always admitted when nothing else is reserved (progress guarantee), even if
+    it is momentarily larger than the pool."""
+    global _gpu_reserved
+    with _GPU_ADMIT_COND:
+        while _gpu_reserved > 0 and _gpu_reserved + nbytes > _pool_reservable_bytes():
+            _GPU_ADMIT_COND.wait()
+        _gpu_reserved += nbytes
+    _warn_if_below_headroom(f"reserve_tile({nbytes >> 20} MiB)")
+
+
+def _release_tile(nbytes: int) -> None:
+    global _gpu_reserved
+    with _GPU_ADMIT_COND:
+        _gpu_reserved = max(0, _gpu_reserved - nbytes)
+        _GPU_ADMIT_COND.notify_all()
 
 
 def free_gpu_memory() -> None:
@@ -165,6 +818,161 @@ def _estimate_grid_bytes(real: np.ndarray, recip: np.ndarray) -> int:
     return int(nf.prod()) * 16          # 16 B per complex128
 
 
+# cuFINUFFT type-3 upsampling factor (sigma) used to size the internal fine grid.
+_TYPE3_UPSAMPFAC = 2.0
+
+# cuFINUFFT allocates more than just the fine grid: a cuFFT workspace (~1x the
+# grid) plus spread/sort scratch. Measured peak residency is ~2.2-2.5x the bare
+# fine grid, so tiling budgets the fine grid times this factor to avoid OOM.
+_TYPE3_RESIDENCY_FACTOR = 2.5
+
+
+def fine_grid_bytes_type3(real: np.ndarray, recip: np.ndarray) -> int:
+    """Estimate the cuFINUFFT type-3 *fine grid* residency (complex128).
+
+    A type-3 transform builds an intermediate uniform grid whose per-axis size
+    scales as the **product of the coordinate spreads** on that axis:
+    ``nf_i ~ sigma * spread_real_i * spread_recip_i / pi`` plus spread padding
+    (``spread = max - min``). That grid is allocated by cuFINUFFT via raw
+    ``cudaMalloc``, bypassing the CuPy pool budget, so it must be sized directly.
+
+    The **spread** (not per-axis ``max``) is the load-bearing quantity: it is
+    what shrinks when the source q-points (or targets) are split into spatial
+    tiles, which is exactly how :func:`_type3_inverse_gpu_tiled` keeps each GPU
+    sub-transform inside VRAM. Concatenating every interval's q-points into one
+    transform makes the recip spread the *entire* reciprocal range (~66) and the
+    real spread the full supercell (~27) -> nf ~1170/axis -> ~22 GiB; tiling the
+    sources restores the small per-tile spreads (and small grids) of the
+    per-interval regime while keeping the batched GPU launch.
+    """
+    real = np.asarray(real)
+    recip = np.asarray(recip)
+    if real.ndim != 2 or recip.ndim != 2 or real.shape[1] != recip.shape[1] or len(real) == 0 or len(recip) == 0:
+        return _estimate_grid_bytes(real, recip)
+    x_spread = real.max(axis=0) - real.min(axis=0)
+    s_spread = recip.max(axis=0) - recip.min(axis=0)
+    nf = np.ceil((_TYPE3_UPSAMPFAC / np.pi) * x_spread * s_spread) + 32.0
+    nf = np.ceil(nf / 16.0) * 16.0
+    return int(np.prod(nf)) * 16          # 16 B per complex128
+
+
+def _gpu_vram_headroom_frac() -> float:
+    """Fraction of *free* VRAM one type-3 GPU sub-transform's fine grid may
+    claim. Sub-transforms larger than this are split (tiled) so they stay on the
+    GPU. Keeps margin for cuFINUFFT work arrays / fragmentation. Override with
+    ``MOSAIC_NUFFT_GPU_VRAM_HEADROOM`` (0 < frac <= 1)."""
+    raw = os.getenv("MOSAIC_NUFFT_GPU_VRAM_HEADROOM")
+    if raw is None or str(raw).strip() == "":
+        return 0.85
+    try:
+        frac = float(raw)
+    except (TypeError, ValueError):
+        return 0.85
+    if not (0.0 < frac <= 1.0):
+        return 0.85
+    return frac
+
+
+# Hard ceiling on tiling recursion depth (2**depth tiles) -- a runaway guard far
+# above any real workload; termination normally comes from the fine-grid budget.
+_MAX_TILE_DEPTH = 24
+
+# Floor on the per-tile fine-grid budget. Prevents pathological over-splitting
+# into thousands of tiny transforms when free VRAM is momentarily scarce (e.g.
+# a second worker holds the card); a ~1 GiB fine grid is already an efficient
+# GPU transform. If a tile this size still will not fit, the leaf executor's own
+# OOM handling is the final backstop.
+_MIN_TILE_BUDGET_BYTES = 1 << 30
+
+
+def _min_tile_budget_bytes(total_vram: int) -> int:
+    """Tile-budget floor for a card of ``total_vram`` bytes: 1 GiB on cards
+    >= 8 GiB (unchanged), an eighth of the card down to 256 MiB below that --
+    a flat 1 GiB exceeded the whole reservable pool on <= 6 GiB parts, so the
+    floor authorized tiles the card could never satisfy."""
+    if total_vram <= 0:
+        return _MIN_TILE_BUDGET_BYTES
+    return min(_MIN_TILE_BUDGET_BYTES, max(total_vram // 8, 256 << 20))
+
+
+def _type3_inverse_gpu_tiled(
+    *,
+    real_coords: np.ndarray,
+    q_coords: np.ndarray,
+    weights_arr: np.ndarray,
+    eps: float,
+    leaf,
+    budget_bytes: int,
+) -> np.ndarray:
+    """Split a type-3 inverse transform along the widest coordinate spread until
+    each leaf's fine grid fits ``budget_bytes``, run every leaf on the GPU, and
+    recombine exactly into a single preallocated output.
+
+    The type-3 inverse is linear in the sources, so splitting the q-points into
+    spatial groups and **summing** the per-group results is exact; splitting the
+    real-space targets partitions the output. Splitting along the axis of largest
+    spread shrinks the fine grid (``nf_i ~ spread_real_i * spread_recip_i``), so a
+    handful of splits turns one VRAM-busting transform into several GPU-sized ones
+    -- no CPU fallback.
+
+    Results accumulate **in place** into one ``(n_trans, n_targets)`` buffer, so
+    host memory stays at ~one output plus one live tile regardless of the split
+    depth (a tree-of-sums would instead hold O(depth) full-size arrays -- fatal
+    for the 10^8-target 3D cases). ``leaf(q_sub, w_sub, real_sub) ->
+    (n_trans, len(real_sub))`` runs one GPU-sized sub-transform (host result).
+    """
+    n_trans = int(weights_arr.shape[0])
+    out = np.zeros((n_trans, int(len(real_coords))), dtype=np.complex128)
+    target_index = np.arange(int(len(real_coords)))
+
+    def _accumulate(tgt_idx, real_sub, q_sub, w_sub, depth):
+        budget = int(budget_bytes() if callable(budget_bytes) else budget_bytes)
+        residency = int(fine_grid_bytes_type3(real_sub, q_sub) * _TYPE3_RESIDENCY_FACTOR)
+        if (residency <= budget or depth >= _MAX_TILE_DEPTH
+                or (len(q_sub) <= 1 and len(real_sub) <= 1)):
+            out[:, tgt_idx] += leaf(q_sub, w_sub, real_sub)
+            return
+
+        s_spread = q_sub.max(axis=0) - q_sub.min(axis=0)
+        x_spread = real_sub.max(axis=0) - real_sub.min(axis=0)
+        split_source = (
+            (float(s_spread.max()) >= float(x_spread.max()) and len(q_sub) > 1)
+            or len(real_sub) <= 1
+        )
+
+        if split_source and len(q_sub) > 1:
+            ax = int(np.argmax(s_spread))
+            coord = q_sub[:, ax]
+            pivot = float(np.median(coord))
+            lo = coord < pivot
+            if not lo.any() or lo.all():          # ties defeat the median split
+                lo = coord <= pivot
+            if lo.any() and not lo.all():
+                # Both source halves accumulate into the SAME targets (exact sum).
+                _accumulate(tgt_idx, real_sub, q_sub[lo], w_sub[:, lo], depth + 1)
+                _accumulate(tgt_idx, real_sub, q_sub[~lo], w_sub[:, ~lo], depth + 1)
+                return
+
+        if len(real_sub) > 1:
+            ax = int(np.argmax(x_spread))
+            coord = real_sub[:, ax]
+            pivot = float(np.median(coord))
+            lo = coord < pivot
+            if not lo.any() or lo.all():
+                lo = coord <= pivot
+            if lo.any() and not lo.all():
+                # Disjoint target slices -> map through the running target index.
+                _accumulate(tgt_idx[lo], real_sub[lo], q_sub, w_sub, depth + 1)
+                _accumulate(tgt_idx[~lo], real_sub[~lo], q_sub, w_sub, depth + 1)
+                return
+
+        # Could not split further (both sides degenerate); run as-is.
+        out[:, tgt_idx] += leaf(q_sub, w_sub, real_sub)
+
+    _accumulate(target_index, real_coords, q_coords, weights_arr, 0)
+    return out
+
+
 def _estimate_launch_bytes(real: np.ndarray, recip: np.ndarray) -> int:
     lower_bound = _estimate_grid_bytes(real, recip)
     scaled = int(lower_bound * _GRID_LOWER_BOUND_ALPHA)
@@ -193,6 +1001,11 @@ def _adaptive_reserve_bytes(*, free_bytes: int, resident_bytes: int) -> int:
         reserve += 512 << 20
     elif resident_gib >= 2.0:
         reserve += 256 << 20
+    # The chunked type-3 paths size purely from free VRAM and never touch the
+    # reservation ledger; lifting their reserve to the absolute headroom keeps
+    # them out of the guaranteed-free band too. The 0.85*free clamp below
+    # stays as the make-progress escape when free is already below headroom.
+    reserve = max(reserve, _gpu_headroom_bytes())
     return int(min(max(reserve, 256 << 20), int(max(free_bytes * 0.85, 0))))
 
 
@@ -215,27 +1028,11 @@ def _resolve_budget_policy(
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid integer %s=%r", name, raw)
-        return default
+    return env_int(name, default, logger=logger, level=logging.WARNING)
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    logger.warning("Ignoring invalid boolean %s=%r", name, raw)
-    return default
+    return bool(env_bool(name, default, logger=logger, level=logging.WARNING))
 
 
 def _experimental_overlap_enabled() -> bool:
@@ -610,6 +1407,8 @@ def execute_inverse_cunufft_super_batch(
     max_batch_width: Optional[int] = None,
 ) -> np.ndarray:
     """Inverse type-3 helper that widens same-geometry batches when safe."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     if real_coords is None:
         raise ValueError("real_coords must be supplied for inverse transform")
     weights_arr = np.asarray(weights, dtype=np.complex128)
@@ -627,16 +1426,13 @@ def execute_inverse_cunufft_super_batch(
         width = total_trans
     else:
         width = max(1, min(int(max_batch_width), total_trans))
-    outputs: list[np.ndarray] = []
-    start = 0
-    while start < total_trans:
-        end = min(start + width, total_trans)
-        batch_weights = weights_arr[start:end]
-        try:
-            batch_result = _execute_inverse_cunufft_batch(
-                q_coords=q_coords,
-                weights_arr=batch_weights,
-                real_coords=real_coords,
+
+    def _leaf(q_sub, w_sub, real_sub):
+        return np.asarray(
+            _execute_inverse_cunufft_batch(
+                q_coords=q_sub,
+                weights_arr=w_sub,
+                real_coords=real_sub,
                 eps=eps,
                 mem_frac=mem_frac,
                 min_chunk=min_chunk,
@@ -645,6 +1441,51 @@ def execute_inverse_cunufft_super_batch(
                 gpu_only=gpu_only,
                 device_out=False,
             )
+        )
+
+    def _reserved_leaf(q_sub, w_sub, real_sub):
+        # Reserve this tile's VRAM from the shared pool so concurrent transforms
+        # pack the card without over-committing; release as soon as it is done.
+        tile_bytes = int(fine_grid_bytes_type3(real_sub, q_sub) * _TYPE3_RESIDENCY_FACTOR)
+        _reserve_tile(tile_bytes)
+        try:
+            return _leaf(q_sub, w_sub, real_sub)
+        finally:
+            _release_tile(tile_bytes)
+
+    # Tile the type-3 fine grid to fit VRAM and keep the work on the GPU (no
+    # silent CPU fallback): the transform is linear, so splitting the q-sources
+    # (sum) or real targets (partition) into spatial tiles is exact. Only when a
+    # GPU is actually the execution target -- a CPU run gains nothing from tiling.
+    use_gpu = _GPU_AVAILABLE and not _CPU_ONLY and not prefer_cpu
+    real_arr = np.asarray(real_coords, dtype=np.float64)
+    q_arr = np.asarray(q_coords, dtype=np.float64)
+
+    outputs: list[np.ndarray] = []
+    start = 0
+    while start < total_trans:
+        end = min(start + width, total_trans)
+        batch_weights = weights_arr[start:end]
+        try:
+            if use_gpu:
+                # Transforms run concurrently and share VRAM dynamically: each
+                # tile claims an equal live share of the free pool (whole card
+                # when alone, 1/N when N are in flight) and reserves it so the
+                # concurrent set never over-commits. All work stays on the GPU.
+                _transform_enter()
+                try:
+                    batch_result = _type3_inverse_gpu_tiled(
+                        real_coords=real_arr,
+                        q_coords=q_arr,
+                        weights_arr=batch_weights,
+                        eps=eps,
+                        leaf=_reserved_leaf,
+                        budget_bytes=_current_tile_budget,
+                    )
+                finally:
+                    _transform_exit()
+            else:
+                batch_result = _leaf(q_coords, batch_weights, real_coords)
             outputs.append(np.asarray(batch_result))
             start = end
         except Exception as exc:
@@ -655,68 +1496,936 @@ def execute_inverse_cunufft_super_batch(
     return np.concatenate(outputs, axis=0)
 
 
-def execute_inverse_cunufft_batch_materialize_once(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray | None = None,
-    *,
-    eps: float = 1e-12,
-    mem_frac: Optional[float] = None,
-    min_chunk: int = 32_000,
-    max_chunk: Optional[int] = 32 * 256_000,
-    prefer_cpu: bool = False,
-    gpu_only: bool = False,
-) -> np.ndarray:
-    """
-    Inverse type-3 helper for task-local GPU accumulation with a single final
-    host materialization when the GPU path succeeds.
-    """
-    return _execute_inverse_cunufft_batch_device(
-        q_coords=q_coords,
-        weights=weights,
-        real_coords=real_coords,
-        eps=eps,
-        mem_frac=mem_frac,
-        min_chunk=min_chunk,
-        max_chunk=max_chunk,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
-    )
+###############################################################################
+#  Lattice (scatter + type-2) inverse path                                    #
+#                                                                             #
+#  MOSAIC's reciprocal-space points sit on a uniform per-axis lattice (h,k,l  #
+#  at integer multiples of 1/N_cell); masks select a SUBSET of lattice sites  #
+#  but never move points off the lattice. The inverse transform               #
+#      F(r) = sum_q v(q) exp(-i r.q)                                          #
+#  is therefore a type-2 NUFFT from a dense coefficient grid (masked-out      #
+#  sites simply stay zero) instead of a type-3 over scattered points. This    #
+#  removes the type-3 fine-grid blow-up entirely: cost is set by the mode     #
+#  grid dimensions, not by (real extent x reciprocal extent). Measured on     #
+#  hkl32: 27x per transform, ~42 min vs 14-31 h end-to-end.                   #
+###############################################################################
 
 
-def _execute_inverse_cunufft_batch_device(
-    q_coords: np.ndarray,
-    weights: np.ndarray,
-    real_coords: np.ndarray | None = None,
+def lattice_host_budget_bytes() -> int:
+    """Host-RAM budget for a dense lattice coefficient grid.
+
+    Env ``MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET`` wins; the default scales with
+    the machine -- 55% of physical RAM (floor 8 GiB, cap 96 GiB) -- so large
+    grids (hkl40: ~31 GiB) take the fast lattice path on capable nodes while
+    small boxes fall back to type-3 rather than swapping."""
+    raw = os.getenv("MOSAIC_RESIDUAL_LATTICE_HOST_BUDGET")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            return max(1 << 20, int(raw))
+        except (TypeError, ValueError):
+            pass
+    from core.runtime.cpu_resources import total_memory_bytes
+
+    total = total_memory_bytes()
+    if total <= 0:
+        return 24 << 30
+    # Floor stays below the smallest realistic allocation (a 6 GB grant
+    # must not be told to budget 8 GB): min(55% of the grant, grant-2GB).
+    floor = min(8 << 30, max(1 << 30, total - (2 << 30)))
+    return int(min(max(int(total * 0.55), floor), 96 << 30))
+
+
+def plan_lattice(q_coords: np.ndarray, *, snap_tol: float = 0.05,
+                 host_budget_bytes: int | None = None, n_trans: int = 2,
+                 max_snap_dev: float | None = None):
+    """Snap scattered q-points onto a uniform per-axis lattice.
+
+    Returns a meta dict ``{origin, dq, dims, snap_dev}`` when every point lies
+    on a common per-axis lattice (within ``snap_tol`` of a step) AND the dense
+    coefficient grid fits ``host_budget_bytes``; otherwise ``None`` (caller
+    falls back to type-3). Degenerate axes (a single plane, e.g. the l=0
+    zero-plane role, or a 2D projection) get ``dq=0`` and one mode.
+
+    ``max_snap_dev`` additionally rejects NEAR-lattice data: truly on-lattice
+    q (exact float64 products) snaps to <=1e-9 of a step after the LSQ
+    refinement, while e.g. a slightly sheared cell produces deviations around
+    1e-6 that ``snap_tol`` would silently accept -- evaluating the transform
+    at the snapped positions then corrupts the result far beyond NUFFT eps.
+    Callers that promise eps-level parity with type-3 must set it."""
+    q = np.asarray(q_coords, dtype=np.float64)
+    if q.ndim != 2 or len(q) == 0 or q.shape[1] not in (1, 2, 3):
+        return None
+    if host_budget_bytes is None:
+        host_budget_bytes = lattice_host_budget_bytes()
+    dim = q.shape[1]
+    origin = np.zeros(dim)
+    dq = np.zeros(dim)
+    dims = np.zeros(dim, dtype=np.int64)
+    idx = np.zeros(q.shape, dtype=np.int64)
+    snap_dev = 0.0
+    for ax in range(dim):
+        col = q[:, ax]
+        span = float(col.max() - col.min())
+        if span <= 1e-12:                      # degenerate axis: one plane
+            origin[ax] = float(col[0]); dq[ax] = 0.0; dims[ax] = 1
+            continue
+        # The min-gap SEED only needs enough points to observe adjacent
+        # lattice values; the O(n log n) unique/sort on the full column
+        # dominates plan cost for large intervals (Stage-1 calls this per
+        # interval). The LSQ refinement below and the snap validation still
+        # run over ALL points, so a pathological subsample can only cause a
+        # fallback to type-3, never a wrong lattice.
+        seed_col = col if len(col) <= 200_000 else col[:: len(col) // 100_000]
+        u = np.unique(np.round(seed_col, 9))
+        gaps = np.diff(u)
+        gaps = gaps[gaps > max(1e-9, span * 1e-6)]   # ignore float-noise micro-gaps
+        if gaps.size == 0:
+            return None
+        step = float(gaps.min())
+        n_axis = int(round(span / step)) + 1
+        if n_axis > (1 << 20):                 # non-lattice data snaps to absurd dims
+            return None
+        origin[ax] = float(col.min())
+        ratio = (col - origin[ax]) / step
+        ax_idx = np.round(ratio).astype(np.int64)
+        dev = float(np.abs(ratio - ax_idx).max())
+        if dev > snap_tol or ax_idx.min() < 0 or ax_idx.max() >= n_axis:
+            return None
+        # LSQ step refinement: the min-gap estimate carries the float noise of
+        # a single gap, which accumulates linearly with the lattice index and
+        # sets the reconstruction floor. Regressing col ~ origin + idx*step
+        # over all points cancels it (same as the residual-task builder).
+        num = float(np.dot(ax_idx, col - origin[ax]))
+        den = float(np.dot(ax_idx, ax_idx))
+        if den > 0.0:
+            refined = num / den
+            if refined > 0.0 and abs(refined - step) < 0.1 * step:
+                step = refined
+                n_axis = int(round(span / step)) + 1
+                ratio = (col - origin[ax]) / step
+                ax_idx = np.round(ratio).astype(np.int64)
+                dev = float(np.abs(ratio - ax_idx).max())
+                if dev > snap_tol or ax_idx.min() < 0 or ax_idx.max() >= n_axis:
+                    return None
+        dq[ax] = step; dims[ax] = n_axis
+        snap_dev = max(snap_dev, dev)
+        idx[:, ax] = ax_idx
+    if max_snap_dev is not None and snap_dev > float(max_snap_dev):
+        return None
+    grid_bytes = int(np.prod(dims)) * 16 * max(1, int(n_trans))
+    if grid_bytes > host_budget_bytes:
+        return None
+    return {
+        "origin": origin, "dq": dq, "dims": tuple(int(v) for v in dims),
+        "snap_dev": snap_dev, "flat_index": np.ravel_multi_index(tuple(idx.T), tuple(int(v) for v in dims)),
+    }
+
+
+def _next_fft_size(n: int) -> int:
+    return max(2, int(2 * n))                  # upsampled fine-grid axis estimate
+
+
+def execute_type2_on_lattice(
+    meta: dict,
+    grids: np.ndarray,
+    real_coords: np.ndarray,
     *,
     eps: float = 1e-12,
-    mem_frac: Optional[float] = None,
-    min_chunk: int = 32_000,
-    max_chunk: Optional[int] = 32 * 256_000,
     prefer_cpu: bool = False,
     gpu_only: bool = False,
-):
-    if real_coords is None:
-        raise ValueError("real_coords must be supplied for inverse transform")
-    weights_arr = np.asarray(weights, dtype=np.complex128)
-    if weights_arr.ndim == 1:
-        weights_arr = weights_arr[np.newaxis, :]
-    if weights_arr.ndim != 2:
-        raise ValueError("weights must be 1-D or 2-D with shape (n_trans, n_sources)")
-    if weights_arr.shape[1] != len(q_coords):
-        raise ValueError("weights shape must match q_coords on axis 1")
-    return _execute_inverse_cunufft_batch(
-        q_coords=q_coords,
-        weights_arr=weights_arr,
-        real_coords=real_coords,
-        eps=eps,
-        mem_frac=mem_frac,
-        min_chunk=min_chunk,
-        max_chunk=max_chunk,
-        prefer_cpu=prefer_cpu,
-        gpu_only=gpu_only,
-        device_out=True,
+    tile_consumer=None,
+) -> np.ndarray | None:
+    """Evaluate ``F(r) = sum_m grid[m] exp(-i r.(origin + m*dq))`` at arbitrary
+    targets via type-2 NUFFT, mode-slabbed along the FIRST axis. Exact to NUFFT
+    eps.
+
+    Memory discipline (the failure modes this design closes):
+      * Slabs are taken along axis 0 of each transform row, so every slab is a
+        contiguous VIEW of the cached grid -- zero host memcpy per work unit.
+      * Uploads (slab + coords + result) live in the CuPy POOL, which the
+        pipeline caps at ~2.4 GiB/worker; slab length is sized against the
+        pool's actual free capacity, not free VRAM (sizing against VRAM is what
+        OOM-crashed the first hkl32 integration run).
+      * TARGETS are tiled too: every target-axis buffer (coords, phase, result
+        rows) is sized by the tile, never by the full call. Streaming
+        subchunks carry the chunk's FULL point range, so n_tgt is
+        points x rifft-grid (hkl40: 3072 x 41^3 = 2.1e8 targets = ~5 GiB of
+        coords alone) -- unconditionally uploading that is what OOM-crashed
+        the first hkl40 streaming run and demoted its workers to CPU.
+      * The cuFINUFFT fine grid is raw cudaMalloc OUTSIDE the pool; it is sized
+        against the dynamically shared VRAM tile budget.
+      * Rows run as separate n_trans=1 calls (halves the fine grid; the phase
+        vector is shared per slab), and any residual OOM halves the slab length
+        and retries instead of failing the work unit.
+
+    Throughput discipline (GPU):
+      * One explicit cuFINUFFT plan per slab shape, reused across slabs and
+        rows -- ``setpts`` (which sorts all targets) runs once per plan, not
+        once per (slab x row) as the simple interface would.
+      * Phase multiply and accumulation happen on the device; the result
+        crosses PCIe once at the end instead of once per (slab x row). If the
+    fixed device buffers do not fit the pool, the call falls back to
+    per-slab host accumulation transparently.
+
+    ``tile_consumer(t0, t1, tile_out)``: when given, the full ``(n_trans,
+    n_tgt)`` result is NEVER materialized. Each completed target tile is
+    handed to the callback as a host ``(n_trans, t1 - t0)`` array (owned by
+    the callee only for the duration of the call) and the function returns
+    ``None``. This is the streaming path for huge target sets: the caller
+    folds tiles straight into its (possibly memmap-backed) accumulator, so
+    host memory is O(tile), not O(targets). The wrapped type-2 coordinates
+    are likewise computed per tile, so ``real_coords`` may be a read-only
+    memmap and no full-size host temporary of it is ever made."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
+    tgt = np.asarray(real_coords, dtype=np.float64)
+    grids = np.asarray(grids, dtype=np.complex128)
+    dims = meta["dims"]
+    dq = np.asarray(meta["dq"], dtype=np.float64)
+    origin = np.asarray(meta["origin"], dtype=np.float64)
+    dim = len(dims)
+    n_trans = int(grids.shape[0])
+    n_tgt = int(len(tgt))
+    out = (
+        None
+        if tile_consumer is not None
+        else np.zeros((n_trans, n_tgt), dtype=np.complex128)
     )
+    if n_tgt == 0 or int(np.prod(dims)) == 0:
+        return out
+
+    use_gpu = (
+        not (_CPU_ONLY or prefer_cpu) and _GPU_AVAILABLE and cp is not None
+    )
+    if use_gpu:
+        try:
+            _ensure_gpu_kernels()
+        except ImportError:
+            use_gpu = False
+    if not use_gpu and gpu_only:
+        raise RuntimeError("GPU execution forced but unavailable for lattice type-2.")
+
+    # Per-target pool bytes while one slab is in flight (device-accum
+    # worst case): d_x (8*dim) + d_tgt (8*dim) + d_out (16*n_trans) +
+    # d_phase (16) + uncommitted row_results (16*n_trans). setpts sort
+    # scratch is raw cudaMalloc outside the pool and is covered by the
+    # 0.5 pool-fraction headroom. Tile sizing itself happens below, AFTER
+    # _transform_enter(), so concurrent siblings are visible to it.
+    bytes_per_tgt = 16 * dim + 32 * n_trans + 16
+
+    # Wrapped type-2 coordinates are computed PER TILE inside the loop below
+    # (degenerate axes with dq=0 map to x=0, a single mode). Materializing the
+    # full (n_tgt, dim) wrap here doubled the target-side host footprint --
+    # ~5 GiB per hkl40 chunk -- before a single tile ran.
+    centers = [d // 2 for d in dims]
+    row_bytes_per_len = 16 * int(np.prod(dims[1:])) if dim > 1 else 16
+    fine_other = 1
+    for a in range(1, dim):
+        fine_other *= _next_fft_size(dims[a])
+
+    def _pool_free_bytes() -> int:
+        try:
+            pool = cp.get_default_memory_pool()
+            limit = int(pool.get_limit() or 0)
+            if limit > 0:
+                return max(0, limit - int(pool.used_bytes()))
+        except Exception:
+            pass
+        return _free_mem_bytes()
+
+    def _slab_len_now(device_accum: bool, tile_n: int) -> int:
+        # pool side: slab upload + coords + per-call result must fit the pool
+        # (target-side terms scale with the TILE, not the whole call)
+        fixed = 24 * tile_n + 16 * tile_n * 2
+        if device_accum:
+            # d_tgt + d_phase + d_out + per-slab row temporaries
+            fixed += 24 * tile_n + 16 * tile_n + 16 * tile_n * n_trans * 2
+        pool_room = max(64 << 20, int(_pool_free_bytes() * 0.5) - fixed)
+        len_pool = pool_room // max(1, row_bytes_per_len)
+        # fine-grid side (raw cudaMalloc): sized from the shared VRAM budget
+        fine_budget = _current_tile_budget() if use_gpu else int(
+            os.getenv("MOSAIC_RESIDUAL_LATTICE_CPU_FINE_BUDGET", str(8 << 30))
+        )
+        len_fine = int(fine_budget // max(1.0, 16 * 2 * fine_other * 1.35))
+        len_fine = max(1, min(int(dims[0]), len_fine))
+        if use_gpu:
+            # Shrink until the ACTUAL reservation footprint (full+tail slab
+            # shapes, next-fft-doubled axes, cuFFT workspace, sort scratch,
+            # x1.25) fits the budget. The divisor above models ~1.35x per unit
+            # length but the real footprint is ~4-5x: on the first hkl32 batch
+            # of a fresh process the slab it produced reserved 30.8 GiB against
+            # a ~13 GiB pool, the empty-ledger progress guarantee admitted it,
+            # and materializing the plans drove free VRAM to 0 (watchdog-
+            # confirmed). Sizing and reserving from the SAME footprint model
+            # keeps the ledger honest regardless of the model's absolute error.
+            while len_fine > 1 and _plan_footprint_bytes(len_fine, tile_n) > fine_budget:
+                len_fine //= 2
+        return max(1, min(int(dims[0]), int(len_pool), len_fine))
+
+    def _is_cufinufft_alloc_failure(exc: Exception) -> bool:
+        # cuFINUFFT raises bare RuntimeErrors when its internal raw cudaMalloc
+        # fails: 'Error creating plan.' (fine grid), 'Error setting
+        # non-uniform points.' (bin-sort scratch, sized by n_tgt), 'Error
+        # executing plan.'. All are memory-shaped under VRAM pressure; treat
+        # them like a pool OOM so the slab backoff can recover instead of
+        # failing the work unit.
+        if not isinstance(exc, RuntimeError):
+            return False
+        message = str(exc).lower()
+        return "plan" in message or "non-uniform points" in message
+
+    def _plan_footprint_bytes(s_len: int, tile_n: int) -> int:
+        # cuFINUFFT raw-cudaMalloc footprint of this call's live plans: the
+        # upsampled fine grid (fw, complex128) plus kernel/sort work arrays
+        # (idxnupts + sortidx + bins ~ 16 B/point), for BOTH slab shapes the
+        # partition produces (full + tail). Reserved via _reserve_tile so
+        # concurrent transforms QUEUE for VRAM instead of racing cuFINUFFT's
+        # makeplan into a cudaErrorMemoryAllocation -- whose C++ cleanup
+        # throws in a destructor and SIGABRTs the whole process (measured on
+        # the base CaTiO3 run with 4 in-flight transforms).
+        shapes = {min(max(1, int(s_len)), int(dims[0]))}
+        tail = int(dims[0]) % max(1, int(s_len))
+        if tail:
+            shapes.add(tail)
+        fine_total = sum(
+            _next_fft_size(m0) * fine_other * 16 * 2 for m0 in shapes
+        )
+        sort_bytes = 16 * int(tile_n) * len(shapes)
+        return int((fine_total + sort_bytes) * 1.25)
+
+    if use_gpu:
+        _transform_enter()
+    plans: dict[tuple[int, ...], object] = {}
+    plans_tile: dict[tuple[int, ...], int] = {}   # shape -> tile of last setpts
+    reserved_bytes = 0
+    persistent_slab_len = None
+
+    def _ensure_plan_reservation(s_len: int) -> None:
+        # Single-point reservation per call: drop the old claim (and the
+        # plans it covered) BEFORE waiting on the new one, so two concurrent
+        # transforms can never hold-and-wait on each other.
+        nonlocal reserved_bytes
+        needed = _plan_footprint_bytes(s_len, tile_len)
+        if needed == reserved_bytes:
+            return
+        if reserved_bytes:
+            plans.clear()
+            plans_tile.clear()
+            _release_tile(reserved_bytes)
+            reserved_bytes = 0
+        _reserve_tile(needed)
+        reserved_bytes = needed
+
+    try:
+        if use_gpu:
+            plan_cls = _lazy_cufinufft("Plan")
+        else:
+            import finufft
+            fn = {1: finufft.nufft1d2, 2: finufft.nufft2d2, 3: finufft.nufft3d2}[dim]
+        oom_errors = (
+            (cp.cuda.memory.OutOfMemoryError, RuntimeError) if use_gpu else tuple()
+        )
+        if use_gpu:
+            # Every (tile x slab) pair costs one cuFINUFFT execute, and each
+            # execute re-runs the slab's FINE-GRID FFT (the API offers no
+            # FFT-once-interpolate-many). Minimizing executes means maximizing
+            # the tile_len x slab_len PRODUCT under the shared pool budget --
+            # an equal split, with the slab side clamped at the whole grid.
+            # (hkl40 measured: 10M-target tiles starved slabs to the 64 MiB
+            # floor -> 22x40 executes, 805 s/batch; a 75/25 slab-first split
+            # still paid 85x3, 642 s/batch. The equal split with an adequate
+            # pool gives ~1 slab x ~a dozen tiles.) Small grids leave the tile
+            # budget ~whole-pool, so small configs never tile.
+            # The half-pool budget is an equal share among in-flight
+            # transforms (this one included, hence sizing after
+            # _transform_enter): pool_free reads ~identically for concurrent
+            # starters, so without the divisor N slot siblings each sized for
+            # 0.5x the pool -- 1.0x combined at slots=2 before any slab.
+            with _GPU_ADMIT_COND:
+                inflight = max(1, _gpu_inflight)
+            budget = int(_pool_free_bytes() * 0.5) // inflight
+            grid_row_bytes = 16 * int(np.prod(dims[1:])) if dim > 1 else 16
+            desired_slab_bytes = min(int(dims[0]) * grid_row_bytes, budget // 2)
+            tile_len = max(
+                262_144, (budget - desired_slab_bytes) // bytes_per_tgt
+            )
+            tile_len = min(tile_len, n_tgt)
+        else:
+            # CPU path: with a tile consumer the caller is streaming tiles
+            # into an accumulator precisely to bound host memory, so honor
+            # that here too instead of materializing every target-axis
+            # temporary at full size.
+            tile_len = (
+                min(n_tgt, _env_int("MOSAIC_NUFFT_CPU_TILE_TARGETS", 8_000_000))
+                if tile_consumer is not None
+                else n_tgt
+            )
+        tile_bounds = [
+            (t0, min(t0 + tile_len, n_tgt)) for t0 in range(0, n_tgt, tile_len)
+        ]
+        if len(tile_bounds) > 1:
+            logger.info(
+                "lattice type-2: %d targets exceed pool tile budget; running %d "
+                "target tiles of <=%d (plans + fine grids reused across tiles)",
+                n_tgt,
+                len(tile_bounds),
+                tile_len,
+            )
+        for tile_idx, (t0, t1) in enumerate(tile_bounds):
+            n_t = t1 - t0
+            tgt_t = np.asarray(tgt[t0:t1], dtype=np.float64)
+            x_t = ((tgt_t * dq[None, :] + np.pi) % (2.0 * np.pi)) - np.pi
+            if use_gpu:
+                try:
+                    d_x = [
+                        cp.asarray(np.ascontiguousarray(x_t[:, a]))
+                        for a in range(dim)
+                    ]
+                except cp.cuda.memory.OutOfMemoryError:
+                    # pool shrank since tile sizing (concurrent transforms):
+                    # drop cached plans and retry once before giving up
+                    plans.clear()
+                    plans_tile.clear()
+                    free_gpu_memory()
+                    d_x = [
+                        cp.asarray(np.ascontiguousarray(x_t[:, a]))
+                        for a in range(dim)
+                    ]
+
+                def _plan_for(n_modes: tuple[int, ...]):
+                    # Plans (and their raw-cudaMalloc fine grids) are keyed by
+                    # slab SHAPE and live across tiles -- only setpts (the
+                    # target sort) reruns per tile. Rebuilding plans per tile
+                    # is what made hkl40 transforms ~10x slower than the
+                    # arithmetic said they should be.
+                    plan = plans.get(n_modes)
+                    if plan is None:
+                        # The CuPy pool caches freed blocks up to its limit;
+                        # that VRAM looks free to us but raw cudaMalloc (which
+                        # cuFINUFFT uses) cannot touch it. Hand blocks back to
+                        # the driver before a large plan build when raw VRAM
+                        # is short.
+                        fine_bytes = 16 * 2 * _next_fft_size(int(n_modes[0])) * fine_other
+                        if _free_mem_bytes() < fine_bytes:
+                            _free_cupy_pool_blocks()
+                        plan = plan_cls(
+                            2, n_modes, n_trans=1, eps=eps, isign=-1, dtype="complex128"
+                        )
+                        plans[n_modes] = plan
+                        plans_tile[n_modes] = -1
+                        _warn_if_below_headroom(f"type2-plan{n_modes}")
+                    if plans_tile.get(n_modes) != tile_idx:
+                        plan.setpts(*d_x)
+                        plans_tile[n_modes] = tile_idx
+                        _warn_if_below_headroom(f"type2-setpts{n_modes}")
+                    return plan
+            else:
+                d_x = [np.ascontiguousarray(x_t[:, a]) for a in range(dim)]
+            d_tgt = d_out = None
+            device_accum = False
+            if use_gpu:
+                try:
+                    d_tgt = cp.asarray(tgt_t)
+                    d_out = cp.zeros((n_trans, n_t), dtype=cp.complex128)
+                    device_accum = True
+                except cp.cuda.memory.OutOfMemoryError:
+                    d_tgt = d_out = None
+                    free_gpu_memory()
+            # Host-side accumulation target for this tile: the caller's full
+            # array when no consumer, a tile-sized scratch row otherwise.
+            tile_buf = None
+            if tile_consumer is not None and not device_accum:
+                tile_buf = np.zeros((n_trans, n_t), dtype=np.complex128)
+            # Slab size is computed ONCE per call (first tile) and reused:
+            # recomputing per tile from fluctuating pool-free bytes minted a
+            # DIFFERENT pinned staging bin every tile (18 tiles x ~0.6 GiB
+            # retained = the 10 GB shmem that OOM-killed workers). The OOM
+            # halving below still adjusts it; halved sizes persist.
+            if persistent_slab_len is None:
+                persistent_slab_len = _slab_len_now(device_accum, n_t)
+            slab_len = persistent_slab_len
+            if use_gpu:
+                _ensure_plan_reservation(slab_len)
+            a0 = 0
+            while a0 < int(dims[0]):
+                a1 = min(a0 + slab_len, int(dims[0]))
+                c = list(centers)
+                c[0] = a0 + (a1 - a0) // 2
+                q_c = origin + np.asarray(c, dtype=np.float64) * dq
+                plan = d_sub = d_o = d_phase = row_results = None
+                try:
+                    if use_gpu:
+                        plan = _plan_for(tuple(int(v) for v in (a1 - a0,) + tuple(dims[1:])))
+                        row_results = []
+                        for row in range(n_trans):
+                            sub = grids[row, a0:a1]    # contiguous view, no copy
+                            d_sub = cp.asarray(sub)
+                            row_results.append(plan.execute(d_sub).reshape(n_t))
+                            d_sub = None
+                        # commit only after the whole slab succeeded, so an OOM
+                        # retry (smaller slab) never double-counts a partial slab
+                        if device_accum:
+                            d_phase = cp.exp(-1j * (d_tgt @ cp.asarray(q_c)))
+                            # in-place ops only from here on -- nothing below
+                            # allocates, so an OOM cannot land BETWEEN row
+                            # commits (which would double-count this slab's
+                            # already-committed rows on the retry)
+                            for d_o in row_results:
+                                d_o *= d_phase
+                            for row, d_o in enumerate(row_results):
+                                d_out[row] += d_o
+                            d_phase = None
+                        else:
+                            phase = np.exp(-1j * (tgt_t @ q_c))
+                            host_rows = [cp.asnumpy(d_o) for d_o in row_results]
+                            for row, o in enumerate(host_rows):
+                                if tile_buf is not None:
+                                    tile_buf[row] += o * phase
+                                else:
+                                    out[row, t0:t1] += o * phase
+                        row_results = None
+                    else:
+                        phase = np.exp(-1j * (tgt_t @ q_c))
+                        row_results = []
+                        for row in range(n_trans):
+                            sub = grids[row, a0:a1]
+                            o = fn(*d_x, sub, isign=-1, eps=eps)
+                            row_results.append(
+                                np.asarray(o, dtype=np.complex128).reshape(n_t)
+                            )
+                        for row, o in enumerate(row_results):
+                            if tile_buf is not None:
+                                tile_buf[row] += o * phase
+                            else:
+                                out[row, t0:t1] += o * phase
+                except oom_errors as exc:
+                    if use_gpu and isinstance(exc, RuntimeError) and not (
+                        isinstance(exc, cp.cuda.memory.OutOfMemoryError)
+                        or _is_cufinufft_alloc_failure(exc)
+                    ):
+                        raise
+                    if slab_len <= 1:
+                        raise
+                    slab_len = max(1, slab_len // 2)
+                    persistent_slab_len = slab_len
+                    # drop every reference to the failed attempt BEFORE freeing:
+                    # these locals would otherwise pin the old fine grid and row
+                    # buffers through the retry's (smaller) allocations
+                    plan = d_sub = d_o = d_phase = row_results = None
+                    plans.clear()
+                    plans_tile.clear()
+                    free_gpu_memory()
+                    if use_gpu:
+                        _ensure_plan_reservation(slab_len)
+                    logger.debug(
+                        "lattice type-2 slab OOM; halving slab_len to %d (%s)",
+                        slab_len,
+                        exc,
+                    )
+                    continue
+                a0 = a1
+            if use_gpu and device_accum:
+                tile_host = cp.asnumpy(d_out)
+                if tile_consumer is not None:
+                    tile_consumer(t0, t1, tile_host)
+                else:
+                    out[:, t0:t1] = tile_host
+                tile_host = None
+            elif tile_buf is not None:
+                tile_consumer(t0, t1, tile_buf)
+            tile_buf = None
+            d_out = d_tgt = None
+            d_x = None
+            if use_gpu:
+                # Collapse the pinned high-water from "every staging size
+                # ever seen" to the live set — free blocks are pure cache.
+                _flush_pinned_pool()
+    finally:
+        plans.clear()
+        plans_tile.clear()
+        if reserved_bytes:
+            _release_tile(reserved_bytes)
+            reserved_bytes = 0
+        if use_gpu:
+            # Success AND failure paths: retained pool blocks from a failed
+            # transform otherwise survive into the retry.
+            _free_cupy_pool_blocks()
+            _transform_exit()
+    return out
+
+
+def _lazy_cufinufft(name):
+    import cufinufft
+    return getattr(cufinufft, name)
+
+
+def cufinufft_nufft1d2(*args, **kwargs):
+    return _lazy_cufinufft("nufft1d2")(*args, **kwargs)
+
+
+def cufinufft_nufft2d2(*args, **kwargs):
+    return _lazy_cufinufft("nufft2d2")(*args, **kwargs)
+
+
+def cufinufft_nufft3d2(*args, **kwargs):
+    return _lazy_cufinufft("nufft3d2")(*args, **kwargs)
+
+
+###############################################################################
+#  Lattice type-1 (forward): nonuniform sources -> uniform lattice box        #
+#                                                                             #
+#  The Stage-1 scattering transform evaluates A(q) = sum_k w_k exp(+i q.r_k)  #
+#  at the q-points of one interval. Those q-points sit on the run's global    #
+#  uniform lattice, so the transform is a type-1 NUFFT onto the interval's    #
+#  mode box. Crucially the wrapped source coordinates x_k = wrap(dq * r_k)    #
+#  depend only on the LATTICE PITCH, not on the interval: one plan + setpts   #
+#  per (source set, box dims, dq) serves every interval of the run, and the   #
+#  interval's box origin enters as a per-call weight phase. The cache below   #
+#  holds those plans; it is bounded, per-process, and must be cleared at the  #
+#  end of the scattering stage (plan scratch is raw cudaMalloc outside the    #
+#  CuPy pool).                                                                #
+###############################################################################
+_TYPE1_PLAN_CACHE: "dict[tuple, _Type1PlanEntry]" = {}
+_TYPE1_PLAN_CACHE_ORDER: list = []
+_TYPE1_PLAN_CACHE_LOCK = threading.Lock()
+
+
+class _Type1PlanEntry:
+    """Leased cache entry.
+
+    Concurrent worker threads can fetch an entry while another thread evicts
+    or clears it (LRU overflow, GPU-OOM cache flush). Destroying the plan in
+    that window would hand a freed cuFINUFFT handle to ``execute`` -- a
+    native use-after-free. Leases make destruction safe: eviction only marks
+    the entry doomed while leases are outstanding, and the LAST release
+    destroys the plan.
+    """
+
+    __slots__ = (
+        "plan", "d_x", "d_r", "lock", "leases", "doomed", "nbytes", "pts_dq"
+    )
+
+    def __init__(self, plan, d_x, d_r, nbytes=0, pts_dq=None):
+        self.plan = plan
+        self.d_x = d_x
+        self.d_r = d_r
+        self.lock = threading.Lock()
+        self.leases = 0
+        self.doomed = False
+        self.nbytes = int(nbytes)
+        # dq bytes the current setpts binding was wrapped with; execute
+        # refreshes the binding when a caller arrives with a different pitch
+        self.pts_dq = pts_dq
+
+
+def _type1_entry_destroy(entry: "_Type1PlanEntry") -> None:
+    with entry.lock:
+        _destroy_plan_quietly(entry.plan)
+        entry.plan = None
+
+
+def _type1_entry_release(entry: "_Type1PlanEntry") -> None:
+    destroy = False
+    with _TYPE1_PLAN_CACHE_LOCK:
+        entry.leases -= 1
+        destroy = entry.doomed and entry.leases <= 0
+    if destroy:
+        _type1_entry_destroy(entry)
+
+
+def _type1_plan_cache_max() -> int:
+    # A run's working set is (source sets) x (distinct interval box shapes):
+    # interior/edge/zero-plane boxes easily produce 40-80 keys, and a cap
+    # below the working set thrashes plan creation per transform. The byte
+    # budget below is the real bound; the count is a backstop.
+    raw = os.getenv("MOSAIC_SCATTERING_TYPE1_PLAN_CACHE_MAX", "256")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 256
+
+
+def _type1_plan_cache_max_bytes() -> int:
+    raw = os.getenv("MOSAIC_SCATTERING_TYPE1_CACHE_MAX_BYTES")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    total = _total_mem_bytes()
+    if total > 0:
+        # 1/8 of the card, capped at the historical 4 GiB: on big cards this
+        # fits the ~30%-of-VRAM plan-scratch model unchanged, on small cards
+        # it stops the cache from squatting on the absolute headroom.
+        return int(min(4 << 30, max(total // 8, 512 << 20)))
+    return 4 << 30
+
+
+def _type1_cache_total_bytes_locked() -> int:
+    return sum(entry.nbytes for entry in _TYPE1_PLAN_CACHE.values())
+
+
+def clear_lattice_type1_plan_cache() -> None:
+    doomed_now: list[_Type1PlanEntry] = []
+    with _TYPE1_PLAN_CACHE_LOCK:
+        for entry in _TYPE1_PLAN_CACHE.values():
+            if entry.leases > 0:
+                entry.doomed = True
+            else:
+                doomed_now.append(entry)
+        _TYPE1_PLAN_CACHE.clear()
+        _TYPE1_PLAN_CACHE_ORDER.clear()
+    for entry in doomed_now:
+        _type1_entry_destroy(entry)
+    _free_cupy_pool_blocks()
+
+
+def _type1_cache_acquire_or_build(key: tuple, builder):
+    """Return ``(entry, cached)`` with one lease taken on ``entry``.
+
+    The caller MUST pair this with ``_type1_entry_release`` (cached entries)
+    or destroy the plan itself (``cached=False``, cache disabled). Leases are
+    taken under the cache lock, so an entry handed out here can never be
+    destroyed underneath its user by eviction or a concurrent clear.
+    """
+    max_entries = _type1_plan_cache_max()
+    if max_entries <= 0:
+        plan, d_x, d_r, nbytes, pts_dq = builder()
+        return _Type1PlanEntry(plan, d_x, d_r, nbytes, pts_dq), False
+    with _TYPE1_PLAN_CACHE_LOCK:
+        entry = _TYPE1_PLAN_CACHE.get(key)
+        if entry is not None:
+            try:
+                _TYPE1_PLAN_CACHE_ORDER.remove(key)
+            except ValueError:
+                pass
+            _TYPE1_PLAN_CACHE_ORDER.append(key)
+            entry.leases += 1
+            return entry, True
+    plan, d_x, d_r, nbytes, pts_dq = builder()
+    entry = _Type1PlanEntry(plan, d_x, d_r, nbytes, pts_dq)
+    victims: list[_Type1PlanEntry] = []
+    max_bytes = _type1_plan_cache_max_bytes()
+    with _TYPE1_PLAN_CACHE_LOCK:
+        existing = _TYPE1_PLAN_CACHE.get(key)
+        if existing is not None:
+            victims.append(entry)  # lost the build race; ours is surplus
+            existing.leases += 1
+            entry = existing
+        else:
+            while _TYPE1_PLAN_CACHE_ORDER and (
+                len(_TYPE1_PLAN_CACHE_ORDER) >= max(1, max_entries)
+                or _type1_cache_total_bytes_locked() + entry.nbytes > max_bytes
+            ):
+                oldest = _TYPE1_PLAN_CACHE_ORDER.pop(0)
+                victim = _TYPE1_PLAN_CACHE.pop(oldest, None)
+                if victim is None:
+                    continue
+                if victim.leases > 0:
+                    victim.doomed = True
+                else:
+                    victims.append(victim)
+            _TYPE1_PLAN_CACHE[key] = entry
+            _TYPE1_PLAN_CACHE_ORDER.append(key)
+            entry.leases += 1
+    for victim in victims:
+        _type1_entry_destroy(victim)
+    return entry, True
+
+
+def _cufinufft_error_is_alloc(exc: Exception) -> bool:
+    """cuFINUFFT raises bare RuntimeErrors when its internal raw cudaMalloc
+    fails ('Error creating plan.', 'Error setting non-uniform points.',
+    'Error executing plan.'); under VRAM pressure they are memory-shaped."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc).lower()
+    return "plan" in message or "non-uniform points" in message
+
+
+def _type1_gpu_method() -> int:
+    raw = os.getenv("MOSAIC_SCATTERING_TYPE1_GPU_METHOD", "1")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
+def _type1_fine_grid_bytes(dims) -> int:
+    fine = 16 * 2  # complex128, ~2x residency for FFT work
+    for d in dims:
+        fine *= _next_fft_size(int(d))
+    return int(fine)
+
+
+def execute_type1_on_lattice(
+    meta: dict,
+    real_coords: np.ndarray,
+    weights: np.ndarray,
+    *,
+    eps: float = 1e-12,
+    prefer_cpu: bool = False,
+    gpu_only: bool = False,
+) -> np.ndarray | None:
+    """Evaluate ``A(q) = sum_k w_k exp(+i q.r_k)`` at ``meta``'s lattice
+    q-points via type-1 NUFFT. Exact to NUFFT eps and identical in convention
+    to ``execute_cunufft`` (forward, isign=+1).
+
+    ``meta`` comes from ``plan_lattice(q_grid)``; the result is gathered at
+    ``meta['flat_index']`` so it aligns with the caller's stored q order.
+    Returns ``None`` when the transform cannot run here (fine grid beyond the
+    memory budget, or GPU OOM persisting after a cache flush) -- callers fall
+    back to the type-3 path."""
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
+    r = np.asarray(real_coords, dtype=np.float64)
+    if r.ndim == 1:
+        r = r[:, None]
+    w = np.asarray(weights, dtype=np.complex128).reshape(-1)
+    dims = tuple(int(v) for v in meta["dims"])
+    dq = np.asarray(meta["dq"], dtype=np.float64)
+    origin = np.asarray(meta["origin"], dtype=np.float64)
+    dim = len(dims)
+    flat_index = np.asarray(meta["flat_index"], dtype=np.int64)
+    if r.shape[0] != w.shape[0]:
+        raise ValueError("Lattice type-1 requires one weight per source point.")
+    if flat_index.size == 0:
+        return np.zeros(0, dtype=np.complex128)
+    if r.shape[0] == 0:
+        return np.zeros(flat_index.size, dtype=np.complex128)
+
+    use_gpu = (
+        not (_CPU_ONLY or prefer_cpu) and _GPU_AVAILABLE and cp is not None
+    )
+    if use_gpu:
+        try:
+            _ensure_gpu_kernels()
+        except ImportError:
+            use_gpu = False
+    if not use_gpu and gpu_only:
+        raise RuntimeError("GPU execution forced but unavailable for lattice type-1.")
+
+    # GPU budget comes from the SHARED reservation pool (an equal live share
+    # among in-flight transforms), not a private fraction of free VRAM: N
+    # threads each sizing themselves from the same free reading is exactly how
+    # the total footprint used to grow with thread count.
+    fine_budget = (
+        _current_tile_budget()
+        if use_gpu
+        else int(os.getenv("MOSAIC_RESIDUAL_LATTICE_CPU_FINE_BUDGET", str(8 << 30)))
+    )
+    if _type1_fine_grid_bytes(dims) > fine_budget:
+        return None
+
+    q_c = origin + (np.asarray(dims, dtype=np.float64) // 2) * dq
+    x = ((r * dq[None, :] + np.pi) % (2.0 * np.pi)) - np.pi
+
+    if not use_gpu:
+        import finufft
+        fn = {1: finufft.nufft1d1, 2: finufft.nufft2d1, 3: finufft.nufft3d1}[dim]
+        c = w * np.exp(1j * (r @ q_c))
+        f = fn(
+            *[np.ascontiguousarray(x[:, a]) for a in range(dim)],
+            c,
+            dims,
+            isign=+1,
+            eps=eps,
+        )
+        return np.asarray(f, dtype=np.complex128).reshape(-1)[flat_index]
+
+    # The cuFINUFFT type-1 plan depends on the mode box (dims), eps and dtype
+    # only; the sources enter via setpts and the interval ORIGIN only via the
+    # per-execute weight phase (q_c). dq is deliberately NOT part of the key:
+    # plan_lattice's LSQ step refinement carries origin-dependent ulp noise
+    # into dq, so byte-equal pitches are not guaranteed across intervals with
+    # the same box — keying on dq minted one plan (and fine grid) per
+    # interval. A pitch change only moves the wrapped setpts coords, which
+    # execute rebinds below from THIS call's dq.
+    key = (
+        hashlib.sha256(np.ascontiguousarray(r).view(np.uint8).tobytes()).digest()[:16],
+        dims,
+        float(eps),
+    )
+
+    def _builder():
+        # Reserve the plan's raw-cudaMalloc footprint from the shared pool for
+        # the duration of the build, so concurrent type-1 builds on other
+        # worker threads queue for VRAM instead of racing cuFINUFFT's
+        # makeplan. Once built, the allocation is visible in live free VRAM,
+        # so the claim is dropped (holding it would double-count).
+        nbytes = _type1_fine_grid_bytes(dims) + r.nbytes * 2
+        _reserve_tile(nbytes)
+        try:
+            d_x = [cp.asarray(np.ascontiguousarray(x[:, a])) for a in range(dim)]
+            d_r = cp.asarray(r)
+            plan = _lazy_cufinufft("Plan")(
+                1, dims, n_trans=1, eps=eps, isign=+1, dtype="complex128",
+                # Global-memory spreading: the default shared-memory subproblem
+                # method collapses on this shape (moderate point counts, wide
+                # eps=1e-12 kernels, small mode boxes) -- measured 70 ms vs 3.9 ms
+                # per execute at hkl32 interval scale, identical results to 2e-15.
+                gpu_method=_type1_gpu_method(),
+            )
+            plan.setpts(*d_x)
+            _warn_if_below_headroom(f"type1-plan-build{dims}")
+            return plan, d_x, d_r, nbytes, dq.tobytes()
+        finally:
+            _release_tile(nbytes)
+
+    _transform_enter()
+    try:
+        last_exc = None
+        for attempt in (0, 1):
+            entry = None
+            cached = False
+            try:
+                entry, cached = _type1_cache_acquire_or_build(key, _builder)
+                # only plan.execute needs the entry lock (cuFINUFFT plans are
+                # not thread-safe); the weight phase and the gather are on
+                # private arrays, and keeping them outside lets other worker
+                # threads overlap their host/device prep instead of
+                # serializing whole intervals on the shared per-source plan
+                d_w = cp.asarray(w) * cp.exp(1j * (entry.d_r @ cp.asarray(q_c)))
+                dq_bytes = dq.tobytes()
+                with entry.lock:
+                    if entry.pts_dq != dq_bytes:
+                        # same box, ulp-different pitch: rebind the wrapped
+                        # coords from THIS call's dq before executing. setpts
+                        # and execute share the lock so a concurrent caller
+                        # with another pitch can never execute on our binding.
+                        d_x = [
+                            cp.asarray(np.ascontiguousarray(x[:, a]))
+                            for a in range(dim)
+                        ]
+                        entry.plan.setpts(*d_x)
+                        entry.d_x = d_x
+                        entry.pts_dq = dq_bytes
+                    d_f = entry.plan.execute(d_w)
+                result = cp.asnumpy(d_f.reshape(-1)[cp.asarray(flat_index)])
+                return result
+            except (cp.cuda.memory.OutOfMemoryError, RuntimeError) as exc:
+                if isinstance(exc, RuntimeError) and not (
+                    isinstance(exc, cp.cuda.memory.OutOfMemoryError)
+                    or _cufinufft_error_is_alloc(exc)
+                ):
+                    raise
+                last_exc = exc
+                clear_lattice_type1_plan_cache()
+                free_gpu_memory()
+            finally:
+                if entry is not None:
+                    if cached:
+                        _type1_entry_release(entry)
+                    else:
+                        _type1_entry_destroy(entry)
+        logger.warning(
+            "lattice type-1 GPU memory failure persists; falling back to "
+            "type-3 for this transform (%s)",
+            last_exc,
+        )
+        return None
+    finally:
+        _transform_exit()
 
 
 def _execute_inverse_cunufft_batch(
@@ -732,6 +2441,8 @@ def _execute_inverse_cunufft_batch(
     gpu_only: bool,
     device_out: bool,
 ) -> np.ndarray:
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     if weights_arr.shape[1] != len(q_coords):
         raise ValueError("weights shape must match q_coords on axis 1")
     experimental_overlap = _experimental_overlap_enabled()
@@ -739,6 +2450,11 @@ def _execute_inverse_cunufft_batch(
         logger.debug(
             "Experimental overlap requested for inverse batch, but the current path remains serialized with timing diagnostics only."
         )
+
+    if gpu_only and (_CPU_ONLY or prefer_cpu):
+        raise RuntimeError("GPU execution forced but CPU execution was requested.")
+    if gpu_only and not _GPU_AVAILABLE:
+        raise RuntimeError("GPU execution forced but no CUDA/cuFINUFFT backend is available.")
 
     if _CPU_ONLY or prefer_cpu or not _GPU_AVAILABLE:
         host = np.stack(
@@ -782,6 +2498,7 @@ def _execute_inverse_cunufft_batch(
     resident_coords = np.asarray(q_coords, dtype=np.float64)
     target_coords = np.asarray(real_coords, dtype=np.float64)
     n_trans = int(weights_arr.shape[0])
+
     telemetry = _begin_telemetry(
         mode="inverse-batch",
         n_sources=int(len(resident_coords)),
@@ -1074,9 +2791,16 @@ def _batched_type3(
     prefer_cpu: bool,
     gpu_only: bool,
 ) -> np.ndarray:
+    if not (_CPU_ONLY or prefer_cpu):
+        _ensure_gpu_backend()
     dim = real_coords.shape[1]
     if dim not in (1, 2, 3):
         raise ValueError("Only 1-, 2-, and 3-D inputs supported")
+
+    if gpu_only and (_CPU_ONLY or prefer_cpu):
+        raise RuntimeError("GPU execution forced but CPU execution was requested.")
+    if gpu_only and not _GPU_AVAILABLE:
+        raise RuntimeError("GPU execution forced but no CUDA/cuFINUFFT backend is available.")
 
     if _CPU_ONLY or prefer_cpu or not _GPU_AVAILABLE:
         return _cpu_fallback(real_coords, weights, q_coords, eps, inverse)
@@ -1306,7 +3030,8 @@ def _batched_type3(
 ###############################################################################
 def _adaptive_gpu_launch(dim, resident_cols, d_w, target_cols, eps, inverse):
     isign = -1 if inverse else 1
-    subprobs = (32, 16, 8, 4, 2, 1)
+    # Single-source the deterministic, history-independent back-off ladder.
+    subprobs = _subprob_order(dim, 1)
 
     for s in subprobs:
         kw = _build_gpu_launch_kwargs(gpu_maxsubprobsize=s)
@@ -1334,27 +3059,30 @@ def _adaptive_gpu_launch(dim, resident_cols, d_w, target_cols, eps, inverse):
 
 
 def _launch_once(dim, resident_cols, d_w, target_cols, eps, isign, kw):
-    if dim == 1:
-        return _KER[1](
-            resident_cols[0],
-            d_w,
-            target_cols[0],
-            eps=eps,
-            isign=isign,
-            **kw,
-        )
-    if dim == 2:
-        return _KER[2](
-            resident_cols[0],
-            resident_cols[1],
-            d_w,
-            target_cols[0],
-            target_cols[1],
-            eps=eps,
-            isign=isign,
-            **kw,
-        )
-    return _KER[3](*resident_cols, d_w, *target_cols, eps=eps, isign=isign, **kw)
+    try:
+        if dim == 1:
+            return _KER[1](
+                resident_cols[0],
+                d_w,
+                target_cols[0],
+                eps=eps,
+                isign=isign,
+                **kw,
+            )
+        if dim == 2:
+            return _KER[2](
+                resident_cols[0],
+                resident_cols[1],
+                d_w,
+                target_cols[0],
+                target_cols[1],
+                eps=eps,
+                isign=isign,
+                **kw,
+            )
+        return _KER[3](*resident_cols, d_w, *target_cols, eps=eps, isign=isign, **kw)
+    finally:
+        _warn_if_below_headroom("type3-simple-launch")
 
 
 def _set_type3_points(plan, *, dim: int, source_cols, target_cols) -> None:
@@ -1389,27 +3117,69 @@ def _execute_inverse_batch_gpu(
     n_trans: int,
     eps: float,
 ):
+    """Inverse type-3 NUFFT with bounded-cache plan reuse.
+
+    Plan cache is keyed only on the Plan() constructor arguments
+    ``(dim, type=3, isign=-1, n_trans, eps, dtype, gpu_maxsubprobsize)``.
+    Different point sets reuse the same cached Plan via ``setpts()`` —
+    that is the operation cuFINUFFT is built around amortizing. The point
+    coords are NOT part of the cache key, so the cache stays small (≈ 6
+    distinct subprobs × small set of n_trans values) regardless of how
+    many distinct geometries the workload exposes. Both ``setpts`` and
+    ``execute`` happen under the per-plan lock because cuFINUFFT Plans
+    are not thread-safe.
+    """
     import cufinufft                   # type: ignore
 
-    subprobs = (32, 16, 8, 4, 2, 1)
+    subprobs = _subprob_order(dim, n_trans)
+    oom_retry_done = False
+
     for s in subprobs:
-        try:
-            plan = cufinufft.Plan(
+        cache_key = (int(dim), 3, -1, int(n_trans), float(eps), int(s))
+
+        def _build(_s=s):
+            return cufinufft.Plan(
                 3,
                 dim,
                 n_trans=n_trans,
                 eps=eps,
                 isign=-1,
                 dtype="complex128",
-                **_build_gpu_launch_kwargs(gpu_maxsubprobsize=s),
+                **_build_gpu_launch_kwargs(gpu_maxsubprobsize=_s),
             )
-            _set_type3_points(
-                plan,
-                dim=dim,
-                source_cols=resident_cols,
-                target_cols=target_cols,
-            )
-            return plan.execute(d_weights)
+
+        def _do_call():
+            plan, per_plan_lock, cached = _plan_cache_get_or_build(cache_key, _build)
+            try:
+                with per_plan_lock:
+                    # Re-bind points for this call (cheap relative to Plan ctor).
+                    _set_type3_points(
+                        plan,
+                        dim=dim,
+                        source_cols=resident_cols,
+                        target_cols=target_cols,
+                    )
+                    result = plan.execute(d_weights)
+                _warn_if_below_headroom("type3-plan-execute")
+                return result
+            finally:
+                # When the cache is disabled, destroy the plan immediately so
+                # cuFINUFFT scratch (allocated via raw cudaMalloc, bypassing
+                # the CuPy pool) is reclaimed before the next call. This is
+                # the only mechanism that bounds plan-internal VRAM under
+                # multi-process workers on a single GPU.
+                if not cached:
+                    _destroy_plan_quietly(plan)
+
+        try:
+            result = _do_call()
+            # Best-effort: return any pool blocks released by the call back
+            # to the device. Live cuFINUFFT Plan internals (kept alive by
+            # the cache) are NOT in the free list; only this task's
+            # working scratch is. Without this, the pool monotonically
+            # grows under concurrent task load.
+            _free_cupy_pool_blocks()
+            return result
         except (
             cp.cuda.memory.OutOfMemoryError,
             RuntimeError,
@@ -1417,6 +3187,22 @@ def _execute_inverse_batch_gpu(
             cp.cuda.runtime.CUDARuntimeError,
             cp.cuda.driver.CUDADriverError,
         ) as e:
+            if (
+                cp is not None
+                and isinstance(e, cp.cuda.memory.OutOfMemoryError)
+                and not oom_retry_done
+            ):
+                # Drop cache + free pool blocks, then retry at this subprob.
+                _clear_plan_cache()
+                oom_retry_done = True
+                try:
+                    result = _do_call()
+                    _free_cupy_pool_blocks()
+                    return result
+                except Exception as e2:
+                    if _is_retryable_resource_error(e2):
+                        continue
+                    raise
             if _is_retryable_resource_error(e):
                 continue
             raise
@@ -1521,18 +3307,15 @@ def _direct_cpu_fallback(
     target_batch = min(int(batch), _DIRECT_CPU_FALLBACK_MAX_TARGETS)
     target_batch = max(1, target_batch)
     isign = -1 if inverse else 1
-    out = np.zeros(n_targets, dtype=np.complex128)
     sources_t = np.ascontiguousarray(sources.T)
 
-    start = 0
-    while start < n_targets:
-        end = min(start + target_batch, n_targets)
-        target_chunk = targets[start:end]
-        phase = target_chunk @ sources_t
-        out[start:end] = np.exp(1j * isign * phase) @ coeffs
-        start = end
-
-    return out
+    return direct_dft_type3(
+        targets,
+        sources_t,
+        coeffs,
+        isign=isign,
+        batch=target_batch,
+    )
 
 
 ###############################################################################

@@ -1,0 +1,28 @@
+name: mosaic
+channels:
+  - conda-forge
+  - nvidia/label/cuda-12.4.0
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - h5py
+  - dask=2026.1.1
+  - distributed=2026.1.1
+  - dask-jobqueue
+  - dask-mpi
+  - numba
+  - pyyaml
+  - requests
+  - sympy
+  - tqdm
+  - cuda-toolkit=12.4.0
+  - pip
+  - pip:
+      - cuda-bindings==12.*
+      - finufft==2.2.0
+      - cupy-cuda12x
+      - cufinufft==2.5.1
+      - dask-cuda>=26.4

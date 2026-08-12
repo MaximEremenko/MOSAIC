@@ -15,6 +15,13 @@ def build_decoding_payload(context: DecodingContext) -> dict[str, object]:
         "refnumbers": to_numpy(context.structure.refnumbers),
         "rspace_info": rspace_info,
         "decoder": rspace_info.get("decoder"),
+        # The run's structure identity (stamped at load). Passed explicitly
+        # rather than by handing the decoder the whole runtime_info, which
+        # would also expose residual_run_digest and switch the source-identity
+        # resolution onto its manifest branch — a change this does not intend.
+        "source_structure_digest": context.workflow_parameters.runtime_info.get(
+            "source_structure_digest"
+        ),
         "vectors": context.structure.vectors,
         "supercell": context.structure.supercell,
         "postprocessing_mode": context.postprocessing_mode,

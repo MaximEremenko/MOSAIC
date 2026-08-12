@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {"const": "mosaic.decoder.commit"},
+    "schema_version": {"const": 1},
+    "run_digest": {"type": "string"},
+    "decoder_cache_path": {"type": "string"},
+    "decoder_cache_file_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "decoder_cache_nbytes": {"type": "integer"},
+    "decoder_cache_identity": {"type": "object"},
+    "decoder_commit_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "run_digest",
+    "decoder_cache_path",
+    "decoder_cache_file_sha256",
+    "decoder_cache_nbytes",
+    "decoder_cache_identity",
+    "decoder_commit_digest"
+  ],
+  "type": "object"
+}
