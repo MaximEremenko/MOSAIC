@@ -10,10 +10,12 @@ masks, applies an inverse Fourier transform to recover atom-centered real-space
 fields, and decodes those fields into site-resolved outputs associated with the
 chosen diffuse features.
 
-The scientific method is described in the accompanying manuscript:
+The scientific method is described in the accompanying paper:
 
-> **A Filter-Based Approach Linking Diffuse Scattering Features to
-> Site-Resolved Real-Space Fields**
+> Maksim Eremenko, Victor Krayzman, Matthew G. Tucker, Igor Levin,
+> **Connecting Diffuse Scattering to Atomic-Site-Resolved Occupancy and
+> Displacement Fields through Fourier Filtering**,
+> arXiv:2607.10440 (2026). <https://arxiv.org/pdf/2607.10440>
 
 ## Method Overview
 
@@ -236,10 +238,12 @@ If you use MOSAIC in your work, please cite:
 
 ```bibtex
 @article{mosaic_paper,
-  author  = {Eremenko, Maksim},
-  title   = {A Filter-Based Approach Linking Diffuse Scattering Features
-             to Site-Resolved Real-Space Fields},
-  year    = {2026}
+  author  = {Eremenko, Maksim and Krayzman, Victor and Tucker, Matthew G. and Levin, Igor},
+  title   = {Connecting Diffuse Scattering to Atomic-Site-Resolved Occupancy
+             and Displacement Fields through Fourier Filtering},
+  journal = {arXiv preprint arXiv:2607.10440},
+  year    = {2026},
+  url     = {https://arxiv.org/pdf/2607.10440}
 }
 ```
 
