@@ -5,7 +5,7 @@ message: >-
   software using the metadata in this file.
 title: "MOSAIC"
 version: "0.1.0"
-date-released: 2026-03-14
+date-released: 2026-08-14
 license: Apache-2.0
 type: software
 authors:
