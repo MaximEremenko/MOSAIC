@@ -83,4 +83,7 @@ ChangeLog
 docs/**/*.log
 
 # Amorphous demo run tree (regenerated per run)
-examples/config_3D/amorphous_sio2/output_amorphous_*/
+examples/config_3D/amorphous_sio2/
+examples/demo_3D_amorphous_SiO2*.ipynb
+examples/paper_amorphous*.ipynb
+docs/amorphous/
