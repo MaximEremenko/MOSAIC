@@ -1758,6 +1758,11 @@ def build_residual_field_reducer_backend(
 def get_process_local_residual_field_backend(
     template_backend: ManifestDrivenResidualFieldReducerBackend,
 ) -> ManifestDrivenResidualFieldReducerBackend:
+    if not isinstance(template_backend, ManifestDrivenResidualFieldReducerBackend):
+        # Test seams substitute duck-typed fakes; they carry their own local
+        # state, so the process-local singleton indirection must not replace
+        # them with a real backend.
+        return template_backend
     key = (
         str(template_backend.layout.kind),
         template_backend.shard_storage_root_override,

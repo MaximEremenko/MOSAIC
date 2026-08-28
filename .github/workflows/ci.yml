@@ -59,16 +59,9 @@ jobs:
         run: |
           pytest -q tests/unit
 
-      - name: Workflow integration tests
+      - name: Integration tests
         run: |
-          pytest -q tests/integration/test_workflow_services.py
-
-      - name: Distributed residual integration tests
-        env:
-          MOSAIC_ENABLE_DISTRIBUTED_TESTS: "1"
-          MOSAIC_DASK_RESOURCE_WAIT_TIMEOUT: "10"
-        run: |
-          pytest --timeout=180 -q tests/integration/test_residual_field_hpc.py
+          pytest --timeout=180 -q tests/integration
 
       - name: CUDA extra resolution and admission gate
         run: |

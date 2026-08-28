@@ -92,7 +92,8 @@ Common keys:
 Common `mask` entries:
 
 - `equation`: a symbolic expression evaluated per Q-point (used by 1D and 2D
-  examples). In the manuscript this is called a *window* W_F(Q).
+  examples). In the manuscript ([arXiv:2607.10440](https://arxiv.org/pdf/2607.10440))
+  this is called a *window* W_F(Q).
 - `special_points`: list of named reciprocal-space points with symmetry and
   shape parameters (used by the 3D example)
 - `shell_radii`: radial bounds (`r1`, `r2`) for shell-based masking around

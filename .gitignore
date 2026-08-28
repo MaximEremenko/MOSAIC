@@ -56,6 +56,7 @@ examples/config_3D/chemical_ordering/output_chem_rest/
 # The demo notebook writes output_demo_lifeo2_<size>_<tag>/; without this
 # pattern 75 files of one run tree were committed, lock files included.
 examples/config_3D/chemical_ordering/output_demo_lifeo2_*/
+examples/config_3D/chemical_ordering/*_demo_20x20x20_*.json
 
 # Legacy / scratch
 src/
